@@ -1,0 +1,43 @@
+# HypoForge — Full Pipeline (all six modules + iteration)
+
+run_name: hypoforge-full
+output_dir: ./output/full_pipeline
+verbose: true
+log_level: INFO
+
+pipeline:
+  enabled_modules: ["m1", "m2", "m3", "m4", "m5", "m6"]
+  max_iterations: 3
+  enable_iteration: true
+  iteration_module_target: "m4"
+
+qwen:
+  max:
+    model: qwen-max
+    max_tokens: 8192
+    temperature: 0.1
+  plus:
+    model: qwen-plus
+    max_tokens: 4096
+    temperature: 0.1
+  turbo:
+    model: qwen-turbo
+    max_tokens: 4096
+    temperature: 0.3
+
+search:
+  tools: ["semantic_scholar", "pubmed"]
+  papers_per_sub_question: 20
+  max_papers_total: 100
+
+module_overrides:
+  m4:
+    kwargs:
+      num_candidates: 7
+      top_k: 3
+      mode: "multi_agent"
+  m6:
+    kwargs:
+      reviewers: ["scientific_logic", "evidence_consistency", "method_feasibility", "overall"]
+
+enabled_skills: []

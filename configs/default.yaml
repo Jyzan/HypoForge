@@ -1,0 +1,36 @@
+# HypoForge — Default Pipeline Configuration
+# Used when no --config flag is given.
+
+run_name: hypoforge-default
+output_dir: ./output
+verbose: true
+log_level: INFO
+
+pipeline:
+  enabled_modules: ["m1", "m2", "m3", "m4", "m5", "m6"]
+  max_iterations: 3
+  enable_iteration: true
+  iteration_module_target: "m4"
+
+qwen:
+  max:
+    model: qwen-max
+    max_tokens: 8192
+    temperature: 0.1
+  plus:
+    model: qwen-plus
+    max_tokens: 4096
+    temperature: 0.1
+  turbo:
+    model: qwen-turbo
+    max_tokens: 4096
+    temperature: 0.3
+
+search:
+  tools: ["semantic_scholar", "pubmed"]
+  papers_per_sub_question: 15
+  max_papers_total: 80
+
+module_overrides: {}
+
+enabled_skills: []

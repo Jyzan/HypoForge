@@ -1,0 +1,13 @@
+# HypoForge — AI Scientist Pipeline
+# ================================
+# Core
+langgraph>=0.2.0
+pydantic>=2.0
+pyyaml>=6.0
+rich>=13.0
+
+# LLM (for real Qwen client — not yet imported by stub)
+langchain-openai>=0.2.0
+
+# Development
+pytest>=8.0

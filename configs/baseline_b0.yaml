@@ -1,0 +1,33 @@
+# HypoForge — Baseline B0: 千问直出 (Qwen direct)
+# Skips M2/M3 (no literature search or evidence graph).
+# M4 runs in "direct" mode — single prompt, no multi-agent.
+
+run_name: baseline-b0
+output_dir: ./output/baseline_b0
+verbose: true
+log_level: INFO
+
+pipeline:
+  enabled_modules: ["m1", "m4", "m5"]
+  max_iterations: 0
+  enable_iteration: false
+
+qwen:
+  max:
+    model: qwen-max
+    max_tokens: 8192
+    temperature: 0.1
+
+search:
+  tools: []
+  papers_per_sub_question: 0
+  max_papers_total: 0
+
+module_overrides:
+  m4:
+    kwargs:
+      num_candidates: 5
+      top_k: 3
+      mode: "direct"
+
+enabled_skills: []

@@ -1,0 +1,33 @@
+# HypoForge — Baseline B1: Qwen + Web Search
+# M2 is enabled (literature search), but M3 (evidence graph) is skipped.
+# M4 runs in "direct" mode (single agent, not multi-agent).
+
+run_name: baseline-b1
+output_dir: ./output/baseline_b1
+verbose: true
+log_level: INFO
+
+pipeline:
+  enabled_modules: ["m1", "m2", "m4", "m5"]
+  max_iterations: 0
+  enable_iteration: false
+
+qwen:
+  max:
+    model: qwen-max
+    max_tokens: 8192
+    temperature: 0.1
+
+search:
+  tools: ["semantic_scholar", "pubmed"]
+  papers_per_sub_question: 15
+  max_papers_total: 60
+
+module_overrides:
+  m4:
+    kwargs:
+      num_candidates: 5
+      top_k: 3
+      mode: "direct"
+
+enabled_skills: []
