@@ -10,11 +10,17 @@ Output: ``reviews`` appended; ``iteration_count`` incremented.
 
 from __future__ import annotations
 
+import json
+import logging
 from typing import Any, Dict, List, Optional
 
 from ..protocol import ModuleProtocol
+from ..prompts.m6_prompts import M6_REVIEWER_PROMPTS, M6_USER_TEMPLATE
 from ..registry import ModuleRegistry
 from ..state import PipelineState, ReviewResult, ReviewerDimension
+from ..tools.qwen_client import QwenClient
+
+logger = logging.getLogger(__name__)
 
 
 @ModuleRegistry.register
@@ -30,6 +36,8 @@ class M6ReviewIteration(ModuleProtocol):
     def __init__(
         self,
         reviewers: Optional[List[str]] = None,
+        mode: str = "stub",
+        llm_config: Optional[Any] = None,
         **kwargs,
     ):
         self.reviewer_dims = reviewers or [
@@ -38,6 +46,9 @@ class M6ReviewIteration(ModuleProtocol):
             "method_feasibility",
             "overall",
         ]
+        self.mode = mode
+        self.llm_config = llm_config
+        self.client = QwenClient.from_config(llm_config) if llm_config else None
 
     # ------------------------------------------------------------------
     # ModuleProtocol implementation
@@ -49,6 +60,42 @@ class M6ReviewIteration(ModuleProtocol):
         config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         version = state.iteration_count + 1
+
+        if self.mode in {"llm", "direct", "api"} and self.client and state.top_hypotheses and state.research_plans:
+            try:
+                hypothesis = state.top_hypotheses[0]
+                plan = next(
+                    (p for p in state.research_plans if p.hypothesis_id == hypothesis.hypothesis_id),
+                    state.research_plans[0],
+                )
+                graph = state.evidence_graph
+                new_reviews: List[ReviewResult] = []
+                for dim in self.reviewer_dims:
+                    payload = await self.client.structured_chat(
+                        system_prompt=M6_REVIEWER_PROMPTS[dim],
+                        user_prompt=M6_USER_TEMPLATE.format(
+                            original_question=state.input_question,
+                            hypothesis_json=json.dumps(hypothesis.model_dump(mode="json"), ensure_ascii=False, indent=2),
+                            plan_json=json.dumps(plan.model_dump(mode="json"), ensure_ascii=False, indent=2),
+                            facts_count=len(graph.established_facts) if graph else 0,
+                            conflicts_count=len(graph.conflicts) if graph else 0,
+                            gaps_count=len(graph.knowledge_gaps) if graph else 0,
+                        ),
+                        output_schema=ReviewResult.model_json_schema(),
+                        max_tokens=getattr(self.llm_config, "max_tokens", 4096),
+                        temperature=getattr(self.llm_config, "temperature", 0.1),
+                    )
+                    payload = dict(payload)
+                    payload["dimension"] = dim
+                    payload["version"] = version
+                    new_reviews.append(ReviewResult.model_validate(payload))
+
+                return {
+                    "reviews": state.reviews + new_reviews,
+                    "iteration_count": version,
+                }
+            except Exception as exc:
+                logger.warning("M6 LLM mode failed; falling back to stub: %s", exc)
 
         # ---- stub reviews for the top hypothesis ----
         if state.top_hypotheses:

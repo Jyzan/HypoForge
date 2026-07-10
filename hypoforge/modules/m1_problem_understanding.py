@@ -9,11 +9,16 @@ Output: ``ProblemCard`` in ``state.problem_card``.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
 from ..protocol import ModuleProtocol
+from ..prompts.m1_prompts import M1_SYSTEM_PROMPT, M1_USER_TEMPLATE
 from ..registry import ModuleRegistry
 from ..state import PipelineState, ProblemCard, QuestionType
+from ..tools.qwen_client import QwenClient
+
+logger = logging.getLogger(__name__)
 
 
 @ModuleRegistry.register
@@ -60,8 +65,15 @@ class M1ProblemUnderstanding(ModuleProtocol):
     # ModuleProtocol implementation
     # ------------------------------------------------------------------
 
-    def __init__(self, **kwargs):
-        pass  # Stub needs no LLM client; real impl will accept LLMConfig
+    def __init__(
+        self,
+        mode: str = "stub",
+        llm_config: Optional[Any] = None,
+        **kwargs,
+    ):
+        self.mode = mode
+        self.llm_config = llm_config
+        self.client = QwenClient.from_config(llm_config) if llm_config else None
 
     async def __call__(
         self,
@@ -69,6 +81,22 @@ class M1ProblemUnderstanding(ModuleProtocol):
         config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         question = state.input_question
+
+        if self.mode in {"llm", "direct", "api"} and self.client:
+            try:
+                payload = await self.client.structured_chat(
+                    system_prompt=M1_SYSTEM_PROMPT,
+                    user_prompt=M1_USER_TEMPLATE.format(question=question),
+                    output_schema=ProblemCard.model_json_schema(),
+                    max_tokens=getattr(self.llm_config, "max_tokens", 4096),
+                    temperature=getattr(self.llm_config, "temperature", 0.1),
+                )
+                card = ProblemCard.model_validate(payload)
+                if not card.original_question:
+                    card.original_question = question
+                return {"problem_card": card}
+            except Exception as exc:
+                logger.warning("M1 LLM mode failed; falling back to stub: %s", exc)
 
         # Simple keyword matching for stub — real impl calls Qwen
         if "protein" in question.lower() and "折叠" in question:

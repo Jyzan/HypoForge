@@ -10,11 +10,16 @@ Output: ``research_plans`` in state.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
 from ..protocol import ModuleProtocol
+from ..prompts.m5_prompts import M5_SYSTEM_PROMPT, M5_USER_TEMPLATE
 from ..registry import ModuleRegistry
 from ..state import PipelineState, ResearchPlan
+from ..tools.qwen_client import QwenClient
+
+logger = logging.getLogger(__name__)
 
 
 @ModuleRegistry.register
@@ -108,8 +113,15 @@ class M5ResearchPlan(ModuleProtocol):
     # ModuleProtocol implementation
     # ------------------------------------------------------------------
 
-    def __init__(self, **kwargs):
-        pass
+    def __init__(
+        self,
+        mode: str = "stub",
+        llm_config: Optional[Any] = None,
+        **kwargs,
+    ):
+        self.mode = mode
+        self.llm_config = llm_config
+        self.client = QwenClient.from_config(llm_config) if llm_config else None
 
     async def __call__(
         self,
@@ -118,6 +130,28 @@ class M5ResearchPlan(ModuleProtocol):
     ) -> Dict[str, Any]:
         plans: List[ResearchPlan] = []
         for h in state.top_hypotheses:
+            if self.mode in {"llm", "direct", "api"} and self.client:
+                try:
+                    payload = await self.client.structured_chat(
+                        system_prompt=M5_SYSTEM_PROMPT,
+                        user_prompt=M5_USER_TEMPLATE.format(
+                            statement=h.statement,
+                            mechanism=h.mechanism,
+                            predictions="\n".join(h.observable_predictions),
+                            falsification_conditions="\n".join(h.falsification_conditions),
+                        ),
+                        output_schema=ResearchPlan.model_json_schema(),
+                        max_tokens=getattr(self.llm_config, "max_tokens", 4096),
+                        temperature=getattr(self.llm_config, "temperature", 0.1),
+                    )
+                    plan = ResearchPlan.model_validate(payload)
+                    if not plan.hypothesis_id:
+                        plan.hypothesis_id = h.hypothesis_id
+                    plans.append(plan)
+                    continue
+                except Exception as exc:
+                    logger.warning("M5 LLM mode failed for %s; falling back to stub: %s", h.hypothesis_id, exc)
+
             stub = self._STUB_PLANS.get(h.hypothesis_id)
             if stub:
                 plan = stub.model_copy()

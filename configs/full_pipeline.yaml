@@ -12,16 +12,20 @@ pipeline:
   iteration_module_target: "m4"
 
 qwen:
+  base:
+    model: qwen3.7-max
+    max_tokens: 8192
+    temperature: 0.1
   max:
-    model: qwen-max
+    model: qwen3.7-max
     max_tokens: 8192
     temperature: 0.1
   plus:
-    model: qwen-plus
+    model: qwen3.7-plus
     max_tokens: 4096
     temperature: 0.1
   turbo:
-    model: qwen-turbo
+    model: qwen3.6-flash
     max_tokens: 4096
     temperature: 0.3
 
@@ -31,13 +35,24 @@ search:
   max_papers_total: 100
 
 module_overrides:
+  m1:
+    kwargs:
+      mode: "llm"
+      llm_tier: "base"
   m4:
     kwargs:
       num_candidates: 7
       top_k: 3
       mode: "multi_agent"
+      llm_tier: "base"
+  m5:
+    kwargs:
+      mode: "llm"
+      llm_tier: "plus"
   m6:
     kwargs:
+      mode: "llm"
+      llm_tier: "plus"
       reviewers: ["scientific_logic", "evidence_consistency", "method_feasibility", "overall"]
 
 enabled_skills: []

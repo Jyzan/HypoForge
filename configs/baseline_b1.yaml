@@ -14,7 +14,7 @@ pipeline:
 
 qwen:
   max:
-    model: qwen-max
+    model: qwen3.7-max
     max_tokens: 8192
     temperature: 0.1
 

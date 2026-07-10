@@ -162,7 +162,7 @@ class HypothesisCard(BaseModel):
 class ResearchPlan(BaseModel):
     """A detailed research plan for one hypothesis (M5 output)."""
 
-    hypothesis_id: str
+    hypothesis_id: str = ""
     study_subjects: str = ""
     independent_variables: List[str] = Field(default_factory=list)
     dependent_variables: List[str] = Field(default_factory=list)

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from typing import List
+from typing import Any, Dict, List
 
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 from rich import box
+from rich.console import Group
 
 from . import COLORS, console
 
@@ -27,7 +28,7 @@ from ..state import (
 # Phase / Module headers
 # ============================================================================
 
-_PHASE_ICONS = {"running": "▶", "done": "✓", "error": "✗"}
+_PHASE_ICONS = {"running": ">", "done": "[OK]", "error": "[ERR]"}
 _PHASE_COLORS = {"running": "primary", "done": "success", "error": "error"}
 
 
@@ -41,10 +42,10 @@ def render_phase_header(
     Example output::
 
         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        ▶ [M1] Problem Understanding — 问题理解与分解
+        > [M1] Problem Understanding — 问题理解与分解
         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     """
-    icon = _PHASE_ICONS.get(status, "▶")
+    icon = _PHASE_ICONS.get(status, ">")
     color = COLORS[_PHASE_COLORS.get(status, "primary")]
     console.print()
     console.print(Rule(
@@ -56,7 +57,7 @@ def render_phase_header(
 
 def render_phase_done(module_name: str) -> None:
     """Shorthand for a completed phase."""
-    console.print(f"  [{COLORS['success']}]✓ [{module_name.upper()}] complete[/{COLORS['success']}]")
+    console.print(f"  [{COLORS['success']}][OK] [{module_name.upper()}] complete[/{COLORS['success']}]")
 
 
 # ============================================================================
@@ -84,7 +85,7 @@ def render_literature_summary(
 ) -> None:
     """Print a one-line summary of literature search results."""
     console.print(
-        f"  [{COLORS['success']}]✓ Retrieved {papers_retrieved} papers "
+        f"  [{COLORS['success']}][OK] Retrieved {papers_retrieved} papers "
         f"across {sub_questions} sub-questions, "
         f"extracted {knowledge_entries} knowledge entries[/{COLORS['success']}]"
     )
@@ -97,7 +98,7 @@ def render_literature_summary(
 def render_evidence_summary(graph: EvidenceGraph) -> None:
     """Print a Rich table summarising the evidence graph."""
     table = Table(
-        title="📊 Evidence Graph Summary",
+        title="Evidence Graph Summary",
         box=box.ROUNDED,
         title_style=f"bold {COLORS['primary']}",
     )
@@ -146,13 +147,13 @@ def render_hypothesis_card(h: HypothesisCard, rank: int, max_width: int = 80) ->
     if h.observable_predictions:
         body.append("Predictions:\n", style="bold")
         for p in h.observable_predictions:
-            body.append(f"  • {p}\n")
+            body.append(f"  - {p}\n")
         body.append("\n")
 
     if h.falsification_conditions:
         body.append("Falsification:\n", style="bold")
         for c in h.falsification_conditions:
-            body.append(f"  • {c}\n")
+            body.append(f"  - {c}\n")
         body.append("\n")
 
     body.append("Scores: ", style="bold")
@@ -160,7 +161,7 @@ def render_hypothesis_card(h: HypothesisCard, rank: int, max_width: int = 80) ->
 
     console.print(Panel(
         body,
-        title=f"[bold]💡 Hypothesis {h.hypothesis_id}",
+        title=f"[bold]Hypothesis {h.hypothesis_id}",
         border_style=COLORS["highlight"],
         box=box.ROUNDED,
         width=max_width,
@@ -198,7 +199,7 @@ def render_research_plan(plan: ResearchPlan) -> None:
     lines.append(f"[bold]Control Groups:[/] {', '.join(plan.control_groups)}")
     lines.append(f"[bold]Procedures:[/]")
     for p in plan.procedures:
-        lines.append(f"  • {p}")
+        lines.append(f"  - {p}")
     lines.append(f"[bold]Metrics:[/] {', '.join(plan.measurement_metrics)}")
     lines.append(f"[bold]Analysis:[/] {', '.join(plan.analysis_methods)}")
     lines.append(f"[bold]If Supported:[/] {plan.expected_results_if_supported[:200]}")
@@ -206,11 +207,41 @@ def render_research_plan(plan: ResearchPlan) -> None:
 
     console.print(Panel(
         "\n".join(lines),
-        title=f"[bold]📋 Research Plan for {plan.hypothesis_id}",
+        title=f"[bold]Research Plan for {plan.hypothesis_id}",
         border_style=COLORS["primary"],
         box=box.ROUNDED,
     ))
     console.print()
+
+
+def render_research_plans_summary(plans: List[ResearchPlan], max_plans: int = 2) -> None:
+    """Render a compact summary of generated research plans."""
+    if not plans:
+        console.print(f"  [{COLORS['muted']}]No research plans generated.[/{COLORS['muted']}]")
+        return
+
+    table = Table(
+        title="Research Plan Summary",
+        box=box.ROUNDED,
+        title_style=f"bold {COLORS['primary']}",
+        show_lines=True,
+    )
+    table.add_column("Hypothesis", style=f"bold {COLORS['highlight']}", no_wrap=True)
+    table.add_column("Subjects")
+    table.add_column("Variables")
+    table.add_column("Metrics")
+
+    for plan in plans:
+        table.add_row(
+            plan.hypothesis_id,
+            plan.study_subjects[:160],
+            "\n".join(plan.independent_variables[:3]) or "-",
+            "\n".join(plan.measurement_metrics[:3]) or "-",
+        )
+    console.print(table)
+
+    for plan in plans[:max_plans]:
+        render_research_plan(plan)
 
 
 # ============================================================================
@@ -230,7 +261,7 @@ def render_iteration_header(iteration: int, max_iterations: int) -> None:
     """Print a header for the current iteration round."""
     console.print()
     console.print(Rule(
-        f"[bold {COLORS['highlight']}]🔄 Iteration Round {iteration}/{max_iterations}",
+        f"[bold {COLORS['highlight']}]Iteration Round {iteration}/{max_iterations}",
         style=COLORS["highlight"],
     ))
 
@@ -240,7 +271,7 @@ def render_iteration_comparison(reviews: List[ReviewResult]) -> None:
     if len(reviews) < 2:
         return
 
-    table = Table(title="📈 Iteration Score Comparison", box=box.ROUNDED)
+    table = Table(title="Iteration Score Comparison", box=box.ROUNDED)
     table.add_column("Dimension", style=f"bold {COLORS['primary']}")
     table.add_column("Before", justify="right")
     table.add_column("After", justify="right")
@@ -269,6 +300,119 @@ def render_iteration_comparison(reviews: List[ReviewResult]) -> None:
 
 
 # ============================================================================
+# Per-module result dispatcher
+# ============================================================================
+
+def _render_m2_results(results: list) -> None:
+    papers = sum(r.papers_retrieved for r in results)
+    entries = sum(len(r.knowledge_entries) for r in results)
+    render_literature_summary(papers, entries, len(results))
+
+    table = Table(
+        title="Literature Extraction Snapshot",
+        box=box.ROUNDED,
+        title_style=f"bold {COLORS['primary']}",
+        show_lines=True,
+    )
+    table.add_column("Sub-question", style=f"bold {COLORS['primary']}", ratio=2)
+    table.add_column("Papers", justify="right", no_wrap=True)
+    table.add_column("Knowledge entries", ratio=3)
+
+    for result in results[:5]:
+        sample_entries = "\n".join(
+            f"{entry.id} [{entry.type.value}]: {entry.content[:120]}"
+            for entry in result.knowledge_entries[:3]
+        ) or "-"
+        table.add_row(
+            result.sub_question,
+            str(result.papers_retrieved),
+            sample_entries,
+        )
+    console.print(table)
+
+
+def _render_m6_reviews(reviews: List[ReviewResult]) -> None:
+    if not reviews:
+        console.print(f"  [{COLORS['muted']}]No reviews generated.[/{COLORS['muted']}]")
+        return
+
+    latest_version = max(review.version for review in reviews)
+    latest_reviews = [review for review in reviews if review.version == latest_version]
+
+    table = Table(
+        title=f"Review Round {latest_version}",
+        box=box.ROUNDED,
+        title_style=f"bold {COLORS['highlight']}",
+        show_lines=True,
+    )
+    table.add_column("Dimension", style=f"bold {COLORS['primary']}", no_wrap=True)
+    table.add_column("Score", justify="right", no_wrap=True)
+    table.add_column("Comments")
+    table.add_column("Suggestions")
+
+    for review in latest_reviews:
+        score_style = COLORS["success"] if review.score >= 4.0 else COLORS["warning"]
+        table.add_row(
+            review.dimension.value,
+            f"[{score_style}]{review.score:.1f}/5[/{score_style}]",
+            review.comments[:180],
+            review.suggestions[:140],
+        )
+    console.print(table)
+
+
+def render_module_result(
+    module_name: str,
+    state: PipelineState,
+    result: Dict[str, Any],
+) -> None:
+    """Render a module's returned state update in a readable terminal form."""
+    if not result:
+        console.print(f"  [{COLORS['muted']}]No state updates returned.[/{COLORS['muted']}]")
+        return
+
+    if module_name == "m1" and result.get("problem_card"):
+        render_problem_card(result["problem_card"])
+        return
+
+    if module_name == "m2" and result.get("literature_results") is not None:
+        _render_m2_results(result["literature_results"])
+        return
+
+    if module_name == "m3" and result.get("evidence_graph"):
+        render_evidence_summary(result["evidence_graph"])
+        return
+
+    if module_name == "m4":
+        candidates = result.get("candidate_hypotheses", [])
+        top = result.get("top_hypotheses", [])
+        render_hypotheses_summary(
+            candidates=len(candidates),
+            passed=len(candidates),
+            top_n=len(top),
+            hypotheses=top,
+        )
+        return
+
+    if module_name == "m5" and result.get("research_plans") is not None:
+        render_research_plans_summary(result["research_plans"])
+        return
+
+    if module_name == "m6":
+        all_reviews = result.get("reviews", state.reviews)
+        _render_m6_reviews(all_reviews)
+        return
+
+    updated_fields = ", ".join(sorted(result.keys()))
+    console.print(Panel(
+        f"Updated fields: {updated_fields}",
+        title=f"[bold]Result: {module_name.upper()}",
+        border_style=COLORS["primary"],
+        box=box.ROUNDED,
+    ))
+
+
+# ============================================================================
 # Final summary
 # ============================================================================
 
@@ -276,7 +420,7 @@ def render_final_summary(state: PipelineState) -> None:
     """Print a closing summary of the full pipeline run."""
     console.print()
     console.print(Rule(
-        f"[bold {COLORS['success']}]✓ Pipeline Complete — {state.run_id}",
+        f"[bold {COLORS['success']}][OK] Pipeline Complete — {state.run_id}",
         style=COLORS["success"],
         characters="═",
     ))

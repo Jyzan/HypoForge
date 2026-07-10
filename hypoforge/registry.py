@@ -102,9 +102,21 @@ class ModuleRegistry:
         dict[str, ModuleProtocol]
             ``{"m1": <instance>, "m2": <instance>, …}``
         """
+        default_tiers = {
+            "m1": "base",
+            "m2": "turbo",
+            "m3": "plus",
+            "m4": "base",
+            "m5": "plus",
+            "m6": "plus",
+        }
+
         instances: Dict[str, ModuleProtocol] = {}
         for name in cls.list_all():
-            kwargs = config.get_module_kwargs(name) if hasattr(config, "get_module_kwargs") else {}
+            kwargs = dict(config.get_module_kwargs(name)) if hasattr(config, "get_module_kwargs") else {}
+            tier = kwargs.pop("llm_tier", default_tiers.get(name, "base"))
+            if hasattr(config, "get_llm_for_tier"):
+                kwargs.setdefault("llm_config", config.get_llm_for_tier(tier))
             instances[name] = cls._modules[name](**kwargs)
         return instances
 

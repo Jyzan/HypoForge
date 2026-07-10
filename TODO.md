@@ -2,7 +2,7 @@
 
 > 挑战杯 2026 · 赛题A：科学假设生成与研究计划设计
 > 当前状态：**骨架已完成，端到端可运行（stub 模式）**
-> 最后更新：2026-07-10
+> 最后更新：2026-07-11
 
 ---
 
@@ -64,6 +64,11 @@ HypoForge 是一个基于 LangGraph StateGraph 的六模块闭环 pipeline：
 ```
 HypoForge/
 ├── run_hypoforge.py                    ✅ CLI 入口 (argparse + asyncio)
+├── README.md                           ✅ 项目说明 + CLI 参考 + Conda 部署
+├── requirements.txt                    ✅ pip 依赖清单
+├── environment.yml                     ✅ Conda 环境一键部署
+├── .env_template                       ✅ API key 配置模板
+├── TODO.md                             ✅ 开发路线图
 ├── configs/
 │   ├── default.yaml                    ✅ 默认配置（全模块+迭代）
 │   ├── full_pipeline.yaml              ✅ 完整系统
@@ -141,11 +146,12 @@ CLI 端到端:
 
 > 负责人：架构/全员
 
-- [ ] **0.1** 在项目根目录添加 `requirements.txt` 或 `pyproject.toml`，注明依赖
+- [x] **0.1** 在项目根目录添加 `requirements.txt`（已完成）和 `environment.yml`（Conda 一键重建）
   - 依赖: `langgraph`, `pydantic>=2`, `pyyaml`, `rich`, `langchain-openai`
-- [ ] **0.2** 确认所有组员能用 `D:/Programming/Anaconda/envs/biodsa/python.exe` 跑通
-  - `python run_hypoforge.py -q "test"` 应无报错
-- [ ] **0.3** 在 `configs/default.yaml` 中填入真实的 `DASHSCOPE_API_KEY`（或用 `.env` 管理）
+- [x] **0.1b** 新建 `.env_template` 模板文件，供组员复制为 `.env` 填写 API key
+- [x] **0.1c** 新建 `environment.yml`，支持 `conda env create -f environment.yml` 一键部署
+- [ ] **0.2** 确认所有组员能跑通`python run_hypoforge.py -q "test"` 应无报错
+- [x] **0.3** `.env` 管理 API key：复制 `.env_template` → `.env`，填入 `OPENAI_API_KEY` 和 `OPENAI_BASE_URL`
 - [ ] **0.4** 确认 Semantic Scholar API 无需 key，PubMed E-utilities 注册 API key（可选）
 
 ---
@@ -384,10 +390,19 @@ PipelineState 字段:
 ### 运行命令
 
 ```bash
-# 激活环境 + 运行
-conda create -n hypoforge python=3.12 -y
+# 方式一：从 environment.yml 一键创建（推荐）
+conda env create -f environment.yml
 conda activate hypoforge
-cd Hypoforge
+
+# 方式二：手动创建
+conda create -n hypoforge python=3.11 -y
+conda activate hypoforge
+pip install -r requirements.txt
+
+# 配置 API key（参考 .env_template）
+cp .env_template .env   # 然后编辑 .env 填入真实 key
+
+# 运行
 python run_hypoforge.py \
   --question "蛋白质如何折叠及错误折叠导致疾病的机制？" \
   --config configs/full_pipeline.yaml

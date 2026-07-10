@@ -11,11 +11,22 @@ Output: ``candidate_hypotheses`` + ``top_hypotheses`` in state.
 
 from __future__ import annotations
 
+import json
+import logging
 from typing import Any, Dict, List, Optional
 
 from ..protocol import ModuleProtocol
+from ..prompts.m4_prompts import (
+    M4_GENERATOR_SYSTEM_PROMPT,
+    M4_GENERATOR_USER_TEMPLATE,
+    M4_RANKER_SYSTEM_PROMPT,
+    M4_RANKER_USER_TEMPLATE,
+)
 from ..registry import ModuleRegistry
 from ..state import HypothesisCard, PipelineState
+from ..tools.qwen_client import QwenClient
+
+logger = logging.getLogger(__name__)
 
 
 @ModuleRegistry.register
@@ -33,11 +44,14 @@ class M4HypothesisGeneration(ModuleProtocol):
         num_candidates: int = 7,
         top_k: int = 3,
         mode: str = "stub",  # "stub" | "direct" | "multi_agent"
+        llm_config: Optional[Any] = None,
         **kwargs,
     ):
         self.num_candidates = num_candidates
         self.top_k = top_k
         self.mode = mode
+        self.llm_config = llm_config
+        self.client = QwenClient.from_config(llm_config) if llm_config else None
 
     # ------------------------------------------------------------------
     # Stub hypotheses
@@ -125,6 +139,99 @@ class M4HypothesisGeneration(ModuleProtocol):
     ]
 
     # ------------------------------------------------------------------
+    # LLM helpers
+    # ------------------------------------------------------------------
+
+    def _entry_lookup(self, state: PipelineState) -> Dict[str, str]:
+        entries: Dict[str, str] = {}
+        for lr in state.literature_results:
+            for entry in lr.knowledge_entries:
+                entries[entry.id] = entry.content
+        return entries
+
+    def _graph_bucket_text(self, state: PipelineState, bucket: str) -> str:
+        graph = state.evidence_graph
+        entry_text = self._entry_lookup(state)
+        ids = getattr(graph, bucket, []) if graph else []
+        lines = [f"- {entry_id}: {entry_text.get(entry_id, entry_id)}" for entry_id in ids]
+        return "\n".join(lines) if lines else "- None available"
+
+    def _normalise_hypotheses(self, payload: Any) -> List[HypothesisCard]:
+        if isinstance(payload, dict):
+            payload = payload.get("hypotheses") or payload.get("items") or payload.get("data") or []
+
+        cards: List[HypothesisCard] = []
+        for idx, item in enumerate(payload or [], start=1):
+            if not isinstance(item, dict):
+                continue
+            item = dict(item)
+            item.setdefault("hypothesis_id", f"H{idx}")
+            item.setdefault("scores", {})
+            card = HypothesisCard.model_validate(item)
+            if "composite" not in card.scores:
+                card.scores["composite"] = 0.0
+            cards.append(card)
+        return cards
+
+    def _rank_top(self, cards: List[HypothesisCard]) -> List[HypothesisCard]:
+        return sorted(
+            cards,
+            key=lambda h: h.scores.get("composite", 0),
+            reverse=True,
+        )[: self.top_k]
+
+    async def _run_llm(self, state: PipelineState) -> Dict[str, Any]:
+        assert self.client is not None
+        question = state.problem_card.original_question if state.problem_card else state.input_question
+
+        generator_schema = {
+            "type": "array",
+            "items": HypothesisCard.model_json_schema(),
+        }
+        generated = await self.client.structured_chat(
+            system_prompt=M4_GENERATOR_SYSTEM_PROMPT.format(num_candidates=self.num_candidates),
+            user_prompt=M4_GENERATOR_USER_TEMPLATE.format(
+                knowledge_gaps=self._graph_bucket_text(state, "knowledge_gaps"),
+                established_facts=self._graph_bucket_text(state, "established_facts"),
+                conflicts=self._graph_bucket_text(state, "conflicts"),
+                original_question=question,
+                num_candidates=self.num_candidates,
+            ),
+            output_schema=generator_schema,
+            max_tokens=getattr(self.llm_config, "max_tokens", 8192),
+            temperature=max(getattr(self.llm_config, "temperature", 0.1), 0.4),
+        )
+        candidates = self._normalise_hypotheses(generated)
+        if not candidates:
+            raise ValueError("M4 generator returned no valid hypotheses")
+
+        if self.mode == "multi_agent":
+            ranked = await self.client.structured_chat(
+                system_prompt=M4_RANKER_SYSTEM_PROMPT.format(top_k=self.top_k),
+                user_prompt=M4_RANKER_USER_TEMPLATE.format(
+                    hypotheses_json=json.dumps(
+                        [h.model_dump(mode="json") for h in candidates],
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    top_k=self.top_k,
+                ),
+                output_schema=generator_schema,
+                max_tokens=getattr(self.llm_config, "max_tokens", 8192),
+                temperature=getattr(self.llm_config, "temperature", 0.1),
+            )
+            top = self._normalise_hypotheses(ranked)
+            if not top:
+                top = self._rank_top(candidates)
+        else:
+            top = self._rank_top(candidates)
+
+        return {
+            "candidate_hypotheses": candidates,
+            "top_hypotheses": top[: self.top_k],
+        }
+
+    # ------------------------------------------------------------------
     # ModuleProtocol implementation
     # ------------------------------------------------------------------
 
@@ -133,6 +240,12 @@ class M4HypothesisGeneration(ModuleProtocol):
         state: PipelineState,
         config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        if self.mode in {"direct", "multi_agent", "llm", "api"} and self.client:
+            try:
+                return await self._run_llm(state)
+            except Exception as exc:
+                logger.warning("M4 LLM mode failed; falling back to stub: %s", exc)
+
         # In stub mode, return pre-crafted hypotheses
         candidates = self._STUB_HYPOTHESES[:self.num_candidates]
         top = sorted(

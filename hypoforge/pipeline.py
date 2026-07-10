@@ -12,7 +12,7 @@ from typing import Dict
 from langgraph.graph import END, StateGraph
 
 from .config import PipelineConfig
-from .display.panels import render_phase_done, render_phase_header
+from .display.panels import render_module_result, render_phase_done, render_phase_header
 from .protocol import ModuleProtocol
 from .registry import ModuleRegistry
 from .state import PipelineState
@@ -107,13 +107,14 @@ class PipelineRunner:
             try:
                 result = await mod(state)
                 if self.config.verbose:
+                    render_module_result(name, state, result)
                     render_phase_done(name)
                 return result
             except Exception as exc:
                 import traceback
                 if self.config.verbose:
                     from .display import console, COLORS
-                    console.print(f"  [{COLORS['error']}]✗ [{name.upper()}] ERROR: {exc}[/{COLORS['error']}]")
+                    console.print(f"  [{COLORS['error']}][ERR] [{name.upper()}] ERROR: {exc}[/{COLORS['error']}]")
                 return {"errors": state.errors + [f"[{name}] {exc}\n{traceback.format_exc()}"]}
 
         return node_fn
@@ -157,7 +158,7 @@ class PipelineRunner:
             console.print()
             console.print(Panel(
                 f"[bold]{question}[/bold]",
-                title=f"[bold {COLORS['primary']}]🚀 HypoForge Pipeline — {run_id}",
+                title=f"[bold {COLORS['primary']}]HypoForge Pipeline — {run_id}",
                 border_style=COLORS["primary"],
             ))
 

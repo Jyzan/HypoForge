@@ -4,6 +4,11 @@ Configuration management for HypoForge.
 Inspired by ``open_deep_research``'s ``Configuration`` Pydantic model
 with environment-variable override.  All tunable parameters live here;
 they can be set via YAML file, environment variable, or runtime override.
+
+Environment variables (loaded from ``.env`` or system env):
+  - ``OPENAI_API_KEY`` — API key for the OpenAI-compatible endpoint (required)
+  - ``OPENAI_BASE_URL`` — Base URL for the OpenAI-compatible endpoint
+  - ``DASHSCOPE_API_KEY`` — Legacy / fallback key name
 """
 
 from __future__ import annotations
@@ -13,35 +18,95 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field, model_validator
+
+
+# ---------------------------------------------------------------------------
+# Auto-load .env  (searches from project root upward)
+# ---------------------------------------------------------------------------
+
+def _find_and_load_dotenv() -> None:
+    """Locate the project-root ``.env`` and load it into ``os.environ``.
+
+    Searches upward from this file's directory; the first ``.env`` found wins.
+    Also checks ``Path.cwd()`` as a fallback so that ``python run_hypoforge.py``
+    works regardless of the working directory.
+    """
+    candidates = [
+        Path(__file__).resolve().parent.parent / ".env",   # repo root relative to hypoforge/
+        Path.cwd() / ".env",                               # current working directory
+    ]
+    for dotenv_path in candidates:
+        if dotenv_path.exists():
+            load_dotenv(dotenv_path, override=True)
+            return
+    # If no .env file is found, try load_dotenv() which searches cwd upward
+    load_dotenv(override=True)
+
+
+_find_and_load_dotenv()
 
 
 # ============================================================================
 # Sub-models
 # ============================================================================
 
+# Tier → default model mapping (uses the latest available models from the API)
+DEFAULT_MODEL_MAP = {
+    "base":  "qwen3.7-max",
+    "max":   "qwen3.7-max",
+    "plus":  "qwen3.7-plus",
+    "turbo": "qwen3.6-flash",
+}
+
+
 class LLMConfig(BaseModel):
     """Configuration for a single LLM endpoint."""
 
-    model: str = "qwen-max"
-    api_base: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    model: str = "qwen3.7-max"
+    api_base: str = ""
     api_key: str = ""
     max_tokens: int = 4096
     temperature: float = 0.1
 
     @model_validator(mode="after")
-    def _resolve_api_key(self) -> "LLMConfig":
+    def _resolve_env(self) -> "LLMConfig":
+        # ---- api_key ----
         if not self.api_key:
-            self.api_key = os.environ.get("DASHSCOPE_API_KEY", "")
+            self.api_key = (
+                os.environ.get("OPENAI_API_KEY")
+                or os.environ.get("DASHSCOPE_API_KEY")
+                or ""
+            )
+        # ---- api_base ----
+        if not self.api_base:
+            self.api_base = (
+                os.environ.get("OPENAI_BASE_URL")
+                or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            )
         return self
 
 
 class QwenModelsConfig(BaseModel):
-    """Three-tier Qwen model assignment (matches competition spec)."""
+    """Three-tier model assignment (matches competition spec).
 
-    max: LLMConfig = Field(default_factory=lambda: LLMConfig(model="qwen-max", max_tokens=8192))
-    plus: LLMConfig = Field(default_factory=lambda: LLMConfig(model="qwen-plus", max_tokens=4096))
-    turbo: LLMConfig = Field(default_factory=lambda: LLMConfig(model="qwen-turbo", max_tokens=4096))
+    The YAML config can override each tier's model / temperature / max_tokens.
+    If ``model`` is left empty, defaults from ``DEFAULT_MODEL_MAP`` are used.
+    """
+
+    base: LLMConfig = Field(default_factory=lambda: LLMConfig(
+        model=DEFAULT_MODEL_MAP["base"], max_tokens=8192,
+    ))
+    max: LLMConfig = Field(default_factory=lambda: LLMConfig(
+        model=DEFAULT_MODEL_MAP["max"], max_tokens=8192,
+    ))
+    plus: LLMConfig = Field(default_factory=lambda: LLMConfig(
+        model=DEFAULT_MODEL_MAP["plus"], max_tokens=4096,
+    ))
+    turbo: LLMConfig = Field(default_factory=lambda: LLMConfig(
+        model=DEFAULT_MODEL_MAP["turbo"], max_tokens=4096, temperature=0.3,
+    ))
 
 
 class SearchConfig(BaseModel):
@@ -107,7 +172,7 @@ class PipelineConfig(BaseModel):
         """Load configuration from a YAML file.
 
         Environment variables take precedence over YAML values for any
-        field that is also a recognised env var (``DASHSCOPE_API_KEY``, …).
+        field that is also a recognised env var (``OPENAI_API_KEY``, …).
         """
         path = Path(path)
         if not path.exists():
@@ -115,6 +180,14 @@ class PipelineConfig(BaseModel):
 
         with open(path, "r", encoding="utf-8") as fh:
             raw: Dict[str, Any] = yaml.safe_load(fh) or {}
+
+        # Flatten nested "pipeline" key if present (for backward compat)
+        if "pipeline" in raw and isinstance(raw["pipeline"], dict):
+            pipeline_raw = raw.pop("pipeline")
+            raw.setdefault("enabled_modules", pipeline_raw.get("enabled_modules", ["m1", "m2", "m3", "m4", "m5", "m6"]))
+            raw.setdefault("max_iterations", pipeline_raw.get("max_iterations", 3))
+            raw.setdefault("enable_iteration", pipeline_raw.get("enable_iteration", True))
+            raw.setdefault("iteration_module_target", pipeline_raw.get("iteration_module_target", "m4"))
 
         # Resolve env vars for well-known keys
         return cls(**raw)
@@ -125,8 +198,13 @@ class PipelineConfig(BaseModel):
         return cls()
 
     def get_llm_for_tier(self, tier: str) -> LLMConfig:
-        """Convenience: return the LLMConfig for *max*, *plus*, or *turbo*."""
-        mapping = {"max": self.qwen.max, "plus": self.qwen.plus, "turbo": self.qwen.turbo}
+        """Convenience: return the LLMConfig for a named model tier."""
+        mapping = {
+            "base": self.qwen.base,
+            "max": self.qwen.max,
+            "plus": self.qwen.plus,
+            "turbo": self.qwen.turbo,
+        }
         if tier not in mapping:
             raise ValueError(f"Unknown LLM tier '{tier}'. Choose from {list(mapping)}.")
         return mapping[tier]
