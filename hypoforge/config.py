@@ -160,6 +160,9 @@ class PipelineConfig(BaseModel):
     # ---- per-module overrides ----
     module_overrides: Dict[str, ModuleOverride] = Field(default_factory=dict)
 
+    # ---- persistence ----
+    memory_cache_dir: str = ""  # if non-empty, M3 persists knowledge graph here
+
     # ---- skills (middleware) ----
     enabled_skills: List[str] = Field(default_factory=list)
 

@@ -150,6 +150,7 @@ class PipelineRunner:
             input_question=question,
             run_id=run_id,
             max_iterations=self.config.max_iterations,
+            memory_cache_dir=self.config.memory_cache_dir,
         )
 
         if self.config.verbose:

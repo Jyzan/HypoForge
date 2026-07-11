@@ -119,7 +119,34 @@ class M3EvidenceGraph(ModuleProtocol):
             knowledge_gaps=gaps,
         )
 
+        # ---- persist to disk (if enabled) ----
+        if getattr(state, "memory_cache_dir", ""):
+            self._persist_graph(graph, state.memory_cache_dir)
+
         return {"evidence_graph": graph}
+
+    # ------------------------------------------------------------------
+    # Persistence helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _persist_graph(graph: EvidenceGraph, cache_dir: str) -> None:
+        """Save the evidence graph to a JSONL-backed persistent store."""
+        import logging
+        from pathlib import Path
+
+        from ..memory.graph_manager import KnowledgeGraphManager
+
+        logger = logging.getLogger(__name__)
+        try:
+            mgr = KnowledgeGraphManager(cache_dir=Path(cache_dir))
+            mgr.save_from_evidence_graph(graph)
+            logger.info(
+                "M3: persisted evidence graph (%d nodes, %d edges) to %s",
+                len(graph.nodes), len(graph.edges), cache_dir,
+            )
+        except Exception as exc:
+            logger.warning("M3: failed to persist evidence graph: %s", exc)
 
     @classmethod
     def get_input_fields(cls) -> List[str]:

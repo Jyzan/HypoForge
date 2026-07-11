@@ -227,6 +227,9 @@ class PipelineState(BaseModel):
     iteration_count: int = 0
     max_iterations: int = 3
 
+    # ---- persistence ----
+    memory_cache_dir: str = ""  # non-empty enables persistent knowledge graph
+
     # ---- metadata ----
     run_id: str = ""
     errors: List[str] = Field(default_factory=list)
