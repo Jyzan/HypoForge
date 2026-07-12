@@ -52,6 +52,57 @@ Abstract:
 Please extract structured knowledge entries from this paper.
 """
 
+M2_BATCH_EXTRACTION_SYSTEM_PROMPT = """\
+You are a biomedical knowledge extraction expert. You will receive a batch of \
+scientific paper abstracts. For each paper, extract six categories of structured \
+knowledge entries.
+
+Categories (zero or more entries each):
+
+1. **established_fact** — widely accepted findings, textbook-level knowledge.
+   Include a confidence level (high / medium / low).
+2. **mechanistic_conclusion** — causal or mechanistic claims the paper makes
+   (e.g. "Protein X activates pathway Y via phosphorylation of Z").
+3. **conflicting_evidence** — findings that contradict other published work,
+   or internal contradictions the authors acknowledge.
+4. **method** — key experimental techniques used (e.g. CRISPR-Cas9 knockout,
+   RNA-seq, SPR, X-ray crystallography, …).
+5. **knowledge_gap** — explicitly stated open questions or limitations that
+   the authors identify as needing future work.
+6. **key_entity** — important proteins, genes, pathways, drugs, diseases that
+   should be tracked in the evidence graph.
+
+IMPORTANT: For every entry, you MUST set ``source_paper_id`` and
+``source_paper_title`` to the exact values shown in the paper's header
+(e.g. ``PMID:12345678`` and the exact title string).  This is how entries
+are linked back to their source.
+
+Return a flat JSON array of all entries across all papers in the batch.
+"""
+
+M2_BATCH_EXTRACTION_USER_TEMPLATE = """\
+The following {paper_count} papers need structured knowledge extraction.
+
+{papers_text}
+
+Please extract all knowledge entries from these papers.  Return a single JSON \
+array containing entries from ALL papers.  For each entry, set \
+``source_paper_id`` to the paper ID shown in the header (e.g. PMID:12345).
+"""
+
+# Template for a single paper block inside the batch
+M2_PAPER_BLOCK_TEMPLATE = """\
+---
+## Paper {index}  [ID: {paper_id}]
+Title: {title}
+Authors: {authors}
+Year: {year}
+Journal: {journal}
+
+Abstract:
+{abstract}
+"""
+
 M2_SEARCH_QUERY_TEMPLATE = """\
 Generate 2–3 focused PubMed / Semantic Scholar search queries for the following \
 sub-question in biomedicine.  Use MeSH terms where appropriate.  Return only \
