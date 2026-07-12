@@ -4,9 +4,17 @@ HypoForge CLI — entry point for running the AI Scientist pipeline.
 
 Usage::
 
+    # Fresh run
     python run_hypoforge.py \\
         --question "蛋白质如何折叠及错误折叠导致疾病的机制？" \\
         --config configs/full_pipeline.yaml
+
+    # Resume from checkpoint (same --run-id as the interrupted run)
+    python run_hypoforge.py \\
+        --question "蛋白质如何折叠及错误折叠导致疾病的机制？" \\
+        --config configs/full_pipeline.yaml \\
+        --run-id hypoforge-abc12345 \\
+        --resume
 
     python run_hypoforge.py \\
         --question "衰老的生物学基础是什么？" \\
@@ -51,6 +59,11 @@ def main():
         type=str,
         default="",
         help="Custom run identifier (auto-generated if omitted).",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from the last checkpoint for this --run-id.",
     )
     parser.add_argument(
         "--quiet",
@@ -100,6 +113,7 @@ def main():
         state = asyncio.run(runner.run(
             question=args.question,
             run_id=args.run_id,
+            resume=args.resume,
         ))
     except KeyboardInterrupt:
         print("\nInterrupted by user.")

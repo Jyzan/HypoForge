@@ -88,7 +88,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
                     system_prompt=M1_SYSTEM_PROMPT,
                     user_prompt=M1_USER_TEMPLATE.format(question=question),
                     output_schema=ProblemCard.model_json_schema(),
-                    max_tokens=getattr(self.llm_config, "max_tokens", 4096),
+                    max_tokens=8192,
                     temperature=getattr(self.llm_config, "temperature", 0.1),
                 )
                 card = ProblemCard.model_validate(payload)

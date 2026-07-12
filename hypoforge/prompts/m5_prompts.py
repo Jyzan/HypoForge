@@ -36,6 +36,14 @@ the following elements:
 
 11. **Risks & alternatives** — technical risks, sample risks, fallback approaches.
 
+Conciseness requirements:
+- Keep each measurement metric to one concise sentence of at most 18 words.
+- Keep each analysis method to one concise sentence of at most 22 words.
+- Keep each procedure to at most 25 words.
+- Omit equipment brands, reagent catalog details, readout units, and secondary
+  implementation details unless essential to test feasibility.
+- Return no more than 8 measurement metrics and 8 analysis methods.
+
 Output a JSON object matching the ResearchPlan schema.
 """
 

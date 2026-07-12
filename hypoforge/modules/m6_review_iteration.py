@@ -69,8 +69,12 @@ class M6ReviewIteration(ModuleProtocol):
                     state.research_plans[0],
                 )
                 graph = state.evidence_graph
+
+                # Separate "overall" — it is computed, not queried via LLM
+                specialist_dims = [d for d in self.reviewer_dims if d != "overall"]
                 new_reviews: List[ReviewResult] = []
-                for dim in self.reviewer_dims:
+
+                for dim in specialist_dims:
                     payload = await self.client.structured_chat(
                         system_prompt=M6_REVIEWER_PROMPTS[dim],
                         user_prompt=M6_USER_TEMPLATE.format(
@@ -82,13 +86,25 @@ class M6ReviewIteration(ModuleProtocol):
                             gaps_count=len(graph.knowledge_gaps) if graph else 0,
                         ),
                         output_schema=ReviewResult.model_json_schema(),
-                        max_tokens=getattr(self.llm_config, "max_tokens", 4096),
+                        max_tokens=8192,
                         temperature=getattr(self.llm_config, "temperature", 0.1),
                     )
                     payload = dict(payload)
                     payload["dimension"] = dim
                     payload["version"] = version
                     new_reviews.append(ReviewResult.model_validate(payload))
+
+                # Compute overall as average of specialist scores
+                if "overall" in self.reviewer_dims and specialist_dims:
+                    specialist_scores = [r.score for r in new_reviews if r.score > 0]
+                    avg = sum(specialist_scores) / len(specialist_scores) if specialist_scores else 3.0
+                    new_reviews.append(ReviewResult(
+                        dimension=ReviewerDimension("overall"),
+                        score=round(avg, 1),
+                        comments=f"Computed from specialist reviews (scientific_logic, evidence_consistency, method_feasibility).",
+                        suggestions="See individual dimension reviews for detailed suggestions.",
+                        version=version,
+                    ))
 
                 return {
                     "reviews": state.reviews + new_reviews,
@@ -106,7 +122,6 @@ class M6ReviewIteration(ModuleProtocol):
                 "scientific_logic":    [3.2, 3.8, 4.2],
                 "evidence_consistency": [3.5, 4.0, 4.3],
                 "method_feasibility":  [2.8, 3.5, 3.9],
-                "overall":             [3.1, 3.7, 4.1],
             }
 
             comments: Dict[str, str] = {
@@ -122,24 +137,36 @@ class M6ReviewIteration(ModuleProtocol):
                     "实验设计合理但样本量偏小，建议增加power analysis来论证n值。"
                     if version < 3 else "方法设计完善，统计方案合理，可执行。"
                 ),
-                "overall": (
-                    "整体质量中等偏上，修订后可达到发表水平。"
-                    if version < 3 else "高质量，建议接受。"
-                ),
             }
 
             new_reviews: List[ReviewResult] = []
-            for dim in self.reviewer_dims:
+            specialist_scores: List[float] = []
+            specialist_dims = [d for d in self.reviewer_dims if d != "overall"]
+
+            for dim in specialist_dims:
                 scores = base_scores.get(dim, [3.0, 3.0, 3.0])
                 idx = min(version - 1, len(scores) - 1)
+                score = scores[idx]
+                specialist_scores.append(score)
                 new_reviews.append(ReviewResult(
                     dimension=ReviewerDimension(dim),
-                    score=scores[idx],
+                    score=score,
                     comments=comments.get(dim, "评审意见。"),
                     suggestions=(
                         "需要更充分的引用支持。"
                         if version == 1 else "可接受。"
                     ),
+                    version=version,
+                ))
+
+            # Compute overall as average of specialist scores
+            if "overall" in self.reviewer_dims and specialist_scores:
+                avg = sum(specialist_scores) / len(specialist_scores)
+                new_reviews.append(ReviewResult(
+                    dimension=ReviewerDimension("overall"),
+                    score=round(avg, 1),
+                    comments=f"Computed from specialist reviews.",
+                    suggestions="See individual dimension reviews for detailed suggestions.",
                     version=version,
                 ))
 

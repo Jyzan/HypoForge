@@ -168,8 +168,22 @@ class M4HypothesisGeneration(ModuleProtocol):
             item.setdefault("hypothesis_id", f"H{idx}")
             item.setdefault("scores", {})
             card = HypothesisCard.model_validate(item)
-            if "composite" not in card.scores:
-                card.scores["composite"] = 0.0
+            # The ranker may omit composite or return an inconsistent value.
+            # Recompute it from the four dimension scores whenever possible so
+            # the displayed score and ranking reflect the documented weights.
+            score_keys = (
+                "novelty",
+                "scientific_soundness",
+                "testability",
+                "evidence_consistency",
+            )
+            if all(key in card.scores for key in score_keys):
+                card.scores["composite"] = (
+                    0.30 * card.scores["novelty"]
+                    + 0.25 * card.scores["scientific_soundness"]
+                    + 0.25 * card.scores["testability"]
+                    + 0.20 * card.scores["evidence_consistency"]
+                )
             cards.append(card)
         return cards
 
@@ -198,7 +212,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                 num_candidates=self.num_candidates,
             ),
             output_schema=generator_schema,
-            max_tokens=getattr(self.llm_config, "max_tokens", 8192),
+            max_tokens=16384,
             temperature=max(getattr(self.llm_config, "temperature", 0.1), 0.4),
         )
         candidates = self._normalise_hypotheses(generated)
@@ -206,6 +220,24 @@ class M4HypothesisGeneration(ModuleProtocol):
             raise ValueError("M4 generator returned no valid hypotheses")
 
         if self.mode == "multi_agent":
+            ranker_item_schema = HypothesisCard.model_json_schema()
+            ranker_item_schema["properties"]["scores"] = {
+                "type": "object",
+                "properties": {
+                    "novelty": {"type": "number", "minimum": 0, "maximum": 1},
+                    "scientific_soundness": {"type": "number", "minimum": 0, "maximum": 1},
+                    "testability": {"type": "number", "minimum": 0, "maximum": 1},
+                    "evidence_consistency": {"type": "number", "minimum": 0, "maximum": 1},
+                    "composite": {"type": "number", "minimum": 0, "maximum": 1},
+                },
+                "required": [
+                    "novelty",
+                    "scientific_soundness",
+                    "testability",
+                    "evidence_consistency",
+                ],
+            }
+            ranker_schema = {"type": "array", "items": ranker_item_schema}
             ranked = await self.client.structured_chat(
                 system_prompt=M4_RANKER_SYSTEM_PROMPT.format(top_k=self.top_k),
                 user_prompt=M4_RANKER_USER_TEMPLATE.format(
@@ -216,12 +248,19 @@ class M4HypothesisGeneration(ModuleProtocol):
                     ),
                     top_k=self.top_k,
                 ),
-                output_schema=generator_schema,
-                max_tokens=getattr(self.llm_config, "max_tokens", 8192),
+                output_schema=ranker_schema,
+                max_tokens=8192,
                 temperature=getattr(self.llm_config, "temperature", 0.1),
             )
             top = self._normalise_hypotheses(ranked)
-            if not top:
+            required_scores = {
+                "novelty",
+                "scientific_soundness",
+                "testability",
+                "evidence_consistency",
+            }
+            if not top or not all(required_scores.issubset(h.scores) for h in top):
+                logger.warning("M4 ranker returned incomplete scores; ranking generated candidates instead")
                 top = self._rank_top(candidates)
         else:
             top = self._rank_top(candidates)

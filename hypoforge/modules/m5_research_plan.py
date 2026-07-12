@@ -141,7 +141,7 @@ class M5ResearchPlan(ModuleProtocol):
                             falsification_conditions="\n".join(h.falsification_conditions),
                         ),
                         output_schema=ResearchPlan.model_json_schema(),
-                        max_tokens=getattr(self.llm_config, "max_tokens", 4096),
+                        max_tokens=16384,  # ResearchPlan has 11 fields — needs headroom
                         temperature=getattr(self.llm_config, "temperature", 0.1),
                     )
                     plan = ResearchPlan.model_validate(payload)
