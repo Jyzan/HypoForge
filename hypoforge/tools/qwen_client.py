@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import urllib.request
 from typing import Any, Dict, Optional
 
@@ -29,6 +30,26 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
 logger = logging.getLogger(__name__)
+
+
+def _recover_partial_edges(raw: str) -> Optional[dict]:
+    """Recover complete edge objects from a response truncated mid-JSON.
+
+    This is intentionally narrow: it only handles the relation schema used by
+    M3 and never pretends that an incomplete arbitrary JSON document is valid.
+    """
+    if '"edges"' not in raw:
+        return None
+    pattern = re.compile(
+        r'\{\s*"source"\s*:\s*"([^"]+)"\s*,\s*'
+        r'"target"\s*:\s*"([^"]+)"\s*,\s*'
+        r'"relation"\s*:\s*"([^"]+)"\s*\}'
+    )
+    edges = [
+        {"source": source, "target": target, "relation": relation}
+        for source, target, relation in pattern.findall(raw)
+    ]
+    return {"edges": edges, "_partial_json": True} if edges else None
 
 # Ensure .env is loaded even when this module is imported standalone
 _load_dotenv_done = False
@@ -73,6 +94,13 @@ class QwenClient:
         falling back to the public DashScope endpoint.
     """
 
+    # ------------------------------------------------------------------
+    # Class-level token counters (shared across all instances)
+    # ------------------------------------------------------------------
+
+    _total_input_tokens: int = 0
+    _total_output_tokens: int = 0
+
     def __init__(
         self,
         model: str = "qwen3.7-max",
@@ -86,6 +114,17 @@ class QwenClient:
             or os.environ.get("OPENAI_BASE_URL")
             or "https://dashscope.aliyuncs.com/compatible-mode/v1"
         )
+
+    @classmethod
+    def get_token_totals(cls) -> tuple[int, int]:
+        """Return cumulative (input_tokens, output_tokens) across all instances."""
+        return cls._total_input_tokens, cls._total_output_tokens
+
+    @classmethod
+    def reset_token_totals(cls) -> None:
+        """Reset the class-level token counters (useful between runs)."""
+        cls._total_input_tokens = 0
+        cls._total_output_tokens = 0
 
     @classmethod
     def from_config(cls, llm_config: Any) -> "QwenClient":
@@ -122,19 +161,51 @@ class QwenClient:
         self,
         max_tokens: int = 4096,
         temperature: float = 0.1,
+        disable_thinking: bool = False,
+        model_kwargs: Optional[Dict[str, Any]] = None,
     ) -> ChatOpenAI:
         """Create a fresh ChatOpenAI instance with the current settings.
 
         We create a new instance per call so that different ``max_tokens`` /
         ``temperature`` values don't interfere across concurrent requests.
+
+        Parameters
+        ----------
+        disable_thinking : bool
+            When True, instruct reasoning models (Qwen3, DeepSeek-R1, etc.)
+            to skip the thinking phase so that the full ``max_tokens`` budget
+            is reserved for the visible output.  This is recommended for
+            structured JSON extraction where chain-of-thought is unnecessary.
+        model_kwargs : dict | None
+            Extra parameters merged into the API request body
+            (e.g. ``response_format``, ``thinking`` control).
         """
+        merged_kwargs: Dict[str, Any] = {}
+        if disable_thinking:
+            merged_kwargs["thinking"] = {"type": "disabled"}
+        if model_kwargs:
+            merged_kwargs.update(model_kwargs)
+
         return ChatOpenAI(
             model=self.model,
             base_url=self.api_base,
             api_key=self.api_key,
             max_tokens=max_tokens,
             temperature=temperature,
+            **(dict(model_kwargs=merged_kwargs) if merged_kwargs else {}),
         )
+
+    @classmethod
+    def _record_tokens(cls, response: Any) -> None:
+        """Extract token usage from a LangChain AIMessage response and accumulate."""
+        try:
+            meta = response.response_metadata or {}
+            usage = meta.get("token_usage", {})
+            if usage:
+                cls._total_input_tokens += int(usage.get("prompt_tokens", 0))
+                cls._total_output_tokens += int(usage.get("completion_tokens", 0))
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # chat  — plain text response
@@ -146,6 +217,7 @@ class QwenClient:
         user_prompt: str = "",
         max_tokens: int = 4096,
         temperature: float = 0.1,
+        disable_thinking: bool = False,
     ) -> str:
         """Send a chat completion request and return the text response.
 
@@ -159,6 +231,8 @@ class QwenClient:
             Maximum completion tokens.
         temperature : float
             Sampling temperature (0.0 – 2.0).
+        disable_thinking : bool
+            When True, skip reasoning/thinking phase (see :meth:`_build_llm`).
 
         Returns
         -------
@@ -170,10 +244,14 @@ class QwenClient:
             messages.append(SystemMessage(content=system_prompt))
         messages.append(HumanMessage(content=user_prompt))
 
-        llm = self._build_llm(max_tokens=max_tokens, temperature=temperature)
+        llm = self._build_llm(
+            max_tokens=max_tokens, temperature=temperature,
+            disable_thinking=disable_thinking,
+        )
 
         try:
             response = await llm.ainvoke(messages)
+            self._record_tokens(response)
             content = response.content
 
             # Handle case where content is a list (e.g. multiple content blocks)
@@ -203,6 +281,7 @@ class QwenClient:
         output_schema: Optional[Dict[str, Any]] = None,
         max_tokens: int = 4096,
         temperature: float = 0.1,
+        disable_thinking: bool = False,
     ) -> dict:
         """Send a chat request and return a structured (JSON) response.
 
@@ -215,17 +294,35 @@ class QwenClient:
         user_prompt : str
         output_schema : dict
             JSON Schema describing the expected output shape, or a Pydantic model.
+            Top-level arrays are automatically wrapped in ``{"entries": …}``
+            for compatibility with ``json_object`` response format.
         max_tokens : int
         temperature : float
+        disable_thinking : bool
+            When True, instruct reasoning models to skip the thinking phase.
+            The full ``max_tokens`` budget is reserved for the visible JSON output.
+            If the API rejects this parameter, the call is retried without it.
 
         Returns
         -------
         dict
-            Parsed JSON response.
+            Parsed JSON response.  If the original schema was a top-level array,
+            the returned dict has an ``"entries"`` key containing the array.
         """
-        # If a JSON schema dict was provided, prompt the model for JSON.
-        # We use the "json_object" response_format for models that support it,
-        # and fall back to prompt-based JSON for others.
+        # ``json_object`` response_format requires the top-level to be an object.
+        # If the caller asks for a bare array, wrap it automatically.
+        array_wrapped = False
+        if output_schema and isinstance(output_schema, dict):
+            if output_schema.get("type") == "array":
+                array_wrapped = True
+                output_schema = {
+                    "type": "object",
+                    "properties": {
+                        "entries": output_schema,
+                    },
+                    "required": ["entries"],
+                }
+
         json_instruction = (
             "\n\nYou MUST respond with valid JSON only — no markdown fences, "
             "no extra text before or after the JSON object."
@@ -244,26 +341,66 @@ class QwenClient:
             messages.append(SystemMessage(content=system_prompt))
         messages.append(HumanMessage(content=full_user))
 
-        llm = self._build_llm(max_tokens=max_tokens, temperature=temperature)
+        # Build the base LLM (without response_format, for fallback)
+        llm = self._build_llm(
+            max_tokens=max_tokens, temperature=temperature,
+            disable_thinking=disable_thinking,
+        )
 
+        # Build kwargs shared across attempts
+        def _make_rfmt_kwargs(include_thinking: bool) -> dict:
+            rfmt: Dict[str, Any] = {"response_format": {"type": "json_object"}}
+            if include_thinking and disable_thinking:
+                rfmt["thinking"] = {"type": "disabled"}
+            return rfmt
+
+        response = None
+        # Attempt 1: with response_format (+ optional thinking disable)
         try:
-            # Try with response_format for models that support it
             llm_with_format = ChatOpenAI(
                 model=self.model,
                 base_url=self.api_base,
                 api_key=self.api_key,
                 max_tokens=max_tokens,
                 temperature=temperature,
-                model_kwargs={"response_format": {"type": "json_object"}},
+                model_kwargs=_make_rfmt_kwargs(include_thinking=True),
             )
             response = await llm_with_format.ainvoke(messages)
+            self._record_tokens(response)
         except Exception:
-            # Fallback: request without response_format
-            logger.debug(
-                "Model %s may not support response_format; falling back to text parse.",
-                self.model,
-            )
+            if disable_thinking:
+                # Attempt 2: retry without thinking disable
+                # (the model / proxy may not support the parameter)
+                logger.debug(
+                    "Model %s may not support thinking disable; retrying without it.",
+                    self.model,
+                )
+                try:
+                    llm_rfmt = ChatOpenAI(
+                        model=self.model,
+                        base_url=self.api_base,
+                        api_key=self.api_key,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        model_kwargs=_make_rfmt_kwargs(include_thinking=False),
+                    )
+                    response = await llm_rfmt.ainvoke(messages)
+                    self._record_tokens(response)
+                except Exception:
+                    logger.debug(
+                        "Model %s may not support response_format; falling back to text parse.",
+                        self.model,
+                    )
+            else:
+                logger.debug(
+                    "Model %s may not support response_format; falling back to text parse.",
+                    self.model,
+                )
+
+        # Attempt 3: plain chat fallback (no response_format)
+        if response is None:
             response = await llm.ainvoke(messages)
+            self._record_tokens(response)
 
         content = response.content
 
@@ -290,10 +427,25 @@ class QwenClient:
             raw = "\n".join(lines).strip()
 
         try:
-            return json.loads(raw)
+            result = json.loads(raw)
         except json.JSONDecodeError:
+            recovered = _recover_partial_edges(raw)
+            if recovered is not None:
+                logger.warning(
+                    "Recovered %d complete edges from truncated model JSON.",
+                    len(recovered["edges"]),
+                )
+                return recovered
             logger.warning("Failed to parse JSON from model response. Raw: %s", raw[:500])
             return {"_parse_error": True, "raw_response": raw}
+
+        # Unwrap array-wrapper if we added one
+        if array_wrapped and isinstance(result, dict) and "entries" in result:
+            entries = result["entries"]
+            if isinstance(entries, list):
+                return entries  # type: ignore[return-value]
+
+        return result
 
 
 # ============================================================================
