@@ -71,7 +71,8 @@ python run_hypoforge.py [OPTIONS]
 | `--question` | `-q` | ✅ | — | 待分析的前沿科学问题 |
 | `--config` | `-c` | ❌ | `configs/default.yaml` | YAML 配置文件路径 |
 | `--output-dir` | `-o` | ❌ | `./output` | 输出目录（会覆盖配置文件中的设置） |
-| `--run-id` | | ❌ | 自动生成 | 自定义运行标识符，用于输出文件命名 |
+| `--run-id` | | ❌ | 自动生成 | 自定义运行标识符，用于输出文件命名和 checkpoint |
+| `--resume` | | ❌ | `false` | 从已有 `--run-id` 的 checkpoint 断点续跑 |
 | `--quiet` | | ❌ | `false` | 静默模式，关闭 Rich 终端美化输出 |
 
 ### 使用示例
@@ -103,6 +104,24 @@ python run_hypoforge.py -q "..." --quiet
 - **`run_id`**：由 `--run-id` 指定；若未指定则自动生成（基于时间戳），例如 `20250711_143052`
 
 JSON 文件包含 PipelineState 的完整序列化结果，涵盖所有六个模块的输出、迭代历史和错误信息。
+
+## Checkpoint / 断点续跑
+
+Pipeline 每完成一个模块就自动保存 checkpoint 到 `<output_dir>/<run_id>_checkpoint.json`。
+如果运行中断（网络超时、API 限流等），可以用相同的 `--run-id` + `--resume` 从断点继续，
+已完成的模块会被跳过：
+
+```bash
+# 首次运行（假设在 M4 时网络中断）
+python run_hypoforge.py -q "..." --run-id my_experiment
+
+# 从 M4 断点恢复（M1/M2/M3 自动跳过）
+python run_hypoforge.py -q "..." --run-id my_experiment --resume
+```
+
+注意事项：
+- M1–M3 有产出即跳过；M4/M5/M6 在迭代未完成时仍会重新运行
+- 如果更改了 `--question` 或配置文件，建议使用新的 `--run-id` 而非 resume
 
 ## 持久化知识图谱
 
@@ -155,18 +174,18 @@ PYTHONIOENCODING=utf-8 python tests/test_pipeline.py
 | 模块 | 状态 | 说明 |
 |------|------|------|
 | M1 问题理解 | 🟡 LLM 就绪 | `mode="llm"` 时调 Qwen `structured_chat` 做问题分解；stub 为 fallback |
-| M2 文献检索 | ✅ 已实现 | PubMed + OpenAlex 双后端检索 → 去重 → Qwen 逐篇知识提取；stub 为 fallback |
-| M3 证据图谱 | ✅ 已实现 | 规则构建节点 + `INVOLVES` 边；`mode="llm"` 时 Qwen 增强跨 Entry 语义边（SUPPORTS / CONTRADICTS / EXTENDS / LIMITS） |
-| M4 假设生成 | 🟡 LLM 就绪 | 支持 `direct` / `multi_agent` 模式（Generator + Ranker 调 Qwen）；Critic / Falsifiability Checker 待补 |
-| M5 研究计划 | 🟡 LLM 就绪 | `mode="llm"` 时调 Qwen `structured_chat` 生成结构化研究计划 |
-| M6 评审迭代 | 🟡 LLM 就绪 | 四维 Reviewer 各自调 Qwen；Meta-Reviewer 综合决策待补 |
+| M2 文献检索 | ✅ 已实现 | PubMed + OpenAlex 双后端检索 → DOI/title 去重 → Qwen 批量知识提取；stub 为 fallback |
+| M3 证据图谱 | ✅ 已实现 | 规则构建节点 + `INVOLVES` 边；`mode="llm"` 时 Qwen 批量提取跨 Entry 语义边（SUPPORTS / CONTRADICTS / EXTENDS / LIMITS），含跨批 bridge 任务和 thinking 控制防止截断 |
+| M4 假设生成 | 🟡 LLM 就绪 | 支持 `direct` / `multi_agent` 模式（Generator + Ranker 调 Qwen）；composite score 由四维加权重算；Critic / Falsifiability Checker 待补 |
+| M5 研究计划 | 🟡 LLM 就绪 | `mode="llm"` 时调 Qwen `structured_chat` 生成含 11 项要素的结构化研究计划 |
+| M6 评审迭代 | 🟡 LLM 就绪 | 三维 Reviewer（scientific_logic / evidence_consistency / method_feasibility）各调 Qwen；overall 由 specialist 分数平均计算 |
 | Semantic Scholar | ✅ 已实现 | 双后端自动切换：有 key → Semantic Scholar；无 key → OpenAlex |
 | PubMed | ✅ 已实现 | NCBI E-utilities（esearch + efetch 两步流程）|
-| QwenClient | ✅ 完成 | 完整 async wrapper（`chat` / `structured_chat` / `list_models` / 多模型切换） |
+| QwenClient | ✅ 完成 | 完整 async wrapper（`chat` / `structured_chat` / `list_models` / `disable_thinking` 推理控制 / 3 层 API 回退） |
 | 持久化 KG | ✅ 完成 | JSONL-backed KnowledgeGraphManager（Entity/Relation CRUD + BM25 搜索） |
-| Pipeline 编排 | ✅ 完成 | LangGraph StateGraph + 条件迭代 + Rich 终端输出 |
+| Pipeline 编排 | ✅ 完成 | LangGraph StateGraph + 条件迭代 + checkpoint/resume + Rich 终端输出 |
 | 配置系统 | ✅ 完成 | YAML + 环境变量 + 6 套 baseline 配置 |
-| Prompt 模板 | ✅ 完成 | M1–M6 全部 prompt 已就绪 |
+| Prompt 模板 | ✅ 完成 | M1–M6 全部 prompt 已就绪，M3 含专用 batch edge-only prompt |
 
 详细开发计划见 [TODO.md](TODO.md)。
 

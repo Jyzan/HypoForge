@@ -1,7 +1,7 @@
 # HypoForge — 开发路线图
 
 > 挑战杯 2026 · 赛题A：科学假设生成与研究计划设计
-> 当前状态：**骨架已完成 → LLM 真实调用阶段。M1/M2/M4/M5/M6 均已接入 Qwen + 真实搜索 API，端到端可运行**
+> 当前状态：**LLM 真实调用阶段 — M1–M6 端到端可跑；M3 含批量 LLM 语义边提取 + thinking 控制；M6 的 overall 维度改为计算值；Pipeline 支持 checkpoint/resume**
 > 最后更新：2026-07-12
 
 ---
@@ -39,7 +39,7 @@ HypoForge 是一个基于 LangGraph StateGraph 的六模块闭环 pipeline：
   └──────┬───────┘
          ▼
   ┌──────────────┐
-  │ M6: 评审与     │ → 多维评审 → 决定接受或迭代
+  │ M6: 评审与     │ → 三维 Specialist Reviewer（LLM）+ overall 计算
   │   迭代更新    │ → 反馈回 M4/M5，循环 ≤3 轮
   └──────────────┘
 ```
@@ -222,9 +222,9 @@ CLI 端到端:
 
 - [ ] **1.6 M2 优化（组员可分工）**
   - 文件：`hypoforge/modules/m2_literature_search.py`
-  - 当前简单实现已可用（搜索 + 去重 + 逐篇 Qwen 知识提取），以下为增强方向：
+  - 当前实现已可用（搜索 + 去重 + Qwen 批量知识提取），以下为增强方向：
     - **Query expansion**：用 `M2_SEARCH_QUERY_TEMPLATE` + Qwen 对每个 sub_question 生成 2-3 个变体查询（MeSH 术语、同义词），提高召回率
-    - **Batch extraction**：将多篇论文摘要合并到一次 LLM 调用中批量提取知识条目，减少 API 开销
+    - [x] **Batch extraction**：将多篇论文摘要合并到一次 LLM 调用中批量提取知识条目（已通过 `batch_size` 参数实现，默认 5 篇/批）
     - **Cross-paper relation detection**：提取完所有论文条目后，检测跨论文的 supports/contradicts 关系（或留给 M3 做）
     - **Citation-aware ranking**：加入语义相似度（query vs abstract embedding）作为排序因子，替代纯引用数排序
     - **Result caching**：基于 query hash 缓存搜索结果，避免重复 PubMed/OpenAlex API 调用
@@ -234,13 +234,15 @@ CLI 端到端:
 
 > Team A（M3 证据图谱）+ Team B（M4 多Agent假设生成）
 
-- [ ] **2.1 M3 证据图谱增强（组员可扩展）**
+- [x] **2.1 M3 批量语义边提取**（已完成）
   - 文件：`hypoforge/modules/m3_evidence_graph.py`
-  - 当前状态：基本实现已完成（规则构建 + `mode="llm"` 时 Qwen 语义边增强）
+  - 当前实现：规则构建 + `mode="llm"` 时 Qwen 批量语义边增强（含跨批 bridge 任务）
+  - QwenClient 已支持 `disable_thinking` 参数，防止推理 token 抢占输出预算
+  - Prompt 已拆分为 edge-only batch prompt（`M3_BATCH_RELATION_SYSTEM_PROMPT`），杜绝模型生成冗余 nodes
   - 以下为增强方向：
     - **Incremental graph update**：改为增量更新——仅处理 M2 新产出的条目
     - **Entity linking**：用 UMLS / MeSH / GO 做实体归一化（"Hsp70" ↔ "HSPA1A"）
-    - **Confidence-weighted edges**：Qwen 提取关系时间步输出置信度分数
+    - **Confidence-weighted edges**：Qwen 提取关系时同步输出置信度分数
     - **Graph visualisation export**：导出 Cytoscape.js / Mermaid 格式供前端 Demo
     - **Iterative graph refinement**：M6 反馈后回补或修正图中关系边
 
@@ -283,13 +285,13 @@ CLI 端到端:
   - 调用 Qwen-Max → 生成结构化研究计划
   - 输出：`List[ResearchPlan]`（含全部 11 项要素）
 
-- [x] **3.2 M6 四维评审 Agent**
+- [x] **3.2 M6 三维 Specialist Reviewer + 计算 overall**
   - 文件：`hypoforge/modules/m6_review_iteration.py`
-  - 四个 Reviewer 各用不同的 system prompt：
+  - 三个 Specialist Reviewer 各用独立 Qwen 调用：
     - `scientific_logic` — 科学逻辑
     - `evidence_consistency` — 证据一致性
     - `method_feasibility` — 方法可行性
-    - `overall` — 综合评分
+  - `overall` 维度改为 **计算值**（三个 specialist 分数平均），不再单独调用 LLM
   - 调用 Qwen-Plus（轻量评审任务）
   - 输出：`List[ReviewResult]`（含 score 1-5 + comments + suggestions）
 
