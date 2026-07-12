@@ -11,10 +11,11 @@ competition specification (§三).
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ============================================================================
@@ -78,6 +79,20 @@ class ProblemCard(BaseModel):
     sub_questions: List[str] = Field(default_factory=list)
     key_entities: List[str] = Field(default_factory=list)
     question_type: QuestionType = QuestionType.MECHANISM
+
+    @field_validator("original_question", mode="before")
+    @classmethod
+    def normalize_original_question(cls, value: Any) -> str:
+        """Keep model-generated line breaks from leaking into terminal/UI output."""
+        return re.sub(r"\s+", " ", str(value or "")).strip()
+
+    @field_validator("domain", "sub_questions", "key_entities", mode="before")
+    @classmethod
+    def normalize_text_lists(cls, value: Any) -> List[str]:
+        """Normalize whitespace in list fields while preserving item boundaries."""
+        if value is None:
+            return []
+        return [re.sub(r"\s+", " ", str(item or "")).strip() for item in value]
 
 
 # ============================================================================

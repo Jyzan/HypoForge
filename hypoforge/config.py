@@ -8,7 +8,6 @@ they can be set via YAML file, environment variable, or runtime override.
 Environment variables (loaded from ``.env`` or system env):
   - ``OPENAI_API_KEY`` — API key for the OpenAI-compatible endpoint (required)
   - ``OPENAI_BASE_URL`` — Base URL for the OpenAI-compatible endpoint
-  - ``DASHSCOPE_API_KEY`` — Legacy / fallback key name
 """
 
 from __future__ import annotations
@@ -74,11 +73,7 @@ class LLMConfig(BaseModel):
     def _resolve_env(self) -> "LLMConfig":
         # ---- api_key ----
         if not self.api_key:
-            self.api_key = (
-                os.environ.get("OPENAI_API_KEY")
-                or os.environ.get("DASHSCOPE_API_KEY")
-                or ""
-            )
+            self.api_key = os.environ.get("OPENAI_API_KEY") or ""
         # ---- api_base ----
         if not self.api_base:
             self.api_base = (

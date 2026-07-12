@@ -1,8 +1,8 @@
 # HypoForge — 开发路线图
 
 > 挑战杯 2026 · 赛题A：科学假设生成与研究计划设计
-> 当前状态：**骨架已完成，端到端可运行（stub 模式）**
-> 最后更新：2026-07-11
+> 当前状态：**骨架已完成 → LLM 真实调用阶段。M1/M2/M4/M5/M6 均已接入 Qwen + 真实搜索 API，端到端可运行**
+> 最后更新：2026-07-12
 
 ---
 
@@ -85,12 +85,12 @@ HypoForge/
 │   ├── pipeline.py                     ✅ PipelineRunner + LangGraph 编排
 │   ├── modules/
 │   │   ├── __init__.py                 ✅
-│   │   ├── m1_problem_understanding.py ✅ M1 Stub
-│   │   ├── m2_literature_search.py     ✅ M2 Stub
-│   │   ├── m3_evidence_graph.py        ✅ M3 Stub (真实图构建逻辑)
-│   │   ├── m4_hypothesis_generation.py ✅ M4 Stub (3 个中文假设)
-│   │   ├── m5_research_plan.py         ✅ M5 Stub
-│   │   └── m6_review_iteration.py      ✅ M6 Stub (模拟分数递进)
+│   │   ├── m1_problem_understanding.py ✅ LLM 就绪（stub fallback）
+│   │   ├── m2_literature_search.py     ✅ 已实现（真实搜索 + LLM 知识提取，stub fallback）
+│   │   ├── m3_evidence_graph.py        ✅ 已实现（规则构建 + LLM 语义边增强，stub fallback）
+│   │   ├── m4_hypothesis_generation.py ✅ LLM 就绪（Generator + Ranker）
+│   │   ├── m5_research_plan.py         ✅ LLM 就绪（structured output）
+│   │   └── m6_review_iteration.py      ✅ LLM 就绪（四维 Reviewer，stub fallback）
 │   ├── prompts/
 │   │   ├── __init__.py                 ✅
 │   │   ├── m1_prompts.py               ✅ 问题分解 prompt
@@ -105,10 +105,10 @@ HypoForge/
 │   │   └── progress.py                 ✅ spinner + progress_bar
 │   ├── tools/
 │   │   ├── __init__.py                 ✅
-│   │   ├── semantic_scholar.py         ⬜ Stub → 待接真实 API (Task 1.2a)
-│   │   ├── pubmed_search.py            ⬜ Stub → 待接真实 API (Task 1.2b)
+│   │   ├── semantic_scholar.py         ✅ 已实现（Semantic Scholar / OpenAlex 双后端自动切换）
+│   │   ├── pubmed_search.py            ✅ 已实现（NCBI E-utilities esearch + efetch）
 │   │   ├── qwen_web_search.py          ❌ 新建 (Task 1.2c, 选做)
-│   │   └── qwen_client.py              ✅ 千问百炼 Client stub
+│   │   └── qwen_client.py              ✅ 已完成（async chat + structured_chat + list_models）
 │   ├── skills/
 │   │   ├── __init__.py                 ✅
 │   │   ├── base.py                     ⬜ LoggingSkill stub → 真实实现 (Task S.1)
@@ -116,6 +116,12 @@ HypoForge/
 │   │   ├── token_tracker.py            ❌ 新建 (Task S.3)
 │   │   ├── result_archiver.py          ❌ 新建 (Task S.4)
 │   │   └── output_translator.py        ❌ 新建 (Task S.5, 选做)
+│   ├── memory/
+│   │   ├── __init__.py                 ✅
+│   │   ├── schema.py                   ✅ Entity/Relation/KnowledgeGraph 数据模型
+│   │   ├── graph_manager.py            ✅ JSONL 持久化 + BM25 搜索 + CRUD
+│   │   ├── bm25_index.py               ✅ BM25 全文检索索引
+│   │   └── tools.py                    ✅ 知识图谱辅助工具
 │   └── evaluation/
 │       ├── __init__.py                 ✅
 │       ├── metrics.py                  ✅ 4 个 Metric stub + MetricRegistry
@@ -158,24 +164,29 @@ CLI 端到端:
 
 ### Phase 1 — 核心 Pipeline 真实实现（7/14 - 8/3，3 周）
 
+> **提示**：`QwenClient` 已完整实现（`chat` + `structured_chat` + `list_models`）。
+> `structured_chat()` 接受 JSON Schema 后自动注入 response_format + markdown fence 剥离，
+> 可直接配合 Pydantic 模型的 `model_json_schema()` 使用。M1/M4/M5/M6 的 LLM 调用路径均
+> 已在 stub 中预留（`mode="llm"` 时生效），替换时只需确认 prompt 和 schema 对齐即可。
+
 #### 第 1 周（7/14-7/20）：M1 + M2 真实实现
 
 > Team A（M2 文献检索 + 知识提取）+ Team C（M1 问题理解）
 
-- [ ] **1.1 M1 真实实现**
+- [x] **1.1 M1 真实实现**
   - 文件：`hypoforge/modules/m1_problem_understanding.py`
-  - 替换 stub：调用 `QwenClient.chat()` 或 `.structured_chat()` 进行问题分解
+  - 当前实现：`mode="llm"` 时调用 `QwenClient.structured_chat()` 进行问题分解，stub 作为 fallback
   - 使用 prompt：`hypoforge/prompts/m1_prompts.py`
   - 输入：`state.input_question`
   - 输出：`ProblemCard`（domain, sub_questions, key_entities, question_type）
   - 接口：`@ModuleRegistry.register`，`module_name = "m1"`
 
-- [ ] **1.2 M2 检索 pipeline 真实实现**
-  - 文件：`hypoforge/modules/m2_literature_search.py` — 替换 stub
+- [x] **1.2 M2 检索 pipeline 真实实现**
+  - 当前实现：`mode="llm"` 时按 sub-question 调用搜索后端并聚合结果，stub 作为 fallback
   - 流程：对每个 sub_question 生成 query → 调用 search tools → 收集 top-N 论文
   - 每个子问题检索 10-20 篇文献
 
-- [ ] **1.2a Tool: Semantic Scholar 真实 API**
+- [x] **1.2a Tool: Semantic Scholar 真实 API**
   - 文件：`hypoforge/tools/semantic_scholar.py`
   - 接口：`async def search(query, limit) -> list[dict]` + `async def fetch(id) -> dict`
   - 注册：已通过 `@ToolRegistry.register` 装饰
@@ -183,7 +194,7 @@ CLI 端到端:
   - 返回标准化字段：title, abstract, year, doi, authors, journal, citationCount
   - 注意：Semantic Scholar 不返回完整 abstract，需额外调用 fetch 获取
 
-- [ ] **1.2b Tool: PubMed E-utilities 真实 API**
+- [x] **1.2b Tool: PubMed E-utilities 真实 API**
   - 文件：`hypoforge/tools/pubmed_search.py`
   - 接口：同上 `ToolProtocol`
   - API：`https://eutils.ncbi.nlm.nih.gov/entrez/eutils/`（建议注册 NCBI API key 提限速到 10req/s）
@@ -196,9 +207,9 @@ CLI 端到端:
   - 作为 Semantic Scholar / PubMed 的补充数据源
   - 如果百炼平台支持 web search plugin，直接走千问 channel
 
-- [ ] **1.3 M2 知识提取真实实现**
+- [x] **1.3 M2 知识提取真实实现**
   - 文件：`hypoforge/modules/m2_literature_search.py`（同一个文件）
-  - 替换 stub 的 `_STUB_ENTRIES`：调用 Qwen 对每篇论文摘要做六类提取
+  - 当前实现：调用 Qwen 对论文摘要做六类知识提取，解析失败时回退到 stub 数据
   - 使用 prompt：`hypoforge/prompts/m2_prompts.py`
   - 输出：`List[LiteratureResult]`，每篇论文 → 多个 `KnowledgeEntry`
 
@@ -209,16 +220,29 @@ CLI 端到端:
 - [ ] **1.5 B1 baseline 跑通**
   - `python run_hypoforge.py -c configs/baseline_b1.yaml -q "..."`
 
+- [ ] **1.6 M2 优化（组员可分工）**
+  - 文件：`hypoforge/modules/m2_literature_search.py`
+  - 当前简单实现已可用（搜索 + 去重 + 逐篇 Qwen 知识提取），以下为增强方向：
+    - **Query expansion**：用 `M2_SEARCH_QUERY_TEMPLATE` + Qwen 对每个 sub_question 生成 2-3 个变体查询（MeSH 术语、同义词），提高召回率
+    - **Batch extraction**：将多篇论文摘要合并到一次 LLM 调用中批量提取知识条目，减少 API 开销
+    - **Cross-paper relation detection**：提取完所有论文条目后，检测跨论文的 supports/contradicts 关系（或留给 M3 做）
+    - **Citation-aware ranking**：加入语义相似度（query vs abstract embedding）作为排序因子，替代纯引用数排序
+    - **Result caching**：基于 query hash 缓存搜索结果，避免重复 PubMed/OpenAlex API 调用
+    - **Query type routing**：临床问题优先 PubMed，工程/CS 问题优先 OpenAlex
+
 #### 第 2 周（7/21-7/27）：M3 + M4 真实实现
 
 > Team A（M3 证据图谱）+ Team B（M4 多Agent假设生成）
 
-- [ ] **2.1 M3 证据图谱关系提取**
+- [ ] **2.1 M3 证据图谱增强（组员可扩展）**
   - 文件：`hypoforge/modules/m3_evidence_graph.py`
-  - M3 的节点/边构建逻辑已经部分实现（stub 里有真实逻辑）。需增强：
-  - 调用 Qwen 做 relation extraction：哪些 entry 之间有关系？
-  - 使用 prompt：`hypoforge/prompts/m3_prompts.py`
-  - 输出：`EvidenceGraph`（含 supports/contradicts/extends/limits/involves 边）
+  - 当前状态：基本实现已完成（规则构建 + `mode="llm"` 时 Qwen 语义边增强）
+  - 以下为增强方向：
+    - **Incremental graph update**：改为增量更新——仅处理 M2 新产出的条目
+    - **Entity linking**：用 UMLS / MeSH / GO 做实体归一化（"Hsp70" ↔ "HSPA1A"）
+    - **Confidence-weighted edges**：Qwen 提取关系时间步输出置信度分数
+    - **Graph visualisation export**：导出 Cytoscape.js / Mermaid 格式供前端 Demo
+    - **Iterative graph refinement**：M6 反馈后回补或修正图中关系边
 
 - [ ] **2.2 M4 Generator Agent**
   - 文件：`hypoforge/modules/m4_hypothesis_generation.py`
@@ -252,14 +276,14 @@ CLI 端到端:
 
 > Team C（M5 研究计划）+ Team B（M6 评审迭代）
 
-- [ ] **3.1 M5 研究计划生成**
+- [x] **3.1 M5 研究计划生成**
   - 文件：`hypoforge/modules/m5_research_plan.py`
   - 输入：M4 的 top_hypotheses
   - 使用 prompt：`hypoforge/prompts/m5_prompts.py`
   - 调用 Qwen-Max → 生成结构化研究计划
   - 输出：`List[ResearchPlan]`（含全部 11 项要素）
 
-- [ ] **3.2 M6 四维评审 Agent**
+- [x] **3.2 M6 四维评审 Agent**
   - 文件：`hypoforge/modules/m6_review_iteration.py`
   - 四个 Reviewer 各用不同的 system prompt：
     - `scientific_logic` — 科学逻辑
@@ -439,3 +463,5 @@ PYTHONIOENCODING=utf-8 python tests/test_pipeline.py
 | 加新的中间件/横切逻辑 | `hypoforge/skills/` + `@SkillRegistry.register` |
 | 加新的评估指标 | `hypoforge/evaluation/metrics.py` |
 | 改 Skill 启用列表 | `configs/*.yaml` → `enabled_skills` 字段 |
+| 操作持久化知识图谱 | `hypoforge/memory/graph_manager.py` → `KnowledgeGraphManager` |
+| 查看 KG 数据模型 | `hypoforge/memory/schema.py` |

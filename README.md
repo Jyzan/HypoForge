@@ -9,7 +9,7 @@
 ### Conda 环境（推荐）
 
 ```bash
-# 1. 创建 conda 环境（Python 3.11+）
+# 1. 创建 conda 环境（Python 3.11–3.13）
 conda create -n hypoforge python=3.11 -y
 
 # 2. 激活环境
@@ -44,12 +44,18 @@ OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 ### 运行
 
 ```bash
-# 跑通示例（当前为 stub 数据）
+# 跑通示例（默认走 LLM mode，会调用 Qwen + PubMed + OpenAlex）
 python run_hypoforge.py -q "蛋白质如何折叠及错误折叠导致疾病的机制？"
+
+# 用 stub 模式快速验证（不调用 LLM / API）
+python run_hypoforge.py -q "test" -c configs/baseline_b0.yaml --quiet
 
 # 用不同配置跑消融实验
 python run_hypoforge.py -q "..." -c configs/baseline_b0.yaml
 python run_hypoforge.py -q "..." -c configs/full_pipeline.yaml
+
+# 指定自定义 run-id
+python run_hypoforge.py -q "..." --run-id my_experiment_01
 ```
 
 运行后终端会输出 Rich 美化的六模块执行过程。
@@ -98,6 +104,22 @@ python run_hypoforge.py -q "..." --quiet
 
 JSON 文件包含 PipelineState 的完整序列化结果，涵盖所有六个模块的输出、迭代历史和错误信息。
 
+## 持久化知识图谱
+
+在配置文件中设置 `memory_cache_dir`（或通过 `configs/*.yaml` 的顶层字段）即可启用 JSONL 持久化知识图谱：
+
+```yaml
+# configs/full_pipeline.yaml
+memory_cache_dir: "./kg_cache"
+```
+
+启用后，M3 模块执行时会自动将证据图谱（Entity + Relation）写入 `{memory_cache_dir}/memory-evidence_graph.jsonl`，支持：
+- **跨运行复用**：后续运行可加载已持久化的图谱
+- **BM25 语义搜索**：通过 `KnowledgeGraphManager.search_nodes()` 检索相关实体
+- **增量更新**：追加新 Entity/Relation 无需全量重写
+
+如果留空（默认），图谱仅在内存中保留，运行结束后丢弃。
+
 ## 模块结构
 
 ```
@@ -122,8 +144,47 @@ PYTHONIOENCODING=utf-8 python tests/test_pipeline.py
 | `configs/baseline_b1.yaml` | B1：+ web search |
 | `configs/baseline_b2.yaml` | B2：+ 结构化提取 |
 | `configs/baseline_b3.yaml` | B3：+ 多 Agent |
-| `configs/full_pipeline.yaml` | 完整系统 |
+| `configs/full_pipeline.yaml` | 完整系统 + 持久化 KG |
+
+> 在配置文件中设置 `memory_cache_dir` 可启用持久化知识图谱（跨运行复用 + BM25 搜索），详见上方「持久化知识图谱」章节。
 
 ## 项目状态
 
-当前为**骨架阶段**：所有六个模块均为 stub 实现，端到端可跑通。详细开发计划见 [TODO.md](TODO.md)。
+当前处于 **LLM 真实调用阶段**。M1–M6 端到端 pipeline 可跑通；全部模块均已接入 Qwen，检索层已对接 PubMed + OpenAlex 真实 API，证据图谱支持 LLM 语义关系抽取。配置文件默认开启 LLM mode。
+
+| 模块 | 状态 | 说明 |
+|------|------|------|
+| M1 问题理解 | 🟡 LLM 就绪 | `mode="llm"` 时调 Qwen `structured_chat` 做问题分解；stub 为 fallback |
+| M2 文献检索 | ✅ 已实现 | PubMed + OpenAlex 双后端检索 → 去重 → Qwen 逐篇知识提取；stub 为 fallback |
+| M3 证据图谱 | ✅ 已实现 | 规则构建节点 + `INVOLVES` 边；`mode="llm"` 时 Qwen 增强跨 Entry 语义边（SUPPORTS / CONTRADICTS / EXTENDS / LIMITS） |
+| M4 假设生成 | 🟡 LLM 就绪 | 支持 `direct` / `multi_agent` 模式（Generator + Ranker 调 Qwen）；Critic / Falsifiability Checker 待补 |
+| M5 研究计划 | 🟡 LLM 就绪 | `mode="llm"` 时调 Qwen `structured_chat` 生成结构化研究计划 |
+| M6 评审迭代 | 🟡 LLM 就绪 | 四维 Reviewer 各自调 Qwen；Meta-Reviewer 综合决策待补 |
+| Semantic Scholar | ✅ 已实现 | 双后端自动切换：有 key → Semantic Scholar；无 key → OpenAlex |
+| PubMed | ✅ 已实现 | NCBI E-utilities（esearch + efetch 两步流程）|
+| QwenClient | ✅ 完成 | 完整 async wrapper（`chat` / `structured_chat` / `list_models` / 多模型切换） |
+| 持久化 KG | ✅ 完成 | JSONL-backed KnowledgeGraphManager（Entity/Relation CRUD + BM25 搜索） |
+| Pipeline 编排 | ✅ 完成 | LangGraph StateGraph + 条件迭代 + Rich 终端输出 |
+| 配置系统 | ✅ 完成 | YAML + 环境变量 + 6 套 baseline 配置 |
+| Prompt 模板 | ✅ 完成 | M1–M6 全部 prompt 已就绪 |
+
+详细开发计划见 [TODO.md](TODO.md)。
+
+## 离线预览终端输出
+
+修改终端展示代码后，可以使用离线预览脚本检查布局，无需调用 LLM 或检索 API：
+
+```bash
+# 预览全部模块
+python scripts/preview_terminal.py
+
+# 模拟不同终端宽度
+python scripts/preview_terminal.py --width 80
+python scripts/preview_terminal.py --width 120
+
+# 只预览指定模块
+python scripts/preview_terminal.py --section m5
+python scripts/preview_terminal.py --section m6
+```
+
+支持的模块选项为 `m1`–`m6` 和 `all`，默认宽度为 100 列。
