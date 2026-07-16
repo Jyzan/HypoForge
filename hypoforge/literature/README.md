@@ -106,3 +106,19 @@ search:
 - 在线集成测试。
 
 这些内容应在对应功能分支中实现并通过 PR 合入。
+
+## Minimal PubMed smoke-test path
+
+This explicit development path searches only real PubMed metadata and uses
+deterministic rules for the remaining M2 Tools. It does not call an LLM, read
+PDFs, perform RAG, fabricate papers, or change the default legacy M2 path.
+
+```powershell
+python scripts/run_m2_pubmed.py `
+  --question "Hippo YAP TAZ organ size mechanotransduction" `
+  --limit 5
+```
+
+PubMed network/HTTP/parse failures produce an error and a non-zero exit code.
+Zero matches produce an empty literature result. There is no synthetic
+fallback.
