@@ -16,6 +16,7 @@ from .models import (
     PaperReadingResult,
     PaperRecord,
     QueryIntent,
+    RemainingSearchBudget,
     ScoutNote,
     SearchBudget,
     SearchQuery,
@@ -33,8 +34,10 @@ from .protocols import (
     PaperRankerProtocol,
     PaperReaderProtocol,
     QueryPlannerProtocol,
+    ReadingExtractionWorkflowProtocol,
     ScoutReaderProtocol,
 )
+from .search import IterativeSearchAgent
 
 __all__ = [
     "ContentLevel",
@@ -49,6 +52,7 @@ __all__ = [
     "EvidenceRetrieverProtocol",
     "FulltextResolverProtocol",
     "FulltextStatus",
+    "IterativeSearchAgent",
     "LiteratureSourceProtocol",
     "PaperDeduplicatorProtocol",
     "PaperRankerProtocol",
@@ -57,6 +61,8 @@ __all__ = [
     "PaperRecord",
     "QueryIntent",
     "QueryPlannerProtocol",
+    "ReadingExtractionWorkflowProtocol",
+    "RemainingSearchBudget",
     "ScoutNote",
     "ScoutReaderProtocol",
     "SearchBudget",

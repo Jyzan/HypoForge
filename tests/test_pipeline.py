@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 # Ensure HypoForge is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -27,6 +28,28 @@ async def test_default_config_loads():
     config = PipelineConfig.from_defaults()
     assert config.enabled_modules == ["m1", "m2", "m3", "m4", "m5", "m6"]
     assert config.max_iterations == 3
+    assert config.search.implementation == "legacy"
+
+
+def test_agentic_search_implementation_is_explicitly_supported() -> None:
+    config = PipelineConfig(search={"implementation": "agentic"})
+
+    assert config.search.implementation == "agentic"
+    assert config.get_module_kwargs("m2")["implementation"] == "agentic"
+
+
+def test_module_override_can_explicitly_override_search_implementation() -> None:
+    config = PipelineConfig(
+        search={"implementation": "agentic"},
+        module_overrides={"m2": {"kwargs": {"implementation": "legacy"}}},
+    )
+
+    assert config.get_module_kwargs("m2")["implementation"] == "legacy"
+
+
+def test_unknown_search_implementation_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        PipelineConfig(search={"implementation": "automatic"})
 
 
 @pytest.mark.asyncio

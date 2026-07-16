@@ -1,6 +1,6 @@
 # M2 Agentic Literature Package
 
-这个目录是新版 M2 的公共开发边界。当前分支只定义共享数据契约、Tool Protocol 和目录职责，不替换现有的 `hypoforge/modules/m2_literature_search.py`，也不包含任何真实 API 实现。
+这个目录是新版 M2 的公共开发边界。它定义共享数据契约、Tool Protocol、迭代式 Search Agent 和 Pipeline适配边界，但不包含任何真实 API 实现，也不改变现有 M2 的默认 legacy行为。
 
 ## 目录边界
 
@@ -55,12 +55,53 @@ M1 ProblemCard
 
 `EvidenceLinkedKnowledge` 是新版 M2 的证据可追溯输出；接入旧 Pipeline 时应通过单独的适配层转换为现有 `hypoforge.state.KnowledgeEntry`，避免各 Tool 自行维护不同转换逻辑。
 
-## 当前不在公共骨架中的内容
+## Search Agent 接入契约
 
-- Search Agent 编排实现；
+`IterativeSearchAgent` 通过构造函数接收 Tool，不导入任何组员的私有实现：
+
+```python
+from hypoforge.literature import IterativeSearchAgent, SearchBudget
+
+agent = IterativeSearchAgent(
+    query_planner=query_planner,
+    sources=[pubmed_source, academic_source],
+    deduplicator=deduplicator,
+    ranker=ranker,
+    scout_reader=scout_reader,
+    coverage_evaluator=coverage_evaluator,
+)
+
+result = await agent.run(
+    sub_question="Does the proposed mechanism hold?",
+    key_entities=["target protein"],
+    domains=["molecular biology"],
+    question_type="mechanism",
+    budget=SearchBudget(max_rounds=3, max_queries=12),
+)
+```
+
+Query Planner 首轮收到空的 `SearchState`；后续轮次收到已使用查询、已知术语、覆盖方向和缺口。每个 `SearchQuery.target_source` 必须与某个 `LiteratureSourceProtocol.source_name` 对应。单一数据源可以抛出异常，Agent会记录失败并继续使用其他来源；去重、排序、Scout或覆盖评估等核心 Tool 异常会以 `StopReason.ERROR` 结束，不会生成 stub结果。
+
+查询预算按实际调度的 `SearchQuery` 计算，论文预算按去重后的唯一论文计算，时间使用单调时钟，Token预算使用可替换的稳定估算器。所有 Tool 必须保证相同输入下返回顺序稳定，方便离线测试和实验复现。
+
+## Pipeline 开关和适配
+
+配置默认值为：
+
+```yaml
+search:
+  implementation: legacy
+```
+
+显式选择 `agentic` 时，现有 M2入口会委托给注入的 `AgenticM2Adapter`。如果没有提供 Adapter，会立即报告配置错误，不会静默回退 legacy或假数据。当前功能分支提供了可离线测试的 Adapter边界；等全文阅读组的实现合入后，需要由最终集成代码创建真实 `ReadingExtractionWorkflowProtocol` 实例并注入。
+
+`AgenticM2Adapter` 本身没有注册到 `ModuleRegistry`，单纯导入它不会替换当前 `M2LiteratureSearch`。
+
+## 仍由其他功能分支提供的内容
+
 - 任何真实数据库调用；
-- legacy/agentic 配置切换；
-- M2 到 M3 的适配器；
+- Query Planner、去重、排序、Scout Reading和覆盖评估的真实算法；
+- Reading Extraction Workflow的真实实现及依赖工厂；
 - 全文存储和向量数据库选型；
 - 在线集成测试。
 

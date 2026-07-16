@@ -12,9 +12,11 @@ from hypoforge.literature.models import (
     FulltextStatus,
     PaperRecord,
     QueryIntent,
+    RemainingSearchBudget,
     SearchBudget,
     SearchQuery,
     SearchRunResult,
+    SearchState,
     StopReason,
 )
 
@@ -57,6 +59,32 @@ def test_paper_record_normalizes_doi_and_rejects_negative_citations() -> None:
 def test_search_budget_requires_positive_limits() -> None:
     with pytest.raises(ValidationError):
         SearchBudget(max_rounds=0)
+
+
+def test_remaining_budget_allows_exhausted_dimensions() -> None:
+    remaining = RemainingSearchBudget(
+        max_rounds=0,
+        max_queries=0,
+        max_papers=0,
+        max_tokens=0,
+        max_seconds=0,
+    )
+
+    assert remaining.max_queries == 0
+
+
+def test_search_state_tracks_iterative_usage() -> None:
+    state = SearchState(
+        queries_executed=2,
+        unique_papers_seen=7,
+        estimated_tokens_used=120,
+        elapsed_seconds=1.5,
+        consecutive_low_gain_rounds=1,
+        consecutive_no_result_rounds=0,
+    )
+
+    assert state.queries_executed == 2
+    assert state.elapsed_seconds == 1.5
 
 
 def test_document_and_evidence_chunks_require_non_empty_source_text() -> None:
@@ -103,6 +131,19 @@ def test_search_run_result_round_trips_with_coverage_and_stop_reason() -> None:
 
     assert restored.coverage.missing_buckets == {EvidenceBucket.CONTRADICTING}
     assert restored.stop_reason is StopReason.MAX_ROUNDS
+
+
+def test_search_result_carries_agent_trace() -> None:
+    result = SearchRunResult(
+        sub_question="Does NAD+ regulate Hsp70 activity?",
+        source_result_counts={"pubmed": 3},
+        reused_paper_ids=["paper-1"],
+        final_state=SearchState(),
+    )
+
+    assert result.source_result_counts == {"pubmed": 3}
+    assert result.reused_paper_ids == ["paper-1"]
+    assert result.final_state is not None
 
 
 def test_document_record_tracks_content_level_without_storing_full_text() -> None:

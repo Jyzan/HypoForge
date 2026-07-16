@@ -129,13 +129,19 @@ class M2LiteratureSearch(ModuleProtocol):
         llm_config: Optional[Any] = None,
         max_papers_per_query: int = 10,
         batch_size: int = 5,
+        implementation: str = "legacy",
+        agentic_adapter: Optional[Any] = None,
         **kwargs,
     ):
+        if implementation not in {"legacy", "agentic"}:
+            raise ValueError("implementation must be 'legacy' or 'agentic'")
         self.search_tools = search_tools or ["semantic_scholar", "pubmed"]
         self.mode = mode
         self.llm_config = llm_config
         self.max_papers_per_query = max_papers_per_query
         self.batch_size = max(batch_size, 1)
+        self.implementation = implementation
+        self.agentic_adapter = agentic_adapter
         self.client = QwenClient.from_config(llm_config) if llm_config else None
 
     # ------------------------------------------------------------------
@@ -217,6 +223,14 @@ class M2LiteratureSearch(ModuleProtocol):
         state: PipelineState,
         config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        if self.implementation == "agentic":
+            if self.agentic_adapter is None:
+                raise RuntimeError(
+                    "search.implementation='agentic' requires an injected "
+                    "AgenticM2Adapter"
+                )
+            return await self.agentic_adapter(state, config)
+
         sub_questions = (
             state.problem_card.sub_questions
             if state.problem_card

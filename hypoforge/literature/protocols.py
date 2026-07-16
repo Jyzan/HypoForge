@@ -28,6 +28,7 @@ class QueryPlannerProtocol(ABC):
         key_entities: Sequence[str] = (),
         domains: Sequence[str] = (),
         question_type: str = "",
+        state: SearchState | None = None,
     ) -> List[SearchQuery]:
         """Create source-aware queries with explicit search intents."""
         ...
@@ -55,7 +56,12 @@ class PaperDeduplicatorProtocol(ABC):
         papers: Sequence[PaperRecord],
         existing_papers: Sequence[PaperRecord] = (),
     ) -> List[PaperRecord]:
-        """Deduplicate a search batch and mark reusable catalog records."""
+        """Return canonical records for incoming hits, reusing catalog matches.
+
+        ``existing_papers`` is a lookup catalog, not an instruction to return
+        every catalog record.  When an incoming hit matches that catalog, the
+        returned item should be the canonical existing record.
+        """
         ...
 
 
@@ -144,4 +150,17 @@ class PaperReaderProtocol(ABC):
         evidence: Sequence[EvidenceChunk],
     ) -> PaperReadingResult:
         """Summarize one paper and extract evidence-linked knowledge entries."""
+        ...
+
+
+class ReadingExtractionWorkflowProtocol(ABC):
+    tool_name = "reading_extraction_workflow"
+
+    @abstractmethod
+    async def run(
+        self,
+        sub_question: str,
+        papers: Sequence[PaperRecord],
+    ) -> List[PaperReadingResult]:
+        """Read Final-K papers and return evidence-linked paper results."""
         ...

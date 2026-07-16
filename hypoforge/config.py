@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import yaml
 from dotenv import load_dotenv
@@ -107,6 +107,7 @@ class QwenModelsConfig(BaseModel):
 class SearchConfig(BaseModel):
     """Literature-search related settings."""
 
+    implementation: Literal["legacy", "agentic"] = "legacy"
     tools: List[str] = Field(default_factory=lambda: ["semantic_scholar", "pubmed"])
     papers_per_sub_question: int = 15
     max_papers_total: int = 80
@@ -210,6 +211,7 @@ class PipelineConfig(BaseModel):
     def get_module_kwargs(self, module_name: str) -> Dict[str, Any]:
         """Return the override kwargs dict for *module_name*, or {}."""
         override = self.module_overrides.get(module_name)
-        if override is None:
-            return {}
-        return override.kwargs
+        kwargs = dict(override.kwargs) if override is not None else {}
+        if module_name == "m2":
+            kwargs.setdefault("implementation", self.search.implementation)
+        return kwargs

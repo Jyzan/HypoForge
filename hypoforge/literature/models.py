@@ -77,6 +77,7 @@ class StopReason(str, Enum):
 class SearchQuery(LiteratureModel):
     query_id: NonEmptyStr
     text: NonEmptyStr
+    round_index: int = Field(default=0, ge=0)
     intent: QueryIntent = QueryIntent.CORE
     target_source: NonEmptyStr
     purpose: NonEmptyStr
@@ -142,6 +143,14 @@ class SearchBudget(LiteratureModel):
     max_seconds: int = Field(default=900, ge=1)
 
 
+class RemainingSearchBudget(LiteratureModel):
+    max_rounds: int = Field(default=0, ge=0)
+    max_queries: int = Field(default=0, ge=0)
+    max_papers: int = Field(default=0, ge=0)
+    max_tokens: int = Field(default=0, ge=0)
+    max_seconds: float = Field(default=0.0, ge=0.0)
+
+
 class SearchState(LiteratureModel):
     round_index: int = Field(default=0, ge=0)
     queries_used: List[SearchQuery] = Field(default_factory=list)
@@ -150,7 +159,15 @@ class SearchState(LiteratureModel):
     missing_topics: Set[str] = Field(default_factory=set)
     candidate_paper_ids: List[str] = Field(default_factory=list)
     bucket_counts: Dict[EvidenceBucket, int] = Field(default_factory=dict)
-    remaining_budget: SearchBudget = Field(default_factory=SearchBudget)
+    remaining_budget: RemainingSearchBudget = Field(
+        default_factory=RemainingSearchBudget
+    )
+    queries_executed: int = Field(default=0, ge=0)
+    unique_papers_seen: int = Field(default=0, ge=0)
+    estimated_tokens_used: int = Field(default=0, ge=0)
+    elapsed_seconds: float = Field(default=0.0, ge=0.0)
+    consecutive_low_gain_rounds: int = Field(default=0, ge=0)
+    consecutive_no_result_rounds: int = Field(default=0, ge=0)
 
 
 class SearchRunResult(LiteratureModel):
@@ -165,6 +182,10 @@ class SearchRunResult(LiteratureModel):
     iterations: int = Field(default=0, ge=0)
     stop_reason: Optional[StopReason] = None
     errors: List[str] = Field(default_factory=list)
+    source_result_counts: Dict[str, int] = Field(default_factory=dict)
+    scout_notes: List[ScoutNote] = Field(default_factory=list)
+    reused_paper_ids: List[str] = Field(default_factory=list)
+    final_state: Optional[SearchState] = None
 
 
 class DocumentRecord(LiteratureModel):
