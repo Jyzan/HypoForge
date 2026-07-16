@@ -199,3 +199,10 @@ async def test_factory_surfaces_pubmed_network_failure() -> None:
 
     with pytest.raises(RuntimeError, match="network unavailable"):
         await module(PipelineState(input_question="question"))
+
+
+def test_factory_passes_source_timeout_to_real_pubmed_source() -> None:
+    adapter = build_minimal_pubmed_adapter(source_timeout_seconds=0.75)
+
+    source = adapter.search_agent.sources["pubmed"]
+    assert source.timeout_seconds == 0.75

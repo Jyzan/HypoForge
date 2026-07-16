@@ -60,10 +60,26 @@ def _to_paper_record(raw: Mapping[str, Any]) -> PaperRecord | None:
 class PubMedLiteratureSource(LiteratureSourceProtocol):
     source_name = "pubmed"
 
-    def __init__(self, backend: PubMedBackend | None = None) -> None:
+    def __init__(
+        self,
+        backend: PubMedBackend | None = None,
+        *,
+        timeout_seconds: float = 30.0,
+    ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        self._uses_default_backend = backend is None
         self.backend = backend or search_pubmed_strict
+        self.timeout_seconds = timeout_seconds
 
     async def search(self, query: SearchQuery, limit: int = 20) -> list[PaperRecord]:
-        rows = await self.backend(query.text, limit)
+        if self._uses_default_backend:
+            rows = await self.backend(
+                query.text,
+                limit,
+                timeout_seconds=self.timeout_seconds,
+            )
+        else:
+            rows = await self.backend(query.text, limit)
         records = (_to_paper_record(row) for row in rows)
         return [record for record in records if record is not None]

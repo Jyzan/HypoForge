@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from hypoforge.literature.models import FulltextStatus, QueryIntent, SearchQuery
+from hypoforge.literature.sources import pubmed as pubmed_source
 from hypoforge.literature.sources.pubmed import PubMedLiteratureSource
 
 
@@ -84,3 +85,37 @@ async def test_pubmed_source_uses_normalized_doi_for_stable_identity() -> None:
         "DOI:10.1000/abc",
         "DOI:10.1000/abc",
     ]
+
+
+@pytest.mark.asyncio
+async def test_real_pubmed_backend_receives_source_timeout(monkeypatch) -> None:
+    calls = []
+
+    async def backend(text: str, limit: int, timeout_seconds: float | None = None):
+        calls.append((text, limit, timeout_seconds))
+        return []
+
+    monkeypatch.setattr(pubmed_source, "search_pubmed_strict", backend)
+
+    result = await PubMedLiteratureSource(timeout_seconds=0.75).search(
+        query(), limit=4
+    )
+
+    assert result == []
+    assert calls == [("Hippo AND YAP AND TAZ", 4, 0.75)]
+
+
+@pytest.mark.asyncio
+async def test_injected_backend_keeps_two_argument_contract() -> None:
+    calls = []
+
+    async def backend(text: str, limit: int):
+        calls.append((text, limit))
+        return []
+
+    result = await PubMedLiteratureSource(
+        backend=backend, timeout_seconds=0.01
+    ).search(query(), limit=3)
+
+    assert result == []
+    assert calls == [("Hippo AND YAP AND TAZ", 3)]

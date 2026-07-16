@@ -1,6 +1,6 @@
 # M2 Agentic Literature Package
 
-这个目录是新版 M2 的公共开发边界。它定义共享数据契约、Tool Protocol、迭代式 Search Agent 和 Pipeline适配边界，但不包含任何真实 API 实现，也不改变现有 M2 的默认 legacy行为。
+这个目录是新版 M2 的公共开发边界。它定义共享数据契约、Tool Protocol、迭代式 Search Agent 和 Pipeline 适配边界。只有下文显式运行的 Minimal PubMed smoke-test path 会调用真实 PubMed API；默认配置和 legacy M2 的运行边界保持不变，也不会隐式发起真实 API 请求。
 
 ## 目录边界
 
@@ -99,7 +99,7 @@ search:
 
 ## 仍由其他功能分支提供的内容
 
-- 任何真实数据库调用；
+- PubMed 以外的真实数据库调用；
 - Query Planner、去重、排序、Scout Reading和覆盖评估的真实算法；
 - Reading Extraction Workflow的真实实现及依赖工厂；
 - 全文存储和向量数据库选型；

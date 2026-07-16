@@ -231,7 +231,10 @@ def build_minimal_pubmed_adapter(
 ) -> AgenticM2Adapter:
     if final_k <= 0:
         raise ValueError("final_k must be positive")
-    source = PubMedLiteratureSource(backend=backend)
+    source = PubMedLiteratureSource(
+        backend=backend,
+        timeout_seconds=source_timeout_seconds,
+    )
     agent = IterativeSearchAgent(
         query_planner=RuleBasedQueryPlanner(),
         sources=[source],
