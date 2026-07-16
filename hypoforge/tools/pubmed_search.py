@@ -11,6 +11,7 @@ the rate limit from 3 req/s to 10 req/s.  Set it via environment variable
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -333,6 +334,17 @@ class PubMedTool(ToolProtocol):
 # ============================================================================
 # Convenience — module-level functions (used by M2)
 # ============================================================================
+
+def _search_pubmed_strict_sync(query: str, limit: int) -> List[dict]:
+    bounded_limit = min(max(limit, 1), 100)
+    pmids = _esearch(query, limit=bounded_limit)
+    return _efetch_batch(pmids)
+
+
+async def search_pubmed_strict(query: str, limit: int = 20) -> List[dict]:
+    """Search PubMed without swallowing failures or blocking the event loop."""
+    return await asyncio.to_thread(_search_pubmed_strict_sync, query, limit)
+
 
 async def search_pubmed(query: str, limit: int = 20) -> List[dict]:
     """Convenience: one-shot PubMed search (async)."""
