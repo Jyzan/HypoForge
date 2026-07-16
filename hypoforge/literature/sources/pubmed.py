@@ -30,7 +30,7 @@ def _paper_id(pmid: str, doi: str, title: str) -> str:
 
 def _to_paper_record(raw: Mapping[str, Any]) -> PaperRecord | None:
     pmid = str(raw.get("pmid") or "").strip()
-    doi = str(raw.get("doi") or "").strip()
+    doi = PaperRecord.normalize_doi(raw.get("doi"))
     title = str(raw.get("title") or "").strip()
     if not pmid and not doi and not title:
         return None

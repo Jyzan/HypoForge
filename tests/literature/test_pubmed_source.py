@@ -67,3 +67,20 @@ async def test_pubmed_source_skips_only_unidentifiable_records() -> None:
     assert len(result) == 2
     assert result[0].paper_id == "DOI:10.2/doi-only"
     assert result[1].paper_id.startswith("TITLE:")
+
+
+@pytest.mark.asyncio
+async def test_pubmed_source_uses_normalized_doi_for_stable_identity() -> None:
+    async def backend(text: str, limit: int):
+        return [
+            {"doi": "https://doi.org/10.1000/ABC"},
+            {"doi": "10.1000/abc"},
+        ]
+
+    result = await PubMedLiteratureSource(backend=backend).search(query())
+
+    assert [paper.doi for paper in result] == ["10.1000/abc", "10.1000/abc"]
+    assert [paper.paper_id for paper in result] == [
+        "DOI:10.1000/abc",
+        "DOI:10.1000/abc",
+    ]
