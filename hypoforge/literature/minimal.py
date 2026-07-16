@@ -4,12 +4,18 @@ import hashlib
 import re
 from collections.abc import Sequence
 
+from ..state import ConfidenceLevel, KnowledgeEntryType
+from .adapter import AgenticM2Adapter
 from .models import (
     CoverageReport,
     EvidenceBucket,
+    EvidenceChunk,
+    EvidenceLinkedKnowledge,
     PaperRecord,
+    PaperReadingResult,
     QueryIntent,
     ScoutNote,
+    SearchBudget,
     SearchQuery,
     SearchState,
 )
@@ -18,8 +24,11 @@ from .protocols import (
     PaperDeduplicatorProtocol,
     PaperRankerProtocol,
     QueryPlannerProtocol,
+    ReadingExtractionWorkflowProtocol,
     ScoutReaderProtocol,
 )
+from .search import IterativeSearchAgent
+from .sources import PubMedBackend, PubMedLiteratureSource
 
 _STOP_WORDS = {
     "and", "are", "does", "for", "from", "how", "into", "the", "what",
@@ -165,3 +174,78 @@ class SingleSourceCoverageEvaluator(CoverageEvaluatorProtocol):
                 if papers else "PubMed returned no valid candidate papers."
             ),
         )
+
+
+class AbstractReadingWorkflow(ReadingExtractionWorkflowProtocol):
+    async def run(
+        self,
+        sub_question: str,
+        papers: Sequence[PaperRecord],
+    ) -> list[PaperReadingResult]:
+        results: list[PaperReadingResult] = []
+        for paper in papers:
+            abstract = " ".join(paper.abstract.split())
+            if not abstract:
+                results.append(PaperReadingResult(
+                    paper_id=paper.paper_id,
+                    summary=paper.title,
+                    degraded_to_abstract=True,
+                    errors=["PubMed abstract unavailable"],
+                ))
+                continue
+            sentence = re.split(r"(?<=[.!?。！？])\s+", abstract, maxsplit=1)[0][:600]
+            evidence_id = f"{paper.paper_id}:abstract:1"
+            evidence = EvidenceChunk(
+                evidence_id=evidence_id,
+                paper_id=paper.paper_id,
+                chunk_id=f"{paper.paper_id}:abstract",
+                section="abstract",
+                quote=sentence,
+                normalized_claim=sentence,
+                relevance_score=0.7,
+            )
+            digest = hashlib.sha256(evidence_id.encode("utf-8")).hexdigest()[:12]
+            entry = EvidenceLinkedKnowledge(
+                entry_id=f"pubmed-{digest}",
+                entry_type=KnowledgeEntryType.ESTABLISHED_FACT,
+                content=f"PubMed abstract reports: {sentence}",
+                confidence=ConfidenceLevel.MEDIUM,
+                entities=_latin_terms(f"{sub_question} {paper.title}", limit=6),
+                evidence_ids=[evidence_id],
+            )
+            results.append(PaperReadingResult(
+                paper_id=paper.paper_id,
+                summary=sentence,
+                evidence=[evidence],
+                knowledge_entries=[entry],
+                degraded_to_abstract=True,
+            ))
+        return results
+
+
+def build_minimal_pubmed_adapter(
+    *,
+    backend: PubMedBackend | None = None,
+    final_k: int = 5,
+    source_timeout_seconds: float = 30.0,
+) -> AgenticM2Adapter:
+    if final_k <= 0:
+        raise ValueError("final_k must be positive")
+    source = PubMedLiteratureSource(backend=backend)
+    agent = IterativeSearchAgent(
+        query_planner=RuleBasedQueryPlanner(),
+        sources=[source],
+        deduplicator=ExactPaperDeduplicator(),
+        ranker=MetadataPaperRanker(),
+        scout_reader=AbstractScoutReader(),
+        coverage_evaluator=SingleSourceCoverageEvaluator(),
+        final_k=final_k,
+        candidate_limit=final_k,
+        per_query_limit=final_k,
+        source_timeout_seconds=source_timeout_seconds,
+    )
+    return AgenticM2Adapter(
+        search_agent=agent,
+        reading_workflow=AbstractReadingWorkflow(),
+        budget=SearchBudget(max_rounds=2, max_queries=2, max_papers=final_k),
+    )

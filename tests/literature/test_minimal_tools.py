@@ -3,11 +3,13 @@ from __future__ import annotations
 import pytest
 
 from hypoforge.literature.minimal import (
+    AbstractReadingWorkflow,
     AbstractScoutReader,
     ExactPaperDeduplicator,
     MetadataPaperRanker,
     RuleBasedQueryPlanner,
     SingleSourceCoverageEvaluator,
+    build_minimal_pubmed_adapter,
 )
 from hypoforge.literature.models import (
     CoverageReport,
@@ -15,6 +17,8 @@ from hypoforge.literature.models import (
     PaperRecord,
     SearchState,
 )
+from hypoforge.modules.m2_literature_search import M2LiteratureSearch
+from hypoforge.state import PipelineState
 
 
 def paper(paper_id: str, *, title: str, abstract: str = "", year: int | None = None,
@@ -112,3 +116,86 @@ async def test_coverage_is_insufficient_without_papers() -> None:
         sufficient=False,
         rationale="PubMed returned no valid candidate papers.",
     )
+
+
+@pytest.mark.asyncio
+async def test_abstract_reader_links_one_real_abstract_sentence() -> None:
+    source = paper(
+        "PMID:123",
+        title="Hippo signaling",
+        abstract="Hippo signaling restrains YAP activity. A second sentence.",
+        pmid="123",
+    )
+
+    result = (await AbstractReadingWorkflow().run("question", [source]))[0]
+
+    assert result.degraded_to_abstract is True
+    assert result.evidence[0].quote == "Hippo signaling restrains YAP activity."
+    assert result.knowledge_entries[0].evidence_ids == [result.evidence[0].evidence_id]
+    assert "PubMed abstract reports" in result.knowledge_entries[0].content
+
+
+@pytest.mark.asyncio
+async def test_abstract_reader_does_not_invent_content_when_abstract_missing() -> None:
+    source = paper("PMID:123", title="No abstract", pmid="123")
+
+    result = (await AbstractReadingWorkflow().run("question", [source]))[0]
+
+    assert result.degraded_to_abstract is True
+    assert result.evidence == []
+    assert result.knowledge_entries == []
+    assert result.errors == ["PubMed abstract unavailable"]
+
+
+@pytest.mark.asyncio
+async def test_factory_runs_m2_directly_with_real_shaped_backend() -> None:
+    async def backend(text: str, limit: int):
+        return [{
+            "pmid": "123",
+            "title": "Hippo signaling",
+            "abstract": "Hippo signaling restrains YAP activity.",
+            "year": 2024,
+        }]
+
+    module = M2LiteratureSearch(
+        implementation="agentic",
+        agentic_adapter=build_minimal_pubmed_adapter(backend=backend, final_k=3),
+    )
+
+    output = await module(PipelineState(input_question="Hippo YAP TAZ organ size"))
+
+    result = output["literature_results"][0]
+    assert result.sub_question == "Hippo YAP TAZ organ size"
+    assert result.papers_retrieved == 1
+    assert result.knowledge_entries[0].source_paper_id == "PMID:123"
+
+
+@pytest.mark.asyncio
+async def test_factory_returns_empty_result_when_pubmed_returns_none() -> None:
+    async def backend(text: str, limit: int):
+        return []
+
+    module = M2LiteratureSearch(
+        implementation="agentic",
+        agentic_adapter=build_minimal_pubmed_adapter(backend=backend),
+    )
+
+    output = await module(PipelineState(input_question="no matching topic"))
+
+    result = output["literature_results"][0]
+    assert result.papers_retrieved == 0
+    assert result.knowledge_entries == []
+
+
+@pytest.mark.asyncio
+async def test_factory_surfaces_pubmed_network_failure() -> None:
+    async def backend(text: str, limit: int):
+        raise OSError("network unavailable")
+
+    module = M2LiteratureSearch(
+        implementation="agentic",
+        agentic_adapter=build_minimal_pubmed_adapter(backend=backend),
+    )
+
+    with pytest.raises(RuntimeError, match="network unavailable"):
+        await module(PipelineState(input_question="question"))
