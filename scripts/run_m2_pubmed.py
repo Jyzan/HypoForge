@@ -16,6 +16,15 @@ from hypoforge.modules.m2_literature_search import M2LiteratureSearch
 from hypoforge.state import PipelineState
 
 
+class CLIArgumentError(ValueError):
+    """Raised when CLI arguments cannot be parsed."""
+
+
+class JSONArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise CLIArgumentError(message)
+
+
 async def _run(question: str, limit: int, timeout: float) -> dict:
     adapter = build_minimal_pubmed_adapter(
         final_k=limit,
@@ -36,12 +45,12 @@ async def _run(question: str, limit: int, timeout: float) -> dict:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run minimal PubMed-only M2")
+    parser = JSONArgumentParser(description="Run minimal PubMed-only M2")
     parser.add_argument("--question", required=True)
     parser.add_argument("--limit", type=int, default=5)
     parser.add_argument("--timeout", type=float, default=30.0)
-    args = parser.parse_args(argv)
     try:
+        args = parser.parse_args(argv)
         payload = asyncio.run(_run(args.question, args.limit, args.timeout))
     except Exception as exc:
         error = {
