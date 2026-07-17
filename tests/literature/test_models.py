@@ -16,6 +16,7 @@ from hypoforge.literature.models import (
     SearchBudget,
     SearchQuery,
     SearchRunResult,
+    ScoutNote,
     SearchState,
     StopReason,
 )
@@ -167,3 +168,25 @@ def test_literature_package_exposes_shared_contracts() -> None:
 
     assert literature.PaperRecord is PaperRecord
     assert literature.SearchRunResult is SearchRunResult
+    assert literature.PaperDeduplicator.__name__ == "PaperDeduplicator"
+    assert literature.PaperRanker.__name__ == "PaperRanker"
+    assert literature.ScoutReader.__name__ == "ScoutReader"
+    assert literature.CoverageEvaluator.__name__ == "CoverageEvaluator"
+
+
+def test_scout_note_round_trips_extended_evidence_contract() -> None:
+    note = ScoutNote(
+        paper_id="PMID:1",
+        relevance_to_question=0.9,
+        evidence_buckets={EvidenceBucket.SUPPORTING, EvidenceBucket.RECENT},
+        study_design="cohort study",
+        evidence_summary="The cohort supports the proposed association.",
+    )
+
+    restored = ScoutNote.model_validate_json(note.model_dump_json())
+
+    assert restored.evidence_buckets == {
+        EvidenceBucket.SUPPORTING,
+        EvidenceBucket.RECENT,
+    }
+    assert restored.study_design == "cohort study"
