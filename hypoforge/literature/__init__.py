@@ -37,10 +37,17 @@ from .protocols import (
     ReadingExtractionWorkflowProtocol,
     ScoutReaderProtocol,
 )
-from .search import IterativeSearchAgent
+from .search import (
+    CoverageEvaluator,
+    IterativeSearchAgent,
+    PaperDeduplicator,
+    PaperRanker,
+    ScoutReader,
+)
 
 __all__ = [
     "ContentLevel",
+    "CoverageEvaluator",
     "CoverageEvaluatorProtocol",
     "CoverageReport",
     "DocumentChunk",
@@ -54,7 +61,9 @@ __all__ = [
     "FulltextStatus",
     "IterativeSearchAgent",
     "LiteratureSourceProtocol",
+    "PaperDeduplicator",
     "PaperDeduplicatorProtocol",
+    "PaperRanker",
     "PaperRankerProtocol",
     "PaperReaderProtocol",
     "PaperReadingResult",
@@ -64,6 +73,7 @@ __all__ = [
     "ReadingExtractionWorkflowProtocol",
     "RemainingSearchBudget",
     "ScoutNote",
+    "ScoutReader",
     "ScoutReaderProtocol",
     "SearchBudget",
     "SearchQuery",

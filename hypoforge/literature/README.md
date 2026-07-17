@@ -80,6 +80,11 @@ result = await agent.run(
 )
 ```
 
+当前包提供可直接注入的 `PaperDeduplicator`、`PaperRanker`、`ScoutReader`
+和 `CoverageEvaluator`。去重与排序是确定性实现；Scout 与覆盖评估接受兼容
+`QwenClient.structured_chat()` 的 client，并在 client 缺失、部分响应或调用失败时
+使用保守的离线规则降级。
+
 Query Planner 首轮收到空的 `SearchState`；后续轮次收到已使用查询、已知术语、覆盖方向和缺口。每个 `SearchQuery.target_source` 必须与某个 `LiteratureSourceProtocol.source_name` 对应。单一数据源可以抛出异常，Agent会记录失败并继续使用其他来源；去重、排序、Scout或覆盖评估等核心 Tool 异常会以 `StopReason.ERROR` 结束，不会生成 stub结果。
 
 查询预算按实际调度的 `SearchQuery` 计算，论文预算按去重后的唯一论文计算，时间使用单调时钟，Token预算使用可替换的稳定估算器。所有 Tool 必须保证相同输入下返回顺序稳定，方便离线测试和实验复现。
@@ -100,7 +105,6 @@ search:
 ## 仍由其他功能分支提供的内容
 
 - 任何真实数据库调用；
-- Query Planner、去重、排序、Scout Reading和覆盖评估的真实算法；
 - Reading Extraction Workflow的真实实现及依赖工厂；
 - 全文存储和向量数据库选型；
 - 在线集成测试。
