@@ -124,6 +124,9 @@ class ScoutNote(LiteratureModel):
     controversies: List[str] = Field(default_factory=list)
     candidate_citations: List[str] = Field(default_factory=list)
     relevance_to_question: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence_buckets: Set[EvidenceBucket] = Field(default_factory=set)
+    study_design: str = ""
+    evidence_summary: str = ""
 
 
 class CoverageReport(LiteratureModel):
