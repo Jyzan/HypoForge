@@ -148,6 +148,18 @@ M1 → M2 → M3 → M4 → M5 → M6 → (loop to M4)
 理解  检索  图谱  生成  计划  迭代
 ```
 
+## M3 全文证据落地（PaperQA 风格）
+
+M3 内部现在包含一个 `FullTextEvidenceGrounding` LangGraph 子图：解析 M2 的论文来源，
+优先读取 `papers/` 下的本地 PDF/TXT/XML，其次尝试 PMC/OpenAlex 开放获取，随后执行
+全文解析、带重叠分块、BM25/可选向量混合检索、MMR 去冗余、RCS 证据压缩、原子主张
+抽取和上下文敏感的关系判断。拿不到合法全文时会明确标记为 `m2_seed_fallback`。
+
+默认不需要下载 embedding 模型，使用 BM25 + MMR 即可运行。在配置中设置
+`embedding_model` 后才会调用当前 OpenAI-compatible 服务的 `/embeddings` 接口；接口不支持时
+自动回退稀疏检索。论文可放入 `papers/`，文件名包含 PMID、DOI、OpenAlex ID 或标题主体即可匹配。
+运行诊断写入 `.hypoforge_cache/m3_grounding/last_grounding_report.json`。
+
 ## 运行测试
 
 ```bash

@@ -1,0 +1,65 @@
+# Live integration test for the PaperQA-inspired M3 grounding path.
+# No local papers are used: M3 only tries PMC/OpenAlex lawful open access.
+run_name: m3-network-integration
+output_dir: ./output/m3_network_integration
+verbose: true
+log_level: INFO
+
+pipeline:
+  enabled_modules: ["m1", "m2", "m3", "m4"]
+  max_iterations: 0
+  enable_iteration: false
+
+qwen:
+  base:
+    model: qwen3.7-max
+    max_tokens: 8192
+    temperature: 0.1
+  plus:
+    model: qwen3.7-plus
+    max_tokens: 4096
+    temperature: 0.1
+  turbo:
+    model: qwen3.6-flash
+    max_tokens: 4096
+    temperature: 0.1
+
+search:
+  tools: ["pubmed", "semantic_scholar"]
+  papers_per_sub_question: 1
+  max_papers_total: 2
+
+module_overrides:
+  m1:
+    kwargs:
+      mode: "llm"
+      llm_tier: "base"
+  m2:
+    kwargs:
+      mode: "llm"
+      llm_tier: "turbo"
+      max_papers_per_query: 1
+      batch_size: 1
+  m3:
+    kwargs:
+      mode: "llm"
+      llm_tier: "plus"
+      # Deliberately absent; proves the network-only retrieval path.
+      local_paper_dir: "__no_local_papers__"
+      cache_dir: ".hypoforge_cache/m3_network_integration"
+      enable_network_fulltext: true
+      embedding_model: ""
+      max_sources: 2
+      max_queries: 2
+      retrieve_k: 4
+      evidence_k: 2
+      min_relevance: 4.0
+      grounding_max_concurrency: 3
+  m4:
+    kwargs:
+      mode: "direct"
+      llm_tier: "base"
+      num_candidates: 3
+      top_k: 1
+
+enabled_skills: []

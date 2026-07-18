@@ -49,6 +49,15 @@ module_overrides:
     kwargs:
       mode: "llm"
       llm_tier: "plus"
+      # PaperQA-inspired full-text grounding (nested inside M3)
+      local_paper_dir: "papers"
+      cache_dir: ".hypoforge_cache/m3_grounding"
+      enable_network_fulltext: true
+      embedding_model: ""       # empty = BM25+MMR; set only if the API supports /embeddings
+      retrieve_k: 30
+      evidence_k: 12
+      min_relevance: 5.0
+      grounding_max_concurrency: 4
   m4:
     kwargs:
       num_candidates: 7

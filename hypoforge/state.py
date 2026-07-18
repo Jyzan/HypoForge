@@ -50,6 +50,8 @@ class EvidenceNodeType(str, Enum):
     LIMITATION = "limitation"
     CONFLICT = "conflict"
     ENTITY = "entity"
+    CHUNK = "chunk"
+    EVIDENCE_RECORD = "evidence_record"
 
 
 class EvidenceEdgeRelation(str, Enum):
@@ -58,6 +60,11 @@ class EvidenceEdgeRelation(str, Enum):
     EXTENDS = "extends"
     LIMITS = "limits"
     INVOLVES = "involves"
+    CONTAINS = "contains"
+    GROUNDS = "grounds"
+    CITES = "cites"
+    SAME_AS = "same_as"
+    REFINES = "refines"
 
 
 class ReviewerDimension(str, Enum):
@@ -138,6 +145,8 @@ class EvidenceEdge(BaseModel):
     source: str
     target: str
     relation: EvidenceEdgeRelation
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    rationale: str = ""
 
 
 class EvidenceGraph(BaseModel):
@@ -150,6 +159,10 @@ class EvidenceGraph(BaseModel):
     established_facts: List[str] = Field(default_factory=list)
     conflicts: List[str] = Field(default_factory=list)
     knowledge_gaps: List[str] = Field(default_factory=list)
+
+    # Auditable M3 full-text grounding diagnostics. Kept as a dictionary so
+    # old checkpoints remain forward/backward compatible.
+    grounding_report: Dict[str, Any] = Field(default_factory=dict)
 
 
 # ============================================================================

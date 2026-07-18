@@ -27,6 +27,7 @@ output/
 
 # Knowledge graph runtime data
 knowledge_graph/
+.hypoforge_cache/
 
 # pytest
 .pytest_cache/
