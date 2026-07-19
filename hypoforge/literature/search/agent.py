@@ -26,6 +26,13 @@ from ..protocols import (
     ScoutReaderProtocol,
 )
 from .budget import calculate_remaining, choose_stop_reason, estimate_tokens
+from .ranking import rerank_with_scout
+
+
+class _SearchTimeBudgetExpired(TimeoutError):
+    def __init__(self, stage: str) -> None:
+        super().__init__(f"search time budget exhausted during {stage}")
+        self.stage = stage
 
 
 class IterativeSearchAgent:
@@ -53,6 +60,7 @@ class IterativeSearchAgent:
         no_result_round_limit: int = 2,
         low_gain_round_limit: int = 2,
         clock: Callable[[], float] = time.monotonic,
+        stage_clock: Callable[[], float] = time.perf_counter,
         token_estimator: Callable[[str], int] = estimate_tokens,
     ) -> None:
         for name, value in (
@@ -91,6 +99,7 @@ class IterativeSearchAgent:
         self.no_result_round_limit = no_result_round_limit
         self.low_gain_round_limit = low_gain_round_limit
         self.clock = clock
+        self.stage_clock = stage_clock
         self.token_estimator = token_estimator
 
     async def run(
@@ -104,6 +113,7 @@ class IterativeSearchAgent:
     ) -> SearchRunResult:
         limits = budget or SearchBudget()
         started_at = self.clock()
+        deadline_started_at = time.monotonic()
         state = SearchState()
         state.remaining_budget = calculate_remaining(limits, state)
         all_queries: list[SearchQuery] = []
@@ -120,16 +130,63 @@ class IterativeSearchAgent:
         reused_ids: set[str] = set()
         existing_ids = {paper.paper_id for paper in existing_papers}
         stop_reason = None
+        stage_elapsed_seconds = {
+            "query_planner": 0.0,
+            "source_search": 0.0,
+            "paper_deduplicator": 0.0,
+            "paper_ranker": 0.0,
+            "scout_reader": 0.0,
+            "coverage_evaluator": 0.0,
+        }
+
+        async def measure(stage: str, operation):
+            stage_started_at = self.stage_clock()
+            try:
+                remaining_seconds = limits.max_seconds - (
+                    time.monotonic() - deadline_started_at
+                )
+                if remaining_seconds <= 0:
+                    close = getattr(operation, "close", None)
+                    if callable(close):
+                        close()
+                    cancel = getattr(operation, "cancel", None)
+                    if callable(cancel):
+                        cancel()
+                    raise _SearchTimeBudgetExpired(stage)
+                task = asyncio.ensure_future(operation)
+                try:
+                    return await asyncio.wait_for(task, timeout=remaining_seconds)
+                except asyncio.TimeoutError as exc:
+                    if task.done() and not task.cancelled():
+                        raise
+                    raise _SearchTimeBudgetExpired(stage) from exc
+            finally:
+                elapsed = max(0.0, self.stage_clock() - stage_started_at)
+                stage_elapsed_seconds[stage] += elapsed
+
+        def mark_time_budget_expired(exc: _SearchTimeBudgetExpired) -> StopReason:
+            errors.append(self._format_error(exc.stage, exc))
+            state.elapsed_seconds = max(
+                state.elapsed_seconds, float(limits.max_seconds)
+            )
+            state.remaining_budget = calculate_remaining(limits, state)
+            return StopReason.TIME_BUDGET
 
         while stop_reason is None:
             try:
-                planned = await self.query_planner.plan(
-                    sub_question,
-                    key_entities=key_entities,
-                    domains=domains,
-                    question_type=question_type,
-                    state=state.model_copy(deep=True),
+                planned = await measure(
+                    "query_planner",
+                    self.query_planner.plan(
+                        sub_question,
+                        key_entities=key_entities,
+                        domains=domains,
+                        question_type=question_type,
+                        state=state.model_copy(deep=True),
+                    ),
                 )
+            except _SearchTimeBudgetExpired as exc:
+                stop_reason = mark_time_budget_expired(exc)
+                break
             except Exception as exc:
                 errors.append(self._format_error("query_planner", exc))
                 stop_reason = StopReason.ERROR
@@ -140,10 +197,12 @@ class IterativeSearchAgent:
                 key = self._query_key(planned_query)
                 if key in query_history:
                     continue
+                query_history.add(key)
+                if planned_query.target_source in state.unavailable_sources:
+                    continue
                 queries.append(
                     planned_query.model_copy(update={"round_index": round_index})
                 )
-                query_history.add(key)
                 if len(queries) >= state.remaining_budget.max_queries:
                     break
 
@@ -152,10 +211,17 @@ class IterativeSearchAgent:
                 stop_reason = StopReason.NO_RESULTS
                 break
 
-            search_results = await asyncio.gather(
-                *(self._search(query) for query in queries),
-                return_exceptions=True,
-            )
+            try:
+                search_results = await measure(
+                    "source_search",
+                    asyncio.gather(
+                        *(self._search(query) for query in queries),
+                        return_exceptions=True,
+                    ),
+                )
+            except _SearchTimeBudgetExpired as exc:
+                stop_reason = mark_time_budget_expired(exc)
+                break
             raw_papers: list[PaperRecord] = []
             successful_queries = 0
             for query, result in zip(queries, search_results):
@@ -163,6 +229,7 @@ class IterativeSearchAgent:
                 if isinstance(result, BaseException):
                     if source_name not in failed_sources:
                         failed_sources.append(source_name)
+                    state.unavailable_sources.add(source_name)
                     errors.append(self._format_error(source_name, result))
                     continue
                 successful_queries += 1
@@ -177,10 +244,19 @@ class IterativeSearchAgent:
             state.queries_executed += len(queries)
             previous_ids = set(canonical_history)
             try:
-                canonical_batch = await self.deduplicator.deduplicate(
-                    raw_papers,
-                    existing_papers=[*existing_papers, *canonical_history.values()],
+                canonical_batch = await measure(
+                    "paper_deduplicator",
+                    self.deduplicator.deduplicate(
+                        raw_papers,
+                        existing_papers=[
+                            *existing_papers,
+                            *canonical_history.values(),
+                        ],
+                    ),
                 )
+            except _SearchTimeBudgetExpired as exc:
+                stop_reason = mark_time_budget_expired(exc)
+                break
             except Exception as exc:
                 errors.append(self._format_error("paper_deduplicator", exc))
                 stop_reason = StopReason.ERROR
@@ -197,24 +273,53 @@ class IterativeSearchAgent:
                     reused_ids.add(paper.paper_id)
 
             try:
-                ranked = await self.ranker.rank(
-                    sub_question,
-                    list(candidate_pool.values()),
-                    limit=min(self.candidate_limit, limits.max_papers),
+                ranked = await measure(
+                    "paper_ranker",
+                    self.ranker.rank(
+                        sub_question,
+                        list(candidate_pool.values()),
+                        limit=min(self.candidate_limit, limits.max_papers),
+                    ),
                 )
+            except _SearchTimeBudgetExpired as exc:
+                stop_reason = mark_time_budget_expired(exc)
+                break
             except Exception as exc:
                 errors.append(self._format_error("paper_ranker", exc))
                 stop_reason = StopReason.ERROR
                 break
             candidate_pool = {paper.paper_id: paper for paper in ranked}
             new_papers = len(set(canonical_history) - previous_ids)
+            papers_needing_scout = [
+                paper for paper in ranked if paper.paper_id not in scout_by_paper
+            ]
             try:
-                scout_notes = await self.scout_reader.read(sub_question, ranked)
+                new_scout_notes = await measure(
+                    "scout_reader",
+                    self.scout_reader.read(sub_question, papers_needing_scout),
+                )
+            except _SearchTimeBudgetExpired as exc:
+                stop_reason = mark_time_budget_expired(exc)
+                break
             except Exception as exc:
                 errors.append(self._format_error("scout_reader", exc))
                 stop_reason = StopReason.ERROR
                 break
-            scout_by_paper.update({note.paper_id: note for note in scout_notes})
+            scout_by_paper.update(
+                {note.paper_id: note for note in new_scout_notes}
+            )
+            scout_notes = [
+                scout_by_paper[paper.paper_id]
+                for paper in ranked
+                if paper.paper_id in scout_by_paper
+            ]
+            ranked = rerank_with_scout(ranked, scout_notes)
+            candidate_pool = {paper.paper_id: paper for paper in ranked}
+            scout_notes = [
+                scout_by_paper[paper.paper_id]
+                for paper in ranked
+                if paper.paper_id in scout_by_paper
+            ]
 
             state.round_index = round_index
             state.candidate_paper_ids = list(candidate_pool)
@@ -244,12 +349,18 @@ class IterativeSearchAgent:
             state.elapsed_seconds = max(0.0, self.clock() - started_at)
 
             try:
-                coverage = await self.coverage_evaluator.evaluate(
-                    sub_question,
-                    ranked,
-                    scout_notes,
-                    state.model_copy(deep=True),
+                coverage = await measure(
+                    "coverage_evaluator",
+                    self.coverage_evaluator.evaluate(
+                        sub_question,
+                        ranked,
+                        scout_notes,
+                        state.model_copy(deep=True),
+                    ),
                 )
+            except _SearchTimeBudgetExpired as exc:
+                stop_reason = mark_time_budget_expired(exc)
+                break
             except Exception as exc:
                 errors.append(self._format_error("coverage_evaluator", exc))
                 stop_reason = StopReason.ERROR
@@ -279,6 +390,7 @@ class IterativeSearchAgent:
             stop_reason=stop_reason,
             errors=errors,
             source_result_counts=source_result_counts,
+            stage_elapsed_seconds=stage_elapsed_seconds,
             scout_notes=list(scout_by_paper.values()),
             reused_paper_ids=[
                 paper.paper_id for paper in ranked if paper.paper_id in reused_ids

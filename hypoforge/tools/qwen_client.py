@@ -177,14 +177,14 @@ class QwenClient:
             is reserved for the visible output.  This is recommended for
             structured JSON extraction where chain-of-thought is unnecessary.
         model_kwargs : dict | None
-            Extra parameters merged into the API request body
-            (e.g. ``response_format``, ``thinking`` control).
+            Standard OpenAI-compatible parameters merged into the request body,
+            such as ``response_format``.  Qwen thinking control is sent through
+            ``extra_body`` because it is provider-specific.
         """
         merged_kwargs: Dict[str, Any] = {}
-        if disable_thinking:
-            merged_kwargs["thinking"] = {"type": "disabled"}
         if model_kwargs:
             merged_kwargs.update(model_kwargs)
+        extra_body = {"enable_thinking": False} if disable_thinking else None
 
         return ChatOpenAI(
             model=self.model,
@@ -193,6 +193,7 @@ class QwenClient:
             max_tokens=max_tokens,
             temperature=temperature,
             **(dict(model_kwargs=merged_kwargs) if merged_kwargs else {}),
+            **(dict(extra_body=extra_body) if extra_body else {}),
         )
 
     @classmethod
@@ -348,11 +349,13 @@ class QwenClient:
         )
 
         # Build kwargs shared across attempts
-        def _make_rfmt_kwargs(include_thinking: bool) -> dict:
-            rfmt: Dict[str, Any] = {"response_format": {"type": "json_object"}}
+        def _make_rfmt_kwargs() -> dict:
+            return {"response_format": {"type": "json_object"}}
+
+        def _thinking_extra_body(include_thinking: bool) -> dict[str, bool] | None:
             if include_thinking and disable_thinking:
-                rfmt["thinking"] = {"type": "disabled"}
-            return rfmt
+                return {"enable_thinking": False}
+            return None
 
         response = None
         # Attempt 1: with response_format (+ optional thinking disable)
@@ -363,7 +366,8 @@ class QwenClient:
                 api_key=self.api_key,
                 max_tokens=max_tokens,
                 temperature=temperature,
-                model_kwargs=_make_rfmt_kwargs(include_thinking=True),
+                model_kwargs=_make_rfmt_kwargs(),
+                extra_body=_thinking_extra_body(include_thinking=True),
             )
             response = await llm_with_format.ainvoke(messages)
             self._record_tokens(response)
@@ -382,7 +386,8 @@ class QwenClient:
                         api_key=self.api_key,
                         max_tokens=max_tokens,
                         temperature=temperature,
-                        model_kwargs=_make_rfmt_kwargs(include_thinking=False),
+                        model_kwargs=_make_rfmt_kwargs(),
+                        extra_body=_thinking_extra_body(include_thinking=False),
                     )
                     response = await llm_rfmt.ainvoke(messages)
                     self._record_tokens(response)

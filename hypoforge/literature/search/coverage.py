@@ -155,6 +155,16 @@ class CoverageEvaluator(CoverageEvaluatorProtocol):
                     type(exc).__name__,
                 )
 
+        if state.round_index >= 2:
+            previous_gaps = {
+                _clean_text(topic).casefold() for topic in state.missing_topics
+            }
+            model_missing = [
+                topic
+                for topic in model_missing
+                if _clean_text(topic).casefold() in previous_gaps
+            ]
+
         missing_topics = _stable_strings([*model_missing, *hard_gaps])
         hard_gate = (
             len(relevant) >= self.min_relevant_papers

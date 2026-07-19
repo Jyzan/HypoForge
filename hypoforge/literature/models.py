@@ -160,6 +160,7 @@ class SearchState(LiteratureModel):
     known_terms: Set[str] = Field(default_factory=set)
     covered_topics: Set[str] = Field(default_factory=set)
     missing_topics: Set[str] = Field(default_factory=set)
+    unavailable_sources: Set[str] = Field(default_factory=set)
     candidate_paper_ids: List[str] = Field(default_factory=list)
     bucket_counts: Dict[EvidenceBucket, int] = Field(default_factory=dict)
     remaining_budget: RemainingSearchBudget = Field(
@@ -186,6 +187,7 @@ class SearchRunResult(LiteratureModel):
     stop_reason: Optional[StopReason] = None
     errors: List[str] = Field(default_factory=list)
     source_result_counts: Dict[str, int] = Field(default_factory=dict)
+    stage_elapsed_seconds: Dict[str, float] = Field(default_factory=dict)
     scout_notes: List[ScoutNote] = Field(default_factory=list)
     reused_paper_ids: List[str] = Field(default_factory=list)
     final_state: Optional[SearchState] = None
@@ -221,6 +223,7 @@ class EvidenceChunk(LiteratureModel):
     quote: NonEmptyStr
     normalized_claim: NonEmptyStr
     relevance_score: float = Field(ge=0.0, le=1.0)
+    citable: bool = True
 
 
 class EvidenceLinkedKnowledge(LiteratureModel):
@@ -237,5 +240,12 @@ class PaperReadingResult(LiteratureModel):
     summary: str = ""
     evidence: List[EvidenceChunk] = Field(default_factory=list)
     knowledge_entries: List[EvidenceLinkedKnowledge] = Field(default_factory=list)
+    content_level: ContentLevel = ContentLevel.METADATA
+    document_id: str = ""
+    document_source_uri: str = ""
+    document_license: str = ""
+    chunks_parsed: int = Field(default=0, ge=0)
+    chunks_retrieved: int = Field(default=0, ge=0)
+    stage_elapsed_seconds: Dict[str, float] = Field(default_factory=dict)
     degraded_to_abstract: bool = False
     errors: List[str] = Field(default_factory=list)

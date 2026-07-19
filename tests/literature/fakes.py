@@ -9,6 +9,7 @@ from hypoforge.literature.models import (
     PaperRecord,
     ScoutNote,
     SearchQuery,
+    SearchRunResult,
     SearchState,
 )
 from hypoforge.literature.protocols import (
@@ -137,6 +138,7 @@ class FakeCoverageEvaluator(CoverageEvaluatorProtocol):
         self.reports = list(reports)
         self.error = error
         self.states: list[SearchState] = []
+        self.note_calls: list[list[str]] = []
 
     async def evaluate(
         self,
@@ -148,6 +150,7 @@ class FakeCoverageEvaluator(CoverageEvaluatorProtocol):
         if self.error:
             raise self.error
         self.states.append(state.model_copy(deep=True))
+        self.note_calls.append([note.paper_id for note in scout_notes])
         index = min(len(self.states) - 1, len(self.reports) - 1)
         return self.reports[index].model_copy(deep=True)
 
@@ -156,11 +159,14 @@ class FakeReadingWorkflow(ReadingExtractionWorkflowProtocol):
     def __init__(self, results: Sequence[PaperReadingResult]) -> None:
         self.results = list(results)
         self.calls: list[list[str]] = []
+        self.search_contexts: list[SearchRunResult | None] = []
 
     async def run(
         self,
         sub_question: str,
         papers: Sequence[PaperRecord],
+        search_context: SearchRunResult | None = None,
     ) -> list[PaperReadingResult]:
         self.calls.append([paper.paper_id for paper in papers])
+        self.search_contexts.append(search_context)
         return [result.model_copy(deep=True) for result in self.results]

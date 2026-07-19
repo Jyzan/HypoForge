@@ -90,6 +90,7 @@ async def test_balanced_coverage_satisfies_deterministic_gate() -> None:
     assert report.missing_topics == []
     assert report.covered_buckets.isdisjoint(report.missing_buckets)
     assert "sufficient" not in client.calls[0]["output_schema"]["properties"]
+    assert client.calls[0]["disable_thinking"] is True
 
 
 @pytest.mark.asyncio
@@ -119,6 +120,35 @@ async def test_llm_critical_topic_gap_can_block_but_not_bypass_hard_gate() -> No
     )
     assert sparse_report.sufficient is False
     assert any("contradicting" in topic for topic in sparse_report.missing_topics)
+
+
+@pytest.mark.asyncio
+async def test_later_round_ignores_new_model_gap_but_keeps_persistent_gap() -> None:
+    papers, notes = balanced_inputs()
+    previous_gap = "direct ATPase measurements"
+    state = SearchState(round_index=2, missing_topics={previous_gap})
+
+    new_gap_report = await CoverageEvaluator(
+        FakeStructuredClient({
+            "covered_topics": ["Hsp70 regulation"],
+            "missing_topics": ["new speculative gap"],
+            "rationale": "A new target appeared.",
+        }),
+        current_year=2026,
+    ).evaluate("question", papers, notes, state)
+    persistent_report = await CoverageEvaluator(
+        FakeStructuredClient({
+            "covered_topics": ["Hsp70 regulation"],
+            "missing_topics": [previous_gap],
+            "rationale": "The prior target remains absent.",
+        }),
+        current_year=2026,
+    ).evaluate("question", papers, notes, state)
+
+    assert new_gap_report.sufficient is True
+    assert new_gap_report.missing_topics == []
+    assert persistent_report.sufficient is False
+    assert persistent_report.missing_topics == [previous_gap]
 
 
 @pytest.mark.asyncio

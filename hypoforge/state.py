@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import re
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ============================================================================
@@ -109,6 +109,7 @@ class KnowledgeEntry(BaseModel):
     source_paper_id: str = ""
     source_paper_title: str = ""
     entities: List[str] = Field(default_factory=list)
+    evidence_ids: List[str] = Field(default_factory=list)
 
 
 class LiteratureResult(BaseModel):
@@ -117,6 +118,149 @@ class LiteratureResult(BaseModel):
     sub_question: str
     papers_retrieved: int = 0
     knowledge_entries: List[KnowledgeEntry] = Field(default_factory=list)
+
+
+class M2SearchQueryExport(BaseModel):
+    query_id: str
+    text: str
+    round_index: int = 0
+    intent: str = "core"
+    target_source: str
+    purpose: str
+    target_gap: str = ""
+    relation_to_question: str = ""
+
+
+class M2CoverageExport(BaseModel):
+    covered_buckets: List[str] = Field(default_factory=list)
+    missing_buckets: List[str] = Field(default_factory=list)
+    covered_topics: List[str] = Field(default_factory=list)
+    missing_topics: List[str] = Field(default_factory=list)
+    sufficient: bool = False
+    rationale: str = ""
+
+
+class M2SearchProvenance(BaseModel):
+    queries: List[M2SearchQueryExport] = Field(default_factory=list)
+    coverage: M2CoverageExport = Field(default_factory=M2CoverageExport)
+    source_result_counts: Dict[str, int] = Field(default_factory=dict)
+    failed_sources: List[str] = Field(default_factory=list)
+    iterations: int = 0
+    stop_reason: Optional[str] = None
+    errors: List[str] = Field(default_factory=list)
+    stage_elapsed_seconds: Dict[str, float] = Field(default_factory=dict)
+    papers_found: int = 0
+    papers_after_dedup: int = 0
+
+
+class M2PaperExport(BaseModel):
+    paper_id: str
+    title: str
+    abstract: str = ""
+    authors: List[str] = Field(default_factory=list)
+    year: Optional[int] = None
+    journal: str = ""
+    doi: str = ""
+    pmid: str = ""
+    pmcid: str = ""
+    external_ids: Dict[str, str] = Field(default_factory=dict)
+    citation_count: Optional[int] = None
+    publication_type: str = ""
+    sources: List[str] = Field(default_factory=list)
+    is_open_access: Optional[bool] = None
+    fulltext_status: str = "unknown"
+    rank_scores: Dict[str, float] = Field(default_factory=dict)
+    reading_summary: str = ""
+    content_level: str = "metadata"
+    document_id: str = ""
+    document_source_uri: str = ""
+    document_license: str = ""
+    degraded_to_abstract: bool = False
+    chunks_parsed: int = 0
+    chunks_retrieved: int = 0
+    stage_elapsed_seconds: Dict[str, float] = Field(default_factory=dict)
+    errors: List[str] = Field(default_factory=list)
+
+
+class M2EvidenceExport(BaseModel):
+    evidence_id: str
+    paper_id: str
+    chunk_id: str
+    section: str = ""
+    page: Optional[int] = None
+    quote: str
+    normalized_claim: str
+    relevance_score: float
+    citable: bool = True
+
+
+class M2KnowledgeRun(BaseModel):
+    sub_question: str
+    papers: List[M2PaperExport] = Field(default_factory=list)
+    evidence: List[M2EvidenceExport] = Field(default_factory=list)
+    knowledge_entries: List[KnowledgeEntry] = Field(default_factory=list)
+    search_provenance: M2SearchProvenance = Field(
+        default_factory=M2SearchProvenance
+    )
+
+    @model_validator(mode="after")
+    def validate_provenance(self) -> "M2KnowledgeRun":
+        paper_ids = [item.paper_id for item in self.papers]
+        if len(paper_ids) != len(set(paper_ids)):
+            raise ValueError("duplicate paper_id in M2 knowledge run")
+
+        evidence_ids = [item.evidence_id for item in self.evidence]
+        if len(evidence_ids) != len(set(evidence_ids)):
+            raise ValueError("duplicate evidence_id in M2 knowledge run")
+
+        knowledge_ids = [item.id for item in self.knowledge_entries]
+        if len(knowledge_ids) != len(set(knowledge_ids)):
+            raise ValueError("duplicate knowledge id in M2 knowledge run")
+
+        paper_set = set(paper_ids)
+        evidence_by_id = {item.evidence_id: item for item in self.evidence}
+        for item in self.evidence:
+            if item.paper_id not in paper_set:
+                raise ValueError(
+                    f"evidence {item.evidence_id!r} references unknown paper"
+                )
+        for item in self.knowledge_entries:
+            if item.source_paper_id not in paper_set:
+                raise ValueError(
+                    f"knowledge {item.id!r} references unknown paper"
+                )
+            if not item.evidence_ids:
+                raise ValueError(f"knowledge {item.id!r} has no evidence_ids")
+            unknown = [
+                evidence_id
+                for evidence_id in item.evidence_ids
+                if evidence_id not in evidence_by_id
+            ]
+            if unknown:
+                raise ValueError(
+                    f"knowledge {item.id!r} references unknown evidence: {unknown}"
+                )
+            cross_paper = [
+                evidence_id
+                for evidence_id in item.evidence_ids
+                if evidence_by_id[evidence_id].paper_id != item.source_paper_id
+            ]
+            if cross_paper:
+                evidence_id = cross_paper[0]
+                evidence_paper_id = evidence_by_id[evidence_id].paper_id
+                raise ValueError(
+                    f"knowledge {item.id!r} references evidence {evidence_id!r} "
+                    f"from paper {evidence_paper_id!r}, expected source paper "
+                    f"{item.source_paper_id!r}"
+                )
+        return self
+
+
+class M2KnowledgeExport(BaseModel):
+    schema_version: Literal["m2-knowledge-export/v1"] = (
+        "m2-knowledge-export/v1"
+    )
+    runs: List[M2KnowledgeRun] = Field(default_factory=list)
 
 
 # ============================================================================
@@ -226,6 +370,7 @@ class PipelineState(BaseModel):
 
     # ---- M2 ----
     literature_results: List[LiteratureResult] = Field(default_factory=list)
+    m2_knowledge_export: Optional[M2KnowledgeExport] = None
 
     # ---- M3 ----
     evidence_graph: Optional[EvidenceGraph] = None

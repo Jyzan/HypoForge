@@ -79,6 +79,29 @@ async def test_citation_impact_is_age_adjusted() -> None:
 
 
 @pytest.mark.asyncio
+async def test_unknown_citation_metadata_is_not_treated_as_known_zero() -> None:
+    unknown = paper(
+        "unknown",
+        "Same topic",
+        citation_count=None,
+        rank_scores={"source_relevance": 0.5},
+    )
+    known_zero = paper(
+        "zero",
+        "Same topic",
+        citation_count=0,
+        rank_scores={"source_relevance": 0.5},
+    )
+
+    ranked = await PaperRanker(current_year=2026).rank(
+        "same topic", [unknown, known_zero], limit=2
+    )
+    scores = {item.paper_id: item.rank_scores for item in ranked}
+
+    assert scores["unknown"]["total"] > scores["zero"]["total"]
+
+
+@pytest.mark.asyncio
 async def test_equal_scores_keep_input_order_and_limit() -> None:
     first = paper("z", "Identical", rank_scores={"source_relevance": 0.5})
     second = paper("a", "Identical", rank_scores={"source_relevance": 0.5})

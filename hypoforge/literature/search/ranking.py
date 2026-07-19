@@ -6,7 +6,7 @@ import math
 from collections.abc import Sequence
 from datetime import datetime, timezone
 
-from ..models import FulltextStatus, PaperRecord
+from ..models import FulltextStatus, PaperRecord, ScoutNote
 from ..protocols import PaperRankerProtocol
 from ._text import lexical_relevance
 
@@ -53,6 +53,48 @@ def _metadata_quality(paper: PaperRecord) -> float:
         identity_present,
     )
     return sum(values) / len(values)
+
+
+def rerank_with_scout(
+    papers: Sequence[PaperRecord],
+    notes: Sequence[ScoutNote],
+    *,
+    scout_weight: float = 0.65,
+) -> list[PaperRecord]:
+    """Blend metadata rank with grounded Scout relevance deterministically."""
+    if not 0.0 <= scout_weight <= 1.0:
+        raise ValueError("scout_weight must be between zero and one")
+    if not papers:
+        return []
+
+    note_by_paper = {note.paper_id: note for note in notes}
+    count = len(papers)
+    reranked: list[tuple[float, int, str, PaperRecord]] = []
+    for index, paper in enumerate(papers):
+        default_base = 1.0 if count == 1 else 1.0 - index / (count - 1)
+        raw_base = paper.rank_scores.get("total", default_base)
+        base = _clamp(float(raw_base)) if math.isfinite(float(raw_base)) else default_base
+        note = note_by_paper.get(paper.paper_id)
+        scout_relevance = note.relevance_to_question if note is not None else base
+        combined = (1.0 - scout_weight) * base + scout_weight * scout_relevance
+        scores = dict(paper.rank_scores)
+        scores.update(
+            {
+                "scout_relevance": scout_relevance,
+                "post_scout_total": combined,
+            }
+        )
+        reranked.append(
+            (
+                combined,
+                index,
+                paper.paper_id,
+                paper.model_copy(update={"rank_scores": scores}),
+            )
+        )
+
+    reranked.sort(key=lambda item: (-item[0], item[1], item[2]))
+    return [item[3] for item in reranked]
 
 
 class PaperRanker(PaperRankerProtocol):
@@ -110,7 +152,15 @@ class PaperRanker(PaperRankerProtocol):
                 "metadata_quality": metadata_quality,
                 "access_quality": access_quality,
             }
-            total = sum(scores[name] * weight for name, weight in _WEIGHTS.items())
+            active_weights = {
+                name: weight
+                for name, weight in _WEIGHTS.items()
+                if name != "citation_impact" or paper.citation_count is not None
+            }
+            weight_sum = sum(active_weights.values())
+            total = sum(
+                scores[name] * weight for name, weight in active_weights.items()
+            ) / weight_sum
             scores["total"] = total
             updated_scores = dict(paper.rank_scores)
             updated_scores.update(scores)

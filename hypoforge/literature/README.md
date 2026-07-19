@@ -1,6 +1,6 @@
 # M2 Agentic Literature Package
 
-这个目录是新版 M2 的公共开发边界。它定义共享数据契约、Tool Protocol、迭代式 Search Agent 和 Pipeline适配边界，但不包含任何真实 API 实现，也不改变现有 M2 的默认 legacy行为。
+这个目录是新版 M2 的公共开发边界。它定义共享数据契约、Tool Protocol、迭代式 Search Agent 和 Pipeline 适配边界。下文两条显式 smoke path 可能调用真实外部服务：Minimal 路径只访问 PubMed，Integrated 路径调用 Qwen 并检索 PubMed、Semantic Scholar/OpenAlex 与 arXiv。默认配置和 legacy M2 的运行边界保持不变，也不会隐式发起真实 API 请求。
 
 ## 目录边界
 
@@ -98,15 +98,102 @@ search:
   implementation: legacy
 ```
 
-显式选择 `agentic` 时，现有 M2入口会委托给注入的 `AgenticM2Adapter`。如果没有提供 Adapter，会立即报告配置错误，不会静默回退 legacy或假数据。当前功能分支提供了可离线测试的 Adapter边界；等全文阅读组的实现合入后，需要由最终集成代码创建真实 `ReadingExtractionWorkflowProtocol` 实例并注入。
+显式选择 `agentic` 时，现有 M2入口会委托给注入的 `AgenticM2Adapter`。如果没有提供 Adapter，会立即报告配置错误，不会静默回退 legacy或假数据。`build_integrated_search_adapter()` 已创建并注入真实的 `FullTextReadingWorkflow`；最小 PubMed 路径仍保留 `AbstractReadingWorkflow`，仅用于独立冒烟测试和备份。
 
 `AgenticM2Adapter` 本身没有注册到 `ModuleRegistry`，单纯导入它不会替换当前 `M2LiteratureSearch`。
 
-## 仍由其他功能分支提供的内容
+## 当前边界
 
-- 任何真实数据库调用；
-- Reading Extraction Workflow的真实实现及依赖工厂；
-- 全文存储和向量数据库选型；
-- 在线集成测试。
+- 全文使用 PMC Open Access BioC JSON 或入选 arXiv 论文的公开 PDF；不可用时明确降级到论文真实摘要；
+- 当前 RAG 使用本地分区感知 BM25、实体/章节加权、MMR 去冗余和相邻块扩展，不依赖向量数据库；
+- 付费墙 PDF、OCR、通用 PDF 解析和默认启用的在线集成测试暂不在本分支范围内。
 
-这些内容应在对应功能分支中实现并通过 PR 合入。
+## Minimal PubMed smoke-test path
+
+This explicit development path searches only real PubMed metadata and uses
+deterministic rules for the remaining M2 Tools. It does not call an LLM, read
+PDFs, perform RAG, fabricate papers, or change the default legacy M2 path.
+
+```powershell
+python scripts/run_m2_pubmed.py `
+  --question "Hippo YAP TAZ organ size mechanotransduction" `
+  --limit 5
+```
+
+PubMed network/HTTP/parse failures produce an error and a non-zero exit code.
+Zero matches produce an empty literature result. There is no synthetic
+fallback.
+
+## Integrated multi-source search smoke path
+
+The primary integration runner combines the available source implementations:
+
+- Qwen Query Planner plus PubMed, Semantic Scholar/OpenAlex, and arXiv sources;
+- canonical paper deduplication and metadata-aware ranking;
+- model-assisted Scout Reading and balanced coverage evaluation;
+- PMC Open Access or selected arXiv PDF resolution, section/page-aware parsing,
+  local hybrid retrieval, and evidence-constrained Qwen extraction.
+
+The integrated path now uses `FullTextReadingWorkflow`. It requests legally
+reusable PMC BioC full text for PubMed-linked records. For selected arXiv
+records it downloads the hosted PDF only after Final-K selection, caches it,
+and parses page-attributed chunks. Both routes fall back explicitly to the real
+abstract when full text is unavailable and return no knowledge when neither
+source is readable.
+Every accepted knowledge entry references retrieved evidence IDs. Whole papers
+remain in the ignored runtime cache and are never placed in the model context.
+The minimal PubMed-only runner above keeps `AbstractReadingWorkflow` as an
+explicit backup and is never selected as an implicit fallback.
+
+```powershell
+python scripts/run_m2_integrated.py `
+  --question "Hippo YAP TAZ organ size mechanotransduction" `
+  --model qwen3.6-plus `
+  --limit 5 `
+  --timeout 30
+```
+
+## arXiv operational boundary
+
+arXiv is an independent planner target named `arxiv`, not an alias for
+Semantic Scholar or OpenAlex. It is intended for recent preprints in computer
+science, mathematics, physics, statistics, electrical engineering,
+quantitative biology, quantitative finance, and economics. An arXiv result is
+a preprint and must not be treated as peer-reviewed merely because its PDF is
+publicly accessible.
+
+```text
+PubMed -> PMC BioC when available -> abstract fallback
+arXiv -> metadata/abstract search -> Final-K cached PDF -> page-aware RAG
+Semantic Scholar/OpenAlex -> metadata/abstract -> abstract fallback
+```
+
+Search candidates carry only metadata and abstracts. PDF download happens
+inside the reading workflow, so only Final-K papers consume bandwidth and
+storage. Failed searches and PDF downloads report the real error; they do not
+return fabricated papers. The PDF document record deliberately leaves the
+licence field empty unless a future source supplies a paper-specific licence.
+
+## Cross-source coverage and timeout policy
+
+On the first search round, the query planner guarantees at least one query for
+every configured and available backend: PubMed, Semantic Scholar/OpenAlex, and
+arXiv. This applies to biomedical questions too; later rounds remain driven by
+the coverage gaps found by the Search Agent. A failed or rate-limited source is
+reported explicitly while the other sources continue independently.
+
+arXiv PDF retrieval is streamed with both a byte cap and a 180-second monotonic
+deadline. The reading workflow also applies a separate 210-second per-paper
+resolver timeout. If one paper exceeds that limit, only that paper is cancelled
+and degraded to its real source abstract; sibling papers continue through
+parsing, retrieval, and reading. The 600-second workflow timeout remains the
+global last-resort guard and does not replace these paper-local limits.
+
+## M2 knowledge export boundary
+
+Agentic M2 returns both literature_results and m2_knowledge_export.
+m2_knowledge_export/v1 contains Final-K paper metadata, reading diagnostics,
+all retrieved evidence excerpts, extracted knowledge entries, and search
+provenance. Every knowledge evidence_id resolves inside the same run. The
+package excludes full papers, local cache paths, and graph construction.
+Downstream modules own their own adaptation to this M2 contract.

@@ -1,4 +1,4 @@
-"""Unified literature search convenience — wraps PubMed + Semantic Scholar.
+"""Unified literature search across biomedical and technical sources.
 
 Provides ``tool_definitions`` for QueryPlanner and a single search entry
 point that dispatches to the appropriate backend.
@@ -13,11 +13,12 @@ from typing import Any, Dict, List, Optional
 
 from hypoforge.literature.models import PaperRecord, SearchQuery
 from hypoforge.literature.sources.academic_source import AcademicSource
+from hypoforge.literature.sources.arxiv_source import ArxivSource
 from hypoforge.literature.sources.pubmed_source import PubMedSource
 
 
 class LiteratureSearchTool:
-    """Unified search across PubMed + Semantic Scholar.
+    """Unified search across PubMed, Semantic Scholar/OpenAlex, and arXiv.
 
     Usage::
 
@@ -55,6 +56,19 @@ class LiteratureSearchTool:
                 "requiring MeSH terms (use PubMed instead)."
             ),
         },
+        {
+            "name": "arxiv",
+            "display_name": "arXiv",
+            "description": (
+                "Search recent preprints in computer science, mathematics, "
+                "physics, statistics, electrical engineering, quantitative "
+                "biology, quantitative finance, and economics. BEST for: "
+                "recent technical methods and openly accessible preprints. "
+                "Results may not have completed peer review. NOT ideal for: "
+                "specialized clinical or biomedical queries requiring MeSH "
+                "terms (use PubMed instead)."
+            ),
+        },
     ]
 
     _TOOL_NAME_SET: set[str] = {d["name"] for d in TOOL_DEFINITIONS}
@@ -63,9 +77,13 @@ class LiteratureSearchTool:
         self,
         pubmed: Optional[PubMedSource] = None,
         academic: Optional[AcademicSource] = None,
+        arxiv_source: Optional[ArxivSource] = None,
     ):
         self._pubmed_source = pubmed if pubmed is not None else PubMedSource()
         self._academic_source = academic if academic is not None else AcademicSource()
+        self._arxiv_source = (
+            arxiv_source if arxiv_source is not None else ArxivSource()
+        )
 
     @property
     def tool_definitions(self) -> List[Dict[str, Any]]:
@@ -79,7 +97,11 @@ class LiteratureSearchTool:
         """Return individual ``LiteratureSourceProtocol`` implementations
         suitable for ``IterativeSearchAgent`` injection.
         """
-        return [self._pubmed_source, self._academic_source]
+        return [
+            self._pubmed_source,
+            self._academic_source,
+            self._arxiv_source,
+        ]
 
     async def search(
         self, query_text: str, backend: str, limit: int = 20,
@@ -95,6 +117,8 @@ class LiteratureSearchTool:
             return await self._pubmed_source.search(query, limit=limit)
         if backend == "semantic_scholar":
             return await self._academic_source.search(query, limit=limit)
+        if backend == "arxiv":
+            return await self._arxiv_source.search(query, limit=limit)
         raise ValueError(
             f"Unknown backend {backend!r}. "
             f"Valid: {sorted(self._TOOL_NAME_SET)}"
