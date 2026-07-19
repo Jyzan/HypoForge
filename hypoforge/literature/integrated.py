@@ -73,7 +73,11 @@ def build_integrated_search_adapter(
         deduplicator=PaperDeduplicator(),
         ranker=PaperRanker(),
         scout_reader=ScoutReader(client),
-        coverage_evaluator=CoverageEvaluator(client),
+        # Coverage must be satisfied by the same leading papers that the
+        # agent will hand to the reading workflow, not by discarded tail
+        # candidates. This remains internal wiring; Protocol signatures stay
+        # unchanged.
+        coverage_evaluator=CoverageEvaluator(client, selection_limit=final_k),
         final_k=final_k,
         candidate_limit=max(20, final_k),
         per_query_limit=final_k,

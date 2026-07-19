@@ -131,6 +131,7 @@ def test_factory_wires_real_paper_selection_tools() -> None:
     assert agent.scout_reader.client is client
     assert isinstance(agent.coverage_evaluator, CoverageEvaluator)
     assert agent.coverage_evaluator.client is client
+    assert agent.coverage_evaluator.selection_limit == 5
     assert agent.candidate_limit == 20
 
 

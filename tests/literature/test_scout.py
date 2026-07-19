@@ -83,7 +83,9 @@ async def test_scout_batches_requests_and_restores_input_order() -> None:
 
 
 @pytest.mark.asyncio
-async def test_scout_filters_unknown_and_duplicate_ids_and_fills_missing_notes() -> None:
+async def test_scout_filters_unknown_and_duplicate_ids_and_fills_missing_notes() -> (
+    None
+):
     def respond(_: dict[str, Any]) -> dict[str, Any]:
         return {
             "notes": [
@@ -130,13 +132,143 @@ async def test_scout_filters_unknown_and_duplicate_ids_and_fills_missing_notes()
 
 
 @pytest.mark.asyncio
+async def test_scout_rejects_ungrounded_directional_labels_and_caps_relevance() -> None:
+    def respond(_: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "notes": [
+                {
+                    "paper_id": "paper-0",
+                    "relevance_to_question": 0.99,
+                    "directness_to_question": 0.99,
+                    "evidence_buckets": ["supporting", "contradicting"],
+                }
+            ]
+        }
+
+    source = paper(
+        0,
+        title="Hsp70 review in unrelated injury models",
+        abstract="However, mice recovered after an unrelated injury.",
+    )
+    notes = await ScoutReader(
+        FakeStructuredClient(responder=respond),
+        current_year=2026,
+    ).read(
+        "Does NAD+ depletion regulate Hsp70 ATPase activity during aging?",
+        [source],
+    )
+
+    assert notes[0].relevance_to_question < 0.55
+    assert notes[0].directness_to_question is not None
+    assert notes[0].directness_to_question < 0.55
+    assert EvidenceBucket.SUPPORTING not in notes[0].evidence_buckets
+    assert EvidenceBucket.CONTRADICTING not in notes[0].evidence_buckets
+
+
+@pytest.mark.asyncio
+async def test_scout_does_not_treat_generic_however_as_contradictory_evidence() -> None:
+    def respond(_: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "notes": [
+                {
+                    "paper_id": "paper-0",
+                    "relevance_to_question": 0.9,
+                    "evidence_buckets": ["contradicting"],
+                }
+            ]
+        }
+
+    source = paper(
+        0,
+        title="Hsp70 ATPase activity during aging",
+        abstract=(
+            "Hsp70 ATPase activity was measured during aging. "
+            "However, the assay protocol required a separate calibration step."
+        ),
+    )
+    notes = await ScoutReader(
+        FakeStructuredClient(responder=respond),
+        current_year=2026,
+    ).read("Does aging regulate Hsp70 ATPase activity?", [source])
+
+    assert EvidenceBucket.CONTRADICTING not in notes[0].evidence_buckets
+
+
+@pytest.mark.asyncio
+async def test_scout_keeps_only_exact_abstract_sentences_as_directional_evidence() -> (
+    None
+):
+    exact_sentence = "NAD+ depletion increased Hsp70 ATPase activity during aging."
+
+    def respond(_: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "notes": [
+                {
+                    "paper_id": "paper-0",
+                    "relevance_to_question": 0.9,
+                    "evidence_buckets": ["supporting"],
+                    "supporting_evidence": [exact_sentence],
+                },
+                {
+                    "paper_id": "paper-1",
+                    "relevance_to_question": 0.9,
+                    "evidence_buckets": ["supporting"],
+                    "supporting_evidence": [
+                        "NAD+ depletion directly increased Hsp70 ATPase activity."
+                    ],
+                },
+                {
+                    "paper_id": "paper-2",
+                    "relevance_to_question": 0.9,
+                    "evidence_buckets": ["supporting"],
+                    "supporting_evidence": [
+                        "The result was confirmed in a replicate assay."
+                    ],
+                },
+            ]
+        }
+
+    sources = [
+        paper(
+            0,
+            title="NAD+ depletion and Hsp70 ATPase activity during aging",
+            abstract=exact_sentence,
+        ),
+        paper(
+            1,
+            title="NAD+ depletion and Hsp70 ATPase activity during aging",
+            abstract="NAD+ depletion altered unrelated metabolite levels during aging.",
+        ),
+        paper(
+            2,
+            title="NAD+ depletion and Hsp70 ATPase activity during aging",
+            abstract="The result was confirmed in a replicate assay.",
+        ),
+    ]
+    notes = await ScoutReader(
+        FakeStructuredClient(responder=respond),
+        current_year=2026,
+    ).read(
+        "Does NAD+ depletion regulate Hsp70 ATPase activity during aging?",
+        sources,
+    )
+
+    assert notes[0].supporting_evidence == [exact_sentence]
+    assert EvidenceBucket.SUPPORTING in notes[0].evidence_buckets
+    assert notes[1].supporting_evidence == []
+    assert EvidenceBucket.SUPPORTING not in notes[1].evidence_buckets
+    assert notes[2].supporting_evidence == []
+    assert EvidenceBucket.SUPPORTING not in notes[2].evidence_buckets
+
+
+@pytest.mark.asyncio
 async def test_scout_uses_conservative_fallback_when_llm_fails() -> None:
     source = paper(
         0,
         title="Systematic review of Hsp70 assays",
         abstract=(
             "This systematic review found inconsistent results. "
-            "Several experiments did not support the proposed mechanism."
+            "Several experiments did not support the proposed Hsp70 mechanism."
         ),
         year=2026,
         citation_count=120,

@@ -109,7 +109,7 @@ class PaperRecord(LiteratureModel):
         doi = str(value or "").strip().lower()
         for prefix in ("https://doi.org/", "http://doi.org/", "doi:", "doi "):
             if doi.startswith(prefix):
-                doi = doi[len(prefix):]
+                doi = doi[len(prefix) :]
                 break
         return doi.strip()
 
@@ -124,6 +124,13 @@ class ScoutNote(LiteratureModel):
     controversies: List[str] = Field(default_factory=list)
     candidate_citations: List[str] = Field(default_factory=list)
     relevance_to_question: float = Field(default=0.0, ge=0.0, le=1.0)
+    # ``None`` preserves compatibility with notes produced before directness
+    # screening was introduced. New ``ScoutReader`` results always populate it.
+    directness_to_question: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    # These are exact, question-anchored abstract sentences. They make a
+    # directional bucket auditable without changing the ScoutReader Protocol.
+    supporting_evidence: List[str] = Field(default_factory=list)
+    contradicting_evidence: List[str] = Field(default_factory=list)
     evidence_buckets: Set[EvidenceBucket] = Field(default_factory=set)
     study_design: str = ""
     evidence_summary: str = ""

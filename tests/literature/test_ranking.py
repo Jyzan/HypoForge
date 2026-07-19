@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from hypoforge.literature.models import FulltextStatus, PaperRecord
-from hypoforge.literature.search.ranking import PaperRanker
+from hypoforge.literature.models import (
+    EvidenceBucket,
+    FulltextStatus,
+    PaperRecord,
+    ScoutNote,
+)
+from hypoforge.literature.search.ranking import PaperRanker, rerank_with_scout
 
 
 def paper(paper_id: str, title: str, **kwargs: object) -> PaperRecord:
@@ -122,3 +127,158 @@ async def test_ranker_supports_cjk_query_tokens_and_nonpositive_limit() -> None:
 
     assert ranked[0].rank_scores["query_relevance"] > 0
     assert await ranker.rank("蛋白质折叠", [item], limit=0) == []
+
+
+def test_scout_rerank_keeps_relevant_directional_primary_evidence_in_early_window() -> (
+    None
+):
+    reviews = [
+        paper(
+            f"review-{index}",
+            f"Review of Hsp70 regulation {index}",
+            rank_scores={"total": 0.90 - index * 0.01},
+        )
+        for index in range(4)
+    ]
+    supporting = paper(
+        "supporting-primary",
+        "Hsp70 ATPase assay supports the proposed mechanism",
+        rank_scores={"total": 0.73},
+    )
+    contradicting = paper(
+        "contradicting-primary",
+        "Hsp70 ATPase experiment finds no association during aging",
+        rank_scores={"total": 0.72},
+    )
+    papers = [*reviews, supporting, contradicting]
+    notes = [
+        ScoutNote(
+            paper_id=item.paper_id,
+            relevance_to_question=0.90,
+            directness_to_question=0.25,
+            evidence_buckets={EvidenceBucket.REVIEW},
+            study_design="review article",
+        )
+        for item in reviews
+    ]
+    notes.extend(
+        [
+            ScoutNote(
+                paper_id=supporting.paper_id,
+                relevance_to_question=0.80,
+                directness_to_question=0.90,
+                evidence_buckets={EvidenceBucket.SUPPORTING},
+                study_design="in vitro study",
+            ),
+            ScoutNote(
+                paper_id=contradicting.paper_id,
+                relevance_to_question=0.75,
+                directness_to_question=0.90,
+                evidence_buckets={EvidenceBucket.CONTRADICTING},
+                study_design="in vitro study",
+            ),
+        ]
+    )
+
+    reranked = rerank_with_scout(papers, notes)
+    early_ids = {item.paper_id for item in reranked[:5]}
+
+    assert supporting.paper_id in early_ids
+    assert contradicting.paper_id in early_ids
+    assert all("diversity_selection_score" in item.rank_scores for item in reranked[:5])
+
+
+def test_scout_rerank_builds_a_credible_final_set_not_a_review_list() -> None:
+    reviews = [
+        paper(
+            f"review-{index}",
+            f"Review of Hsp70 ATPase activity during aging {index}",
+            rank_scores={"total": 0.90 - index * 0.01},
+        )
+        for index in range(4)
+    ]
+    supporting = paper(
+        "supporting-primary",
+        "Hsp70 ATPase experiment supports the mechanism",
+        abstract="An in vitro assay demonstrates the proposed Hsp70 mechanism.",
+        rank_scores={"total": 0.72},
+    )
+    contradicting = paper(
+        "contradicting-primary",
+        "Hsp70 ATPase experiment finds no association",
+        abstract="An in vivo experiment found no association during aging.",
+        rank_scores={"total": 0.71},
+    )
+    additional_primary = paper(
+        "additional-primary",
+        "Hsp70 ATPase activity in an aging animal model",
+        abstract="An animal study measures ATPase activity during aging.",
+        rank_scores={"total": 0.70},
+    )
+    low_relevance = paper(
+        "low-relevance-review",
+        "Review of Hsp70 in unrelated disorders",
+        rank_scores={"total": 0.85},
+    )
+    papers = [
+        *reviews,
+        supporting,
+        contradicting,
+        additional_primary,
+        low_relevance,
+    ]
+    notes = [
+        ScoutNote(
+            paper_id=item.paper_id,
+            relevance_to_question=0.90,
+            directness_to_question=0.85,
+            evidence_buckets={EvidenceBucket.REVIEW},
+            study_design="review article",
+        )
+        for item in reviews
+    ]
+    notes.extend(
+        [
+            ScoutNote(
+                paper_id=supporting.paper_id,
+                relevance_to_question=0.80,
+                directness_to_question=0.90,
+                evidence_buckets={EvidenceBucket.SUPPORTING},
+                study_design="in vitro study",
+            ),
+            ScoutNote(
+                paper_id=contradicting.paper_id,
+                relevance_to_question=0.78,
+                directness_to_question=0.90,
+                evidence_buckets={EvidenceBucket.CONTRADICTING},
+                study_design="in vivo study",
+            ),
+            ScoutNote(
+                paper_id=additional_primary.paper_id,
+                relevance_to_question=0.75,
+                directness_to_question=0.90,
+                evidence_buckets={EvidenceBucket.METHODOLOGICAL},
+                study_design="animal study",
+            ),
+            ScoutNote(
+                paper_id=low_relevance.paper_id,
+                relevance_to_question=0.50,
+                directness_to_question=0.80,
+                evidence_buckets={EvidenceBucket.REVIEW},
+                study_design="review article",
+            ),
+        ]
+    )
+
+    reranked = rerank_with_scout(papers, notes)
+    early = reranked[:5]
+    early_ids = {item.paper_id for item in early}
+    early_review_count = sum("review" in item.title.casefold() for item in early)
+
+    assert early_review_count <= 2
+    assert {
+        supporting.paper_id,
+        contradicting.paper_id,
+        additional_primary.paper_id,
+    }.issubset(early_ids)
+    assert low_relevance.paper_id not in early_ids

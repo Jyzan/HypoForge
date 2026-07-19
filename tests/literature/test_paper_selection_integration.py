@@ -58,9 +58,7 @@ class ScoutClient:
     }
 
     async def structured_chat(self, **kwargs: Any) -> dict[str, Any]:
-        payload = json.loads(
-            kwargs["user_prompt"].split("Papers to screen:\n", 1)[1]
-        )
+        payload = json.loads(kwargs["user_prompt"].split("Papers to screen:\n", 1)[1])
         return {
             "notes": [
                 {
@@ -110,10 +108,31 @@ async def test_real_paper_selection_tools_fill_gap_across_two_agent_rounds() -> 
     source = FakeSource(
         "pubmed",
         {
-            "initial evidence": [paper(index) for index in range(4)],
+            "initial evidence": [
+                paper(
+                    index,
+                    abstract=(
+                        "This study demonstrates Hsp70 regulation of protein folding."
+                    ),
+                )
+                for index in range(4)
+            ],
             "negative evidence": [
-                paper(4),
-                paper(5, year=2010, citation_count=150),
+                paper(
+                    4,
+                    abstract=(
+                        "This experiment found no association between Hsp70 "
+                        "activity and protein folding."
+                    ),
+                ),
+                paper(
+                    5,
+                    year=2010,
+                    citation_count=150,
+                    abstract=(
+                        "This study demonstrates Hsp70 regulation of protein folding."
+                    ),
+                ),
             ],
         },
     )
@@ -123,9 +142,7 @@ async def test_real_paper_selection_tools_fill_gap_across_two_agent_rounds() -> 
         deduplicator=PaperDeduplicator(),
         ranker=PaperRanker(current_year=2026),
         scout_reader=ScoutReader(ScoutClient(), current_year=2026),
-        coverage_evaluator=CoverageEvaluator(
-            CoverageClient(), current_year=2026
-        ),
+        coverage_evaluator=CoverageEvaluator(CoverageClient(), current_year=2026),
         final_k=10,
     )
 
@@ -139,7 +156,6 @@ async def test_real_paper_selection_tools_fill_gap_across_two_agent_rounds() -> 
     assert result.coverage.sufficient is True
     assert len(result.final_papers) == 6
     assert any(
-        "negative evidence" in topic
-        for topic in planner.states[1].missing_topics
+        "negative evidence" in topic for topic in planner.states[1].missing_topics
     )
     assert all("total" in item.rank_scores for item in result.final_papers)

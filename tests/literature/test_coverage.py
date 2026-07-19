@@ -123,32 +123,145 @@ async def test_llm_critical_topic_gap_can_block_but_not_bypass_hard_gate() -> No
 
 
 @pytest.mark.asyncio
-async def test_later_round_ignores_new_model_gap_but_keeps_persistent_gap() -> None:
+async def test_later_round_keeps_new_model_gap_and_persistent_gap() -> None:
     papers, notes = balanced_inputs()
     previous_gap = "direct ATPase measurements"
     state = SearchState(round_index=2, missing_topics={previous_gap})
 
     new_gap_report = await CoverageEvaluator(
-        FakeStructuredClient({
-            "covered_topics": ["Hsp70 regulation"],
-            "missing_topics": ["new speculative gap"],
-            "rationale": "A new target appeared.",
-        }),
+        FakeStructuredClient(
+            {
+                "covered_topics": ["Hsp70 regulation"],
+                "missing_topics": ["new speculative gap"],
+                "rationale": "A new target appeared.",
+            }
+        ),
         current_year=2026,
     ).evaluate("question", papers, notes, state)
     persistent_report = await CoverageEvaluator(
-        FakeStructuredClient({
-            "covered_topics": ["Hsp70 regulation"],
-            "missing_topics": [previous_gap],
-            "rationale": "The prior target remains absent.",
-        }),
+        FakeStructuredClient(
+            {
+                "covered_topics": ["Hsp70 regulation"],
+                "missing_topics": [previous_gap],
+                "rationale": "The prior target remains absent.",
+            }
+        ),
         current_year=2026,
     ).evaluate("question", papers, notes, state)
 
-    assert new_gap_report.sufficient is True
-    assert new_gap_report.missing_topics == []
+    assert new_gap_report.sufficient is False
+    assert new_gap_report.missing_topics == ["new speculative gap"]
     assert persistent_report.sufficient is False
     assert persistent_report.missing_topics == [previous_gap]
+
+
+@pytest.mark.asyncio
+async def test_selection_limit_requires_final_window_to_cover_mandatory_buckets() -> (
+    None
+):
+    papers = [paper(index, year=2024) for index in range(6)]
+    notes = [
+        note(0, EvidenceBucket.SUPPORTING),
+        note(1, EvidenceBucket.REVIEW),
+        note(2, EvidenceBucket.METHODOLOGICAL),
+        note(3, EvidenceBucket.SUPPORTING),
+        note(4, EvidenceBucket.SUPPORTING),
+        note(5, EvidenceBucket.CONTRADICTING),
+    ]
+
+    report = await CoverageEvaluator(
+        selection_limit=5,
+        current_year=2026,
+    ).evaluate("question", papers, notes, SearchState())
+
+    assert report.sufficient is False
+    assert EvidenceBucket.CONTRADICTING not in report.covered_buckets
+    assert EvidenceBucket.CONTRADICTING in report.missing_buckets
+    assert any("contradicting" in item for item in report.missing_topics)
+
+
+@pytest.mark.asyncio
+async def test_known_indirect_notes_cannot_satisfy_direct_evidence_requirement() -> (
+    None
+):
+    papers, notes = balanced_inputs()
+    notes = [item.model_copy(update={"directness_to_question": 0.20}) for item in notes]
+
+    report = await CoverageEvaluator(current_year=2026).evaluate(
+        "Does Hsp70 ATPase activity change during aging?",
+        papers,
+        notes,
+        SearchState(),
+    )
+
+    assert report.sufficient is False
+    assert any("direct evidence" in item for item in report.missing_topics)
+
+
+@pytest.mark.asyncio
+async def test_contextual_reviews_do_not_count_as_direct_evidence_for_research_question() -> (
+    None
+):
+    papers = [
+        paper(index, title=f"Systematic review of Hsp70 mechanism {index}", year=2024)
+        for index in range(5)
+    ]
+    notes = [
+        note(
+            index,
+            *(
+                (EvidenceBucket.SUPPORTING, EvidenceBucket.REVIEW)
+                if index == 0
+                else (EvidenceBucket.CONTRADICTING, EvidenceBucket.METHODOLOGICAL)
+                if index == 1
+                else (EvidenceBucket.REVIEW,)
+            ),
+            directness_to_question=0.95,
+            study_design="systematic review",
+        )
+        for index in range(5)
+    ]
+
+    report = await CoverageEvaluator(current_year=2026).evaluate(
+        "Does Hsp70 directly regulate ATPase activity?",
+        papers,
+        notes,
+        SearchState(),
+    )
+
+    assert report.sufficient is False
+    assert any("direct evidence" in item for item in report.missing_topics)
+
+
+@pytest.mark.asyncio
+async def test_single_dual_labeled_paper_cannot_supply_balanced_directional_evidence() -> (
+    None
+):
+    papers = [paper(index, year=2024) for index in range(5)]
+    notes = [
+        note(
+            0,
+            EvidenceBucket.SUPPORTING,
+            EvidenceBucket.CONTRADICTING,
+            directness_to_question=0.9,
+        ),
+        note(1, EvidenceBucket.REVIEW, directness_to_question=0.9),
+        note(2, EvidenceBucket.METHODOLOGICAL, directness_to_question=0.9),
+        note(3, EvidenceBucket.RECENT, directness_to_question=0.9),
+        note(4, EvidenceBucket.CLASSIC, directness_to_question=0.9),
+    ]
+
+    report = await CoverageEvaluator(current_year=2026).evaluate(
+        "Does Hsp70 directly regulate ATPase activity?",
+        papers,
+        notes,
+        SearchState(),
+    )
+
+    assert report.sufficient is False
+    assert any(
+        "independent directional evidence" in item for item in report.missing_topics
+    )
 
 
 @pytest.mark.asyncio
@@ -228,6 +341,7 @@ async def test_empty_input_reports_actionable_gaps_without_calling_llm() -> None
         {"min_relevant_papers": 0},
         {"min_bucket_count": 0},
         {"min_bucket_count": 7},
+        {"selection_limit": 0},
         {"max_tokens": 0},
     ],
 )
