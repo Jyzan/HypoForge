@@ -78,13 +78,26 @@ class Relation:
     from_entity: str
     to_entity: str
     relation_type: str
+    confidence: float | None = None
+    rationale: str = ""
+    evidence_ids: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload = {
             "from": self.from_entity,
             "to": self.to_entity,
             "relationType": self.relation_type,
         }
+        if self.confidence is not None:
+            payload["confidence"] = self.confidence
+        if self.rationale:
+            payload["rationale"] = self.rationale
+        if self.evidence_ids:
+            payload["evidenceIds"] = list(self.evidence_ids)
+        if self.metadata:
+            payload["metadata"] = dict(self.metadata)
+        return payload
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Relation":
@@ -92,6 +105,10 @@ class Relation:
             from_entity=data["from"],
             to_entity=data["to"],
             relation_type=data["relationType"],
+            confidence=data.get("confidence"),
+            rationale=data.get("rationale", ""),
+            evidence_ids=data.get("evidenceIds", []),
+            metadata=data.get("metadata", {}),
         )
 
 
@@ -137,8 +154,7 @@ def evidence_graph_to_knowledge_graph(eg: "EvidenceGraph") -> KnowledgeGraph:
       - ``from_entity`` = edge.source
       - ``to_entity`` = edge.target
       - ``relation_type`` = edge.relation.value
-    * The three bucket lists (``established_facts``, ``conflicts``,
-      ``knowledge_gaps``) are stored as observations on a special
+    * Bucket lists and ``grounding_report`` are stored as observations on a special
       ``_buckets`` meta-entity so they survive round-trips.
     """
     _ensure_imports()
@@ -168,6 +184,10 @@ def evidence_graph_to_knowledge_graph(eg: "EvidenceGraph") -> KnowledgeGraph:
                 from_entity=edge.source,
                 to_entity=edge.target,
                 relation_type=edge.relation.value,
+                confidence=edge.confidence,
+                rationale=edge.rationale,
+                evidence_ids=edge.evidence_ids,
+                metadata=edge.metadata,
             )
         )
 
@@ -179,6 +199,9 @@ def evidence_graph_to_knowledge_graph(eg: "EvidenceGraph") -> KnowledgeGraph:
         bucket_obs.append("conflicts:" + ",".join(eg.conflicts))
     if eg.knowledge_gaps:
         bucket_obs.append("knowledge_gaps:" + ",".join(eg.knowledge_gaps))
+    if eg.grounding_report:
+        import json
+        bucket_obs.append("grounding_report:" + json.dumps(eg.grounding_report, ensure_ascii=False))
     if bucket_obs:
         entities.append(
             Entity(
@@ -214,6 +237,7 @@ def knowledge_graph_to_evidence_graph(kg: KnowledgeGraph) -> "EvidenceGraph":
     established_facts: List[str] = []
     conflicts: List[str] = []
     knowledge_gaps: List[str] = []
+    grounding_report: Dict[str, Any] = {}
 
     for entity in kg.entities:
         # --- meta entities ---
@@ -228,6 +252,12 @@ def knowledge_graph_to_evidence_graph(kg: KnowledgeGraph) -> "EvidenceGraph":
                 elif obs.startswith("knowledge_gaps:"):
                     payload = obs[len("knowledge_gaps:"):]
                     knowledge_gaps = payload.split(",") if payload else []
+                elif obs.startswith("grounding_report:"):
+                    payload = obs[len("grounding_report:"):]
+                    try:
+                        grounding_report = json.loads(payload) if payload else {}
+                    except json.JSONDecodeError:
+                        grounding_report = {}
             continue
 
         # --- regular entity → EvidenceNode ---
@@ -266,6 +296,10 @@ def knowledge_graph_to_evidence_graph(kg: KnowledgeGraph) -> "EvidenceGraph":
                 source=rel.from_entity,
                 target=rel.to_entity,
                 relation=edge_rel,
+                confidence=rel.confidence,
+                rationale=rel.rationale,
+                evidence_ids=rel.evidence_ids,
+                metadata=rel.metadata,
             )
         )
 
@@ -275,6 +309,7 @@ def knowledge_graph_to_evidence_graph(kg: KnowledgeGraph) -> "EvidenceGraph":
         established_facts=established_facts,
         conflicts=conflicts,
         knowledge_gaps=knowledge_gaps,
+        grounding_report=grounding_report,
     )
 
 

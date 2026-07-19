@@ -1,0 +1,70 @@
+# M3 Evidence-GAMS experimental configuration.
+# The top-level pipeline remains unchanged; only M3 semantic-edge selection differs.
+run_name: m3-evidence-gams
+output_dir: ./output/m3_evidence_gams
+verbose: true
+log_level: INFO
+
+pipeline:
+  enabled_modules: ["m1", "m2", "m3", "m4"]
+  max_iterations: 0
+  enable_iteration: false
+
+qwen:
+  base:
+    model: qwen3.7-max
+    max_tokens: 8192
+    temperature: 0.1
+  plus:
+    model: qwen3.7-plus
+    max_tokens: 4096
+    temperature: 0.0
+  turbo:
+    model: qwen3.6-flash
+    max_tokens: 4096
+    temperature: 0.1
+
+search:
+  tools: ["pubmed", "semantic_scholar"]
+  papers_per_sub_question: 10
+  max_papers_total: 30
+
+module_overrides:
+  m1:
+    kwargs:
+      mode: "llm"
+      llm_tier: "base"
+  m2:
+    kwargs:
+      mode: "llm"
+      llm_tier: "turbo"
+      max_papers_per_query: 10
+      batch_size: 5
+  m3:
+    kwargs:
+      mode: "llm"
+      llm_tier: "plus"
+      local_paper_dir: "papers"
+      cache_dir: ".hypoforge_cache/m3_evidence_gams"
+      enable_network_fulltext: true
+      embedding_model: ""
+      retrieve_k: 30
+      evidence_k: 12
+      min_relevance: 5.0
+      grounding_max_concurrency: 4
+      relation_selection_mode: "evidence_gams"
+      relation_candidate_k: 12
+      relation_max_pairs: 60
+      relation_batch_size: 10
+      relation_min_confidence: 0.65
+      evidence_gams_iterations: 128
+      evidence_gams_exploration_weight: 0.35
+      evidence_gams_seed: 42
+  m4:
+    kwargs:
+      mode: "direct"
+      llm_tier: "base"
+      num_candidates: 5
+      top_k: 2
+
+enabled_skills: []

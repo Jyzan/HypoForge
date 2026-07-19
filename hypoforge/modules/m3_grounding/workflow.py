@@ -31,7 +31,11 @@ from .models import (
     FullTextChunk,
     GroundingReport,
     PaperSource,
+    RelationCandidate,
+    RelationPair,
 )
+from .evidence_gams import EvidenceGraphGAMS
+from .relation_retrieval import RelationCandidateRetriever
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +103,8 @@ class GroundingState(TypedDict, total=False):
     candidates: List[Dict[str, Any]]
     evidence_records: List[EvidenceRecord]
     claims: List[AtomicClaim]
+    relation_pairs: List[RelationPair]
+    relation_candidates: List[RelationCandidate]
     relations: List[EvidenceRelation]
     report: GroundingReport
 
@@ -122,6 +128,16 @@ class FullTextEvidenceGrounding:
         max_queries: int = 16,
         max_sources: int = 60,
         max_concurrency: int = 4,
+        relation_selection_mode: str = "direct",
+        relation_candidate_k: int = 12,
+        relation_max_pairs: int = 60,
+        relation_batch_size: int = 10,
+        relation_min_confidence: float = 0.65,
+        evidence_gams_iterations: int = 128,
+        evidence_gams_exploration_weight: float = 0.35,
+        evidence_gams_seed: int = 42,
+        llm_call_timeout: float = 120.0,
+        relation_judge_retries: int = 2,
     ):
         self.client = client
         self.mode = mode
@@ -137,6 +153,24 @@ class FullTextEvidenceGrounding:
         self.max_queries = max(1, max_queries)
         self.max_sources = max(1, max_sources)
         self.max_concurrency = max(1, max_concurrency)
+        self.relation_selection_mode = (
+            relation_selection_mode if relation_selection_mode in {"direct", "evidence_gams"}
+            else "direct"
+        )
+        self.relation_batch_size = max(1, relation_batch_size)
+        self.relation_min_confidence = min(1.0, max(0.0, relation_min_confidence))
+        self.evidence_gams_iterations = max(1, evidence_gams_iterations)
+        self.llm_call_timeout = max(10.0, float(llm_call_timeout))
+        self.relation_judge_retries = max(0, int(relation_judge_retries))
+        self.relation_retriever = RelationCandidateRetriever(
+            max_candidates_per_claim=relation_candidate_k,
+            max_pairs_total=relation_max_pairs,
+        )
+        self.evidence_gams = EvidenceGraphGAMS(
+            minimum_confidence=self.relation_min_confidence,
+            exploration_weight=evidence_gams_exploration_weight,
+            random_seed=evidence_gams_seed,
+        )
         self._compiled = self._build_graph().compile()
 
     def _build_graph(self) -> StateGraph:
@@ -148,7 +182,9 @@ class FullTextEvidenceGrounding:
         graph.add_node("retrieve", self._retrieve)
         graph.add_node("rcs", self._rcs)
         graph.add_node("atomize_claims", self._atomize_claims)
-        graph.add_node("judge_relations", self._judge_relations)
+        graph.add_node("recall_relation_candidates", self._recall_relation_candidates)
+        graph.add_node("judge_candidate_relations", self._judge_candidate_relations)
+        graph.add_node("select_relations", self._select_relations)
         graph.add_node("finalize", self._finalize)
         graph.set_entry_point("resolve_sources")
         graph.add_edge("resolve_sources", "acquire_fulltext")
@@ -157,8 +193,10 @@ class FullTextEvidenceGrounding:
         graph.add_edge("plan_queries", "retrieve")
         graph.add_edge("retrieve", "rcs")
         graph.add_edge("rcs", "atomize_claims")
-        graph.add_edge("atomize_claims", "judge_relations")
-        graph.add_edge("judge_relations", "finalize")
+        graph.add_edge("atomize_claims", "recall_relation_candidates")
+        graph.add_edge("recall_relation_candidates", "judge_candidate_relations")
+        graph.add_edge("judge_candidate_relations", "select_relations")
+        graph.add_edge("select_relations", "finalize")
         graph.add_edge("finalize", END)
         return graph
 
@@ -546,8 +584,8 @@ class FullTextEvidenceGrounding:
         try:
             data = await self.client.structured_chat(
                 system_prompt="You extract auditable scientific evidence. Never invent text absent from the chunk.",
-                user_prompt=prompt, output_schema=schema, max_tokens=2500,
-                temperature=0.0, disable_thinking=True,
+                user_prompt=prompt, output_schema=schema, max_tokens=4096,
+                temperature=0.0, disable_thinking=False,
             )
             excerpt = str(data.get("excerpt") or "").strip()
             if excerpt and excerpt not in chunk.text:
@@ -575,7 +613,13 @@ class FullTextEvidenceGrounding:
 
         async def guarded(item: Dict[str, Any]) -> EvidenceRecord:
             async with semaphore:
-                return await self._rcs_one(item)
+                try:
+                    return await asyncio.wait_for(
+                        self._rcs_one(item), timeout=self.llm_call_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("RCS timed out for %s; using extractive fallback", item["chunk"].id)
+                    return self._fallback_record(item)
 
         records = await asyncio.gather(*(guarded(x) for x in gs.get("candidates", [])))
         # Deduplicate repeated query/chunk evidence and keep only relevant records.
@@ -602,6 +646,7 @@ class FullTextEvidenceGrounding:
                 if claim:
                     if record.id not in claim.evidence_record_ids:
                         claim.evidence_record_ids.append(record.id)
+                    claim.entities = list(dict.fromkeys(claim.entities + record.entities))
                     claim.confidence = min(1.0, claim.confidence + 0.1)
                 else:
                     claims[key] = AtomicClaim(
@@ -614,47 +659,364 @@ class FullTextEvidenceGrounding:
         report.claims_total = len(claim_list)
         return {"claims": claim_list, "report": report}
 
-    async def _judge_relations(self, gs: GroundingState) -> Dict[str, Any]:
-        claims = gs.get("claims", [])
-        relations: List[EvidenceRelation] = []
-        # Every claim keeps explicit provenance to its evidence record.
-        for claim in claims:
-            for erid in claim.evidence_record_ids:
-                relations.append(EvidenceRelation(
-                    source=erid, target=claim.id, relation="supports",
-                    confidence=claim.confidence, rationale="Atomic claim extracted from this evidence record.",
-                ))
-        # Cross-claim judgements are LLM-only and intentionally bounded/conservative.
-        if self.client and self.mode in {"llm", "api", "direct"} and 1 < len(claims) <= 80:
-            schema = {
-                "type": "object", "properties": {"relations": {"type": "array", "maxItems": 80,
-                    "items": {"type": "object", "properties": {
-                        "source": {"type": "string"}, "target": {"type": "string"},
-                        "relation": {"type": "string", "enum": ["contradicts", "extends", "limits", "same_as", "refines"]},
-                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                        "rationale": {"type": "string"}},
-                        "required": ["source", "target", "relation", "confidence", "rationale"]}}},
-                "required": ["relations"],
-            }
-            payload = [{"id": c.id, "statement": c.statement, "entities": c.entities} for c in claims]
-            try:
-                data = await self.client.structured_chat(
-                    system_prompt=("Judge scientific claim relations conservatively. Contradiction requires "
-                                   "incompatible conclusions under comparable population, intervention, outcome, "
-                                   "dose, time and method; methodological differences usually LIMIT, not contradict."),
-                    user_prompt="Claims:\n" + json.dumps(payload, ensure_ascii=False),
-                    output_schema=schema, max_tokens=5000, temperature=0.0, disable_thinking=True,
-                )
-                valid = {c.id for c in claims}
-                for raw in data.get("relations", []):
-                    if raw.get("source") in valid and raw.get("target") in valid and raw.get("source") != raw.get("target"):
-                        rel = EvidenceRelation.model_validate(raw)
-                        if rel.confidence >= 0.65:
-                            relations.append(rel)
-            except Exception as exc:
-                logger.warning("Cross-claim relation judgement failed: %s", exc)
+    async def _recall_relation_candidates(self, gs: GroundingState) -> Dict[str, Any]:
+        pairs = self.relation_retriever.recall(
+            gs.get("claims", []), gs.get("evidence_records", [])
+        )
         report = gs["report"].model_copy(deep=True)
+        report.relation_pairs_recalled = len(pairs)
+        return {"relation_pairs": pairs, "report": report}
+
+    @staticmethod
+    def _claim_payload(
+        claim: AtomicClaim,
+        record_map: Dict[str, EvidenceRecord],
+    ) -> Dict[str, Any]:
+        evidence = []
+        paper_ids: List[str] = []
+        for record_id in claim.evidence_record_ids[:3]:
+            record = record_map.get(record_id)
+            if not record:
+                continue
+            if record.paper_id:
+                paper_ids.append(record.paper_id)
+            evidence.append({
+                "evidence_id": record.id,
+                "paper_id": record.paper_id,
+                "query": record.query,
+                "summary": record.summary[:1000],
+                "excerpt": record.excerpt[:1200],
+                "entities": record.entities[:20],
+                "methods": record.methods[:8],
+                "limitations": record.limitations[:8],
+                "context": record.context,
+                "relevance_score": record.relevance_score,
+            })
+        return {
+            "node_type": "claim",
+            "id": claim.id,
+            "statement": claim.statement,
+            "entities": claim.entities,
+            "paper_ids": list(dict.fromkeys(paper_ids)),
+            "evidence": evidence,
+        }
+
+    @staticmethod
+    def _evidence_payload(record: EvidenceRecord) -> Dict[str, Any]:
+        return {
+            "node_type": "evidence_record",
+            "id": record.id,
+            "paper_id": record.paper_id,
+            "query": record.query,
+            "summary": record.summary[:1000],
+            "excerpt": record.excerpt[:1200],
+            "claims": record.claims[:5],
+            "entities": record.entities[:20],
+            "methods": record.methods[:8],
+            "limitations": record.limitations[:8],
+            "context": record.context,
+            "relevance_score": record.relevance_score,
+        }
+
+    def _relation_node_payload(
+        self,
+        node_id: str,
+        claim_map: Dict[str, AtomicClaim],
+        record_map: Dict[str, EvidenceRecord],
+    ) -> Dict[str, Any]:
+        if node_id in claim_map:
+            return self._claim_payload(claim_map[node_id], record_map)
+        if node_id in record_map:
+            return self._evidence_payload(record_map[node_id])
+        raise KeyError(node_id)
+
+    async def _judge_relation_batch(
+        self,
+        pairs: List[RelationPair],
+        claim_map: Dict[str, AtomicClaim],
+        record_map: Dict[str, EvidenceRecord],
+    ) -> List[RelationCandidate]:
+        if not self.client:
+            return []
+        cached: List[RelationCandidate] = []
+        pending: List[RelationPair] = []
+        cache_paths: Dict[str, Path] = {}
+        model_name = getattr(self.client, "model", "unknown")
+        for pair in pairs:
+            source_payload = self._relation_node_payload(pair.source, claim_map, record_map)
+            target_payload = self._relation_node_payload(pair.target, claim_map, record_map)
+            cache_path = self.cache_dir / "relations" / (
+                _hash(
+                    "relation-v2", model_name, pair.id,
+                    json.dumps(source_payload, ensure_ascii=False, sort_keys=True),
+                    json.dumps(target_payload, ensure_ascii=False, sort_keys=True),
+                ) + ".json"
+            )
+            cache_paths[pair.id] = cache_path
+            if cache_path.exists():
+                try:
+                    cached.append(RelationCandidate.model_validate_json(
+                        cache_path.read_text(encoding="utf-8")
+                    ))
+                    continue
+                except Exception:
+                    logger.debug("Ignoring invalid relation cache file %s", cache_path)
+            pending.append(pair)
+        pairs = pending
+        if not pairs:
+            return cached
+        schema = {
+            "type": "object",
+            "properties": {
+                "relations": {
+                    "type": "array",
+                    "maxItems": len(pairs),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "pair_id": {"type": "string"},
+                            "source": {"type": "string"},
+                            "target": {"type": "string"},
+                            "relation": {
+                                "type": "string",
+                                "enum": [
+                                    "supports", "contradicts", "extends", "limits",
+                                    "same_as", "refines", "unrelated",
+                                ],
+                            },
+                            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                            "condition_comparability": {
+                                "type": "number", "minimum": 0, "maximum": 1,
+                            },
+                            "rationale": {"type": "string"},
+                            "evidence_ids": {
+                                "type": "array", "items": {"type": "string"},
+                            },
+                        },
+                        "required": [
+                            "pair_id", "source", "target", "relation", "confidence",
+                            "condition_comparability", "rationale", "evidence_ids",
+                        ],
+                    },
+                },
+            },
+            "required": ["relations"],
+        }
+        payload = []
+        for pair in pairs:
+            payload.append({
+                "pair_id": pair.id,
+                "pair_type": f"{pair.source_type}_to_{pair.target_type}",
+                "retrieval_score": pair.retrieval_score,
+                "entity_overlap": pair.entity_overlap,
+                "candidate_origin": pair.candidate_origin,
+                "source": self._relation_node_payload(pair.source, claim_map, record_map),
+                "target": self._relation_node_payload(pair.target, claim_map, record_map),
+            })
+        data = await self.client.structured_chat(
+            system_prompt=(
+                "Judge each recalled scientific pair conservatively. Return one decision per pair. "
+                "Use UNRELATED when no defensible semantic relation exists. For EVIDENCE_RECORD_TO_CLAIM, "
+                "only SUPPORTS, CONTRADICTS, LIMITS or UNRELATED are allowed and the evidence record must "
+                "remain the source. For CLAIM_TO_CLAIM, never use SUPPORTS; only CONTRADICTS, EXTENDS, "
+                "LIMITS, SAME_AS, REFINES or UNRELATED are allowed. CONTRADICTS requires "
+                "incompatible conclusions under comparable population, intervention, outcome, dose, "
+                "time and method. If conditions differ and one result only narrows another, use LIMITS. "
+                "Direction matters: source SUPPORTS/EXTENDS/REFINES target. Cite only supplied evidence IDs."
+            ),
+            user_prompt="Recalled pairs:\n" + json.dumps(payload, ensure_ascii=False),
+            output_schema=schema,
+            max_tokens=max(6000, 1800 * len(pairs)),
+            temperature=0.0,
+            disable_thinking=False,
+        )
+        pair_map = {pair.id: pair for pair in pairs}
+        decisions: List[RelationCandidate] = []
+        for raw in data.get("relations", []):
+            pair = pair_map.get(str(raw.get("pair_id") or ""))
+            if not pair:
+                continue
+            source, target = str(raw.get("source") or ""), str(raw.get("target") or "")
+            source_payload = self._relation_node_payload(pair.source, claim_map, record_map)
+            target_payload = self._relation_node_payload(pair.target, claim_map, record_map)
+            endpoint_statements: Dict[str, str] = {}
+            for endpoint_id, endpoint_payload in (
+                (pair.source, source_payload), (pair.target, target_payload)
+            ):
+                for field in ("statement", "summary", "excerpt"):
+                    value = str(endpoint_payload.get(field) or "").strip()
+                    if value:
+                        endpoint_statements[value] = endpoint_id
+            source = endpoint_statements.get(source.strip(), source)
+            target = endpoint_statements.get(target.strip(), target)
+            if {source, target} != {pair.source, pair.target} or source == target:
+                continue
+            if pair.source_type == "evidence_record":
+                source, target = pair.source, pair.target
+            evidence_ids = [
+                evidence_id for evidence_id in raw.get("evidence_ids", [])
+                if evidence_id in set(pair.source_evidence_ids + pair.target_evidence_ids)
+            ]
+            if not evidence_ids:
+                evidence_ids = list(dict.fromkeys(
+                    pair.source_evidence_ids + pair.target_evidence_ids
+                ))
+            source_papers = pair.source_paper_ids if source == pair.source else pair.target_paper_ids
+            target_papers = pair.target_paper_ids if target == pair.target else pair.source_paper_ids
+            relation = str(raw.get("relation") or "unrelated")
+            allowed_relations = (
+                {"supports", "contradicts", "limits", "unrelated"}
+                if pair.source_type == "evidence_record"
+                else {"contradicts", "extends", "limits", "same_as", "refines", "unrelated"}
+            )
+            rationale = str(raw.get("rationale") or "")
+            if relation not in allowed_relations:
+                rationale = (
+                    f"Type constraint rejected {relation} for {pair.source_type}_to_{pair.target_type}. "
+                    + rationale
+                )
+                relation = "unrelated"
+            candidate = RelationCandidate(
+                id="REL_" + _hash(pair.id, source, target, relation),
+                source=source,
+                target=target,
+                relation=relation,
+                confidence=float(raw.get("confidence", 0.0)),
+                condition_comparability=float(raw.get("condition_comparability", 0.5)),
+                rationale=rationale,
+                evidence_ids=evidence_ids,
+                source_paper_ids=source_papers,
+                target_paper_ids=target_papers,
+                retrieval_score=pair.retrieval_score,
+                entity_overlap=pair.entity_overlap,
+                candidate_origin=pair.candidate_origin,
+            )
+            decisions.append(candidate)
+            cache_path = cache_paths.get(pair.id)
+            if cache_path:
+                try:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    cache_path.write_text(candidate.model_dump_json(), encoding="utf-8")
+                except OSError:
+                    logger.debug("Could not write relation cache file %s", cache_path)
+        if len(decisions) != len(pairs):
+            logger.warning(
+                "Relation validation retained %d/%d decisions for pairs %s; raw=%s",
+                len(decisions), len(pairs), [pair.id for pair in pairs],
+                json.dumps(data, ensure_ascii=False)[:4000],
+            )
+        return cached + decisions
+
+    async def _judge_candidate_relations(self, gs: GroundingState) -> Dict[str, Any]:
+        pairs = gs.get("relation_pairs", [])
+        candidates: List[RelationCandidate] = []
+        if self.client and self.mode in {"llm", "api", "direct"} and pairs:
+            claim_map = {claim.id: claim for claim in gs.get("claims", [])}
+            record_map = {record.id: record for record in gs.get("evidence_records", [])}
+            batches = [
+                pairs[index:index + self.relation_batch_size]
+                for index in range(0, len(pairs), self.relation_batch_size)
+            ]
+            semaphore = asyncio.Semaphore(self.max_concurrency)
+
+            async def guarded(batch: List[RelationPair]) -> List[RelationCandidate]:
+                async with semaphore:
+                    for attempt in range(self.relation_judge_retries + 1):
+                        try:
+                            decisions = await asyncio.wait_for(
+                                self._judge_relation_batch(batch, claim_map, record_map),
+                                timeout=self.llm_call_timeout,
+                            )
+                            if len(decisions) == len(batch):
+                                return decisions
+                            logger.warning(
+                                "Relation batch returned %d/%d decisions (attempt %d)",
+                                len(decisions), len(batch), attempt + 1,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "Relation candidate batch timed out for %d pair(s) (attempt %d)",
+                                len(batch), attempt + 1,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Relation candidate batch failed (attempt %d): %s",
+                                attempt + 1, exc,
+                            )
+                    return []
+
+            results = await asyncio.gather(*(guarded(batch) for batch in batches))
+            deduplicated: Dict[tuple[str, str, str], RelationCandidate] = {}
+            for candidate in [item for batch in results for item in batch]:
+                key = (candidate.source, candidate.target, candidate.relation)
+                old = deduplicated.get(key)
+                if old is None or candidate.confidence > old.confidence:
+                    deduplicated[key] = candidate
+            candidates = list(deduplicated.values())
+        report = gs["report"].model_copy(deep=True)
+        report.relation_candidates_judged = len(candidates)
+        return {"relation_candidates": candidates, "report": report}
+
+    @staticmethod
+    def _provenance_relations(
+        claims: List[AtomicClaim],
+        records: List[EvidenceRecord],
+    ) -> List[EvidenceRelation]:
+        record_map = {record.id: record for record in records}
+        relations: List[EvidenceRelation] = []
+        for claim in claims:
+            for record_id in claim.evidence_record_ids:
+                record = record_map.get(record_id)
+                relations.append(EvidenceRelation(
+                    id="REL_" + _hash(record_id, claim.id, "supports"),
+                    source=record_id,
+                    target=claim.id,
+                    relation="supports",
+                    confidence=claim.confidence,
+                    rationale="Atomic claim extracted from this evidence record.",
+                    evidence_ids=[record_id],
+                    source_paper_ids=[record.paper_id] if record and record.paper_id else [],
+                    target_paper_ids=[record.paper_id] if record and record.paper_id else [],
+                    retrieval_score=(record.retrieval_score if record else 0.0),
+                    condition_comparability=1.0,
+                    candidate_origin=["provenance"],
+                ))
+        return relations
+
+    async def _select_relations(self, gs: GroundingState) -> Dict[str, Any]:
+        candidates = gs.get("relation_candidates", [])
+        provenance = self._provenance_relations(
+            gs.get("claims", []), gs.get("evidence_records", [])
+        )
+        if self.relation_selection_mode == "evidence_gams":
+            selected_candidates, trace = self.evidence_gams.search(
+                candidates, iterations=self.evidence_gams_iterations
+            )
+        else:
+            selected_candidates = [
+                candidate for candidate in candidates
+                if candidate.relation != "unrelated"
+                and candidate.confidence >= self.relation_min_confidence
+            ]
+            trace = {
+                "mode": "direct",
+                "candidate_count": len([
+                    candidate for candidate in candidates if candidate.relation != "unrelated"
+                ]),
+                "selected_count": len(selected_candidates),
+                "minimum_confidence": self.relation_min_confidence,
+                "selected_edge_ids": sorted(candidate.id for candidate in selected_candidates),
+                "rejected_edge_ids": sorted(
+                    candidate.id for candidate in candidates if candidate not in selected_candidates
+                ),
+            }
+        semantic_relations = [candidate.to_relation() for candidate in selected_candidates]
+        relations = provenance + semantic_relations
+        report = gs["report"].model_copy(deep=True)
+        report.relation_selection_mode = self.relation_selection_mode
+        report.relation_candidates_selected = len(selected_candidates)
         report.relations_total = len(relations)
+        report.relation_search = trace
         return {"relations": relations, "report": report}
 
     async def _finalize(self, gs: GroundingState) -> Dict[str, Any]:
