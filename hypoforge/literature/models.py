@@ -109,7 +109,7 @@ class PaperRecord(LiteratureModel):
         doi = str(value or "").strip().lower()
         for prefix in ("https://doi.org/", "http://doi.org/", "doi:", "doi "):
             if doi.startswith(prefix):
-                doi = doi[len(prefix):]
+                doi = doi[len(prefix) :]
                 break
         return doi.strip()
 
@@ -124,6 +124,13 @@ class ScoutNote(LiteratureModel):
     controversies: List[str] = Field(default_factory=list)
     candidate_citations: List[str] = Field(default_factory=list)
     relevance_to_question: float = Field(default=0.0, ge=0.0, le=1.0)
+    # ``None`` preserves compatibility with notes produced before directness
+    # screening was introduced. New ``ScoutReader`` results always populate it.
+    directness_to_question: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    # These are exact, question-anchored abstract sentences. They make a
+    # directional bucket auditable without changing the ScoutReader Protocol.
+    supporting_evidence: List[str] = Field(default_factory=list)
+    contradicting_evidence: List[str] = Field(default_factory=list)
     evidence_buckets: Set[EvidenceBucket] = Field(default_factory=set)
     study_design: str = ""
     evidence_summary: str = ""
@@ -160,6 +167,7 @@ class SearchState(LiteratureModel):
     known_terms: Set[str] = Field(default_factory=set)
     covered_topics: Set[str] = Field(default_factory=set)
     missing_topics: Set[str] = Field(default_factory=set)
+    unavailable_sources: Set[str] = Field(default_factory=set)
     candidate_paper_ids: List[str] = Field(default_factory=list)
     bucket_counts: Dict[EvidenceBucket, int] = Field(default_factory=dict)
     remaining_budget: RemainingSearchBudget = Field(
@@ -186,6 +194,7 @@ class SearchRunResult(LiteratureModel):
     stop_reason: Optional[StopReason] = None
     errors: List[str] = Field(default_factory=list)
     source_result_counts: Dict[str, int] = Field(default_factory=dict)
+    stage_elapsed_seconds: Dict[str, float] = Field(default_factory=dict)
     scout_notes: List[ScoutNote] = Field(default_factory=list)
     reused_paper_ids: List[str] = Field(default_factory=list)
     final_state: Optional[SearchState] = None
@@ -221,6 +230,7 @@ class EvidenceChunk(LiteratureModel):
     quote: NonEmptyStr
     normalized_claim: NonEmptyStr
     relevance_score: float = Field(ge=0.0, le=1.0)
+    citable: bool = True
 
 
 class EvidenceLinkedKnowledge(LiteratureModel):
@@ -237,5 +247,12 @@ class PaperReadingResult(LiteratureModel):
     summary: str = ""
     evidence: List[EvidenceChunk] = Field(default_factory=list)
     knowledge_entries: List[EvidenceLinkedKnowledge] = Field(default_factory=list)
+    content_level: ContentLevel = ContentLevel.METADATA
+    document_id: str = ""
+    document_source_uri: str = ""
+    document_license: str = ""
+    chunks_parsed: int = Field(default=0, ge=0)
+    chunks_retrieved: int = Field(default=0, ge=0)
+    stage_elapsed_seconds: Dict[str, float] = Field(default_factory=dict)
     degraded_to_abstract: bool = False
     errors: List[str] = Field(default_factory=list)

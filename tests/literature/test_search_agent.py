@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import asyncio
+import math
+import time
+
 import pytest
 
 from hypoforge.literature.models import (
     CoverageReport,
     PaperRecord,
     QueryIntent,
+    ScoutNote,
     SearchBudget,
     SearchQuery,
     StopReason,
 )
 from hypoforge.literature.search.agent import IterativeSearchAgent
+from hypoforge.literature.sources.pubmed_source import PubMedSource
 
 from .fakes import (
     FakeCoverageEvaluator,
@@ -144,6 +150,83 @@ async def test_agent_uses_coverage_gap_to_plan_a_second_round() -> None:
     assert result.stop_reason is StopReason.COVERAGE_SATISFIED
 
 
+@pytest.mark.asyncio
+async def test_agent_scouts_only_new_papers_and_reuses_cached_notes() -> None:
+    planner = FakePlanner(
+        [
+            [query("q-1", "first", "pubmed")],
+            [query("q-2", "second", "pubmed")],
+        ]
+    )
+    source = FakeSource(
+        "pubmed",
+        {
+            "first": [paper("paper-1", "pubmed")],
+            "second": [paper("paper-2", "pubmed")],
+        },
+    )
+    scout = FakeScoutReader()
+    coverage = FakeCoverageEvaluator(
+        [CoverageReport(sufficient=False), CoverageReport(sufficient=True)]
+    )
+    agent = IterativeSearchAgent(
+        query_planner=planner,
+        sources=[source],
+        deduplicator=FakeDeduplicator(),
+        ranker=FakeRanker(),
+        scout_reader=scout,
+        coverage_evaluator=coverage,
+    )
+
+    result = await agent.run("question")
+
+    assert result.stop_reason is StopReason.COVERAGE_SATISFIED
+    assert scout.calls == [["paper-1"], ["paper-2"]]
+    assert coverage.note_calls == [["paper-1"], ["paper-1", "paper-2"]]
+
+
+@pytest.mark.asyncio
+async def test_agent_reranks_candidates_with_scout_relevance_before_final_k() -> None:
+    class RelevanceScout(FakeScoutReader):
+        async def read(self, sub_question, papers):
+            self.calls.append([item.paper_id for item in papers])
+            relevance = {"metadata-favorite": 0.1, "scout-favorite": 0.95}
+            return [
+                ScoutNote(
+                    paper_id=item.paper_id,
+                    relevance_to_question=relevance[item.paper_id],
+                )
+                for item in papers
+            ]
+
+    metadata_favorite = paper("metadata-favorite", "pubmed").model_copy(
+        update={"rank_scores": {"total": 0.9}}
+    )
+    scout_favorite = paper("scout-favorite", "pubmed").model_copy(
+        update={"rank_scores": {"total": 0.1}}
+    )
+    agent = IterativeSearchAgent(
+        query_planner=FakePlanner([[query("q-1", "core", "pubmed")]]),
+        sources=[
+            FakeSource(
+                "pubmed",
+                {"core": [metadata_favorite, scout_favorite]},
+            )
+        ],
+        deduplicator=FakeDeduplicator(),
+        ranker=FakeRanker(),
+        scout_reader=RelevanceScout(),
+        coverage_evaluator=FakeCoverageEvaluator([CoverageReport(sufficient=True)]),
+        final_k=1,
+    )
+
+    result = await agent.run("Which paper directly addresses the mechanism?")
+
+    assert [item.paper_id for item in result.final_papers] == ["scout-favorite"]
+    assert result.final_papers[0].rank_scores["scout_relevance"] == 0.95
+    assert "post_scout_total" in result.final_papers[0].rank_scores
+
+
 def build_agent(
     *,
     planner: FakePlanner | None = None,
@@ -190,6 +273,50 @@ async def test_one_source_failure_keeps_other_source_results() -> None:
 
 
 @pytest.mark.asyncio
+async def test_failed_source_circuit_opens_for_later_rounds() -> None:
+    planner = FakePlanner(
+        [
+            [
+                query("q-1", "bad one", "semantic_scholar"),
+                query("q-2", "good one", "pubmed"),
+            ],
+            [
+                query("q-3", "bad two", "semantic_scholar"),
+                query("q-4", "good two", "pubmed"),
+            ],
+        ]
+    )
+    academic = FakeSource(
+        "semantic_scholar",
+        errors={
+            "bad one": RuntimeError("rate limited"),
+            "bad two": RuntimeError("must not be called"),
+        },
+    )
+    pubmed = FakeSource(
+        "pubmed",
+        {
+            "good one": [paper("paper-1", "pubmed")],
+            "good two": [paper("paper-2", "pubmed")],
+        },
+    )
+    agent = build_agent(
+        planner=planner,
+        sources=[academic, pubmed],
+        coverage=FakeCoverageEvaluator(
+            [CoverageReport(sufficient=False), CoverageReport(sufficient=True)]
+        ),
+    )
+
+    result = await agent.run("question")
+
+    assert [call.text for call in academic.calls] == ["bad one"]
+    assert [call.text for call in pubmed.calls] == ["good one", "good two"]
+    assert planner.states[1].unavailable_sources == {"semantic_scholar"}
+    assert result.failed_sources == ["semantic_scholar"]
+
+
+@pytest.mark.asyncio
 async def test_all_sources_failed_returns_structured_error() -> None:
     agent = build_agent(
         sources=[
@@ -207,6 +334,27 @@ async def test_all_sources_failed_returns_structured_error() -> None:
     assert result.final_papers == []
     assert result.failed_sources == ["pubmed"]
     assert "service unavailable" in result.errors[0]
+
+
+@pytest.mark.asyncio
+async def test_agent_records_failure_from_strict_teammate_source() -> None:
+    class StrictFailingPubMedTool:
+        async def search_strict(self, query: str, limit: int = 20):
+            raise OSError("real backend unavailable")
+
+        async def search(self, query: str, limit: int = 20):
+            return []
+
+    agent = build_agent(
+        sources=[PubMedSource(tool=StrictFailingPubMedTool())],
+        coverage=FakeCoverageEvaluator([CoverageReport(sufficient=False)]),
+    )
+
+    result = await agent.run("question")
+
+    assert result.stop_reason is StopReason.ERROR
+    assert result.failed_sources == ["pubmed"]
+    assert any("real backend unavailable" in error for error in result.errors)
 
 
 @pytest.mark.asyncio
@@ -392,6 +540,52 @@ async def test_wall_clock_budget_uses_injected_monotonic_clock() -> None:
     result = await agent.run("question", budget=SearchBudget(max_seconds=5))
 
     assert result.stop_reason is StopReason.TIME_BUDGET
+
+
+@pytest.mark.asyncio
+async def test_global_time_budget_cancels_a_slow_planner() -> None:
+    class SlowPlanner:
+        async def plan(self, *args, **kwargs):
+            await asyncio.sleep(1.5)
+            return [query("q-1", "core query", "pubmed")]
+
+    agent = build_agent(planner=SlowPlanner())
+    started = time.perf_counter()
+
+    result = await agent.run("question", budget=SearchBudget(max_seconds=1))
+
+    elapsed = time.perf_counter() - started
+    assert elapsed < 1.3
+    assert result.stop_reason is StopReason.TIME_BUDGET
+    assert any("time budget" in error for error in result.errors)
+
+
+@pytest.mark.asyncio
+async def test_agent_reports_cumulative_elapsed_time_for_each_tool_stage() -> None:
+    class IncrementingClock:
+        def __init__(self) -> None:
+            self.value = -0.25
+
+        def __call__(self) -> float:
+            self.value += 0.25
+            return self.value
+
+    agent = build_agent(stage_clock=IncrementingClock())
+
+    result = await agent.run("question", budget=SearchBudget(max_seconds=1000))
+
+    assert set(result.stage_elapsed_seconds) == {
+        "query_planner",
+        "source_search",
+        "paper_deduplicator",
+        "paper_ranker",
+        "scout_reader",
+        "coverage_evaluator",
+    }
+    assert all(
+        math.isfinite(seconds) and seconds >= 0
+        for seconds in result.stage_elapsed_seconds.values()
+    )
 
 
 @pytest.mark.asyncio

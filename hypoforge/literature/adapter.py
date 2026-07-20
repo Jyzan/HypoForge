@@ -5,7 +5,8 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from ..protocol import ModuleProtocol
-from ..state import KnowledgeEntry, LiteratureResult, PipelineState
+from ..state import LiteratureResult, M2KnowledgeExport, PipelineState
+from .export import build_m2_knowledge_export_run
 from .models import SearchBudget, StopReason
 from .protocols import ReadingExtractionWorkflowProtocol
 from .search import IterativeSearchAgent
@@ -45,6 +46,7 @@ class AgenticM2Adapter(ModuleProtocol):
         question_type = problem_card.question_type.value if problem_card else ""
 
         literature_results: list[LiteratureResult] = []
+        export_runs = []
         for sub_question in sub_questions:
             search_result = await self.search_agent.run(
                 sub_question,
@@ -60,36 +62,26 @@ class AgenticM2Adapter(ModuleProtocol):
             reading_results = await self.reading_workflow.run(
                 sub_question,
                 search_result.final_papers,
+                search_context=search_result,
             )
-            papers_by_id = {
-                paper.paper_id: paper for paper in search_result.final_papers
-            }
-            knowledge_entries: list[KnowledgeEntry] = []
-            for reading in reading_results:
-                source_paper = papers_by_id.get(reading.paper_id)
-                source_title = source_paper.title if source_paper else ""
-                for entry in reading.knowledge_entries:
-                    knowledge_entries.append(
-                        KnowledgeEntry(
-                            id=entry.entry_id,
-                            type=entry.entry_type,
-                            content=entry.content,
-                            confidence=entry.confidence,
-                            source_paper_id=reading.paper_id,
-                            source_paper_title=source_title,
-                            entities=entry.entities,
-                        )
-                    )
-
+            export_run = build_m2_knowledge_export_run(
+                sub_question,
+                search_result,
+                reading_results,
+            )
+            export_runs.append(export_run)
             literature_results.append(
                 LiteratureResult(
                     sub_question=sub_question,
-                    papers_retrieved=len(search_result.final_papers),
-                    knowledge_entries=knowledge_entries,
+                    papers_retrieved=len(export_run.papers),
+                    knowledge_entries=list(export_run.knowledge_entries),
                 )
             )
 
-        return {"literature_results": literature_results}
+        return {
+            "literature_results": literature_results,
+            "m2_knowledge_export": M2KnowledgeExport(runs=export_runs),
+        }
 
     @classmethod
     def get_input_fields(cls) -> list[str]:
@@ -97,4 +89,4 @@ class AgenticM2Adapter(ModuleProtocol):
 
     @classmethod
     def get_output_fields(cls) -> list[str]:
-        return ["literature_results"]
+        return ["literature_results", "m2_knowledge_export"]

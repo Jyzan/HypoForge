@@ -8,6 +8,7 @@ that include backend selection and coverage intent.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional, Sequence
 
 from hypoforge.literature.models import QueryIntent, SearchQuery, SearchState
@@ -15,6 +16,14 @@ from hypoforge.literature.protocols import QueryPlannerProtocol
 from hypoforge.tools.qwen_client import QwenClient
 
 logger = logging.getLogger(__name__)
+
+_FIELD_TAG_PATTERN = re.compile(r"\[[^\]]+\]")
+
+
+def _sanitize_query(text: str, backend: str) -> str:
+    if backend != "pubmed":
+        text = _FIELD_TAG_PATTERN.sub("", text)
+    return " ".join(text.split())
 
 # ---------------------------------------------------------------------------
 # Prompts (mirrored from m2_branch for standalone use)
@@ -43,10 +52,16 @@ select the most appropriate search tool for each query.
   - `the role of heat shock protein 70 in ATP-dependent protein folding` ← too long, no tags
   - `Hsp70 mechanism` ← single vague term
 
-### For Semantic Scholar queries (all other disciplines):
+### For Semantic Scholar/OpenAlex queries (cross-disciplinary discovery):
 - Use phrase quotes for multi-word terms: `"protein folding"`.
 - Keep each concept short; combine with AND/OR when helpful.
 - S2 syntax is simpler than PubMed — keyword search works fine.
+
+### For arXiv queries (recent technical preprints):
+- Prefer arXiv for computer science, mathematics, physics, statistics,
+  electrical engineering, and other technical preprints.
+- Use short keyword phrases and AND/OR; never use PubMed field tags.
+- Remember that arXiv results may not have completed peer review.
 
 ## Coverage Dimensions
 
@@ -66,6 +81,7 @@ In later rounds, target only the gaps identified by the coverage evaluator.
 2. Keep each concept/term short (1-3 words).
 3. Assign each query to the most appropriate tool based on domain.
 4. Never repeat a query that has already been used.
+5. Never select a search tool listed as unavailable.
 
 Return valid JSON only — no markdown fences, no extra text."""
 
@@ -83,13 +99,14 @@ _QUERY_PLANNING_USER_FIRST = """\
 - Papers found so far: 0
 - Queries already used: (none)
 - Current gaps identified: (none — first round)
+- Unavailable search tools: {unavailable_sources}
 
 ## Task
 Generate 3–6 search queries covering at least 3 different coverage dimensions.
 For each query, output:
 - `text`: the search query string. Use short concepts (recommend 1-3 words each, no more than 5 words), \
   field tags like `[tiab]`/`[MeSH Terms]` for PubMed, and AND/OR to combine.
-- `tool`: which tool to use ("pubmed" or "semantic_scholar")
+- `tool`: one of the available search tools listed above
 - `purpose`: which coverage dimension this query targets
 - `reasoning`: why this query is needed
 
@@ -109,6 +126,7 @@ _QUERY_PLANNING_USER_RETRY = """\
 - Papers found so far: {paper_count}
 - Queries already used: {queries_used}
 - Current gaps identified: {gaps}
+- Unavailable search tools: {unavailable_sources}
 
 ## Task
 Generate 2–4 targeted queries to fill the gaps above. Use the same query \
@@ -142,10 +160,12 @@ class QueryPlanner(QueryPlannerProtocol):
         client: QwenClient,
         tool_definitions: Optional[List[Dict[str, Any]]] = None,
         max_rounds: int = 3,
+        strict: bool = False,
     ):
         self._client = client
         self._tool_definitions = tool_definitions or []
         self._max_rounds = max_rounds
+        self.strict = strict
         self._valid_backends: set[str] = {
             d["name"] for d in self._tool_definitions
         }
@@ -178,11 +198,13 @@ class QueryPlanner(QueryPlannerProtocol):
                 for q in state.queries_used[-20:]
             ]
             gaps = sorted(state.missing_topics)
+            unavailable_sources = sorted(state.unavailable_sources)
         else:
             round_num = 1
             paper_count = 0
             queries_used = []
             gaps = []
+            unavailable_sources = []
 
         return await self._plan_impl(
             sub_question=sub_question,
@@ -193,6 +215,7 @@ class QueryPlanner(QueryPlannerProtocol):
             paper_count=paper_count,
             queries_used=queries_used,
             gaps=gaps,
+            unavailable_sources=unavailable_sources,
         )
 
     # ------------------------------------------------------------------
@@ -223,6 +246,7 @@ class QueryPlanner(QueryPlannerProtocol):
             paper_count=paper_count,
             queries_used=queries_used,
             gaps=gaps,
+            unavailable_sources=[],
         )
 
     # ------------------------------------------------------------------
@@ -239,6 +263,7 @@ class QueryPlanner(QueryPlannerProtocol):
         paper_count: int,
         queries_used: List[str],
         gaps: List[str],
+        unavailable_sources: List[str],
     ) -> List[SearchQuery]:
         """Core planning logic — shared by plan() and plan_next()."""
         tool_descriptions = "\n\n".join(
@@ -255,6 +280,9 @@ class QueryPlanner(QueryPlannerProtocol):
                 entities=", ".join(entities) if entities else "unknown",
                 question_type=question_type or "unknown",
                 max_rounds=self._max_rounds,
+                unavailable_sources=(
+                    ", ".join(unavailable_sources) if unavailable_sources else "(none)"
+                ),
             )
         else:
             user = _QUERY_PLANNING_USER_RETRY.format(
@@ -267,6 +295,9 @@ class QueryPlanner(QueryPlannerProtocol):
                 paper_count=paper_count,
                 queries_used="\n".join(queries_used[-20:]) if queries_used else "(none)",
                 gaps="\n".join(gaps) if gaps else "(none — first round)",
+                unavailable_sources=(
+                    ", ".join(unavailable_sources) if unavailable_sources else "(none)"
+                ),
             )
 
         schema = {
@@ -299,11 +330,14 @@ class QueryPlanner(QueryPlannerProtocol):
                 user_prompt=user,
                 output_schema=schema,
                 max_tokens=4096,
-                temperature=0.3,
+                temperature=0.0,
+                disable_thinking=True,
             )
         except Exception:
             logger.exception("Query planning failed for %r", sub_question[:60])
-            return self._fallback_queries(sub_question)
+            if self.strict:
+                raise
+            return self._fallback_queries(sub_question, unavailable_sources)
 
         # Normalise
         if isinstance(result, list):
@@ -314,7 +348,9 @@ class QueryPlanner(QueryPlannerProtocol):
             raw_queries = []
 
         if not raw_queries:
-            return self._fallback_queries(sub_question)
+            if self.strict:
+                raise RuntimeError("query planner returned no queries")
+            return self._fallback_queries(sub_question, unavailable_sources)
 
         # Convert to SearchQuery model, filtering invalid backends
         queries: List[SearchQuery] = []
@@ -322,36 +358,97 @@ class QueryPlanner(QueryPlannerProtocol):
             if not isinstance(raw, dict):
                 continue
             backend = raw.get("tool", "").strip()
-            if backend not in self._valid_backends:
+            if (
+                backend not in self._valid_backends
+                or backend in unavailable_sources
+            ):
                 continue
 
-            text = raw.get("text", "").strip()
+            text = _sanitize_query(raw.get("text", "").strip(), backend)
             if not text:
                 continue
 
             purpose = raw.get("purpose", "").strip()
             intent = _purpose_to_intent(purpose)
+            reasoning = str(raw.get("reasoning") or "").strip()
+            relation = reasoning or f"Targets the {purpose or 'search'} dimension."
 
             queries.append(SearchQuery(
                 query_id=f"q-{round_num}-{i + 1}",
                 text=text,
                 intent=intent,
                 target_source=backend,
-                purpose=purpose,
+                purpose=purpose or "search",
                 target_gap="",
-                relation_to_question=raw.get("reasoning", ""),
+                relation_to_question=relation,
             ))
 
         if not queries:
-            return self._fallback_queries(sub_question)
+            if self.strict:
+                raise RuntimeError("query planner returned no valid queries")
+            return self._fallback_queries(sub_question, unavailable_sources)
+
+        if round_num == 1:
+            queries = self._ensure_first_round_coverage(
+                sub_question,
+                queries,
+                unavailable_sources,
+            )
 
         logger.debug("Planned %d queries (round %d)", len(queries), round_num)
         return queries
 
-    def _fallback_queries(self, sub_question: str) -> List[SearchQuery]:
+    def _ensure_first_round_coverage(
+        self,
+        sub_question: str,
+        queries: Sequence[SearchQuery],
+        unavailable_sources: Sequence[str],
+    ) -> List[SearchQuery]:
+        """Add one deterministic query for every omitted available backend."""
+        primary: list[SearchQuery] = []
+        repeated: list[SearchQuery] = []
+        selected: set[str] = set()
+        for item in queries:
+            if item.target_source in selected:
+                repeated.append(item)
+                continue
+            selected.add(item.target_source)
+            primary.append(item)
+        unavailable = set(unavailable_sources)
+        missing = self._valid_backends - selected - unavailable
+        coverage: list[SearchQuery] = []
+        for backend in sorted(missing):
+            text = _sanitize_query(sub_question, backend)
+            if not text:
+                continue
+            coverage.append(
+                SearchQuery(
+                    query_id=f"q-1-coverage-{backend}",
+                    text=text,
+                    round_index=0,
+                    intent=QueryIntent.CORE,
+                    target_source=backend,
+                    purpose="cross_source_coverage",
+                    target_gap="",
+                    relation_to_question=(
+                        "Guarantees first-round coverage of the "
+                        f"{backend} source."
+                    ),
+                )
+            )
+        # Put one query per source first so the agent's query-budget slicing
+        # cannot discard coverage while retaining repeated same-source work.
+        return [*primary, *coverage, *repeated]
+
+    def _fallback_queries(
+        self,
+        sub_question: str,
+        unavailable_sources: Sequence[str] = (),
+    ) -> List[SearchQuery]:
         """Fallback: use sub_question directly on all known backends."""
         queries: List[SearchQuery] = []
-        for i, backend in enumerate(sorted(self._valid_backends)):
+        available = self._valid_backends - set(unavailable_sources)
+        for i, backend in enumerate(sorted(available)):
             queries.append(SearchQuery(
                 query_id=f"q-fb-{i + 1}",
                 text=sub_question,

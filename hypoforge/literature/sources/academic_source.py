@@ -13,10 +13,15 @@ from hypoforge.literature.protocols import LiteratureSourceProtocol
 from hypoforge.tools.semantic_scholar import SemanticScholarTool
 
 
+class AcademicBackendError(OSError):
+    """Academic backend failure with the resolved provider in its message."""
+
+
 def _dict_to_record(d: dict, source_name: str) -> PaperRecord:
     """Convert a legacy S2 / OpenAlex dict to a ``PaperRecord``."""
-    doi = (d.get("doi") or "").strip()
+    doi = PaperRecord.normalize_doi(d.get("doi"))
     title = (d.get("title") or "").strip()
+    abstract = str(d.get("abstract") or "").strip()
     legacy_source = (d.get("source") or "").strip()
     legacy_paper_id = (d.get("paper_id") or "").strip()
     year = d.get("year") or 0
@@ -46,7 +51,7 @@ def _dict_to_record(d: dict, source_name: str) -> PaperRecord:
     return PaperRecord(
         paper_id=paper_id,
         title=title,
-        abstract=(d.get("abstract") or "").strip(),
+        abstract=abstract,
         authors=d.get("authors", []),
         year=year if year else None,
         journal=(d.get("journal") or "").strip(),
@@ -58,8 +63,8 @@ def _dict_to_record(d: dict, source_name: str) -> PaperRecord:
         publication_type="",
         sources=[source_name],
         fulltext_status=(
-            FulltextStatus.UNKNOWN if doi
-            else FulltextStatus.ABSTRACT_ONLY
+            FulltextStatus.ABSTRACT_ONLY if abstract
+            else FulltextStatus.UNKNOWN
         ),
     )
 
@@ -77,10 +82,30 @@ class AcademicSource(LiteratureSourceProtocol):
         """Optionally inject a stub tool for testing."""
         self._tool = tool if tool is not None else SemanticScholarTool()
 
+    @property
+    def backend_name(self) -> str:
+        return str(getattr(self._tool, "backend_name", self.source_name))
+
     async def search(
         self,
         query: SearchQuery,
         limit: int = 20,
     ) -> List[PaperRecord]:
-        raw = await self._tool.search(query.text, limit=limit)
-        return [_dict_to_record(p, self.source_name) for p in raw]
+        strict_search = getattr(self._tool, "search_strict", None)
+        search = strict_search if callable(strict_search) else self._tool.search
+        try:
+            raw = await search(query.text, limit=limit)
+        except Exception as exc:
+            raise AcademicBackendError(
+                f"{self.backend_name} backend failed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        records = []
+        for row in raw:
+            if not any(
+                str(row.get(key) or "").strip()
+                for key in ("paper_id", "doi", "title")
+            ):
+                continue
+            records.append(_dict_to_record(row, self.source_name))
+        return records

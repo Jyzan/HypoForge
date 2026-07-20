@@ -6,6 +6,7 @@ import pytest
 
 from hypoforge.literature.adapter import AgenticM2Adapter
 from hypoforge.literature.models import (
+    EvidenceChunk,
     EvidenceLinkedKnowledge,
     PaperReadingResult,
     PaperRecord,
@@ -54,6 +55,18 @@ async def test_adapter_maps_evidence_linked_entries_to_legacy_literature_results
         [
             PaperReadingResult(
                 paper_id="paper-1",
+                evidence=[
+                    EvidenceChunk(
+                        evidence_id="evidence-1",
+                        paper_id="paper-1",
+                        chunk_id="chunk-1",
+                        section="results",
+                        page=2,
+                        quote="The mechanism depends on ATP.",
+                        normalized_claim="The mechanism depends on ATP.",
+                        relevance_score=0.9,
+                    )
+                ],
                 knowledge_entries=[
                     EvidenceLinkedKnowledge(
                         entry_id="entry-1",
@@ -89,7 +102,62 @@ async def test_adapter_maps_evidence_linked_entries_to_legacy_literature_results
     assert entry.source_paper_id == "paper-1"
     assert entry.source_paper_title == "Canonical paper title"
     assert entry.entities == ["ATP"]
+    assert entry.evidence_ids == ["evidence-1"]
+    package = output["m2_knowledge_export"]
+    assert package.schema_version == "m2-knowledge-export/v1"
+    assert len(package.runs) == 1
+    assert package.runs[0].papers[0].paper_id == "paper-1"
+    assert package.runs[0].evidence[0].evidence_id == "evidence-1"
+    assert package.runs[0].knowledge_entries[0] == entry
+    assert set(adapter.get_output_fields()) == {
+        "literature_results",
+        "m2_knowledge_export",
+    }
     assert reading.calls == [["paper-1"]]
+    assert reading.search_contexts == [search_agent.results[0]]
+
+
+@pytest.mark.asyncio
+async def test_adapter_preserves_sub_question_order_in_knowledge_export() -> None:
+    paper = PaperRecord(
+        paper_id="paper-1",
+        title="Canonical paper title",
+        sources=["pubmed"],
+    )
+    adapter = AgenticM2Adapter(
+        search_agent=FakeSearchAgent(
+            [
+                SearchRunResult(
+                    sub_question="First sub-question",
+                    final_papers=[paper],
+                    stop_reason=StopReason.COVERAGE_SATISFIED,
+                ),
+                SearchRunResult(
+                    sub_question="Second sub-question",
+                    final_papers=[paper],
+                    stop_reason=StopReason.COVERAGE_SATISFIED,
+                ),
+            ]
+        ),
+        reading_workflow=FakeReadingWorkflow(
+            [PaperReadingResult(paper_id="paper-1")]
+        ),
+    )
+
+    output = await adapter(
+        PipelineState(
+            input_question="Original question",
+            problem_card=ProblemCard(
+                original_question="Original question",
+                sub_questions=["First sub-question", "Second sub-question"],
+            ),
+        )
+    )
+
+    assert [run.sub_question for run in output["m2_knowledge_export"].runs] == [
+        "First sub-question",
+        "Second sub-question",
+    ]
 
 
 @pytest.mark.asyncio

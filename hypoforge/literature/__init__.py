@@ -24,6 +24,7 @@ from .models import (
     SearchState,
     StopReason,
 )
+from .export import build_m2_knowledge_export_run
 from .protocols import (
     CoverageEvaluatorProtocol,
     DocumentParserProtocol,
@@ -44,6 +45,14 @@ from .search import (
     PaperRanker,
     ScoutReader,
 )
+from .reading import (
+    BioCDocumentParser,
+    FullTextReadingWorkflow,
+    HybridEvidenceRetriever,
+    InMemoryChunkStore,
+    PMCFulltextResolver,
+    QwenPaperReader,
+)
 
 __all__ = [
     "ContentLevel",
@@ -59,6 +68,9 @@ __all__ = [
     "EvidenceRetrieverProtocol",
     "FulltextResolverProtocol",
     "FulltextStatus",
+    "FullTextReadingWorkflow",
+    "HybridEvidenceRetriever",
+    "InMemoryChunkStore",
     "IterativeSearchAgent",
     "LiteratureSourceProtocol",
     "PaperDeduplicator",
@@ -68,8 +80,10 @@ __all__ = [
     "PaperReaderProtocol",
     "PaperReadingResult",
     "PaperRecord",
+    "PMCFulltextResolver",
     "QueryIntent",
     "QueryPlannerProtocol",
+    "QwenPaperReader",
     "ReadingExtractionWorkflowProtocol",
     "RemainingSearchBudget",
     "ScoutNote",
@@ -80,4 +94,6 @@ __all__ = [
     "SearchRunResult",
     "SearchState",
     "StopReason",
+    "BioCDocumentParser",
+    "build_m2_knowledge_export_run",
 ]

@@ -10,6 +10,7 @@ from hypoforge.literature.models import (
     EvidenceBucket,
     EvidenceChunk,
     FulltextStatus,
+    PaperReadingResult,
     PaperRecord,
     QueryIntent,
     RemainingSearchBudget,
@@ -172,6 +173,8 @@ def test_literature_package_exposes_shared_contracts() -> None:
     assert literature.PaperRanker.__name__ == "PaperRanker"
     assert literature.ScoutReader.__name__ == "ScoutReader"
     assert literature.CoverageEvaluator.__name__ == "CoverageEvaluator"
+    assert literature.FullTextReadingWorkflow.__name__ == "FullTextReadingWorkflow"
+    assert literature.PMCFulltextResolver.__name__ == "PMCFulltextResolver"
 
 
 def test_scout_note_round_trips_extended_evidence_contract() -> None:
@@ -190,3 +193,18 @@ def test_scout_note_round_trips_extended_evidence_contract() -> None:
         EvidenceBucket.RECENT,
     }
     assert restored.study_design == "cohort study"
+def test_paper_reading_result_records_content_and_stage_trace() -> None:
+    result = PaperReadingResult(
+        paper_id="PMID:1",
+        content_level=ContentLevel.STRUCTURED_FULLTEXT,
+        document_id="PMID_1-pmc",
+        chunks_parsed=12,
+        chunks_retrieved=7,
+        stage_elapsed_seconds={"resolver": 0.2},
+    )
+
+    assert result.content_level is ContentLevel.STRUCTURED_FULLTEXT
+    assert result.document_id == "PMID_1-pmc"
+    assert result.chunks_parsed == 12
+    assert result.chunks_retrieved == 7
+    assert result.stage_elapsed_seconds == {"resolver": 0.2}

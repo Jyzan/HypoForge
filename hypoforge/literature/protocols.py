@@ -14,6 +14,7 @@ from .models import (
     PaperRecord,
     ScoutNote,
     SearchQuery,
+    SearchRunResult,
     SearchState,
 )
 
@@ -161,6 +162,7 @@ class ReadingExtractionWorkflowProtocol(ABC):
         self,
         sub_question: str,
         papers: Sequence[PaperRecord],
+        search_context: SearchRunResult | None = None,
     ) -> List[PaperReadingResult]:
         """Read Final-K papers and return evidence-linked paper results."""
         ...

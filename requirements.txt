@@ -6,6 +6,8 @@ pydantic>=2.0
 pyyaml>=6.0
 rich>=13.0
 python-dotenv>=1.0
+arxiv>=4.0.0
+pypdf>=5.0
 
 # LLM (OpenAI-compatible client for Qwen / DeepSeek / GLM etc.)
 langchain-openai>=0.2.0
