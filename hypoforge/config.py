@@ -20,6 +20,8 @@ import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, model_validator
 
+from .evaluation.rubric import DEFAULT_HYPOTHESIS_WEIGHTS
+
 
 # ---------------------------------------------------------------------------
 # Auto-load .env  (searches from project root upward)
@@ -119,6 +121,22 @@ class ModuleOverride(BaseModel):
     kwargs: Dict[str, Any] = Field(default_factory=dict)
 
 
+class ScoringConfig(BaseModel):
+    """Scoring / evaluation settings — the single source of truth for the
+    composite weights and iteration threshold.
+
+    ``hypothesis_weights`` feeds *both* M4's composite formula and the
+    post-hoc scorer, so the two can never drift apart.  ``review_threshold``
+    is the M6 ``overall`` score (1–5) at or above which iteration stops early.
+    """
+
+    hypothesis_weights: Dict[str, float] = Field(
+        default_factory=lambda: dict(DEFAULT_HYPOTHESIS_WEIGHTS)
+    )
+    review_threshold: float = 4.0
+    auto_score: bool = True  # write {run_id}_scores.json after each run
+
+
 # ============================================================================
 # Top-level Pipeline Config
 # ============================================================================
@@ -137,6 +155,7 @@ class PipelineConfig(BaseModel):
     output_dir: str = "./output"
     verbose: bool = True
     log_level: str = "INFO"  # DEBUG / INFO / WARNING / ERROR
+    interactive: bool = False  # solicit human guidance between iterations (the CLI enables this)
 
     # ---- pipeline control ----
     enabled_modules: List[str] = Field(
@@ -154,6 +173,9 @@ class PipelineConfig(BaseModel):
 
     # ---- per-module overrides ----
     module_overrides: Dict[str, ModuleOverride] = Field(default_factory=dict)
+
+    # ---- scoring / evaluation ----
+    scoring: ScoringConfig = Field(default_factory=ScoringConfig)
 
     # ---- persistence ----
     memory_cache_dir: str = ""  # if non-empty, M3 persists knowledge graph here

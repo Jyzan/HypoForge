@@ -143,10 +143,22 @@ class MetricProtocol(ABC):
 
     Each metric receives a hypothesis (or research plan) and the body of
     literature / evidence it was derived from, and returns a float score.
+
+    Class attributes
+    ----------------
+    independent : bool
+        ``True`` if the metric is computed independently of the generator's
+        self-reported scores; ``False`` if it merely echoes them (which the
+        scorer treats as *self-reported*, not evaluation).
+    implemented : bool
+        ``True`` if a real implementation exists.  The scorer skips metrics
+        flagged ``False`` instead of reporting a placeholder value.
     """
 
     metric_name: str
     metric_description: str
+    independent: bool = True
+    implemented: bool = True
 
     @abstractmethod
     async def compute(

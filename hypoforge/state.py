@@ -166,6 +166,9 @@ class HypothesisCard(BaseModel):
     falsification_conditions: List[str] = Field(default_factory=list)
     supporting_evidence: List[str] = Field(default_factory=list)
 
+    # Reasoning written by the Ranker *before* the numeric scores (reason-before-score).
+    ranking_rationale: str = ""
+
     # Multi-dimensional scores (populated by Ranker in M4)
     scores: Dict[str, float] = Field(default_factory=dict)
 
@@ -199,6 +202,7 @@ class ReviewResult(BaseModel):
     """A single reviewer's assessment (M6 output)."""
 
     dimension: ReviewerDimension
+    reasoning: str = ""  # written *before* the score (reason-before-score)
     score: float  # 1.0 – 5.0
     comments: str = ""
     suggestions: str = ""
@@ -233,6 +237,7 @@ class PipelineState(BaseModel):
     # ---- M4 ----
     candidate_hypotheses: List[HypothesisCard] = Field(default_factory=list)
     top_hypotheses: List[HypothesisCard] = Field(default_factory=list)
+    best_hypotheses: List[HypothesisCard] = Field(default_factory=list)  # keep-best across iterations
 
     # ---- M5 ----
     research_plans: List[ResearchPlan] = Field(default_factory=list)
@@ -241,6 +246,8 @@ class PipelineState(BaseModel):
     reviews: List[ReviewResult] = Field(default_factory=list)
     iteration_count: int = 0
     max_iterations: int = 3
+    review_score_threshold: float = 4.0  # M6 overall (1–5) at/above which iteration stops
+    user_guidance: List[str] = Field(default_factory=list)  # human guidance injected between iterations
 
     # ---- persistence ----
     memory_cache_dir: str = ""  # non-empty enables persistent knowledge graph
