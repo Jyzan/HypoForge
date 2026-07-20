@@ -103,11 +103,12 @@ Abstract:
 {abstract}
 """
 
-M2_SEARCH_QUERY_TEMPLATE = """\
-Generate 2–3 focused PubMed / Semantic Scholar search queries for the following \
-sub-question in biomedicine.  Use MeSH terms where appropriate.  Return only \
-the queries, one per line.
+M2_SEARCH_QUERY_SYSTEM_PROMPT = """\
+You translate Chinese biomedical questions into English keyword phrases.
+Output one phrase per line, 2–3 lines total.  No explanations, no JSON.
+"""
 
-Sub-question: {sub_question}
-Key entities: {entities}
+M2_SEARCH_QUERY_TEMPLATE = """\
+{entities}
+{sub_question}
 """

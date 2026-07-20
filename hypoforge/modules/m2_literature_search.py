@@ -5,10 +5,8 @@ Searches PubMed + OpenAlex (or Semantic Scholar) for each sub-question,
 then uses Qwen to extract six categories of structured knowledge from
 the retrieved paper abstracts.
 
-In ``mode="stub"`` (default), returns hard-coded entries for quick testing.
-In ``mode="llm"``, performs real search + **batch** LLM extraction end-to-end:
-papers are grouped by ``batch_size`` (default 5) so 15 papers need only 3
-LLM calls instead of 15.
+Performs real search + **batch** LLM extraction end-to-end: papers are grouped
+by ``batch_size`` (default 5) so 15 papers need only 3 LLM calls instead of 15.
 
 Output: ``literature_results`` (list of ``LiteratureResult``) in state.
 """
@@ -16,7 +14,9 @@ Output: ``literature_results`` (list of ``LiteratureResult``) in state.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from ..protocol import ModuleProtocol
@@ -26,6 +26,7 @@ from ..prompts.m2_prompts import (
     M2_EXTRACTION_SYSTEM_PROMPT,
     M2_EXTRACTION_USER_TEMPLATE,
     M2_PAPER_BLOCK_TEMPLATE,
+    M2_SEARCH_QUERY_SYSTEM_PROMPT,
     M2_SEARCH_QUERY_TEMPLATE,
 )
 from ..registry import ModuleRegistry
@@ -36,9 +37,60 @@ from ..state import (
     LiteratureResult,
     PipelineState,
 )
-from ..tools.qwen_client import QwenClient
+from ..tools.qwen_client import QwenClient, _salvage_string_arrays
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Query-extraction helper (called by _generate_search_queries)
+# ---------------------------------------------------------------------------
+
+def _extract_queries_from_text(raw_text: str) -> List[str]:
+    """Pull search-query strings out of a free-text LLM response.
+
+    The prompt instructs the model to return one query per line (no JSON, no
+    markdown).  This function parses those lines, stripping common noise
+    (numbering, bullets, leading/trailing punctuation).  It also falls back to
+    JSON parsing for backward compatibility with older prompts.
+    """
+    text = raw_text.strip()
+    if not text:
+        return []
+
+    # 1. Try JSON (backward compat — older prompts asked for JSON)
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and isinstance(data.get("queries"), list):
+            queries = [str(q).strip() for q in data["queries"] if str(q).strip()]
+            if queries:
+                return list(dict.fromkeys(queries))
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # 2. Salvage garbled / truncated JSON
+    salvaged = _salvage_string_arrays(text)
+    if salvaged:
+        for key in ("queries", "items", "entries"):
+            items = salvaged.get(key)
+            if items:
+                cleaned = [str(q).strip() for q in items if str(q).strip()]
+                if cleaned:
+                    return list(dict.fromkeys(cleaned))
+
+    # 3. Primary path: one query per line
+    lines = text.splitlines()
+    candidates = []
+    for line in lines:
+        line = line.strip().strip('"\'')
+        # Remove common prefixes: "1.", "1)", "-", "*", "•"
+        line = re.sub(r'^(?:\d+[.)]\s*|[-*•]\s*)+', '', line).strip()
+        # Filter out obvious non-query lines (explanations, JSON brackets, etc.)
+        if not line or line in ('{', '}', '[', ']'):
+            continue
+        if len(line) > 5:  # real queries are never this short
+            candidates.append(line)
+    return list(dict.fromkeys(candidates))
 
 # ---------------------------------------------------------------------------
 # Helpers — paper merge / dedup
@@ -125,10 +177,15 @@ class M2LiteratureSearch(ModuleProtocol):
     def __init__(
         self,
         search_tools: Optional[List[str]] = None,
-        mode: str = "stub",  # "stub" | "llm"
+        mode: str = "llm",
         llm_config: Optional[Any] = None,
+        query_llm_config: Optional[Any] = None,
         max_papers_per_query: int = 10,
         batch_size: int = 5,
+        max_search_queries: int = 3,
+        query_max_tokens: int = 2048,
+        query_disable_thinking: bool = True,
+        query_max_attempts: int = 2,
         **kwargs,
     ):
         self.search_tools = search_tools or ["semantic_scholar", "pubmed"]
@@ -136,77 +193,19 @@ class M2LiteratureSearch(ModuleProtocol):
         self.llm_config = llm_config
         self.max_papers_per_query = max_papers_per_query
         self.batch_size = max(batch_size, 1)
+        # How many English search queries to synthesise per sub-question.  0 keeps
+        # the raw sub-question (no query generation).
+        self.max_search_queries = max(0, max_search_queries)
+        self.query_max_tokens = max(128, query_max_tokens)
+        self.query_disable_thinking = query_disable_thinking
+        self.query_max_attempts = max(1, query_max_attempts)
         self.client = QwenClient.from_config(llm_config) if llm_config else None
-
-    # ------------------------------------------------------------------
-    # Stub data (fallback)
-    # ------------------------------------------------------------------
-
-    _STUB_ENTRIES = [
-        KnowledgeEntry(
-            id="KE001",
-            type=KnowledgeEntryType.ESTABLISHED_FACT,
-            content="Hsp70 chaperones assist protein folding via an ATP-dependent cycle.",
-            confidence=ConfidenceLevel.HIGH,
-            source_paper_id="PMID:32012345",
-            source_paper_title="Hsp70 chaperone cycle: structure and mechanism",
-            entities=["Hsp70", "ATP"],
-        ),
-        KnowledgeEntry(
-            id="KE002",
-            type=KnowledgeEntryType.MECHANISTIC_CONCLUSION,
-            content="NAD+ depletion impairs Hsp70 ATPase activity in aged cells.",
-            confidence=ConfidenceLevel.MEDIUM,
-            source_paper_id="PMID:31987654",
-            source_paper_title="NAD+ metabolism regulates proteostasis in aging",
-            entities=["NAD+", "Hsp70", "aging"],
-        ),
-        KnowledgeEntry(
-            id="KE003",
-            type=KnowledgeEntryType.CONFLICTING_EVIDENCE,
-            content="Some studies suggest Hsp70 is NAD+-independent; others show NAD+ modulation.",
-            confidence=ConfidenceLevel.LOW,
-            source_paper_id="PMID:31876543",
-            source_paper_title="Debate: metabolic regulation of chaperone activity",
-            entities=["Hsp70", "NAD+"],
-        ),
-        KnowledgeEntry(
-            id="KE004",
-            type=KnowledgeEntryType.METHOD,
-            content="ATPase activity assay, FRET-based folding sensor, Cryo-EM.",
-            confidence=ConfidenceLevel.HIGH,
-            source_paper_id="PMID:32012345",
-            source_paper_title="Hsp70 chaperone cycle: structure and mechanism",
-            entities=["Hsp70"],
-        ),
-        KnowledgeEntry(
-            id="KE005",
-            type=KnowledgeEntryType.KNOWLEDGE_GAP,
-            content="The direct link between cellular NAD+/NADH ratio and Hsp70 folding efficiency in vivo is unknown.",
-            confidence=None,
-            source_paper_id="PMID:31987654",
-            source_paper_title="NAD+ metabolism regulates proteostasis in aging",
-            entities=["NAD+", "NADH", "Hsp70"],
-        ),
-        KnowledgeEntry(
-            id="KE006",
-            type=KnowledgeEntryType.ESTABLISHED_FACT,
-            content="Amyloid-beta aggregation is a hallmark of Alzheimer disease pathology.",
-            confidence=ConfidenceLevel.HIGH,
-            source_paper_id="PMID:31765432",
-            source_paper_title="Amyloid cascade hypothesis: 2024 update",
-            entities=["amyloid-beta", "Alzheimer disease"],
-        ),
-        KnowledgeEntry(
-            id="KE007",
-            type=KnowledgeEntryType.KNOWLEDGE_GAP,
-            content="Whether enhancing chaperone activity can clear pre-formed amyloid aggregates remains controversial.",
-            confidence=None,
-            source_paper_id="PMID:31654321",
-            source_paper_title="Chaperone-based therapies for neurodegeneration",
-            entities=["chaperone", "amyloid"],
-        ),
-    ]
+        # Query generation uses a separate (more reliable) model tier because
+        # the turbo model often returns empty output for translation tasks on
+        # the Alibaba Cloud MaaS endpoint.  Falls back to the main client.
+        _qcfg = query_llm_config if query_llm_config is not None else llm_config
+        self.query_llm_config = _qcfg
+        self.query_client = QwenClient.from_config(_qcfg) if _qcfg else None
 
     # ------------------------------------------------------------------
     # ModuleProtocol implementation
@@ -217,34 +216,30 @@ class M2LiteratureSearch(ModuleProtocol):
         state: PipelineState,
         config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        if self.client is None:
+            raise RuntimeError(
+                "M2 requires an LLM client — pass llm_config / set OPENAI_API_KEY."
+            )
         sub_questions = (
             state.problem_card.sub_questions
             if state.problem_card
             else [state.input_question]
         )
-
-        if self.mode in {"llm", "direct", "api"} and self.client:
-            try:
-                results = await self._run_real(sub_questions)
-                return {"literature_results": results}
-            except Exception as exc:
-                logger.warning("M2 LLM mode failed; falling back to stub: %s", exc)
-
-        # Stub fallback
-        results: List[LiteratureResult] = []
-        for sq in sub_questions:
-            results.append(LiteratureResult(
-                sub_question=sq,
-                papers_retrieved=5,
-                knowledge_entries=self._STUB_ENTRIES,
-            ))
+        key_entities = (
+            state.problem_card.key_entities if state.problem_card else []
+        )
+        results = await self._run_real(sub_questions, key_entities)
         return {"literature_results": results}
 
     # ------------------------------------------------------------------
     # Real pipeline
     # ------------------------------------------------------------------
 
-    async def _run_real(self, sub_questions: List[str]) -> List[LiteratureResult]:
+    async def _run_real(
+        self,
+        sub_questions: List[str],
+        key_entities: Optional[List[str]] = None,
+    ) -> List[LiteratureResult]:
         """Execute real search + LLM extraction for each sub_question."""
         from ..tools.pubmed_search import PubMedTool
         from ..tools.semantic_scholar import SemanticScholarTool
@@ -252,27 +247,36 @@ class M2LiteratureSearch(ModuleProtocol):
         pubmed = PubMedTool()
         academic = SemanticScholarTool()
         limit = self.max_papers_per_query
+        key_entities = key_entities or []
 
         results: List[LiteratureResult] = []
         for sq in sub_questions:
             logger.info("M2: searching for sub_question=%r", sq[:80])
 
-            # --- Step 1: parallel search across backends ---
-            # TODO(组员): 用 Qwen + M2_SEARCH_QUERY_TEMPLATE 生成 2-3 个
-            #  变体查询（MeSH 术语、同义词），对每个变体分别搜索后合并。
-            #  当前直接用 sub_question 原文作为查询。
-            pubmed_papers, acad_papers = await asyncio.gather(
-                pubmed.search(sq, limit=limit),
-                academic.search(sq, limit=limit),
+            # --- Step 0: synthesise English search queries ---
+            # PubMed / OpenAlex return ~0 results for Chinese-language queries,
+            # so we translate the (possibly Chinese) sub-question into focused
+            # English queries before searching.
+            queries = await self._generate_search_queries(sq, key_entities)
+            logger.info("M2: %d search queries: %s", len(queries), [q[:60] for q in queries])
+
+            # --- Step 1: search every query across both backends ---
+            search_calls = []
+            for q in queries:
+                search_calls.append(("pubmed", pubmed.search(q, limit=limit)))
+                search_calls.append(("academic", academic.search(q, limit=limit)))
+            raw_results = await asyncio.gather(
+                *(call for _, call in search_calls),
                 return_exceptions=True,
             )
 
-            if isinstance(pubmed_papers, Exception):
-                logger.warning("PubMed search failed: %s", pubmed_papers)
-                pubmed_papers = []
-            if isinstance(acad_papers, Exception):
-                logger.warning("Academic search failed: %s", acad_papers)
-                acad_papers = []
+            pubmed_papers: List[dict] = []
+            acad_papers: List[dict] = []
+            for (backend, _), res in zip(search_calls, raw_results):
+                if isinstance(res, Exception):
+                    logger.warning("%s search failed: %s", backend, res)
+                    continue
+                (pubmed_papers if backend == "pubmed" else acad_papers).extend(res)
 
             # --- Step 2: merge & deduplicate ---
             all_papers = _merge_deduplicate(pubmed_papers, acad_papers)
@@ -318,6 +322,72 @@ class M2LiteratureSearch(ModuleProtocol):
             ))
 
         return results
+
+    # ------------------------------------------------------------------
+    # Search-query generation (English, from any-language sub-question)
+    # ------------------------------------------------------------------
+
+    async def _generate_search_queries(
+        self,
+        sub_question: str,
+        key_entities: List[str],
+    ) -> List[str]:
+        """Translate a (possibly non-English) sub-question into English search queries.
+
+        PubMed and OpenAlex return almost nothing for Chinese-language queries, so
+        we ask Qwen for a few focused English queries.  Falls back to the raw
+        sub-question when generation is disabled, unavailable, or fails.
+
+        Uses a plain-text chat (one query per line) because the turbo-tier model
+        often returns empty output when asked for JSON — but handles simple
+        line-by-line instructions reliably.
+        """
+        if self.query_client is None or self.max_search_queries <= 0:
+            return [sub_question]
+
+        user_prompt = M2_SEARCH_QUERY_TEMPLATE.format(
+            sub_question=sub_question,
+            entities=", ".join(key_entities) if key_entities else "(none provided)",
+        )
+        last_error: Optional[Exception] = None
+
+        # Qwen reasoning models may otherwise spend the entire small completion
+        # budget on hidden reasoning and return an empty ``content`` field.  The
+        # task is a direct translation/query-rewrite, so thinking is unnecessary.
+        for attempt in range(1, self.query_max_attempts + 1):
+            try:
+                raw_text = await self.query_client.chat(
+                    system_prompt=M2_SEARCH_QUERY_SYSTEM_PROMPT,
+                    user_prompt=user_prompt,
+                    max_tokens=self.query_max_tokens,
+                    temperature=getattr(self.query_llm_config, "temperature", 0.1),
+                    disable_thinking=self.query_disable_thinking,
+                )
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "M2 query generation attempt %d/%d failed: %s",
+                    attempt,
+                    self.query_max_attempts,
+                    exc,
+                )
+                continue
+
+            cleaned = _extract_queries_from_text(raw_text)
+            if cleaned:
+                return cleaned[: self.max_search_queries]
+            logger.warning(
+                "M2 query generation attempt %d/%d returned empty output",
+                attempt,
+                self.query_max_attempts,
+            )
+
+        detail = f": {last_error}" if last_error is not None else ""
+        raise RuntimeError(
+            "M2 could not generate an English literature-search query after "
+            f"{self.query_max_attempts} attempts"
+            f"{detail}. Refusing to silently search the original non-English question."
+        )
 
     # ------------------------------------------------------------------
     # Batch knowledge extraction
