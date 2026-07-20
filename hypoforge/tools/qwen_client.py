@@ -172,19 +172,16 @@ class QwenClient:
         Parameters
         ----------
         disable_thinking : bool
-            When True, instruct reasoning models (Qwen3, DeepSeek-R1, etc.)
-            to skip the thinking phase so that the full ``max_tokens`` budget
-            is reserved for the visible output.  This is recommended for
-            structured JSON extraction where chain-of-thought is unnecessary.
+            Retained for API compatibility. It is not forwarded because many
+            OpenAI-compatible gateways reject the Qwen-specific ``thinking``
+            request field.
         model_kwargs : dict | None
             Extra parameters merged into the API request body
-            (e.g. ``response_format``, ``thinking`` control).
+            (e.g. ``response_format`` control).
         """
-        merged_kwargs: Dict[str, Any] = {}
-        if disable_thinking:
-            merged_kwargs["thinking"] = {"type": "disabled"}
-        if model_kwargs:
-            merged_kwargs.update(model_kwargs)
+        # ``thinking`` is provider-specific rather than OpenAI-compatible.
+        # Keep the argument for existing callers, but never send it.
+        merged_kwargs: Dict[str, Any] = dict(model_kwargs or {})
 
         return ChatOpenAI(
             model=self.model,
@@ -299,9 +296,8 @@ class QwenClient:
         max_tokens : int
         temperature : float
         disable_thinking : bool
-            When True, instruct reasoning models to skip the thinking phase.
-            The full ``max_tokens`` budget is reserved for the visible JSON output.
-            If the API rejects this parameter, the call is retried without it.
+            Retained for compatibility. No provider-specific ``thinking``
+            field is sent to the OpenAI-compatible endpoint.
 
         Returns
         -------
@@ -347,15 +343,9 @@ class QwenClient:
             disable_thinking=disable_thinking,
         )
 
-        # Build kwargs shared across attempts
-        def _make_rfmt_kwargs(include_thinking: bool) -> dict:
-            rfmt: Dict[str, Any] = {"response_format": {"type": "json_object"}}
-            if include_thinking and disable_thinking:
-                rfmt["thinking"] = {"type": "disabled"}
-            return rfmt
-
         response = None
-        # Attempt 1: with response_format (+ optional thinking disable)
+        # Attempt 1: OpenAI-standard JSON mode only. Do not send Qwen's
+        # provider-specific ``thinking`` field.
         try:
             llm_with_format = ChatOpenAI(
                 model=self.model,
@@ -363,39 +353,15 @@ class QwenClient:
                 api_key=self.api_key,
                 max_tokens=max_tokens,
                 temperature=temperature,
-                model_kwargs=_make_rfmt_kwargs(include_thinking=True),
+                model_kwargs={"response_format": {"type": "json_object"}},
             )
             response = await llm_with_format.ainvoke(messages)
             self._record_tokens(response)
         except Exception:
-            if disable_thinking:
-                # Attempt 2: retry without thinking disable
-                # (the model / proxy may not support the parameter)
-                logger.debug(
-                    "Model %s may not support thinking disable; retrying without it.",
-                    self.model,
-                )
-                try:
-                    llm_rfmt = ChatOpenAI(
-                        model=self.model,
-                        base_url=self.api_base,
-                        api_key=self.api_key,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        model_kwargs=_make_rfmt_kwargs(include_thinking=False),
-                    )
-                    response = await llm_rfmt.ainvoke(messages)
-                    self._record_tokens(response)
-                except Exception:
-                    logger.debug(
-                        "Model %s may not support response_format; falling back to text parse.",
-                        self.model,
-                    )
-            else:
-                logger.debug(
-                    "Model %s may not support response_format; falling back to text parse.",
-                    self.model,
-                )
+            logger.debug(
+                "Model %s may not support response_format; falling back to text parse.",
+                self.model,
+            )
 
         # Attempt 3: plain chat fallback (no response_format)
         if response is None:
