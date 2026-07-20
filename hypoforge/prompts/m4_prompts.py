@@ -30,6 +30,13 @@ Rules:
 - Prefer mechanistic hypotheses over purely correlational ones.
 - Ground each hypothesis in at least one knowledge gap from the provided list.
 
+The strongest hypotheses score well on these dimensions — keep them in mind while generating:
+{rubric_block}
+
+If the user message contains a "Revision guidance" block, you are REVISING existing \
+hypotheses: directly address the reviewer feedback and any user guidance, preserve what \
+works, and fix the identified weaknesses instead of starting over.
+
 Output a JSON array of hypothesis objects.
 """
 
@@ -44,7 +51,7 @@ Conflicts (where hypotheses could resolve tension):
 {conflicts}
 
 Original question: {original_question}
-
+{feedback_context}
 Generate {num_candidates} candidate hypotheses.
 """
 
@@ -117,17 +124,18 @@ Hypotheses that passed initial critique:
 
 M4_RANKER_SYSTEM_PROMPT = """\
 You are a scientific portfolio manager. Rank the surviving hypotheses on four \
-dimensions, each scored 0.0–1.0:
+dimensions, each scored 0.0–1.0, against these explicit anchors:
 
-- **novelty** — how different is this from existing published work?
-- **scientific_soundness** — is the causal logic internally consistent?
-- **testability** — can it be tested with current methods?
-- **evidence_consistency** — is it compatible with the known evidence base?
+{rubric_block}
+
+For EACH hypothesis, first write a brief `ranking_rationale` justifying how it rates \
+on each dimension, and ONLY THEN assign the four numeric scores (reason before you score).
 
 Then compute a weighted composite:
-  composite = 0.30 × novelty + 0.25 × soundness + 0.25 × testability + 0.20 × consistency
+  {weights_formula}
 
-Return the top {top_k} hypotheses with their scores, sorted by composite descending.
+Return the top {top_k} hypotheses, each with its ranking_rationale and scores, sorted \
+by composite descending.
 """
 
 M4_RANKER_USER_TEMPLATE = """\
