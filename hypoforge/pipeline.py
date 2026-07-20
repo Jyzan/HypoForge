@@ -26,7 +26,7 @@ def _should_continue_iterating(state: PipelineState) -> str:
     # Check latest overall review score
     recent = [r for r in state.reviews if r.version == state.iteration_count]
     overall = [r for r in recent if r.dimension.value == "overall"]
-    if overall and overall[0].score >= 4.0:
+    if overall and overall[0].score >= state.review_score_threshold:
         return "end"  # quality threshold met
 
     return "iterate"
@@ -261,6 +261,10 @@ class PipelineRunner:
                 memory_cache_dir=self.config.memory_cache_dir,
             )
 
+        # Iteration stop-threshold comes from config (single source of truth),
+        # applied on both fresh and resumed runs.
+        initial_state.review_score_threshold = self.config.scoring.review_threshold
+
         if self.config.verbose:
             from .display import console, COLORS
             from rich.panel import Panel
@@ -298,6 +302,28 @@ class PipelineRunner:
 
         # ---- save output ----
         self._save_output(final_state)
+
+        # ---- automated scoring report (single source: config.scoring) ----
+        if self.config.scoring.auto_score:
+            from .evaluation.scorer import save_scoring_report_async
+            # The independent metrics use a lightweight (turbo) model for
+            # LLM-as-judge evaluations so they don't add meaningful latency.
+            metric_llm_config = self.config.get_llm_for_tier("turbo")
+            try:
+                scores_path = await save_scoring_report_async(
+                    final_state,
+                    self.config.output_dir,
+                    self.config.scoring.hypothesis_weights,
+                    llm_config=metric_llm_config,
+                )
+                if self.config.verbose:
+                    from .display import console, COLORS
+                    console.print(
+                        f"  [{COLORS['muted']}]Scores saved to {scores_path}[/{COLORS['muted']}]"
+                    )
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning("Scoring report failed: %s", exc)
 
         return final_state
 

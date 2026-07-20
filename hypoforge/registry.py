@@ -117,6 +117,22 @@ class ModuleRegistry:
             tier = kwargs.pop("llm_tier", default_tiers.get(name, "base"))
             if hasattr(config, "get_llm_for_tier"):
                 kwargs.setdefault("llm_config", config.get_llm_for_tier(tier))
+            # M2 query generation needs a more reliable model (turbo-tier
+            # returns empty output for translation tasks on some endpoints).
+            if name == "m2" and hasattr(config, "get_llm_for_tier"):
+                kwargs.setdefault("query_llm_config", config.get_llm_for_tier("plus"))
+
+            # Inject scoring weights into M4 so the composite formula has a
+            # single source of truth (PipelineConfig.scoring → rubric defaults).
+            if name == "m4":
+                scoring = getattr(config, "scoring", None)
+                if scoring is not None:
+                    kwargs.setdefault("weights", dict(scoring.hypothesis_weights))
+                kwargs.setdefault("interactive", getattr(config, "interactive", False))
+                # Ranker uses a separate (plus) tier so the model that scores
+                # hypotheses is not the same model that generated them.
+                if hasattr(config, "get_llm_for_tier") and "ranker_llm_config" not in kwargs:
+                    kwargs["ranker_llm_config"] = config.get_llm_for_tier("plus")
             instances[name] = cls._modules[name](**kwargs)
         return instances
 
