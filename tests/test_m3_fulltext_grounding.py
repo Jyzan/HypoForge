@@ -3,6 +3,8 @@ from pathlib import Path
 import pytest
 
 from hypoforge.modules.m3_evidence_graph import M3EvidenceGraph
+from hypoforge.modules.m3_grounding.models import PaperSource
+from hypoforge.modules.m3_grounding.workflow import FullTextEvidenceGrounding, _document_suffix
 from hypoforge.state import (
     ConfidenceLevel,
     EvidenceEdgeRelation,
@@ -81,3 +83,22 @@ async def test_m3_marks_seed_fallback_instead_of_claiming_fulltext(tmp_path: Pat
     source = next(node for node in graph.nodes if node.type == EvidenceNodeType.SOURCE)
     assert source.metadata["acquisition_status"] == "m2_seed_fallback"
     assert graph.grounding_report["warnings"]
+
+
+def test_m3_detects_pdf_magic_bytes_even_when_cached_with_xml_suffix(tmp_path: Path):
+    """OpenAlex redirects can return PDFs from URLs without a .pdf suffix."""
+    from pypdf import PdfWriter
+
+    cached_as_xml = tmp_path / "mislabelled.xml"
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    with cached_as_xml.open("wb") as handle:
+        writer.write(handle)
+
+    assert _document_suffix(cached_as_xml.read_bytes()) == ".pdf"
+    grounder = FullTextEvidenceGrounding(cache_dir=str(tmp_path / "cache"))
+    pages = grounder._extract_document(PaperSource(
+        id="PMID:123", full_text_path=str(cached_as_xml), seed_text="fallback"
+    ))
+    assert len(pages) == 1
+    assert pages[0][1] == 1

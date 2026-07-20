@@ -84,11 +84,36 @@ def _is_retrievable_chunk(chunk: FullTextChunk) -> bool:
 def _is_error_payload(payload: bytes) -> bool:
     """Recognise the small HTML/text error pages returned by OA providers."""
     prefix = payload.lstrip()[:2000].lower()
+    if prefix.startswith(b"\xef\xbb\xbf"):
+        prefix = prefix[3:]
     return (
         prefix.startswith(b"[error]")
         or prefix.startswith(b"<html")
+        or prefix.startswith(b"<!doctype html")
         or b"no result can be found" in prefix
     )
+
+
+def _document_suffix(payload: bytes, content_type: str = "") -> str:
+    """Infer document type from the response, not from a URL suffix.
+
+    OA providers commonly redirect a URL without ``.pdf`` to a PDF.  The
+    magic bytes are authoritative, while the content type handles valid XML
+    responses whose declaration is omitted.
+    """
+    prefix = payload.lstrip()[:2000].lower()
+    if prefix.startswith(b"\xef\xbb\xbf"):
+        prefix = prefix[3:]
+    normalized_type = content_type.lower()
+    if prefix.startswith(b"%pdf-") or "pdf" in normalized_type:
+        return ".pdf"
+    if (
+        prefix.startswith(b"<?xml")
+        or prefix.startswith(b"<collection")
+        or "xml" in normalized_type
+    ):
+        return ".xml"
+    return ""
 
 
 class GroundingState(TypedDict, total=False):
@@ -213,22 +238,23 @@ class FullTextEvidenceGrounding:
                 return path
         return None
 
-    async def _download(self, url: str, target: Path) -> bool:
+    async def _download(self, url: str, target_stem: Path, fallback_suffix: str) -> Optional[Path]:
         try:
             async with httpx.AsyncClient(follow_redirects=True, timeout=45) as http:
                 response = await http.get(url, headers={"User-Agent": "HypoForge/0.3 (open-access research client)"})
                 response.raise_for_status()
                 content_type = response.headers.get("content-type", "")
                 is_error_page = _is_error_payload(response.content)
-                if (len(response.content) < 500 or is_error_page
-                        or ("html" in content_type and target.suffix in {".pdf", ".xml"})):
-                    return False
+                if len(response.content) < 500 or is_error_page or "html" in content_type:
+                    return None
+                suffix = _document_suffix(response.content, content_type) or fallback_suffix
+                target = target_stem.with_suffix(suffix)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(response.content)
-                return True
+                return target
         except Exception as exc:
             logger.debug("Full-text download failed for %s: %s", url, exc)
-            return False
+            return None
 
     async def _openalex_oa_url(self, source: PaperSource) -> str:
         identifier = ""
@@ -289,9 +315,11 @@ class FullTextEvidenceGrounding:
             # prevent the OpenAlex OA location from being tried afterwards.
             urls = [await self._pmc_xml_url(source), await self._openalex_oa_url(source)]
             for url in dict.fromkeys(url for url in urls if url):
-                suffix = ".pdf" if ".pdf" in url.lower() else ".xml"
-                target = paper_cache / f"{_hash(source.id)}{suffix}"
-                if await self._download(url, target):
+                fallback_suffix = ".pdf" if ".pdf" in url.lower() else ".xml"
+                target = await self._download(
+                    url, paper_cache / _hash(source.id), fallback_suffix
+                )
+                if target:
                     source.full_text_path = str(target)
                     source.url = url
                     source.acquisition_status = "open_access_fulltext"
@@ -325,14 +353,21 @@ class FullTextEvidenceGrounding:
         if not source.full_text_path:
             return [("M2 seed fallback", 0, source.seed_text)] if source.seed_text else []
         path = Path(source.full_text_path)
-        if path.suffix.lower() == ".pdf":
+        try:
+            with path.open("rb") as handle:
+                detected_suffix = _document_suffix(handle.read(2000))
+        except OSError:
+            detected_suffix = ""
+        # Keep old caches usable: a previously misnamed ``.xml`` with PDF
+        # magic bytes is parsed as PDF immediately, without a manual cleanup.
+        if detected_suffix == ".pdf" or path.suffix.lower() == ".pdf":
             try:
                 from pypdf import PdfReader
                 return [("", i + 1, page.extract_text() or "") for i, page in enumerate(PdfReader(str(path)).pages)]
             except Exception as exc:
                 logger.warning("Could not parse PDF %s: %s", path, exc)
                 return [("M2 seed fallback", 0, source.seed_text)] if source.seed_text else []
-        if path.suffix.lower() == ".xml":
+        if detected_suffix == ".xml" or path.suffix.lower() == ".xml":
             try:
                 root = ET.parse(path).getroot()
                 records: List[tuple[str, int, str]] = []
