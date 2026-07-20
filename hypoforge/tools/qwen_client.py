@@ -51,6 +51,29 @@ def _recover_partial_edges(raw: str) -> Optional[dict]:
     ]
     return {"edges": edges, "_partial_json": True} if edges else None
 
+
+def _salvage_string_arrays(raw: str) -> Optional[dict]:
+    """Try to extract string-array values from garbled / truncated JSON.
+
+    Looks for patterns like ``"queries": ["…", "…"]`` or ``"items": ["…"]``
+    and returns a dict keyed by the property name.  This is the last-resort
+    recovery for structured_chat when a smaller model (e.g. turbo tier)
+    produces syntactically broken JSON.
+    """
+    # Match top-level string-array properties: "key": ["val1", "val2", …]
+    pattern = re.compile(
+        r'"(\w+)"\s*:\s*\[(.*?)\]',
+        re.DOTALL,
+    )
+    recovered: Dict[str, list] = {}
+    for key, body in pattern.findall(raw):
+        # Extract individual quoted strings from the array body
+        values = re.findall(r'"((?:[^"\\]|\\.)*)"', body)
+        values = [v.strip() for v in values if v.strip()]
+        if values:
+            recovered[key] = values
+    return recovered if recovered else None
+
 # Ensure .env is loaded even when this module is imported standalone
 _load_dotenv_done = False
 
@@ -180,11 +203,12 @@ class QwenClient:
             Extra parameters merged into the API request body
             (e.g. ``response_format``, ``thinking`` control).
         """
-        merged_kwargs: Dict[str, Any] = {}
-        if disable_thinking:
-            merged_kwargs["thinking"] = {"type": "disabled"}
-        if model_kwargs:
-            merged_kwargs.update(model_kwargs)
+        merged_kwargs: Dict[str, Any] = dict(model_kwargs or {})
+        # ``thinking`` is not an OpenAI Chat Completions parameter, so passing
+        # it through model_kwargs makes the OpenAI SDK reject the request before
+        # it reaches DashScope.  Qwen's OpenAI-compatible endpoint accepts the
+        # provider-specific switch in ``extra_body`` instead.
+        extra_body = {"enable_thinking": False} if disable_thinking else None
 
         return ChatOpenAI(
             model=self.model,
@@ -193,6 +217,7 @@ class QwenClient:
             max_tokens=max_tokens,
             temperature=temperature,
             **(dict(model_kwargs=merged_kwargs) if merged_kwargs else {}),
+            **(dict(extra_body=extra_body) if extra_body else {}),
         )
 
     @classmethod
@@ -348,11 +373,8 @@ class QwenClient:
         )
 
         # Build kwargs shared across attempts
-        def _make_rfmt_kwargs(include_thinking: bool) -> dict:
-            rfmt: Dict[str, Any] = {"response_format": {"type": "json_object"}}
-            if include_thinking and disable_thinking:
-                rfmt["thinking"] = {"type": "disabled"}
-            return rfmt
+        def _make_rfmt_kwargs() -> dict:
+            return {"response_format": {"type": "json_object"}}
 
         response = None
         # Attempt 1: with response_format (+ optional thinking disable)
@@ -363,7 +385,11 @@ class QwenClient:
                 api_key=self.api_key,
                 max_tokens=max_tokens,
                 temperature=temperature,
-                model_kwargs=_make_rfmt_kwargs(include_thinking=True),
+                model_kwargs=_make_rfmt_kwargs(),
+                **(
+                    {"extra_body": {"enable_thinking": False}}
+                    if disable_thinking else {}
+                ),
             )
             response = await llm_with_format.ainvoke(messages)
             self._record_tokens(response)
@@ -382,7 +408,7 @@ class QwenClient:
                         api_key=self.api_key,
                         max_tokens=max_tokens,
                         temperature=temperature,
-                        model_kwargs=_make_rfmt_kwargs(include_thinking=False),
+                        model_kwargs=_make_rfmt_kwargs(),
                     )
                     response = await llm_rfmt.ainvoke(messages)
                     self._record_tokens(response)
@@ -436,6 +462,15 @@ class QwenClient:
                     len(recovered["edges"]),
                 )
                 return recovered
+            # General fallback: try to salvage string-array properties from
+            # garbled JSON (e.g. "queries", "items", "entries").
+            salvaged = _salvage_string_arrays(raw)
+            if salvaged is not None:
+                logger.warning(
+                    "Salvaged %d string-array key(s) from garbled JSON: %s",
+                    len(salvaged), list(salvaged.keys()),
+                )
+                return salvaged
             logger.warning("Failed to parse JSON from model response. Raw: %s", raw[:500])
             return {"_parse_error": True, "raw_response": raw}
 
