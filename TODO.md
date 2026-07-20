@@ -383,7 +383,7 @@ CLI 端到端:
 3. 替换 `__init__` 方法：接收真实的配置参数（LLM client、API keys 等）
 4. 替换 `__call__` 方法：调用真实 API 而非返回 stub 数据
 5. 使用 `hypoforge/prompts/` 中的 prompt 模板
-6. 运行测试确认：`python tests/test_pipeline.py`
+6. 运行测试确认：`python scripts/test_pipeline.py`
 
 ### 接口速查
 
@@ -444,7 +444,7 @@ python run_hypoforge.py \
   -q "..." -c configs/baseline_b3.yaml
 
 # 运行测试
-PYTHONIOENCODING=utf-8 python tests/test_pipeline.py
+PYTHONIOENCODING=utf-8 python scripts/test_pipeline.py
 ```
 
 ---

@@ -44,11 +44,11 @@ OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 ### 运行
 
 ```bash
-# 跑通示例（默认走 LLM mode，会调用 Qwen + PubMed + OpenAlex）
+# 完整运行（调用 Qwen + PubMed + OpenAlex）
 python run_hypoforge.py -q "蛋白质如何折叠及错误折叠导致疾病的机制？"
 
-# 用 stub 模式快速验证（不调用 LLM / API）
-python run_hypoforge.py -q "test" -c configs/baseline_b0.yaml --quiet
+# 快速端到端 smoke（真实调用，但缩小每个模块的工作量）
+python scripts/smoke_pipeline.py -q "蛋白质如何折叠及错误折叠导致疾病的机制？"
 
 # 用不同配置跑消融实验
 python run_hypoforge.py -q "..." -c configs/baseline_b0.yaml
@@ -59,6 +59,23 @@ python run_hypoforge.py -q "..." --run-id my_experiment_01
 ```
 
 运行后终端会输出 Rich 美化的六模块执行过程。
+
+### 快速 Smoke Pipeline
+
+`scripts/smoke_pipeline.py` 会运行真实的 M1→M6 链路，但将子问题、论文数、候选假设数和迭代次数压缩到最小，适合在修改代码后快速检查 API、检索、结构化输出和模块连接是否正常：
+
+```bash
+# 默认使用 direct 模式
+python scripts/smoke_pipeline.py
+
+# 自定义问题
+python scripts/smoke_pipeline.py -q "衰老的生物学基础是什么？"
+
+# 同时验证 M4 Ranker
+python scripts/smoke_pipeline.py --m4-mode multi_agent
+```
+
+> Smoke 中的 M2 会先使用 `qwen3.7-plus` 将中文问题改写为英文检索词，再查询 PubMed 与 OpenAlex。查询生成关闭隐藏思考、使用 2048 token 上限，并在空响应时重试一次；连续失败会报告明确错误，不会静默退回中文整句检索。
 
 ## CLI 参考
 
@@ -93,15 +110,17 @@ python run_hypoforge.py -q "..." --quiet
 
 ## 输出文件
 
-每次运行会在 `<output_dir>/` 下生成一个 JSON 结果文件：
+每次运行会在 `<output_dir>/` 下保存完整结果，并在各模块完成后更新 checkpoint；启用自动评分时还会生成评分报告：
 
 ```
 <output_dir>/
-└── <run_id>.json
+├── <run_id>.json
+├── <run_id>_checkpoint.json
+└── <run_id>_scores.json
 ```
 
 - **`output_dir`**：由 `--output-dir`（或配置文件中的 `output_dir`）指定，默认为 `./output`
-- **`run_id`**：由 `--run-id` 指定；若未指定则自动生成（基于时间戳），例如 `20250711_143052`
+- **`run_id`**：由 `--run-id` 指定；若未指定则自动生成，例如 `hypoforge-a1b2c3d4`
 
 JSON 文件包含 PipelineState 的完整序列化结果，涵盖所有六个模块的输出、迭代历史和错误信息。
 
@@ -151,8 +170,14 @@ M1 → M2 → M3 → M4 → M5 → M6 → (loop to M4)
 ## 运行测试
 
 ```bash
-PYTHONIOENCODING=utf-8 python tests/test_pipeline.py
+# pytest 模式
+python -m pytest scripts/test_pipeline.py -q
+
+# 直接运行
+python scripts/test_pipeline.py
 ```
+
+测试为离线逻辑检查，不调用 LLM 或文献检索 API。真实端到端验证请使用 `scripts/smoke_pipeline.py`。
 
 ## 配置文件
 
@@ -173,8 +198,8 @@ PYTHONIOENCODING=utf-8 python tests/test_pipeline.py
 
 | 模块 | 状态 | 说明 |
 |------|------|------|
-| M1 问题理解 | 🟡 LLM 就绪 | `mode="llm"` 时调 Qwen `structured_chat` 做问题分解；stub 为 fallback |
-| M2 文献检索 | ✅ 已实现 | PubMed + OpenAlex 双后端检索 → DOI/title 去重 → Qwen 批量知识提取；stub 为 fallback |
+| M1 问题理解 | ✅ 已实现 | 调用 Qwen `structured_chat` 完成问题分解，并支持限制 smoke 的子问题数量 |
+| M2 文献检索 | ✅ 已实现 | 中文问题改写为英文检索词 → PubMed + OpenAlex 双后端检索 → DOI/title 去重 → Qwen 批量知识提取；查询生成支持关闭思考、token 配置与空响应重试 |
 | M3 证据图谱 | ✅ 已实现 | 规则构建节点 + `INVOLVES` 边；`mode="llm"` 时 Qwen 批量提取跨 Entry 语义边（SUPPORTS / CONTRADICTS / EXTENDS / LIMITS），含跨批 bridge 任务和 thinking 控制防止截断 |
 | M4 假设生成 | 🟡 LLM 就绪 | 支持 `direct` / `multi_agent` 模式（Generator + Ranker 调 Qwen）；composite score 由四维加权重算；Critic / Falsifiability Checker 待补 |
 | M5 研究计划 | 🟡 LLM 就绪 | `mode="llm"` 时调 Qwen `structured_chat` 生成含 11 项要素的结构化研究计划 |
@@ -203,7 +228,14 @@ python scripts/preview_terminal.py --width 120
 
 # 只预览指定模块
 python scripts/preview_terminal.py --section m5
+# M6 会在评审结果后等待输入人工指导
 python scripts/preview_terminal.py --section m6
+
+# 只查看 M6 guidance 提示，不阻塞 stdin
+python scripts/preview_terminal.py --section m6 --no-input
+
+# 单独预览 M6 多轮评审与交互提示（不读取输入）
+python scripts/preview_m6.py --width 100 --no-input
 ```
 
 支持的模块选项为 `m1`–`m6` 和 `all`，默认宽度为 100 列。

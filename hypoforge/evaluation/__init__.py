@@ -1,5 +1,5 @@
 """Evaluation module for HypoForge."""
 
-from . import metrics, scorer
+from . import metrics, rubric, scorer
 
-__all__ = ["metrics", "scorer"]
+__all__ = ["metrics", "rubric", "scorer"]

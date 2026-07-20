@@ -50,6 +50,15 @@ most important improvement the authors should make.
 }
 
 
+# Appended to every specialist reviewer prompt so the judge reasons *before* it
+# commits to a number (reason-before-score improves calibration).
+M6_REASON_FIRST = (
+    "First write your `reasoning`: cite the specific parts of the hypothesis, the "
+    "research plan, and the evidence-graph summary that justify your assessment. "
+    "ONLY AFTER that, assign the 1–5 score, and put concrete fixes in `suggestions`."
+)
+
+
 M6_USER_TEMPLATE = """\
 Original question: {original_question}
 

@@ -1,9 +1,10 @@
 """
 M6: Review & Iterative Refinement.
 
-Four reviewer agents evaluate the hypothesis and research plan on different
-dimensions.  A meta-reviewer synthesises the feedback and decides whether
-to accept or iterate.
+Three specialist reviewer agents (scientific_logic / evidence_consistency /
+method_feasibility) score the top hypothesis + research plan on a 1–5 scale;
+each reasons *before* it scores (rubric-anchored).  The ``overall`` score is
+computed as the mean of the specialist scores.
 
 Output: ``reviews`` appended; ``iteration_count`` incremented.
 """
@@ -15,7 +16,8 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from ..protocol import ModuleProtocol
-from ..prompts.m6_prompts import M6_REVIEWER_PROMPTS, M6_USER_TEMPLATE
+from ..prompts.m6_prompts import M6_REASON_FIRST, M6_REVIEWER_PROMPTS, M6_USER_TEMPLATE
+from ..evaluation.rubric import review_rubric_line
 from ..registry import ModuleRegistry
 from ..state import PipelineState, ReviewResult, ReviewerDimension
 from ..tools.qwen_client import QwenClient
@@ -36,7 +38,7 @@ class M6ReviewIteration(ModuleProtocol):
     def __init__(
         self,
         reviewers: Optional[List[str]] = None,
-        mode: str = "stub",
+        mode: str = "llm",
         llm_config: Optional[Any] = None,
         **kwargs,
     ):
@@ -61,122 +63,66 @@ class M6ReviewIteration(ModuleProtocol):
     ) -> Dict[str, Any]:
         version = state.iteration_count + 1
 
-        if self.mode in {"llm", "direct", "api"} and self.client and state.top_hypotheses and state.research_plans:
-            try:
-                hypothesis = state.top_hypotheses[0]
-                plan = next(
-                    (p for p in state.research_plans if p.hypothesis_id == hypothesis.hypothesis_id),
-                    state.research_plans[0],
-                )
-                graph = state.evidence_graph
+        if self.client is None:
+            raise RuntimeError(
+                "M6 requires an LLM client — pass llm_config / set OPENAI_API_KEY."
+            )
 
-                # Separate "overall" — it is computed, not queried via LLM
-                specialist_dims = [d for d in self.reviewer_dims if d != "overall"]
-                new_reviews: List[ReviewResult] = []
+        # Nothing to review yet — just advance the iteration counter.
+        if not (state.top_hypotheses and state.research_plans):
+            return {"iteration_count": version}
 
-                for dim in specialist_dims:
-                    payload = await self.client.structured_chat(
-                        system_prompt=M6_REVIEWER_PROMPTS[dim],
-                        user_prompt=M6_USER_TEMPLATE.format(
-                            original_question=state.input_question,
-                            hypothesis_json=json.dumps(hypothesis.model_dump(mode="json"), ensure_ascii=False, indent=2),
-                            plan_json=json.dumps(plan.model_dump(mode="json"), ensure_ascii=False, indent=2),
-                            facts_count=len(graph.established_facts) if graph else 0,
-                            conflicts_count=len(graph.conflicts) if graph else 0,
-                            gaps_count=len(graph.knowledge_gaps) if graph else 0,
-                        ),
-                        output_schema=ReviewResult.model_json_schema(),
-                        max_tokens=8192,
-                        temperature=getattr(self.llm_config, "temperature", 0.1),
-                    )
-                    payload = dict(payload)
-                    payload["dimension"] = dim
-                    payload["version"] = version
-                    new_reviews.append(ReviewResult.model_validate(payload))
+        hypothesis = state.top_hypotheses[0]
+        plan = next(
+            (p for p in state.research_plans if p.hypothesis_id == hypothesis.hypothesis_id),
+            state.research_plans[0],
+        )
+        graph = state.evidence_graph
 
-                # Compute overall as average of specialist scores
-                if "overall" in self.reviewer_dims and specialist_dims:
-                    specialist_scores = [r.score for r in new_reviews if r.score > 0]
-                    avg = sum(specialist_scores) / len(specialist_scores) if specialist_scores else 3.0
-                    new_reviews.append(ReviewResult(
-                        dimension=ReviewerDimension("overall"),
-                        score=round(avg, 1),
-                        comments=f"Computed from specialist reviews (scientific_logic, evidence_consistency, method_feasibility).",
-                        suggestions="See individual dimension reviews for detailed suggestions.",
-                        version=version,
-                    ))
+        # Specialist reviewers (LLM); "overall" is computed, not queried.
+        specialist_dims = [d for d in self.reviewer_dims if d != "overall"]
+        new_reviews: List[ReviewResult] = []
 
-                return {
-                    "reviews": state.reviews + new_reviews,
-                    "iteration_count": version,
-                }
-            except Exception as exc:
-                logger.warning("M6 LLM mode failed; falling back to stub: %s", exc)
-
-        # ---- stub reviews for the top hypothesis ----
-        if state.top_hypotheses:
-            h = state.top_hypotheses[0]
-
-            # Simulate improving scores across iterations
-            base_scores: Dict[str, List[float]] = {
-                "scientific_logic":    [3.2, 3.8, 4.2],
-                "evidence_consistency": [3.5, 4.0, 4.3],
-                "method_feasibility":  [2.8, 3.5, 3.9],
-            }
-
-            comments: Dict[str, str] = {
-                "scientific_logic": (
-                    "因果链基本完整，但机制解释中的NAD+→Hsp70调控环节需更多直接证据支持。"
-                    if version < 3 else "因果链严密，逻辑连贯。"
+        for dim in specialist_dims:
+            # Anchor the score (rubric) and force reason-before-score, both
+            # sourced from the single rubric definition.
+            system_prompt = "\n\n".join(
+                p for p in (M6_REVIEWER_PROMPTS[dim], review_rubric_line(dim), M6_REASON_FIRST) if p
+            )
+            payload = await self.client.structured_chat(
+                system_prompt=system_prompt,
+                user_prompt=M6_USER_TEMPLATE.format(
+                    original_question=state.input_question,
+                    hypothesis_json=json.dumps(hypothesis.model_dump(mode="json"), ensure_ascii=False, indent=2),
+                    plan_json=json.dumps(plan.model_dump(mode="json"), ensure_ascii=False, indent=2),
+                    facts_count=len(graph.established_facts) if graph else 0,
+                    conflicts_count=len(graph.conflicts) if graph else 0,
+                    gaps_count=len(graph.knowledge_gaps) if graph else 0,
                 ),
-                "evidence_consistency": (
-                    "引用了关键文献，但忽略了部分关于Hsp70独立于NAD+功能的报道。"
-                    if version < 3 else "证据引用充分，冲突文献已被合理回应。"
-                ),
-                "method_feasibility": (
-                    "实验设计合理但样本量偏小，建议增加power analysis来论证n值。"
-                    if version < 3 else "方法设计完善，统计方案合理，可执行。"
-                ),
-            }
+                output_schema=ReviewResult.model_json_schema(),
+                max_tokens=8192,
+                temperature=getattr(self.llm_config, "temperature", 0.1),
+            )
+            payload = dict(payload)
+            payload["dimension"] = dim
+            payload["version"] = version
+            new_reviews.append(ReviewResult.model_validate(payload))
 
-            new_reviews: List[ReviewResult] = []
-            specialist_scores: List[float] = []
-            specialist_dims = [d for d in self.reviewer_dims if d != "overall"]
+        # Compute overall as the mean of the specialist scores.
+        if "overall" in self.reviewer_dims and new_reviews:
+            specialist_scores = [r.score for r in new_reviews if r.score > 0]
+            avg = sum(specialist_scores) / len(specialist_scores) if specialist_scores else 3.0
+            new_reviews.append(ReviewResult(
+                dimension=ReviewerDimension("overall"),
+                reasoning="Computed as the mean of the specialist reviews.",
+                score=round(avg, 1),
+                comments="Computed from specialist reviews (scientific_logic, evidence_consistency, method_feasibility).",
+                suggestions="See individual dimension reviews for detailed suggestions.",
+                version=version,
+            ))
 
-            for dim in specialist_dims:
-                scores = base_scores.get(dim, [3.0, 3.0, 3.0])
-                idx = min(version - 1, len(scores) - 1)
-                score = scores[idx]
-                specialist_scores.append(score)
-                new_reviews.append(ReviewResult(
-                    dimension=ReviewerDimension(dim),
-                    score=score,
-                    comments=comments.get(dim, "评审意见。"),
-                    suggestions=(
-                        "需要更充分的引用支持。"
-                        if version == 1 else "可接受。"
-                    ),
-                    version=version,
-                ))
-
-            # Compute overall as average of specialist scores
-            if "overall" in self.reviewer_dims and specialist_scores:
-                avg = sum(specialist_scores) / len(specialist_scores)
-                new_reviews.append(ReviewResult(
-                    dimension=ReviewerDimension("overall"),
-                    score=round(avg, 1),
-                    comments=f"Computed from specialist reviews.",
-                    suggestions="See individual dimension reviews for detailed suggestions.",
-                    version=version,
-                ))
-
-            return {
-                "reviews": state.reviews + new_reviews,
-                "iteration_count": version,
-            }
-
-        # No hypotheses to review — just bump the counter
         return {
+            "reviews": state.reviews + new_reviews,
             "iteration_count": version,
         }
 

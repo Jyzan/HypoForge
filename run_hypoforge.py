@@ -70,6 +70,11 @@ def main():
         action="store_true",
         help="Suppress Rich terminal output.",
     )
+    parser.add_argument(
+        "--no-interactive",
+        action="store_true",
+        help="Do not pause for human guidance between iterations.",
+    )
 
     args = parser.parse_args()
 
@@ -100,9 +105,12 @@ def main():
     # ---- override output dir ----
     config.output_dir = args.output_dir
 
-    # ---- override verbose ----
+    # ---- override verbose / interactivity ----
     if args.quiet:
         config.verbose = False
+        config.interactive = False
+    else:
+        config.interactive = not args.no_interactive
 
     # ---- run ----
     from hypoforge.pipeline import PipelineRunner

@@ -6,6 +6,7 @@ import re
 from typing import Any, Dict, List
 
 from rich.panel import Panel
+from rich.padding import Padding
 from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
@@ -63,6 +64,29 @@ def _numbered_lines(value: Any) -> str:
     return "\n".join(part.strip() for part in parts if part.strip())
 
 
+def _split_numbered(value: Any) -> List[tuple] | None:
+    """Parse an inline numbered list into ``(marker, body)`` pairs.
+
+    Markers are normalised to ``"N."`` form (so a model that writes ``1)`` and
+    one that writes ``1.`` render identically).  Returns ``None`` when *value*
+    contains no numbered markers (i.e. it is prose that should render inline).
+    """
+    text = _single_line(value)
+    if not text:
+        return None
+    parts = [p.strip() for p in re.split(r"\s+(?=\d+[.)]\s)", text) if p.strip()]
+    items: List[tuple] = []
+    for part in parts:
+        match = re.match(r"(\d+)[.)]\s*(.*)", part)
+        if match:
+            items.append((f"{match.group(1)}.", match.group(2).strip()))
+        else:
+            # Text before the first marker (a preamble) — keep it, unmarked.
+            items.append((None, part))
+    has_marker = any(marker is not None for marker, _ in items)
+    return items if has_marker else None
+
+
 def _preview_text(value: Any, limit: int = 64) -> str:
     """Keep dense M5 table cells readable without another LLM call."""
     text = _single_line(value)
@@ -111,7 +135,7 @@ def _timeline_text(value: Any) -> Text:
             result.append("\n")
         match = re.match(r"((?:Months?|Weeks?|Days?)\s+[\w\-–—]+\s*:)(.*)", phase)
         if match:
-            result.append(match.group(1), style=f"bold {COLORS['primary']}")
+            result.append(match.group(1), style="bold white")
             result.append(f" {match.group(2).strip()}")
         else:
             result.append(phase)
@@ -155,10 +179,19 @@ def render_problem_card(card: ProblemCard) -> None:
     """Print the structured problem decomposition."""
     console.print(f"  [{COLORS['muted']}]Domain:[/] {', '.join(card.domain)}")
     console.print(f"  [{COLORS['muted']}]Sub-questions:[/] {len(card.sub_questions)}")
+    sub_question_table = Table(
+        box=None,
+        show_header=False,
+        show_edge=False,
+        pad_edge=False,
+        padding=(0, 1, 0, 0),
+    )
+    sub_question_table.add_column(justify="right", no_wrap=True)
+    sub_question_table.add_column(overflow="fold")
     for i, sq in enumerate(card.sub_questions, 1):
-        # Let the terminal handle visual wrapping so Rich does not split the
-        # numbered prefix from a long CJK question.
-        console.print(f"    {i}. {_single_line(sq)}", soft_wrap=True)
+        sub_question_table.add_row(f"{i}.", _single_line(sq))
+    if card.sub_questions:
+        console.print(Padding(sub_question_table, (0, 0, 0, 4)))
     console.print(f"  [{COLORS['muted']}]Key entities:[/] {', '.join(card.key_entities)}")
     console.print(f"  [{COLORS['muted']}]Question type:[/] {card.question_type.value}")
 
@@ -331,14 +364,19 @@ def render_evidence_summary(graph: EvidenceGraph, state: PipelineState | None = 
         console.print(f"  [bold {color}]{label}[/bold {color}]")
         for eid in ids[:max_show]:
             content = _lookup_entry_content(eid, state)
-            line_limit = max(60, console.width - 2)
-            line = _preview_text(f"{eid} {_single_line(content)}", line_limit)
-            row = Text()
-            row.append(line.split(" ", 1)[0], style=COLORS["muted"])
-            row.append(line[len(line.split(" ", 1)[0]):])
-            console.print(row, soft_wrap=True)
+            # Keep each evidence preview on one terminal line.  Category labels
+            # start at two spaces; entries sit one indentation level beneath
+            # them and Rich replaces overflow with an ellipsis.
+            row = Text(no_wrap=True, overflow="ellipsis")
+            row.append("    ")
+            row.append(_single_line(eid), style=COLORS["muted"])
+            row.append(" ")
+            row.append(_single_line(content))
+            console.print(row, no_wrap=True, overflow="ellipsis")
         if len(ids) > max_show:
-            console.print(f"[{COLORS['muted']}]... and {len(ids) - max_show} more[/{COLORS['muted']}]")
+            console.print(
+                f"    [{COLORS['muted']}]... and {len(ids) - max_show} more[/{COLORS['muted']}]"
+            )
         console.print()
 
 
@@ -456,10 +494,10 @@ def render_research_plan(plan: ResearchPlan) -> None:
 
     # ── Overview ──
     overview = Text()
-    overview.append("Subjects\n", style="bold")
+    overview.append("Subjects\n", style=f"bold {COLORS['primary']}")
     overview.append(f"  {_single_line(plan.study_subjects)}")
     overview.append("\n\n")
-    overview.append("Timeline\n", style="bold")
+    overview.append("Timeline\n", style=f"bold {COLORS['primary']}")
     timeline = _timeline_text(plan.timeline)
     for index, phase in enumerate(timeline.split("\n")):
         if index:
@@ -470,24 +508,37 @@ def render_research_plan(plan: ResearchPlan) -> None:
                           box=box.ROUNDED, padding=(1, 2)))
 
     # ── Variables & Controls ──
-    var_table = Table(
-        box=box.SIMPLE,
-        show_header=True,
-        header_style=f"bold {COLORS['highlight']}",
-    )
-    var_table.add_column("Independent", style="white")
-    var_table.add_column("Dependent", style="white")
-    var_table.add_column("Controls", style="white")
-    max_rows = max(len(plan.independent_variables), len(plan.dependent_variables),
-                   len(plan.control_groups))
-    for i in range(max_rows):
-        var_table.add_row(
-            plan.independent_variables[i] if i < len(plan.independent_variables) else "",
-            plan.dependent_variables[i] if i < len(plan.dependent_variables) else "",
-            plan.control_groups[i] if i < len(plan.control_groups) else "",
-        )
-    sections.append(Panel(var_table, title="Variables & Controls", border_style=COLORS["highlight"],
-                          box=box.ROUNDED, padding=(1, 2)))
+    # A vertical layout gives long experimental variables the full panel width
+    # instead of forcing them into three narrow, heavily wrapped columns.
+    variable_groups = [
+        ("Independent", plan.independent_variables),
+        ("Dependent", plan.dependent_variables),
+        ("Controls", plan.control_groups),
+    ]
+    variable_renderables: List[Any] = []
+    for group_index, (label, values) in enumerate(variable_groups):
+        block = Text()
+        block.append(label, style=f"bold {COLORS['highlight']}")
+        block.append("\n")
+        if values:
+            for item_index, value in enumerate(values, 1):
+                if item_index > 1:
+                    block.append("\n")
+                block.append(f"  {item_index}. ", style=f"bold {COLORS['highlight']}")
+                block.append(_single_line(value), style="white")
+        else:
+            block.append("  -", style=COLORS["muted"])
+        variable_renderables.append(block)
+        if group_index < len(variable_groups) - 1:
+            variable_renderables.append(Rule(style="white", characters="─"))
+
+    sections.append(Panel(
+        Group(*variable_renderables),
+        title="Variables & Controls",
+        border_style=COLORS["highlight"],
+        box=box.ROUNDED,
+        padding=(1, 2),
+    ))
 
     # ── Procedures ──
     proc_text = Text()
@@ -507,9 +558,19 @@ def render_research_plan(plan: ResearchPlan) -> None:
     ma_table.add_column("Analysis Methods", style="white", no_wrap=True, overflow="ellipsis")
     max_ma = max(len(plan.measurement_metrics), len(plan.analysis_methods))
     for i in range(max_ma):
+        metric_cell = Text()
+        if i < len(plan.measurement_metrics):
+            metric_cell.append(f"{i + 1}. ", style=f"bold {COLORS['info']}")
+            metric_cell.append(_metric_label(plan.measurement_metrics[i]), style="white")
+
+        analysis_cell = Text()
+        if i < len(plan.analysis_methods):
+            analysis_cell.append(f"{i + 1}. ", style=f"bold {COLORS['info']}")
+            analysis_cell.append(_preview_text(plan.analysis_methods[i]), style="white")
+
         ma_table.add_row(
-            _metric_label(plan.measurement_metrics[i]) if i < len(plan.measurement_metrics) else "",
-            _preview_text(plan.analysis_methods[i]) if i < len(plan.analysis_methods) else "",
+            metric_cell,
+            analysis_cell,
         )
     sections.append(Panel(ma_table, title="Metrics & Analysis", border_style=COLORS["primary"],
                           box=box.ROUNDED, padding=(1, 2)))
@@ -527,16 +588,26 @@ def render_research_plan(plan: ResearchPlan) -> None:
 
     # ── Risks ──
     if plan.risks_and_alternatives:
-        risk_text = Text()
-        for line in _numbered_lines(plan.risks_and_alternatives).splitlines():
-            match = re.match(r"(\d+[.)])\s*(.*)", line)
-            if match:
-                risk_text.append(f"  {match.group(1)} ", style=f"bold {COLORS['warning']}")
-                risk_text.append(f"{match.group(2)}\n")
-            else:
-                risk_text.append(f"  {line}\n")
-        sections.append(Panel(risk_text, title="Risks & Alternatives",
-                              border_style=COLORS["warning"], box=box.ROUNDED, padding=(1, 2)))
+        parsed_risks = _split_numbered(plan.risks_and_alternatives)
+        risk_items = (
+            [body for _, body in parsed_risks]
+            if parsed_risks
+            else [_single_line(plan.risks_and_alternatives)]
+        )
+        risk_renderables: List[Any] = []
+        for index, risk in enumerate(risk_items, 1):
+            item = Text()
+            item.append(f"{index}. ", style=f"bold {COLORS['warning']}")
+            item.append(_single_line(risk), style="white")
+            risk_renderables.append(item)
+
+        sections.append(Panel(
+            Group(*risk_renderables),
+            title="Risks & Alternatives",
+            border_style=COLORS["warning"],
+            box=box.ROUNDED,
+            padding=(1, 2),
+        ))
 
     # ── Assemble ──
     console.print(
@@ -650,6 +721,69 @@ def render_iteration_comparison(reviews: List[ReviewResult]) -> None:
     console.print(table)
 
 
+def render_guidance_prompt(iteration: int) -> None:
+    """Render the Claude-Code-style cue that asks the user for revision guidance.
+
+    Prints the visual cue only; the caller performs the blocking ``input()``
+    (I/O is kept out of the display layer).  Shared by M4's interactive step and
+    the M6 preview harness so the on-screen prompt is tuned in exactly one place.
+    """
+    hint = Text()
+    hint.append("Guide the next M4 revision — e.g. ", style=COLORS["muted"])
+    hint.append('"focus on the mechanism"', style="italic")
+    hint.append(".\n", style=COLORS["muted"])
+    hint.append("Press ", style=COLORS["muted"])
+    hint.append("Enter", style=f"bold {COLORS['primary']}")
+    hint.append(" to skip.", style=COLORS["muted"])
+    console.print()
+    console.print(Panel(
+        hint,
+        title=f"[bold {COLORS['highlight']}]Your guidance · iteration {iteration}",
+        border_style=COLORS["highlight"],
+        box=box.ROUNDED,
+        padding=(0, 2),
+    ))
+
+
+def _labelled_block(label: str, body: Any, *, indent: int = 4) -> None:
+    """Print ``<label>: <body>`` with wrapped lines left-aligned under the label.
+
+    A uniform *indent* means a continuation line sits directly below the label
+    word rather than jumping back to column 0.
+    """
+    text = Text()
+    text.append(f"{label}: ", style="bold")
+    text.append(_single_line(body))
+    console.print(Padding(text, (0, 0, 0, indent)))
+
+
+def _numbered_block(label: str, items: List[tuple], *, indent: int = 4) -> None:
+    """Print a bold *label* then a numbered list.
+
+    Each marker sits at *indent* (aligned under the label) while wrapped body
+    lines hang under the item's own text — achieved with a borderless two-column
+    table so CJK width is measured correctly.
+    """
+    console.print(Padding(Text(f"{label}:", style="bold"), (0, 0, 0, indent)))
+    table = Table(
+        box=None,
+        show_header=False,
+        show_edge=False,
+        pad_edge=False,
+        padding=(0, 1, 0, 0),
+    )
+    table.add_column(justify="left", no_wrap=True, style="bold")
+    table.add_column(overflow="fold")
+    for marker, body in items:
+        table.add_row(marker or "", Text(_single_line(body)))
+    console.print(Padding(table, (0, 0, 0, indent)))
+
+
+def _review_block_separator(*, indent: int = 4) -> None:
+    """Separate M6 detail blocks with an indented white horizontal rule."""
+    console.print(Padding(Rule(style="white", characters="─"), (0, 0, 0, indent)))
+
+
 def _render_m6_reviews(reviews: List[ReviewResult]) -> None:
     """Print review results as a Rich table with colour-coded scores."""
     if not reviews:
@@ -690,12 +824,21 @@ def _render_m6_reviews(reviews: List[ReviewResult]) -> None:
     for review in latest_reviews:
         console.print()
         console.print(f"  [bold {COLORS['primary']}]{review.dimension.value}[/bold {COLORS['primary']}]")
-        console.print(f"    [bold]Assessment:[/bold] {_single_line(review.comments)}")
+        if review.reasoning:
+            _labelled_block("Reasoning", review.reasoning)
+            _review_block_separator()
+        _labelled_block("Assessment", review.comments)
         if review.suggestions:
-            formatted = _numbered_lines(review.suggestions)
-            console.print("    [bold]Suggestions:[/bold]")
-            for line in formatted.splitlines():
-                console.print(f"      {line}")
+            _review_block_separator()
+            # "overall" is a summary line whose Reasoning / Assessment do not
+            # wrap onto their own lines, so render its suggestion inline to match.
+            # Specialist reviews carry a numbered list → hanging-indent block.
+            is_overall = review.dimension.value == "overall"
+            items = None if is_overall else _split_numbered(review.suggestions)
+            if items:
+                _numbered_block("Suggestions", items)
+            else:
+                _labelled_block("Suggestions", review.suggestions)
     console.print()
 
 

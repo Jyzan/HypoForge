@@ -8,6 +8,8 @@ Examples:
     python scripts/preview_terminal.py
     python scripts/preview_terminal.py --width 80
     python scripts/preview_terminal.py --section m5
+    python scripts/preview_terminal.py --section m6
+    python scripts/preview_terminal.py --section m6 --no-input
 """
 
 from __future__ import annotations
@@ -345,6 +347,34 @@ def render_section(section: str) -> None:
         panels.render_phase_done(name)
 
 
+def preview_m6_guidance(*, no_input: bool = False) -> None:
+    """Preview the real human-guidance prompt and optionally wait for input."""
+    reviews = sample_reviews()
+    latest_iteration = max((review.version for review in reviews), default=1)
+    muted = panels.COLORS["muted"]
+
+    panels.render_guidance_prompt(latest_iteration)
+    if no_input:
+        panels.console.print(f"  [{muted}](--no-input: skipping stdin)[/{muted}]")
+        return
+
+    try:
+        guidance = input("  > ").strip()
+    except (EOFError, KeyboardInterrupt):
+        guidance = ""
+
+    if guidance:
+        panels.console.print(
+            f"\n  [{panels.COLORS['success']}]Captured -> M4 revision context:"
+            f"[/{panels.COLORS['success']}] {guidance}"
+        )
+    else:
+        panels.console.print(
+            f"\n  [{muted}]No guidance entered (Enter = skip); "
+            f"M4 would revise from the reviews alone.[/{muted}]"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Preview HypoForge terminal output without running the pipeline.")
     parser.add_argument("--width", type=int, default=100, help="Simulated terminal width, default: 100")
@@ -353,6 +383,11 @@ def main() -> None:
         choices=["all", "m1", "m2", "m3", "m4", "m5", "m6"],
         default="all",
         help="Preview one module or all modules, default: all",
+    )
+    parser.add_argument(
+        "--no-input",
+        action="store_true",
+        help="When previewing only M6, show the guidance prompt without blocking for input.",
     )
     args = parser.parse_args()
 
@@ -367,6 +402,8 @@ def main() -> None:
         legacy_windows=False,
     )
     render_section(args.section)
+    if args.section == "m6":
+        preview_m6_guidance(no_input=args.no_input)
 
 
 if __name__ == "__main__":
