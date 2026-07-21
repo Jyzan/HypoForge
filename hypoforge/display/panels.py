@@ -635,6 +635,7 @@ def render_research_plan(plan: ResearchPlan) -> None:
         box=box.SIMPLE,
         show_header=True,
         header_style=f"bold {COLORS['primary']}",
+        border_style=COLORS["primary"],
     )
     ma_table.add_column("Metrics", style="white", no_wrap=True, overflow="ellipsis")
     ma_table.add_column("Analysis Methods", style="white", no_wrap=True, overflow="ellipsis")
@@ -642,12 +643,12 @@ def render_research_plan(plan: ResearchPlan) -> None:
     for i in range(max_ma):
         metric_cell = Text()
         if i < len(plan.measurement_metrics):
-            metric_cell.append(f"{i + 1}. ", style=f"bold {COLORS['info']}")
+            metric_cell.append(f"{i + 1}. ", style=f"bold {COLORS['primary']}")
             metric_cell.append(_metric_label(plan.measurement_metrics[i]), style="white")
 
         analysis_cell = Text()
         if i < len(plan.analysis_methods):
-            analysis_cell.append(f"{i + 1}. ", style=f"bold {COLORS['info']}")
+            analysis_cell.append(f"{i + 1}. ", style=f"bold {COLORS['primary']}")
             analysis_cell.append(_preview_text(plan.analysis_methods[i]), style="white")
 
         ma_table.add_row(
