@@ -139,12 +139,30 @@ class M4HypothesisGeneration(ModuleProtocol):
         if not self.interactive or not sys.stdin.isatty():
             return ""
         try:
-            from ..display.panels import render_guidance_prompt
+            from ..display.panels import render_guidance_prompt, render_guidance_result
             render_guidance_prompt(state.iteration_count)
             text = await asyncio.to_thread(input, "  > ")
         except (EOFError, KeyboardInterrupt):
             return ""
-        return text.strip()
+        guidance = text.strip()
+        render_guidance_result(guidance)
+        return guidance
+
+    async def collect_user_guidance(self, state: PipelineState) -> Dict[str, Any]:
+        """Collect the next revision instruction before the M4 header renders.
+
+        ``PipelineRunner`` calls this pre-phase hook before printing the M4
+        phase header.  Returning a state patch keeps the captured instruction
+        in the normal LangGraph state flow and checkpoint output.
+        """
+        if state.iteration_count <= 0:
+            return {}
+        extra = await self._prompt_user_guidance(state)
+        if not extra:
+            return {}
+        guidance = list(state.user_guidance)
+        guidance.append(f"[iter {state.iteration_count}] {extra}")
+        return {"user_guidance": guidance}
 
     def _build_feedback_context(self, state: PipelineState, guidance: List[str]) -> str:
         """Assemble reviewer feedback + prior hypotheses + human guidance into a
@@ -435,13 +453,10 @@ class M4HypothesisGeneration(ModuleProtocol):
                 "M4 requires an LLM client — pass llm_config / set OPENAI_API_KEY."
             )
 
-        # On revision rounds, optionally gather human guidance (Claude-Code-style)
-        # and fold it — plus the latest reviewer feedback — into the generator.
+        # PipelineRunner collects optional human guidance before rendering the
+        # M4 phase header.  Fold that state — plus reviewer feedback — into the
+        # generator here.
         guidance = list(state.user_guidance)
-        if state.iteration_count > 0:
-            extra = await self._prompt_user_guidance(state)
-            if extra:
-                guidance.append(f"[iter {state.iteration_count}] {extra}")
         feedback_context = self._build_feedback_context(state, guidance)
 
         result = await self._run_llm(state, feedback_context)

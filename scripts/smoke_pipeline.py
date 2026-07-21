@@ -11,9 +11,11 @@ It still calls Qwen at every LLM stage (M1–M6); it just shrinks the workload:
     M3  → LLM edges, 1 small batch, no bridges (enable_cross_batch=False)
     M4  → 2 candidates, keep top 1          (num_candidates=2, top_k=1)
     M5  → 1 plan (top_k=1)
-    M6  → 3 specialist reviews, NO iteration (enable_iteration=False)
+    M6  → 3 specialist reviews, then one real feedback revision through M4
 
-Total ≈ 8–9 LLM calls instead of the dozens a full run makes.
+By default the smoke run performs one M6 → guidance → M4 → M5 → M6 loop so
+the human-feedback path is exercised rather than merely previewed.  Use
+``--no-feedback-round`` when only the shortest single-pass smoke is needed.
 
 Requires ``OPENAI_API_KEY`` (see ``.env_template``).
 
@@ -22,6 +24,7 @@ Usage::
     python scripts/smoke_pipeline.py
     python scripts/smoke_pipeline.py -q "衰老的生物学基础是什么？"
     python scripts/smoke_pipeline.py --m4-mode multi_agent   # also exercise the ranker
+    python scripts/smoke_pipeline.py --no-feedback-round     # shortest single pass
 """
 
 from __future__ import annotations
@@ -38,7 +41,11 @@ from hypoforge.config import ModuleOverride, PipelineConfig
 from hypoforge.pipeline import PipelineRunner
 
 
-def build_fast_config(base_config: str, m4_mode: str = "direct") -> PipelineConfig:
+def build_fast_config(
+    base_config: str,
+    m4_mode: str = "direct",
+    feedback_round: bool = True,
+) -> PipelineConfig:
     """Load *base_config* and apply the fast-smoke simplification knobs.
 
     Kept separate from the run so the wiring can be inspected/tested without
@@ -46,10 +53,14 @@ def build_fast_config(base_config: str, m4_mode: str = "direct") -> PipelineConf
     """
     config = PipelineConfig.from_yaml(base_config)
 
-    # No iteration loop (the single biggest time saver) and no stdin prompts.
-    config.enable_iteration = False
-    config.max_iterations = 1
-    config.interactive = False
+    # Exercise one real feedback loop by default.  A threshold above M6's
+    # maximum score guarantees that the first review reaches M4, where the
+    # user can enter guidance before the revision is generated.
+    config.enable_iteration = feedback_round
+    config.max_iterations = 2 if feedback_round else 1
+    config.interactive = feedback_round
+    if feedback_round:
+        config.scoring.review_threshold = 5.1
 
     def _fast(name: str, **kw) -> None:
         override = config.module_overrides.get(name) or ModuleOverride()
@@ -84,9 +95,18 @@ async def _main() -> int:
     parser.add_argument("--run-id", default="smoke")
     parser.add_argument("--m4-mode", default="direct", choices=["direct", "multi_agent"],
                         help="'direct' = generator only (fastest); 'multi_agent' also runs the ranker.")
+    parser.add_argument(
+        "--no-feedback-round",
+        action="store_true",
+        help="Skip the M6-to-M4 feedback revision and run a single pass.",
+    )
     args = parser.parse_args()
 
-    config = build_fast_config(args.config, m4_mode=args.m4_mode)
+    config = build_fast_config(
+        args.config,
+        m4_mode=args.m4_mode,
+        feedback_round=not args.no_feedback_round,
+    )
     runner = PipelineRunner(config)
 
     started = time.perf_counter()

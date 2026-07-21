@@ -87,10 +87,87 @@ def _split_numbered(value: Any) -> List[tuple] | None:
     return items if has_marker else None
 
 
+def _split_risks_and_alternatives(value: Any) -> tuple[List[str], List[str]]:
+    """Extract repeated ``Risk:`` / ``Alternative:`` pairs from model prose.
+
+    Models often number only the first pair and then emit one continuous string,
+    for example ``1. Risk: ... Alternative: ... Risk: ... Alternative: ...``.
+    Number-only parsing treats that as one item, so use the semantic labels as
+    the primary delimiters and fall back to a conventional numbered list.
+    """
+    text = _single_line(value)
+    if not text:
+        return [], []
+
+    label_pattern = re.compile(
+        r"(?i)(?<!\S)(?:\d+[.)]\s*)?(risks?|alternatives?)\s*(?:#?\d+)?\s*:\s*"
+    )
+    matches = list(label_pattern.finditer(text))
+    risks: List[str] = []
+    alternatives: List[str] = []
+
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        body = text[match.end():end].strip(" \t\r\n-;|\u2502")
+        if not body:
+            continue
+        label = match.group(1).lower()
+        if label.startswith("risk"):
+            risks.append(body)
+        else:
+            alternatives.append(body)
+
+    if risks or alternatives:
+        return risks, alternatives
+
+    parsed = _split_numbered(text)
+    if parsed:
+        return [body for _, body in parsed if body], []
+    return [text], []
+
+
 def _preview_text(value: Any, limit: int = 64) -> str:
     """Keep dense M5 table cells readable without another LLM call."""
     text = _single_line(value)
     return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
+
+
+def _labelled_wrapped_table(label: str, value: Any) -> Table:
+    """Return a label/value row whose wrapped lines use a hanging indent."""
+    table = Table(
+        box=None,
+        show_header=False,
+        show_edge=False,
+        pad_edge=False,
+        padding=(0, 1, 0, 0),
+        expand=True,
+    )
+    table.add_column(style=COLORS["muted"], no_wrap=True)
+    table.add_column(overflow="fold", ratio=1)
+    table.add_row(label, _single_line(value))
+    return table
+
+
+def _numbered_wrapped_table(
+    items: List[str],
+    *,
+    marker_style: str,
+    body_style: str = "white",
+) -> Table:
+    """Return a numbered list whose continuation lines align with the body."""
+    table = Table(
+        box=None,
+        show_header=False,
+        show_edge=False,
+        pad_edge=False,
+        padding=(0, 1, 0, 0),
+        expand=True,
+    )
+    table.add_column(justify="right", no_wrap=True, style=marker_style)
+    table.add_column(overflow="fold", ratio=1, style=body_style)
+    for index, body in enumerate(items, 1):
+        table.add_row(f"{index}.", _single_line(body))
+    return table
 
 
 def _preview_cell(value: Any, limit: int) -> Text:
@@ -192,7 +269,10 @@ def render_problem_card(card: ProblemCard) -> None:
         sub_question_table.add_row(f"{i}.", _single_line(sq))
     if card.sub_questions:
         console.print(Padding(sub_question_table, (0, 0, 0, 4)))
-    console.print(f"  [{COLORS['muted']}]Key entities:[/] {', '.join(card.key_entities)}")
+    console.print(Padding(
+        _labelled_wrapped_table("Key entities:", ", ".join(card.key_entities)),
+        (0, 0, 0, 2),
+    ))
     console.print(f"  [{COLORS['muted']}]Question type:[/] {card.question_type.value}")
 
 
@@ -530,7 +610,9 @@ def render_research_plan(plan: ResearchPlan) -> None:
             block.append("  -", style=COLORS["muted"])
         variable_renderables.append(block)
         if group_index < len(variable_groups) - 1:
-            variable_renderables.append(Rule(style="white", characters="─"))
+            variable_renderables.append(
+                Rule(style=COLORS["highlight"], characters="─")
+            )
 
     sections.append(Panel(
         Group(*variable_renderables),
@@ -588,18 +670,28 @@ def render_research_plan(plan: ResearchPlan) -> None:
 
     # ── Risks ──
     if plan.risks_and_alternatives:
-        parsed_risks = _split_numbered(plan.risks_and_alternatives)
-        risk_items = (
-            [body for _, body in parsed_risks]
-            if parsed_risks
-            else [_single_line(plan.risks_and_alternatives)]
+        risk_items, alternative_items = _split_risks_and_alternatives(
+            plan.risks_and_alternatives
         )
         risk_renderables: List[Any] = []
-        for index, risk in enumerate(risk_items, 1):
-            item = Text()
-            item.append(f"{index}. ", style=f"bold {COLORS['warning']}")
-            item.append(_single_line(risk), style="white")
-            risk_renderables.append(item)
+
+        def append_warning_list(label: str, items: List[str]) -> None:
+            risk_renderables.append(Text(label, style=f"bold {COLORS['warning']}"))
+            if not items:
+                risk_renderables.append(Text("  -", style=COLORS["muted"]))
+                return
+            risk_renderables.append(Padding(
+                _numbered_wrapped_table(
+                    items,
+                    marker_style=f"bold {COLORS['warning']}",
+                ),
+                (0, 0, 0, 2),
+            ))
+
+        append_warning_list("Risk", risk_items)
+        if alternative_items:
+            risk_renderables.append(Rule(style=COLORS["warning"], characters="─"))
+            append_warning_list("Alternative", alternative_items)
 
         sections.append(Panel(
             Group(*risk_renderables),
@@ -743,6 +835,21 @@ def render_guidance_prompt(iteration: int) -> None:
         box=box.ROUNDED,
         padding=(0, 2),
     ))
+
+
+def render_guidance_result(guidance: str) -> None:
+    """Confirm whether typed guidance will be sent to the M4 revision."""
+    guidance = _single_line(guidance)
+    if guidance:
+        console.print(
+            f"\n  [{COLORS['success']}]Captured → M4 revision context:"
+            f"[/{COLORS['success']}] {guidance}"
+        )
+        return
+    console.print(
+        f"\n  [{COLORS['muted']}]No guidance entered (Enter = skip); "
+        f"M4 will revise from the reviews alone.[/{COLORS['muted']}]"
+    )
 
 
 def _labelled_block(label: str, body: Any, *, indent: int = 4) -> None:

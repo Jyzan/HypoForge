@@ -36,6 +36,10 @@ the following elements:
 
 11. **Risks & alternatives** — technical risks, sample risks, fallback approaches.
 
+For the ``risks_and_alternatives`` string, provide 3-6 paired items using
+repeated explicit labels: ``Risk: ... Alternative: ...``.  Keep every risk
+and its corresponding fallback concise; do not return an unlabeled paragraph.
+
 Conciseness requirements:
 - Keep each measurement metric to one concise sentence of at most 18 words.
 - Keep each analysis method to one concise sentence of at most 22 words.

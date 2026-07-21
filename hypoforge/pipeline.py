@@ -172,16 +172,41 @@ class PipelineRunner:
                     )
                 return {}
 
-            if self.config.verbose:
-                render_phase_header(name, mod.description)
-
             try:
+                # M4 collects interactive revision guidance before its phase
+                # header, so the UI reads: guidance -> M4 -> revised output.
+                pre_header_patch: Dict[str, Any] = {}
+                collect_guidance = getattr(mod, "collect_user_guidance", None)
+                if callable(collect_guidance):
+                    collected = await collect_guidance(state)
+                    if collected is not None:
+                        if not isinstance(collected, dict):
+                            raise TypeError(
+                                f"Module {name} collect_user_guidance must return a dict patch"
+                            )
+                        unknown = set(collected) - set(PipelineState.model_fields)
+                        if unknown:
+                            raise ValueError(
+                                f"Module {name} collect_user_guidance returned unknown "
+                                f"state fields: {sorted(unknown)}"
+                            )
+                        pre_header_patch.update(collected)
+
+                state_before_hooks_dict = state.model_dump(mode="python")
+                state_before_hooks_dict.update(pre_header_patch)
+                state_before_hooks = PipelineState(**state_before_hooks_dict)
+
+                if self.config.verbose:
+                    render_phase_header(name, mod.description)
+
                 # --- before hooks ---
                 before_patches: Dict = {}
                 for skill in enabled_skills:
-                    before_patches.update(await run_hook(skill, "before", name, state))
+                    before_patches.update(
+                        await run_hook(skill, "before", name, state_before_hooks)
+                    )
 
-                state_for_module_dict = state.model_dump(mode="python")
+                state_for_module_dict = state_before_hooks.model_dump(mode="python")
                 state_for_module_dict.update(before_patches)
                 state_for_module = PipelineState(**state_for_module_dict)
 
@@ -220,7 +245,12 @@ class PipelineRunner:
                     after_patches.update(patch)
 
                 # Merge all patches into the result
-                final = {**before_patches, **result, **after_patches}
+                final = {
+                    **pre_header_patch,
+                    **before_patches,
+                    **result,
+                    **after_patches,
+                }
 
                 if self.config.verbose:
                     render_module_result(name, state, final)

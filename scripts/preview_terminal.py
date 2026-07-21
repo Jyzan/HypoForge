@@ -6,6 +6,7 @@ perform literature searches, or run the LangGraph pipeline.
 
 Examples:
     python scripts/preview_terminal.py
+    python scripts/preview_terminal.py --no-input
     python scripts/preview_terminal.py --width 80
     python scripts/preview_terminal.py --section m5
     python scripts/preview_terminal.py --section m6
@@ -257,7 +258,16 @@ def sample_plans() -> list[ResearchPlan]:
             expected_results_if_supported="Sequential immunization increases the abundance and breadth of Env-specific bNAb lineages.",
             expected_results_if_refuted="No group shows improved precursor maturation or neutralization breadth over controls.",
             timeline="Months 1-3: immunogen design and pilot production; Months 4-9: immunization and sample collection; Months 10-12: neutralization assays and analysis",
-            risks_and_alternatives="1. If precursor frequencies are too low, enrich the starting B-cell population and validate in a second model. 2. If Env probes show nonspecific binding, repeat validation with orthogonal reagents. 3. If neutralization throughput is limiting, use a representative tier-2 panel. 4. If mRNA-LNP optimization is delayed, extend the pilot phase before the main study.",
+            risks_and_alternatives=(
+                "Risk: Precursor frequencies may be too low for reliable lineage tracking. "
+                "Alternative: Enrich the starting B-cell population and validate in a second model. "
+                "Risk: Env probes may show nonspecific binding. "
+                "Alternative: Repeat validation with orthogonal probes and competition controls. "
+                "Risk: Neutralization testing may exceed the available assay throughput. "
+                "Alternative: Use a representative tier-2 panel before expanding the screen. "
+                "Risk: mRNA-LNP optimization may delay the main study. "
+                "Alternative: Extend the pilot phase and retain a validated protein-immunogen fallback."
+            ),
         )
     ]
 
@@ -347,32 +357,36 @@ def render_section(section: str) -> None:
         panels.render_phase_done(name)
 
 
-def preview_m6_guidance(*, no_input: bool = False) -> None:
+def preview_m6_guidance(*, no_input: bool = False) -> str:
     """Preview the real human-guidance prompt and optionally wait for input."""
     reviews = sample_reviews()
     latest_iteration = max((review.version for review in reviews), default=1)
-    muted = panels.COLORS["muted"]
-
     panels.render_guidance_prompt(latest_iteration)
     if no_input:
+        muted = panels.COLORS["muted"]
         panels.console.print(f"  [{muted}](--no-input: skipping stdin)[/{muted}]")
-        return
+        return ""
 
     try:
         guidance = input("  > ").strip()
     except (EOFError, KeyboardInterrupt):
         guidance = ""
 
-    if guidance:
-        panels.console.print(
-            f"\n  [{panels.COLORS['success']}]Captured -> M4 revision context:"
-            f"[/{panels.COLORS['success']}] {guidance}"
-        )
-    else:
-        panels.console.print(
-            f"\n  [{muted}]No guidance entered (Enter = skip); "
-            f"M4 would revise from the reviews alone.[/{muted}]"
-        )
+    panels.render_guidance_result(guidance)
+    return guidance
+
+
+def preview_m4_revision() -> None:
+    """Show the M4 phase that follows the guidance interaction."""
+    hypotheses = sample_hypotheses()
+    panels.render_phase_header("m4", "Terminal preview for M4 revision")
+    panels.render_hypotheses_summary(
+        len(hypotheses),
+        len(hypotheses),
+        len(hypotheses),
+        hypotheses,
+    )
+    panels.render_phase_done("m4")
 
 
 def main() -> None:
@@ -387,7 +401,7 @@ def main() -> None:
     parser.add_argument(
         "--no-input",
         action="store_true",
-        help="When previewing only M6, show the guidance prompt without blocking for input.",
+        help="Show the guidance UI without blocking for input in all/M6 previews.",
     )
     args = parser.parse_args()
 
@@ -402,8 +416,10 @@ def main() -> None:
         legacy_windows=False,
     )
     render_section(args.section)
-    if args.section == "m6":
+    if args.section in {"all", "m6"}:
         preview_m6_guidance(no_input=args.no_input)
+    if args.section == "all":
+        preview_m4_revision()
 
 
 if __name__ == "__main__":
