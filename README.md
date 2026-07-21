@@ -171,10 +171,10 @@ M1 → M2 → M3 → M4 → M5 → M6 → (loop to M4)
 
 ```bash
 # pytest 模式
-python -m pytest scripts/test_pipeline.py -q
+python -m pytest tests -q
 
 # 直接运行
-python scripts/test_pipeline.py
+python tests/test_pipeline.py
 ```
 
 测试为离线逻辑检查，不调用 LLM 或文献检索 API。真实端到端验证请使用 `scripts/smoke_pipeline.py`。

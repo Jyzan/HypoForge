@@ -20,6 +20,7 @@ API.  A module author simply writes::
 
 from __future__ import annotations
 
+import importlib
 from typing import Any, Dict, List, Optional, Type
 
 from .protocol import ModuleProtocol, SkillProtocol, ToolProtocol
@@ -45,6 +46,27 @@ class ModuleRegistry:
     """
 
     _modules: Dict[str, Type[ModuleProtocol]] = {}
+
+    @staticmethod
+    def _load_module_class(dotted_path: str, expected_name: str) -> Type[ModuleProtocol]:
+        module_path, separator, class_name = dotted_path.rpartition(".")
+        if not separator or not module_path or not class_name:
+            raise ValueError(
+                f"Invalid module class path {dotted_path!r}; expected 'package.module.ClassName'"
+            )
+        try:
+            module = importlib.import_module(module_path)
+            module_cls = getattr(module, class_name)
+        except (ImportError, AttributeError) as exc:
+            raise ImportError(f"Cannot load module class {dotted_path!r}: {exc}") from exc
+        if not isinstance(module_cls, type) or not issubclass(module_cls, ModuleProtocol):
+            raise TypeError(f"{dotted_path!r} is not a ModuleProtocol subclass")
+        if module_cls.module_name != expected_name:
+            raise ValueError(
+                f"Module class {dotted_path!r} declares module_name="
+                f"{module_cls.module_name!r}, expected {expected_name!r}"
+            )
+        return module_cls
 
     # ------------------------------------------------------------------
     # Decorator-based registration
@@ -95,7 +117,8 @@ class ModuleRegistry:
         Parameters
         ----------
         config : PipelineConfig
-            The pipeline configuration (used to resolve per-module kwargs).
+            The pipeline configuration (used to resolve per-module kwargs,
+            tier assignment, agentic-M2 override, and grounding config).
 
         Returns
         -------
@@ -114,6 +137,19 @@ class ModuleRegistry:
         instances: Dict[str, ModuleProtocol] = {}
         for name in cls.list_all():
             kwargs = dict(config.get_module_kwargs(name)) if hasattr(config, "get_module_kwargs") else {}
+            override = getattr(config, "module_overrides", {}).get(name)
+            module_cls = cls._modules[name]
+            if override is not None and override.class_name:
+                module_cls = cls._load_module_class(override.class_name, name)
+            elif name == "m2" and config.search.implementation == "agentic":
+                dotted_path = "hypoforge.literature.adapter.AgenticM2Module"
+                try:
+                    module_cls = cls._load_module_class(dotted_path, "m2")
+                except ImportError as exc:
+                    raise ImportError(
+                        "Agentic M2 was selected, but AgenticM2Module is unavailable. "
+                        "Install agentic dependencies and merge Track A's adapter."
+                    ) from exc
             tier = kwargs.pop("llm_tier", default_tiers.get(name, "base"))
             if hasattr(config, "get_llm_for_tier"):
                 kwargs.setdefault("llm_config", config.get_llm_for_tier(tier))
@@ -121,6 +157,18 @@ class ModuleRegistry:
             # returns empty output for translation tasks on some endpoints).
             if name == "m2" and hasattr(config, "get_llm_for_tier"):
                 kwargs.setdefault("query_llm_config", config.get_llm_for_tier("plus"))
+
+                if config.search.implementation == "legacy":
+                    kwargs.setdefault("search_tools", config.search.tools)
+                    kwargs.setdefault(
+                        "max_papers_per_query", config.search.papers_per_sub_question
+                    )
+
+            # ---- M3 grounding config injection ----
+            if name == "m3":
+                grounding = getattr(config, "grounding", None)
+                if grounding is not None:
+                    kwargs.setdefault("grounding_config", grounding)
 
             # Inject scoring weights into M4 so the composite formula has a
             # single source of truth (PipelineConfig.scoring → rubric defaults).
@@ -133,7 +181,8 @@ class ModuleRegistry:
                 # hypotheses is not the same model that generated them.
                 if hasattr(config, "get_llm_for_tier") and "ranker_llm_config" not in kwargs:
                     kwargs["ranker_llm_config"] = config.get_llm_for_tier("plus")
-            instances[name] = cls._modules[name](**kwargs)
+
+            instances[name] = module_cls(**kwargs)
         return instances
 
     @classmethod
@@ -184,29 +233,43 @@ class ToolRegistry:
 class SkillRegistry:
     """Registry for middleware skills.
 
+    The registry stores classes only. ``PipelineRunner`` creates fresh
+    instances for each runner and reuses them only across that runner's nodes.
+
     Usage::
 
         @SkillRegistry.register
         class CitationFormatter(SkillProtocol):
             skill_name = "citation_formatter"
             ...
+
+        # In PipelineRunner._build_graph():
+        skills = SkillRegistry.build_enabled(["citation_formatter"])
     """
 
-    _skills: Dict[str, Type[SkillProtocol]] = {}
+    _skill_classes: Dict[str, Type[SkillProtocol]] = {}
 
     @classmethod
     def register(cls, skill_cls: Type[SkillProtocol]) -> Type[SkillProtocol]:
-        cls._skills[skill_cls.skill_name] = skill_cls
+        cls._skill_classes[skill_cls.skill_name] = skill_cls
         return skill_cls
 
     @classmethod
     def get(cls, name: str) -> Optional[Type[SkillProtocol]]:
-        return cls._skills.get(name)
+        return cls._skill_classes.get(name)
 
     @classmethod
     def list_all(cls) -> List[str]:
-        return sorted(cls._skills.keys())
+        return sorted(cls._skill_classes)
+
+    @classmethod
+    def build_enabled(cls, names: List[str]) -> List[SkillProtocol]:
+        """Build fresh instances for one PipelineRunner."""
+        unknown = sorted(set(names) - set(cls._skill_classes))
+        if unknown:
+            raise ValueError(f"Unknown enabled skills: {unknown}")
+        return [cls._skill_classes[name]() for name in names]
 
     @classmethod
     def clear(cls) -> None:
-        cls._skills.clear()
+        cls._skill_classes.clear()

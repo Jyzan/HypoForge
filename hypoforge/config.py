@@ -14,11 +14,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .evaluation.rubric import DEFAULT_HYPOTHESIS_WEIGHTS
 
@@ -109,9 +109,20 @@ class QwenModelsConfig(BaseModel):
 class SearchConfig(BaseModel):
     """Literature-search related settings."""
 
+    implementation: Literal["legacy", "agentic"] = "legacy"
     tools: List[str] = Field(default_factory=lambda: ["semantic_scholar", "pubmed"])
-    papers_per_sub_question: int = 15
-    max_papers_total: int = 80
+    papers_per_sub_question: int = Field(default=15, ge=0)
+    max_papers_total: int = Field(default=80, ge=0)
+    max_rounds: int = Field(default=3, ge=1)
+    max_queries: int = Field(default=12, ge=1)
+    max_tokens: int = Field(default=100_000, ge=1)
+    max_seconds: int = Field(default=900, ge=1)
+
+    @model_validator(mode="after")
+    def _validate_agentic_budget(self) -> "SearchConfig":
+        if self.implementation == "agentic" and self.max_papers_total <= 0:
+            raise ValueError("agentic search requires max_papers_total > 0")
+        return self
 
 
 class ModuleOverride(BaseModel):
@@ -137,6 +148,24 @@ class ScoringConfig(BaseModel):
     auto_score: bool = True  # write {run_id}_scores.json after each run
 
 
+class GroundingConfig(BaseModel):
+    """Configuration for M3 evidence grounding (full-text → claims → relations).
+
+    .. note::
+        ``enable_gams`` defaults to ``False``.  GAMS is experimental and
+        should only be enabled after the comparison framework in Track B.8
+        validates it against simpler baselines on a human-annotated set.
+    """
+
+    enabled: bool = False
+    max_papers: int = Field(default=10, ge=1)
+    max_evidence_items: int = Field(default=200, ge=1)
+    max_claims: int = Field(default=100, ge=1)
+    enable_gams: bool = False  # experimental — default OFF
+    gams_iterations: int = Field(default=100, ge=1)
+    gams_min_confidence: float = Field(default=0.35, ge=0.0, le=1.0)
+
+
 # ============================================================================
 # Top-level Pipeline Config
 # ============================================================================
@@ -149,6 +178,8 @@ class PipelineConfig(BaseModel):
 
         config = PipelineConfig.from_yaml("configs/full_pipeline.yaml")
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     # ---- general ----
     run_name: str = "hypoforge-run"
@@ -180,8 +211,21 @@ class PipelineConfig(BaseModel):
     # ---- persistence ----
     memory_cache_dir: str = ""  # if non-empty, M3 persists knowledge graph here
 
+    # ---- M3 grounding (full-text → claims → relations) ----
+    grounding: GroundingConfig = Field(default_factory=GroundingConfig)
+
     # ---- skills (middleware) ----
     enabled_skills: List[str] = Field(default_factory=list)
+    skill_fail_fast: bool = False
+
+    @model_validator(mode="after")
+    def _validate_feature_dependencies(self) -> "PipelineConfig":
+        if self.grounding.enabled and self.search.implementation != "agentic":
+            raise ValueError(
+                "grounding.enabled=true requires search.implementation='agentic' "
+                "because M3 consumes M2KnowledgeExport evidence"
+            )
+        return self
 
     # ------------------------------------------------------------------
     # Factory methods

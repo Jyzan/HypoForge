@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import re
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ============================================================================
@@ -58,6 +58,8 @@ class EvidenceEdgeRelation(str, Enum):
     EXTENDS = "extends"
     LIMITS = "limits"
     INVOLVES = "involves"
+    SAME_AS = "same_as"
+    REFINES = "refines"
 
 
 class ReviewerDimension(str, Enum):
@@ -109,6 +111,7 @@ class KnowledgeEntry(BaseModel):
     source_paper_id: str = ""
     source_paper_title: str = ""
     entities: List[str] = Field(default_factory=list)
+    evidence_ids: List[str] = Field(default_factory=list)
 
 
 class LiteratureResult(BaseModel):
@@ -133,11 +136,21 @@ class EvidenceNode(BaseModel):
 
 
 class EvidenceEdge(BaseModel):
-    """A directed, typed edge in the evidence graph."""
+    """A directed, typed edge in the evidence graph.
+
+    .. versionchanged:: 0.2.0
+        Added optional ``confidence``, ``rationale``, and ``evidence_ids``
+        fields to support M3 grounding's enhanced relation output.
+    """
 
     source: str
     target: str
     relation: EvidenceEdgeRelation
+
+    # ---- M3 grounding enhanced fields (optional) ----
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    rationale: Optional[str] = None
+    evidence_ids: List[str] = Field(default_factory=list)
 
 
 class EvidenceGraph(BaseModel):
@@ -210,6 +223,227 @@ class ReviewResult(BaseModel):
 
 
 # ============================================================================
+# M2 增强导出 — canonical KnowledgeExport (agentic M2 → M3)
+# ============================================================================
+
+class M2SearchQueryExport(BaseModel):
+    """One search query issued by the IterativeSearchAgent."""
+
+    query_id: str
+    text: str
+    round_index: int = 0
+    intent: str = "core"
+    target_source: str
+    purpose: str
+    target_gap: str = ""
+    relation_to_question: str = ""
+
+
+class M2CoverageExport(BaseModel):
+    """Coverage assessment from the CoverageEvaluator."""
+
+    covered_buckets: List[str] = Field(default_factory=list)
+    missing_buckets: List[str] = Field(default_factory=list)
+    covered_topics: List[str] = Field(default_factory=list)
+    missing_topics: List[str] = Field(default_factory=list)
+    sufficient: bool = False
+    rationale: str = ""
+
+
+class M2SearchProvenance(BaseModel):
+    """Full provenance trail for a single sub-question search run."""
+
+    queries: List[M2SearchQueryExport] = Field(default_factory=list)
+    coverage: M2CoverageExport = Field(default_factory=M2CoverageExport)
+    source_result_counts: Dict[str, int] = Field(default_factory=dict)
+    failed_sources: List[str] = Field(default_factory=list)
+    iterations: int = 0
+    stop_reason: Optional[str] = None
+    errors: List[str] = Field(default_factory=list)
+    stage_elapsed_seconds: Dict[str, float] = Field(default_factory=dict)
+    papers_found: int = 0
+    papers_after_dedup: int = 0
+
+
+class M2PaperExport(BaseModel):
+    """Canonical paper metadata exported by agentic M2."""
+
+    paper_id: str
+    title: str
+    abstract: str = ""
+    authors: List[str] = Field(default_factory=list)
+    year: Optional[int] = None
+    journal: str = ""
+    doi: str = ""
+    pmid: str = ""
+    pmcid: str = ""
+    external_ids: Dict[str, str] = Field(default_factory=dict)
+    citation_count: Optional[int] = None
+    publication_type: str = ""
+    sources: List[str] = Field(default_factory=list)
+    is_open_access: Optional[bool] = None
+    fulltext_status: str = "unknown"
+    rank_scores: Dict[str, float] = Field(default_factory=dict)
+    reading_summary: str = ""
+    content_level: str = "metadata"
+    document_id: str = ""
+    document_source_uri: str = ""
+    document_license: str = ""
+    degraded_to_abstract: bool = False
+    chunks_parsed: int = 0
+    chunks_retrieved: int = 0
+    stage_elapsed_seconds: Dict[str, float] = Field(default_factory=dict)
+    errors: List[str] = Field(default_factory=list)
+
+
+class M2EvidenceExport(BaseModel):
+    """One evidence item extracted during full-text reading."""
+
+    evidence_id: str
+    paper_id: str
+    chunk_id: str
+    section: str = ""
+    page: Optional[int] = None
+    quote: str
+    normalized_claim: str
+    relevance_score: float
+    citable: bool = True
+
+
+class M2KnowledgeRun(BaseModel):
+    """Aggregated results for one sub-question (agentic M2 output)."""
+
+    sub_question: str
+    papers: List[M2PaperExport] = Field(default_factory=list)
+    evidence: List[M2EvidenceExport] = Field(default_factory=list)
+    knowledge_entries: List[KnowledgeEntry] = Field(default_factory=list)
+    search_provenance: M2SearchProvenance = Field(default_factory=M2SearchProvenance)
+
+    @model_validator(mode="after")
+    def validate_provenance(self) -> "M2KnowledgeRun":
+        """Ensure every exported knowledge item is traceable to local evidence."""
+        paper_ids = [item.paper_id for item in self.papers]
+        if len(paper_ids) != len(set(paper_ids)):
+            raise ValueError("duplicate paper_id in M2 knowledge run")
+
+        evidence_ids = [item.evidence_id for item in self.evidence]
+        if len(evidence_ids) != len(set(evidence_ids)):
+            raise ValueError("duplicate evidence_id in M2 knowledge run")
+
+        knowledge_ids = [item.id for item in self.knowledge_entries]
+        if len(knowledge_ids) != len(set(knowledge_ids)):
+            raise ValueError("duplicate knowledge id in M2 knowledge run")
+
+        paper_set = set(paper_ids)
+        evidence_by_id = {item.evidence_id: item for item in self.evidence}
+        for item in self.evidence:
+            if item.paper_id not in paper_set:
+                raise ValueError(
+                    f"evidence {item.evidence_id!r} references unknown paper"
+                )
+        for item in self.knowledge_entries:
+            if item.source_paper_id not in paper_set:
+                raise ValueError(
+                    f"knowledge {item.id!r} references unknown paper"
+                )
+            if not item.evidence_ids:
+                raise ValueError(f"knowledge {item.id!r} has no evidence_ids")
+            unknown = [
+                evidence_id
+                for evidence_id in item.evidence_ids
+                if evidence_id not in evidence_by_id
+            ]
+            if unknown:
+                raise ValueError(
+                    f"knowledge {item.id!r} references unknown evidence: {unknown}"
+                )
+            cross_paper = [
+                evidence_id
+                for evidence_id in item.evidence_ids
+                if evidence_by_id[evidence_id].paper_id != item.source_paper_id
+            ]
+            if cross_paper:
+                evidence_id = cross_paper[0]
+                raise ValueError(
+                    f"knowledge {item.id!r} references evidence {evidence_id!r} "
+                    "from a different paper"
+                )
+        return self
+
+
+class M2KnowledgeExport(BaseModel):
+    """Complete M2 agentic-search export — the data contract between M2 and M3."""
+
+    schema_version: Literal["m2-knowledge-export/v1"] = "m2-knowledge-export/v1"
+    runs: List[M2KnowledgeRun] = Field(default_factory=list)
+
+
+# ============================================================================
+# M3 Grounding 模型 — 全文证据接地
+# ============================================================================
+
+class AtomicClaim(BaseModel):
+    """An atomic claim grounded in one or more M2 evidence records."""
+
+    id: str
+    statement: str
+    evidence_ids: List[str] = Field(default_factory=list)
+    paper_ids: List[str] = Field(default_factory=list)
+    entities: List[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class EvidenceRelation(BaseModel):
+    """A judged semantic relation before conversion to an EvidenceEdge."""
+
+    id: str
+    source: str
+    target: str
+    relation: Literal[
+        "supports", "contradicts", "extends", "limits", "same_as", "refines"
+    ]
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    rationale: str = ""
+    evidence_ids: List[str] = Field(default_factory=list)
+    source_paper_ids: List[str] = Field(default_factory=list)
+    target_paper_ids: List[str] = Field(default_factory=list)
+
+
+class GroundingReport(BaseModel):
+    """M3 grounding 产出报告。
+
+    .. note::
+        ``evidence_records`` and ``relations_total`` are **count** fields
+        (integers), not the full record/relation payloads.  The actual
+        records live inside ``EvidenceGraph`` nodes and edges.
+    """
+
+    papers_total: int = 0
+    full_text_papers: int = 0
+    abstract_only_papers: int = 0
+    fallback_papers: int = 0
+    chunks_total: int = 0
+    queries_total: int = 0
+    evidence_records: int = 0  # count, not list
+    claims_total: int = 0
+    relations_total: int = 0
+    relation_pairs_recalled: int = 0
+    relation_candidates_judged: int = 0
+    relation_candidates_selected: int = 0
+    relation_selection_mode: str = "direct"
+    relation_search: Dict[str, Any] = Field(default_factory=dict)
+    warnings: List[str] = Field(default_factory=list)
+
+
+class GroundingResult(BaseModel):
+    """Typed result returned by the future M3 grounding workflow."""
+
+    claims: List[AtomicClaim] = Field(default_factory=list)
+    relations: List[EvidenceRelation] = Field(default_factory=list)
+    report: GroundingReport = Field(default_factory=GroundingReport)
+
+
+# ============================================================================
 # Global Pipeline State
 # ============================================================================
 
@@ -230,9 +464,11 @@ class PipelineState(BaseModel):
 
     # ---- M2 ----
     literature_results: List[LiteratureResult] = Field(default_factory=list)
+    m2_knowledge_export: Optional[M2KnowledgeExport] = None  # agentic M2 enhanced export
 
     # ---- M3 ----
     evidence_graph: Optional[EvidenceGraph] = None
+    grounding_report: Optional[GroundingReport] = None  # M3 grounding variant
 
     # ---- M4 ----
     candidate_hypotheses: List[HypothesisCard] = Field(default_factory=list)

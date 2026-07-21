@@ -118,18 +118,64 @@ class SkillProtocol(ABC):
     Skills are applied *before* and *after* every module (or a selected subset).
     Use-cases: citation formatting, language translation of output, logging,
     metric collection, etc.
+
+    .. versionchanged:: 0.2.0
+        ``before`` now receives ``(module_name, state)`` and returns a
+        ``Dict[str, Any]`` *patch* (not the full state).
+        ``after`` now receives ``(module_name, state_before, result, state_after)``
+        so it can see both the module's output and the pre/post state.
     """
 
     skill_name: str
 
     @abstractmethod
-    async def before(self, state: PipelineState, **kwargs) -> PipelineState:
-        """Transform the state *before* a module runs."""
+    async def before(self, module_name: str, state: PipelineState) -> Dict[str, Any]:
+        """Run *before* a module executes.
+
+        Parameters
+        ----------
+        module_name : str
+            The name of the module about to run (e.g. ``"m2"``).
+        state : PipelineState
+            The current pipeline state *before* the module runs.
+
+        Returns
+        -------
+        Dict[str, Any]
+            A dictionary of fields to *merge* into the state before the
+            module executes (e.g. tracking metadata).  Return an empty
+            dict for a no-op.
+        """
         ...
 
     @abstractmethod
-    async def after(self, state: PipelineState, **kwargs) -> PipelineState:
-        """Transform the state *after* a module runs."""
+    async def after(
+        self,
+        module_name: str,
+        state_before: PipelineState,
+        result: Dict[str, Any],
+        state_after: PipelineState,
+    ) -> Dict[str, Any]:
+        """Run *after* a module executes.
+
+        Parameters
+        ----------
+        module_name : str
+            The name of the module that just ran.
+        state_before : PipelineState
+            Snapshot of the state *before* the module executed.
+        result : Dict[str, Any]
+            The raw return value from the module (before merging into state).
+        state_after : PipelineState
+            The state *after* the module's result has been merged.
+
+        Returns
+        -------
+        Dict[str, Any]
+            Additional fields to *merge* into the final state for this
+            node (e.g. sidecar logs, token counts, translated text).
+            Return an empty dict for a no-op.
+        """
         ...
 
 

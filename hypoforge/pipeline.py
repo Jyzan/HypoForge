@@ -7,15 +7,18 @@ conditional iteration edges, and compiles the graph.
 
 from __future__ import annotations
 
-from typing import Dict
+import logging
+from typing import Any, Dict
 
 from langgraph.graph import END, StateGraph
 
 from .config import PipelineConfig
 from .display.panels import render_module_result, render_phase_done, render_phase_header
 from .protocol import ModuleProtocol
-from .registry import ModuleRegistry
+from .registry import ModuleRegistry, SkillRegistry
 from .state import PipelineState
+
+logger = logging.getLogger(__name__)
 
 
 def _should_continue_iterating(state: PipelineState) -> str:
@@ -46,6 +49,7 @@ class PipelineRunner:
     def __init__(self, config: PipelineConfig):
         self.config = config
         self._graph = None
+        self._skills = None
 
     # ------------------------------------------------------------------
     # Graph construction
@@ -60,10 +64,20 @@ class PipelineRunner:
         # Trigger imports so @ModuleRegistry.register fires
         from . import modules as _  # noqa: F401
 
+        # Trigger skill imports and instantiate fresh per-runner skills.
+        from . import skills as _  # noqa: F401
+        if self._skills is None:
+            self._skills = SkillRegistry.build_enabled(self.config.enabled_skills)
+
         all_modules = ModuleRegistry.build_all(self.config)
 
         # Filter to enabled modules, preserving order
         enabled = self.config.enabled_modules
+        missing = [name for name in enabled if name not in all_modules]
+        if missing:
+            raise ValueError(f"Unknown or unavailable enabled modules: {missing}")
+        if not enabled:
+            raise ValueError("enabled_modules must contain at least one module")
         active = {name: all_modules[name] for name in enabled if name in all_modules}
 
         # --- build graph ---
@@ -98,7 +112,8 @@ class PipelineRunner:
         return self._graph
 
     def _make_node_wrapper(self, name: str, mod: ModuleProtocol):
-        """Wrap a module callable so it prints Rich headers and handles errors.
+        """Wrap a module callable so it prints Rich headers, handles errors,
+        and runs Skill hooks before/after execution.
 
         Two additions on top of the vanilla wrapper:
 
@@ -108,8 +123,43 @@ class PipelineRunner:
 
         2. **Checkpoint** — after the module succeeds, the full state is
            persisted to disk so a later run can pick up from here.
+
+        3. **Skills** — before the module runs, all enabled skills get their
+           ``before()`` hook.  After the module runs, all enabled skills get
+           their ``after()`` hook (with access to both pre- and post-state).
+           Skill-returned patches are merged into the node's return value.
         """
         output_fields = set(mod.get_output_fields())
+
+        # Resolve enabled skill instances once per node wrapper
+        enabled_skills = self._skills or []
+
+        class SkillHookError(RuntimeError):
+            pass
+
+        class SkillPatchError(ValueError):
+            pass
+
+        def validate_patch(patch: Any, hook: str) -> Dict[str, Any]:
+            if patch is None:
+                return {}
+            if not isinstance(patch, dict):
+                raise TypeError(f"Skill {hook} hook must return a dict patch")
+            unknown = set(patch) - set(PipelineState.model_fields)
+            if unknown:
+                raise ValueError(
+                    f"Skill {hook} hook returned unknown state fields: {sorted(unknown)}"
+                )
+            return patch
+
+        async def run_hook(skill, hook: str, *args) -> Dict[str, Any]:
+            try:
+                return validate_patch(await getattr(skill, hook)(*args), hook)
+            except Exception as exc:
+                logger.exception("Skill %s %s hook failed", skill.skill_name, hook)
+                if self.config.skill_fail_fast:
+                    raise SkillHookError(str(exc)) from exc
+                return {}
 
         async def node_fn(state: PipelineState) -> Dict:
             # --- Resume: skip already-completed modules ---
@@ -126,18 +176,65 @@ class PipelineRunner:
                 render_phase_header(name, mod.description)
 
             try:
-                result = await mod(state)
+                # --- before hooks ---
+                before_patches: Dict = {}
+                for skill in enabled_skills:
+                    before_patches.update(await run_hook(skill, "before", name, state))
+
+                state_for_module_dict = state.model_dump(mode="python")
+                state_for_module_dict.update(before_patches)
+                state_for_module = PipelineState(**state_for_module_dict)
+
+                # Snapshot state before module execution (for after hooks)
+                state_before = state_for_module
+
+                # --- execute module ---
+                result = await mod(state_for_module)
+                if result is None:
+                    result = {}
+                if not isinstance(result, dict):
+                    raise TypeError(f"Module {name} must return a dict")
+                unknown_result = set(result) - set(PipelineState.model_fields)
+                if unknown_result:
+                    raise ValueError(
+                        f"Module {name} returned unknown state fields: {sorted(unknown_result)}"
+                    )
+
+                # --- build post-execution state for after hooks ---
+                state_after_dict = state_for_module.model_dump(mode="python")
+                state_after_dict.update(result)
+                state_after = PipelineState(**state_after_dict)
+
+                # --- after hooks ---
+                after_patches: Dict = {}
+                for skill in enabled_skills:
+                    patch = await run_hook(
+                        skill, "after", name, state_before, result, state_after
+                    )
+                    collisions = set(patch) & output_fields
+                    if collisions:
+                        raise SkillPatchError(
+                            f"Skill {skill.skill_name} after hook cannot overwrite "
+                            f"module output fields: {sorted(collisions)}"
+                        )
+                    after_patches.update(patch)
+
+                # Merge all patches into the result
+                final = {**before_patches, **result, **after_patches}
+
                 if self.config.verbose:
-                    render_module_result(name, state, result)
+                    render_module_result(name, state, final)
                     render_phase_done(name)
                 # --- checkpoint: save state after each successful module ---
-                self._save_checkpoint(name, state, result)
-                return result
+                self._save_checkpoint(name, state, final)
+                return final
             except Exception as exc:
                 import traceback
                 if self.config.verbose:
                     from .display import console, COLORS
                     console.print(f"  [{COLORS['error']}][ERR] [{name.upper()}] ERROR: {exc}[/{COLORS['error']}]")
+                if isinstance(exc, (SkillHookError, SkillPatchError)):
+                    raise
                 return {"errors": state.errors + [f"[{name}] {exc}\n{traceback.format_exc()}"]}
 
         return node_fn

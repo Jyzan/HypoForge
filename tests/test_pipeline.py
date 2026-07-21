@@ -8,8 +8,8 @@ an API key).  These tests cover pure logic + the scorer against a hand-built
 
 Run::
 
-    python -m pytest scripts/test_pipeline.py -q
-    python scripts/test_pipeline.py
+    python -m pytest tests/test_pipeline.py -q
+    python tests/test_pipeline.py
 """
 
 from __future__ import annotations
@@ -188,7 +188,7 @@ def test_review_result_reason_before_score():
 
 
 if __name__ == "__main__":
-    # Allow running directly: python scripts/test_pipeline.py
+    # Allow running directly: python tests/test_pipeline.py
     async def _run_all():
         test_default_config_loads()
         print("[PASS] Default config loads")
