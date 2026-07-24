@@ -32,7 +32,8 @@ def _sanitize_query(text: str, backend: str) -> str:
 _QUERY_PLANNING_SYSTEM = """\
 You are a scientific literature search strategist. Your job is to generate \
 high-quality, targeted search queries for a given research sub-question and \
-select the most appropriate search tool for each query.
+select the most appropriate search tool for each query. Remember that the \
+current year is 2026.
 
 ## Available Search Tools
 
@@ -54,13 +55,14 @@ select the most appropriate search tool for each query.
 
 ### For Semantic Scholar/OpenAlex queries (cross-disciplinary discovery):
 - Use phrase quotes for multi-word terms: `"protein folding"`.
-- Keep each concept short; combine with AND/OR when helpful.
+- Keep each concept short (no more than 3 words); combine with AND/OR when helpful. No more than 3 concepts.
 - S2 syntax is simpler than PubMed — keyword search works fine.
 
 ### For arXiv queries (recent technical preprints):
 - Prefer arXiv for computer science, mathematics, physics, statistics,
   electrical engineering, and other technical preprints.
 - Use short keyword phrases and AND/OR; never use PubMed field tags.
+- Each keyword should be no more than 3 words. No more than 3 key words combined by AND/OR.
 - Remember that arXiv results may not have completed peer review.
 
 ## Coverage Dimensions
@@ -102,7 +104,7 @@ _QUERY_PLANNING_USER_FIRST = """\
 - Unavailable search tools: {unavailable_sources}
 
 ## Task
-Generate 3–6 search queries covering at least 3 different coverage dimensions.
+Generate 3–6 search queries covering at least 3 different coverage dimensions. Since it is the first round, the queries should cover all tools available.
 For each query, output:
 - `text`: the search query string. Use short concepts (recommend 1-3 words each, no more than 5 words), \
   field tags like `[tiab]`/`[MeSH Terms]` for PubMed, and AND/OR to combine.
