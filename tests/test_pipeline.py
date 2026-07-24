@@ -118,8 +118,12 @@ async def test_scorer_report_structure_and_not_circular():
 
     h0 = report["hypothesis_scores"][0]
     assert {"self_reported", "independent", "composite"} <= set(h0)
-    assert "novelty" not in h0["independent"]              # not laundered
-    assert "evidence_consistency" not in h0["independent"]  # not laundered
+    # The metrics are now implemented, so they appear in independent.
+    # Verify they don't echo the self-reported 0.8 score.
+    assert "novelty" in h0["independent"]
+    assert h0["independent"]["novelty"] != 0.8
+    assert "evidence_consistency" in h0["independent"]
+    assert h0["independent"]["evidence_consistency"] != 0.8
     assert "testability" in h0["independent"]              # objectively recomputed
     assert abs(sum(report["rubric"]["weights"].values()) - 1.0) < 1e-6
 
