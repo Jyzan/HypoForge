@@ -276,6 +276,7 @@ class PipelineConfig(BaseModel):
     def get_module_kwargs(self, module_name: str) -> Dict[str, Any]:
         """Return the override kwargs dict for *module_name*, or {}."""
         override = self.module_overrides.get(module_name)
-        if override is None:
-            return {}
-        return override.kwargs
+        kwargs = dict(override.kwargs) if override is not None else {}
+        if module_name == "m2":
+            kwargs.setdefault("implementation", self.search.implementation)
+        return kwargs
