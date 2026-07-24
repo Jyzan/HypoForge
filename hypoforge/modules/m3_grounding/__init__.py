@@ -7,10 +7,15 @@ from .models import (
     FullTextChunk,
     GroundingReport,
     PaperSource,
+    RelationCandidate,
+    RelationPair,
 )
+from .evidence_gams import EvidenceGraphGAMS
+from .relation_retrieval import RelationCandidateRetriever
 from .workflow import FullTextEvidenceGrounding
 
 __all__ = [
     "AtomicClaim", "EvidenceRecord", "EvidenceRelation", "FullTextChunk",
-    "GroundingReport", "PaperSource", "FullTextEvidenceGrounding",
+    "GroundingReport", "PaperSource", "RelationCandidate", "RelationPair",
+    "EvidenceGraphGAMS", "RelationCandidateRetriever", "FullTextEvidenceGrounding",
 ]

@@ -58,6 +58,16 @@ module_overrides:
       evidence_k: 12
       min_relevance: 5.0
       grounding_max_concurrency: 4
+      # Relation candidates are recalled and judged before entering the graph.
+      # Keep direct as the backward-compatible baseline; use evidence_gams for A/B tests.
+      relation_selection_mode: "direct"
+      relation_candidate_k: 12
+      relation_max_pairs: 60
+      relation_batch_size: 10
+      relation_min_confidence: 0.65
+      evidence_gams_iterations: 128
+      evidence_gams_exploration_weight: 0.35
+      evidence_gams_seed: 42
   m4:
     kwargs:
       num_candidates: 7

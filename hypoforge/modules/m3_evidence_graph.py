@@ -37,8 +37,8 @@ class M3EvidenceGraph(ModuleProtocol):
     """
 
     module_name = "m3"
-    module_version = "0.3.0"
-    description = "Full-text evidence grounding + provenance-aware evidence graph"
+    module_version = "0.4.0"
+    description = "Full-text grounding + candidate relation recall + optional Evidence-GAMS"
 
     def __init__(
         self,
@@ -56,6 +56,16 @@ class M3EvidenceGraph(ModuleProtocol):
         max_queries: int = 16,
         max_sources: int = 60,
         grounding_max_concurrency: int = 4,
+        relation_selection_mode: str = "direct",
+        relation_candidate_k: int = 12,
+        relation_max_pairs: int = 60,
+        relation_batch_size: int = 10,
+        relation_min_confidence: float = 0.65,
+        evidence_gams_iterations: int = 128,
+        evidence_gams_exploration_weight: float = 0.35,
+        evidence_gams_seed: int = 42,
+        llm_call_timeout: float = 120.0,
+        relation_judge_retries: int = 2,
         **_: Any,
     ):
         self.mode = mode
@@ -75,6 +85,16 @@ class M3EvidenceGraph(ModuleProtocol):
             max_queries=max_queries,
             max_sources=max_sources,
             max_concurrency=grounding_max_concurrency,
+            relation_selection_mode=relation_selection_mode,
+            relation_candidate_k=relation_candidate_k,
+            relation_max_pairs=relation_max_pairs,
+            relation_batch_size=relation_batch_size,
+            relation_min_confidence=relation_min_confidence,
+            evidence_gams_iterations=evidence_gams_iterations,
+            evidence_gams_exploration_weight=evidence_gams_exploration_weight,
+            evidence_gams_seed=evidence_gams_seed,
+            llm_call_timeout=llm_call_timeout,
+            relation_judge_retries=relation_judge_retries,
         )
 
     async def __call__(
@@ -230,6 +250,15 @@ class M3EvidenceGraph(ModuleProtocol):
                 graph.edges.append(EvidenceEdge(
                     source=rel.source, target=rel.target, relation=relation_enum[rel.relation],
                     confidence=rel.confidence, rationale=rel.rationale,
+                    evidence_ids=rel.evidence_ids,
+                    metadata={
+                        "relation_id": rel.id,
+                        "source_paper_ids": rel.source_paper_ids,
+                        "target_paper_ids": rel.target_paper_ids,
+                        "retrieval_score": rel.retrieval_score,
+                        "condition_comparability": rel.condition_comparability,
+                        "candidate_origin": rel.candidate_origin,
+                    },
                 ))
                 seen_edges.add(key)
 
@@ -239,13 +268,40 @@ class M3EvidenceGraph(ModuleProtocol):
         # already filtered records by its relevance threshold (5.0 by default),
         # so retain those accepted full-text records here instead of silently
         # hiding useful medium/high-relevance evidence from the downstream step.
-        graph.established_facts = list(dict.fromkeys(
-            graph.established_facts + [r.id for r in records if r.relevance_score >= 5]
-        ))
-        contradicted = {r.source for r in relations if r.relation == "contradicts"} | {
-            r.target for r in relations if r.relation == "contradicts"
+        accepted_records = [record.id for record in records if record.relevance_score >= 5]
+        support_sources: Dict[str, set[str]] = {claim.id: set() for claim in claims}
+        for relation in relations:
+            if relation.relation != "supports" or relation.target not in claim_map:
+                continue
+            support_sources[relation.target].update(relation.source_paper_ids)
+            support_sources[relation.target].update(relation.target_paper_ids)
+            for evidence_id in relation.evidence_ids:
+                record = record_map.get(evidence_id)
+                if record and record.paper_id:
+                    support_sources[relation.target].add(record.paper_id)
+
+        contradicted = {
+            endpoint
+            for relation in relations
+            if relation.relation == "contradicts" and relation.confidence >= 0.65
+            for endpoint in (relation.source, relation.target)
+            if endpoint in claim_map
         }
-        graph.conflicts = list(dict.fromkeys(graph.conflicts + list(contradicted)))
+        established_claims = [
+            claim.id for claim in claims
+            if len(support_sources.get(claim.id, set())) >= 2 and claim.id not in contradicted
+        ]
+        under_supported_claims = [
+            claim.id for claim in claims
+            if len(support_sources.get(claim.id, set())) < 2 and claim.id not in contradicted
+        ]
+        graph.established_facts = list(dict.fromkeys(
+            graph.established_facts + accepted_records + established_claims
+        ))
+        graph.conflicts = list(dict.fromkeys(graph.conflicts + sorted(contradicted)))
+        graph.knowledge_gaps = list(dict.fromkeys(
+            graph.knowledge_gaps + under_supported_claims
+        ))
         graph.grounding_report = report.model_dump() if report else {}
         return graph
 
