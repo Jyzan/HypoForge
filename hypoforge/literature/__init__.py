@@ -4,6 +4,7 @@ Feature branches should import public contracts from this module instead of
 depending on another tool's private implementation.
 """
 
+from .adapter import AgenticM2Adapter, AgenticM2Module
 from .models import (
     ContentLevel,
     CoverageReport,
@@ -55,6 +56,8 @@ from .reading import (
 )
 
 __all__ = [
+    "AgenticM2Adapter",
+    "AgenticM2Module",
     "ContentLevel",
     "CoverageEvaluator",
     "CoverageEvaluatorProtocol",

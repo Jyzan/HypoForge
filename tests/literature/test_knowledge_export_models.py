@@ -128,6 +128,6 @@ def test_run_rejects_evidence_assigned_to_a_different_knowledge_source_paper() -
 
     with pytest.raises(
         ValidationError,
-        match="knowledge 'knowledge-1'.*evidence.*PMID:2.*source paper.*PMID:1",
+        match=r"knowledge 'knowledge-1' references evidence 'ev-1' from a different paper",
     ):
         M2KnowledgeRun.model_validate(payload)

@@ -11,9 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from hypoforge.literature.adapter import AgenticM2Adapter
+from hypoforge.literature.adapter import AgenticM2Module
 from hypoforge.literature.integrated import build_integrated_search_adapter
-from hypoforge.modules.m2_literature_search import M2LiteratureSearch
 from hypoforge.state import PipelineState
 from hypoforge.tools.qwen_client import QwenClient
 
@@ -71,16 +70,12 @@ async def _run(
     )
     search = RecordingSearchAgent(adapter.search_agent)
     reading = RecordingReadingWorkflow(adapter.reading_workflow)
-    traced_adapter = AgenticM2Adapter(
+    traced_module = AgenticM2Module(
         search_agent=search,
         reading_workflow=reading,
         budget=adapter.budget,
     )
-    module = M2LiteratureSearch(
-        implementation="agentic",
-        agentic_adapter=traced_adapter,
-    )
-    output = await module(PipelineState(input_question=question))
+    output = await traced_module(PipelineState(input_question=question))
     return {
         "status": "ok",
         "trace": {

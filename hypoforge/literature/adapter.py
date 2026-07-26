@@ -1,4 +1,16 @@
-"""Adapter boundary between agentic literature workflows and legacy M2 state."""
+"""Agentic M2 module — config-driven wrapper with internal DI adapter.
+
+Track A delivers two classes:
+
+* ``AgenticM2Adapter`` — internal dependency-injection adapter.  Accepts
+  pre-built ``search_agent``, ``reading_workflow`` and ``budget``.
+  Used by ``integrated.py`` / ``minimal.py`` factories and scripts.
+
+* ``AgenticM2Module`` — config-driven public wrapper loaded by
+  ``ModuleRegistry`` when ``search.implementation == "agentic"``.
+  Accepts ``llm_config`` + ``variant`` and builds the internal adapter
+  via ``build_adapter_from_config()``.
+"""
 
 from __future__ import annotations
 
@@ -12,8 +24,17 @@ from .protocols import ReadingExtractionWorkflowProtocol
 from .search import IterativeSearchAgent
 
 
+# ============================================================================
+# Internal DI adapter (used by factories and scripts)
+# ============================================================================
+
+
 class AgenticM2Adapter(ModuleProtocol):
-    """Run agentic search and reading while preserving the M2 public output."""
+    """Internal dependency-injection adapter.
+
+    Accepts pre-built *search_agent*, *reading_workflow* and *budget*.
+    Not registered — loaded programmatically by factories or scripts.
+    """
 
     module_name = "m2"
     module_version = "0.1.0-agentic-adapter"
@@ -90,3 +111,93 @@ class AgenticM2Adapter(ModuleProtocol):
     @classmethod
     def get_output_fields(cls) -> list[str]:
         return ["literature_results", "m2_knowledge_export"]
+
+
+# ============================================================================
+# Public config-driven wrapper (loaded by ModuleRegistry)
+# ============================================================================
+
+
+class AgenticM2Module(ModuleProtocol):
+    """Config-driven agentic M2 module.
+
+    Loaded by ``ModuleRegistry`` when ``search.implementation == "agentic"``.
+    Internally builds an ``AgenticM2Adapter`` via ``build_adapter_from_config()``
+    and delegates all calls to it.
+    """
+
+    module_name = "m2"
+    module_version = "0.2.0-agentic"
+    description = "Agentic literature search and evidence-linked reading module"
+
+    def __init__(
+        self,
+        llm_config: Optional[Any] = None,
+        variant: str = "integrated",
+        **kwargs,
+    ) -> None:
+        self.adapter = build_adapter_from_config(
+            llm_config=llm_config,
+            variant=variant,
+            **kwargs,
+        )
+
+    async def __call__(
+        self,
+        state: PipelineState,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return await self.adapter(state, config)
+
+    @classmethod
+    def get_input_fields(cls) -> list[str]:
+        return ["problem_card"]
+
+    @classmethod
+    def get_output_fields(cls) -> list[str]:
+        return ["literature_results", "m2_knowledge_export"]
+
+
+# ============================================================================
+# Factory
+# ============================================================================
+
+
+def build_adapter_from_config(
+    *,
+    llm_config: Optional[Any] = None,
+    variant: str = "integrated",
+    **kwargs,
+) -> AgenticM2Adapter:
+    """Build an ``AgenticM2Adapter`` from config parameters.
+
+    Parameters
+    ----------
+    llm_config :
+        LLM configuration for the Qwen client (required for ``variant="integrated"``).
+    variant :
+        ``"integrated"`` — full multi-source search + reading pipeline.
+        ``"minimal"`` — PubMed-only rule-based pipeline (no LLM required).
+    **kwargs :
+        Forwarded to ``build_integrated_search_adapter()`` or
+        ``build_minimal_pubmed_adapter()`` (e.g. *final_k*, *budget*,
+        *source_timeout_seconds*).
+    """
+    if variant == "integrated":
+        if llm_config is None:
+            raise ValueError("variant='integrated' requires llm_config")
+        # Lazy import to avoid circular dependency (integrated.py imports
+        # AgenticM2Adapter from this module).
+        from ..tools.qwen_client import QwenClient
+        from .integrated import build_integrated_search_adapter
+
+        client = QwenClient.from_config(llm_config)
+        return build_integrated_search_adapter(client=client, **kwargs)
+
+    if variant == "minimal":
+        from .minimal import build_minimal_pubmed_adapter
+        return build_minimal_pubmed_adapter(**kwargs)
+
+    raise ValueError(
+        f"Unknown variant {variant!r}; expected 'integrated' or 'minimal'"
+    )

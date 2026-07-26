@@ -21,7 +21,6 @@ from hypoforge.literature.search.search_tool import LiteratureSearchTool
 from hypoforge.literature.sources.academic_source import AcademicSource
 from hypoforge.literature.sources.arxiv_source import ArxivSource
 from hypoforge.literature.sources.pubmed_source import PubMedSource
-from hypoforge.modules.m2_literature_search import M2LiteratureSearch
 from hypoforge.state import PipelineState
 
 
@@ -180,9 +179,7 @@ async def test_integrated_factory_runs_m2_without_minimal_fallback(tmp_path) -> 
         reading_cache_dir=tmp_path,
         pmc_backend=unavailable_pmc,
     )
-    module = M2LiteratureSearch(implementation="agentic", agentic_adapter=adapter)
-
-    output = await module(PipelineState(input_question="Hippo YAP TAZ"))
+    output = await adapter(PipelineState(input_question="Hippo YAP TAZ"))
 
     result = output["literature_results"][0]
     assert result.papers_retrieved == 2

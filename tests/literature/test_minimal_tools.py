@@ -17,7 +17,6 @@ from hypoforge.literature.models import (
     PaperRecord,
     SearchState,
 )
-from hypoforge.modules.m2_literature_search import M2LiteratureSearch
 from hypoforge.state import PipelineState
 
 
@@ -157,10 +156,7 @@ async def test_factory_runs_m2_directly_with_real_shaped_backend() -> None:
             "year": 2024,
         }]
 
-    module = M2LiteratureSearch(
-        implementation="agentic",
-        agentic_adapter=build_minimal_pubmed_adapter(backend=backend, final_k=3),
-    )
+    module = build_minimal_pubmed_adapter(backend=backend, final_k=3)
 
     output = await module(PipelineState(input_question="Hippo YAP TAZ organ size"))
 
@@ -175,10 +171,7 @@ async def test_factory_returns_empty_result_when_pubmed_returns_none() -> None:
     async def backend(text: str, limit: int):
         return []
 
-    module = M2LiteratureSearch(
-        implementation="agentic",
-        agentic_adapter=build_minimal_pubmed_adapter(backend=backend),
-    )
+    module = build_minimal_pubmed_adapter(backend=backend)
 
     output = await module(PipelineState(input_question="no matching topic"))
 
@@ -192,10 +185,7 @@ async def test_factory_surfaces_pubmed_network_failure() -> None:
     async def backend(text: str, limit: int):
         raise OSError("network unavailable")
 
-    module = M2LiteratureSearch(
-        implementation="agentic",
-        agentic_adapter=build_minimal_pubmed_adapter(backend=backend),
-    )
+    module = build_minimal_pubmed_adapter(backend=backend)
 
     with pytest.raises(RuntimeError, match="network unavailable"):
         await module(PipelineState(input_question="question"))

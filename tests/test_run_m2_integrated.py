@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from hypoforge.literature.adapter import AgenticM2Adapter
+from hypoforge.literature.adapter import AgenticM2Module
 from hypoforge.literature.models import (
     CoverageReport,
     PaperReadingResult,
@@ -14,9 +14,6 @@ from hypoforge.literature.models import (
     SearchQuery,
     SearchRunResult,
     StopReason,
-)
-from hypoforge.modules.m2_literature_search import (
-    M2LiteratureSearch as RealM2LiteratureSearch,
 )
 from scripts import run_m2_integrated
 
@@ -96,14 +93,13 @@ async def test_run_uses_integrated_adapter_once_and_returns_complete_trace(
     search_agent = FakeSearchAgent(search_result)
     reading_workflow = FakeReadingWorkflow(reading_result)
     budget = SearchBudget(max_rounds=2, max_queries=4)
-    base_adapter = AgenticM2Adapter(
+    base_adapter = AgenticM2Module(
         search_agent=search_agent,
         reading_workflow=reading_workflow,
         budget=budget,
     )
     client_models: list[str] = []
     builder_calls: list[dict] = []
-    m2_instances = []
 
     class FakeQwenClient:
         def __init__(self, *, model: str) -> None:
@@ -113,21 +109,10 @@ async def test_run_uses_integrated_adapter_once_and_returns_complete_trace(
         builder_calls.append(kwargs)
         return base_adapter
 
-    class RecordingM2(RealM2LiteratureSearch):
-        def __init__(self, *args, **kwargs) -> None:
-            super().__init__(*args, **kwargs)
-            self.calls = 0
-            m2_instances.append(self)
-
-        async def __call__(self, state, config=None):
-            self.calls += 1
-            return await super().__call__(state, config)
-
     monkeypatch.setattr(run_m2_integrated, "QwenClient", FakeQwenClient)
     monkeypatch.setattr(
         run_m2_integrated, "build_integrated_search_adapter", fake_builder
     )
-    monkeypatch.setattr(run_m2_integrated, "M2LiteratureSearch", RecordingM2)
 
     payload = await run_m2_integrated._run(
         question=QUESTION,
@@ -141,12 +126,6 @@ async def test_run_uses_integrated_adapter_once_and_returns_complete_trace(
     assert isinstance(builder_calls[0]["client"], FakeQwenClient)
     assert builder_calls[0]["final_k"] == 7
     assert builder_calls[0]["source_timeout_seconds"] == 12.5
-    assert len(m2_instances) == 1
-    assert m2_instances[0].calls == 1
-    assert m2_instances[0].implementation == "agentic"
-    assert isinstance(m2_instances[0].agentic_adapter, AgenticM2Adapter)
-    assert m2_instances[0].agentic_adapter is not base_adapter
-    assert m2_instances[0].agentic_adapter.budget is budget
     assert search_agent.calls == 1
     assert reading_workflow.calls == 1
     assert payload == {

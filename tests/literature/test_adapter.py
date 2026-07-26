@@ -4,7 +4,7 @@ from collections.abc import Sequence
 
 import pytest
 
-from hypoforge.literature.adapter import AgenticM2Adapter
+from hypoforge.literature.adapter import AgenticM2Adapter, AgenticM2Module
 from hypoforge.literature.models import (
     EvidenceChunk,
     EvidenceLinkedKnowledge,
@@ -33,6 +33,11 @@ class FakeSearchAgent:
     async def run(self, sub_question: str, **kwargs) -> SearchRunResult:
         self.calls.append(sub_question)
         return self.results[len(self.calls) - 1].model_copy(deep=True)
+
+
+# ---------------------------------------------------------------------------
+# AgenticM2Adapter (DI) tests
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -179,42 +184,27 @@ async def test_adapter_rejects_unrecoverable_search_error() -> None:
         await adapter(PipelineState(input_question="question"))
 
 
-def test_importing_adapter_does_not_replace_registered_legacy_m2() -> None:
+# ---------------------------------------------------------------------------
+# AgenticM2Module (config wrapper) tests
+# ---------------------------------------------------------------------------
+
+
+def test_importing_module_does_not_replace_registered_legacy_m2() -> None:
     assert ModuleRegistry.get("m2") is M2LiteratureSearch
 
 
-class FakeAgenticAdapter:
-    def __init__(self) -> None:
-        self.calls = 0
-
-    async def __call__(self, state: PipelineState, config=None):
-        self.calls += 1
-        return {"literature_results": []}
+def test_agentic_module_requires_llm_config_for_integrated_variant() -> None:
+    with pytest.raises(ValueError, match="variant='integrated' requires llm_config"):
+        AgenticM2Module()
 
 
-def test_m2_legacy_remains_default() -> None:
-    module = M2LiteratureSearch()
-
-    assert module.implementation == "legacy"
-
-
-@pytest.mark.asyncio
-async def test_m2_agentic_delegates_to_injected_adapter() -> None:
-    adapter = FakeAgenticAdapter()
-    module = M2LiteratureSearch(
-        implementation="agentic",
-        agentic_adapter=adapter,
-    )
-
-    result = await module(PipelineState(input_question="question"))
-
-    assert adapter.calls == 1
-    assert result == {"literature_results": []}
+def test_agentic_module_rejects_unknown_variant() -> None:
+    with pytest.raises(ValueError, match="Unknown variant"):
+        AgenticM2Module(llm_config=object(), variant="nonexistent")
 
 
-@pytest.mark.asyncio
-async def test_m2_agentic_requires_adapter() -> None:
-    module = M2LiteratureSearch(implementation="agentic")
-
-    with pytest.raises(RuntimeError, match="AgenticM2Adapter"):
-        await module(PipelineState(input_question="question"))
+def test_agentic_module_builds_minimal_variant_without_llm_config() -> None:
+    module = AgenticM2Module(variant="minimal")
+    assert isinstance(module.adapter, AgenticM2Adapter)
+    assert module.adapter.search_agent is not None
+    assert module.adapter.reading_workflow is not None
