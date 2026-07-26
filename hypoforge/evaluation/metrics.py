@@ -20,7 +20,17 @@ as ``score_plan_completeness`` rather than in this hypothesis-metric registry.
 from __future__ import annotations
 
 import logging
-from typing import Any, List, Optional
+import asyncio
+import math
+import numpy as np
+import yaml
+import os
+from collections import deque
+import networkx as nx
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple, Type
+
+from pydantic import BaseModel, Field
 
 from ..protocol import MetricProtocol
 from ..state import HypothesisCard, KnowledgeEntry, EvidenceGraph, EvidenceNode, EvidenceEdgeRelation, EvidenceNodeType
@@ -215,10 +225,10 @@ hypothesis into a list of independent, verifiable 'atomic claims'.
 
 Rules:
 1. An atomic claim must assert exactly ONE biological interaction, mechanism, or fact.
-2. It must be self-contained (replace pronouns like 'it' with the actual entity).
-3. Do not lose the epistemic context (if the hypothesis states 'A might cause B', \
-   the claim is 'A causes B').
-4. Output ONLY a JSON object with the key "claims" containing a list of strings.
+2. Extract the 'subject' (e.g. 'Gene A') and the 'object' (e.g. 'Protein B') of the claim.
+3. Extract the 'relation' (e.g. 'inhibits').
+4. Include the full sentence as 'claim' (it must be self-contained).
+5. Output ONLY a JSON object with the key "claims" containing a list of these objects.
 """
 
 class GraphMetricBase(MetricProtocol):
@@ -229,13 +239,27 @@ class GraphMetricBase(MetricProtocol):
         from ..tools.qwen_client import QwenClient  # noqa: F811
         self._client = QwenClient.from_config(llm_config) if llm_config else None
         
-    async def _decompose_hypothesis(self, hypothesis: HypothesisCard) -> List[str]:
+    async def _decompose_hypothesis(self, hypothesis: HypothesisCard) -> List[Dict[str, str]]:
         if not self._client:
-            return [hypothesis.statement]
+            return [{"subject": "", "relation": "", "object": "", "claim": hypothesis.statement}]
             
         schema = {
             "type": "object", 
-            "properties": {"claims": {"type": "array", "items": {"type": "string"}}}
+            "properties": {
+                "claims": {
+                    "type": "array", 
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "subject": {"type": "string"},
+                            "relation": {"type": "string"},
+                            "object": {"type": "string"},
+                            "claim": {"type": "string"}
+                        },
+                        "required": ["subject", "relation", "object", "claim"]
+                    }
+                }
+            }
         }
         try:
             result = await self._client.structured_chat(
@@ -247,35 +271,21 @@ class GraphMetricBase(MetricProtocol):
             )
             if isinstance(result, dict) and "claims" in result:
                 return result["claims"]
-            return [hypothesis.statement]
+            return [{"subject": "", "relation": "", "object": "", "claim": hypothesis.statement}]
         except Exception as exc:
             logger.warning("Failed to decompose hypothesis: %s", exc)
-            return [hypothesis.statement]
+            return [{"subject": "", "relation": "", "object": "", "claim": hypothesis.statement}]
             
-    def _bm25_search(self, query: str, nodes: List[EvidenceNode], top_k: int = 3) -> List[Tuple[EvidenceNode, float]]:
-        try:
-            from rank_bm25 import BM25Okapi
-            import tiktoken
-            enc = tiktoken.get_encoding("cl100k_base")
-            tokenized_nodes = [enc.encode(n.label) for n in nodes]
-            query_tokens = enc.encode(query)
-            bm25 = BM25Okapi(tokenized_nodes)
-            scores = bm25.get_scores(query_tokens)
-            
-            scored_nodes = list(zip(nodes, scores))
-            scored_nodes.sort(key=lambda x: x[1], reverse=True)
-            return scored_nodes[:top_k]
-        except ImportError:
-            # Fallback linear search
-            query_lower = query.lower()
-            scored_nodes = []
-            for n in nodes:
-                score = 0.0
-                if query_lower in n.label.lower():
-                    score = 1.0
-                scored_nodes.append((n, score))
-            scored_nodes.sort(key=lambda x: x[1], reverse=True)
-            return scored_nodes[:top_k]
+    def _keyword_search(self, query: str, nodes: List[EvidenceNode]) -> List[EvidenceNode]:
+        """Find all nodes that contain the keyword (substring match)."""
+        if not query:
+            return []
+        query_lower = query.lower()
+        matched = []
+        for n in nodes:
+            if query_lower in n.label.lower():
+                matched.append(n)
+        return matched
 
 
 @MetricRegistry.register
@@ -294,39 +304,62 @@ class NoveltyMetric(GraphMetricBase):
         if not claims:
             return 0.0
             
-        searchable_nodes = [n for n in evidence_graph.nodes if n.type in (EvidenceNodeType.CLAIM, EvidenceNodeType.EVIDENCE)]
+        searchable_nodes = [n for n in evidence_graph.nodes if n.type in (EvidenceNodeType.CLAIM, EvidenceNodeType.EVIDENCE, EvidenceNodeType.ENTITY)]
         
-        system_prompt = """You evaluate scientific novelty.
-Given a 'Target Claim' and 'Known Literature Facts', determine if the Target Claim is already explicitly stated as an established fact.
-If the Target Claim proposes a NEW connection, mechanism, or idea not explicitly present in the Known Facts, it is novel.
-If it is just restating a Known Fact, it is not novel.
-Output JSON: {"is_novel": true/false, "rationale": "..."}"""
-
-        novel_count = 0
-        for claim in claims:
-            anchors = self._bm25_search(claim, searchable_nodes, top_k=3)
-            # Filter zero scores if we want, but for now we pass top_k valid ones
-            valid_anchors = [n for n, score in anchors if score > 0.0]
-            if not valid_anchors:
-                novel_count += 1  # No related anchors, completely novel
+        # Build networkx graph for fast BFS, omitting conflict edges
+        G = nx.Graph()
+        for n in evidence_graph.nodes:
+            G.add_node(n.id)
+        
+        conflict_rels = {EvidenceEdgeRelation.CONTRADICTS, EvidenceEdgeRelation.LIMITS}
+        for edge in evidence_graph.edges:
+            if edge.relation not in conflict_rels:
+                G.add_edge(edge.source, edge.target)
+                
+        total_score = 0.0
+        for claim_obj in claims:
+            subject_str = claim_obj.get("subject", "")
+            object_str = claim_obj.get("object", "")
+            
+            s_a = self._keyword_search(subject_str, searchable_nodes)
+            s_b = self._keyword_search(object_str, searchable_nodes)
+            
+            if not s_a or not s_b:
+                total_score += 1.0  # Concept missing -> fully novel
                 continue
                 
-            known_facts = "\n".join(f"- {n.label}" for n in valid_anchors)
-            schema = {"type": "object", "properties": {"is_novel": {"type": "boolean"}, "rationale": {"type": "string"}}}
+            s_a_ids = {n.id for n in s_a}
+            s_b_ids = {n.id for n in s_b}
             
-            try:
-                res = await self._client.structured_chat(
-                    system_prompt=system_prompt,
-                    user_prompt=f"Target Claim: {claim}\nKnown Literature Facts:\n{known_facts}",
-                    output_schema=schema,
-                    temperature=0.0
-                )
-                if isinstance(res, dict) and res.get("is_novel", False):
-                    novel_count += 1
-            except Exception:
-                novel_count += 1  # Assume novel on LLM failure
+            # Shortest path between any node in s_a and any node in s_b
+            min_dist = float('inf')
+            queue = deque([(node_id, 0) for node_id in s_a_ids])
+            visited = set(s_a_ids)
+            
+            while queue:
+                current_id, dist = queue.popleft()
+                if current_id in s_b_ids:
+                    min_dist = dist
+                    break
+                    
+                for neighbor in G.neighbors(current_id):
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append((neighbor, dist + 1))
+            
+            # Map distance to novelty score
+            if min_dist == float('inf'):
+                score = 1.0
+            elif min_dist == 0 or min_dist == 1:
+                score = 0.0
+            elif min_dist == 2:
+                score = 0.6
+            else:
+                score = 0.8
                 
-        return round(novel_count / len(claims), 4)
+            total_score += score
+            
+        return round(total_score / len(claims), 4)
 
     async def batch_compute(self, hypotheses: List[HypothesisCard], knowledge_entries: List[KnowledgeEntry], **kwargs) -> List[float]:
         return [await self.compute(h, knowledge_entries, **kwargs) for h in hypotheses]
@@ -339,6 +372,39 @@ class EvidenceConsistencyMetric(GraphMetricBase):
     independent = True
     implemented = True
 
+    def __init__(self, llm_config: Any = None):
+        super().__init__(llm_config)
+        self.embeddings = None
+        self.similarity_threshold = 0.8
+        self._load_embedding_config()
+        
+    def _load_embedding_config(self):
+        try:
+            from pathlib import Path
+            config_path = Path("configs/evaluation.yaml")
+            if config_path.exists():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f)
+                    emb_cfg = cfg.get("evaluation", {}).get("embedding", {})
+                    self.similarity_threshold = cfg.get("evaluation", {}).get("consistency", {}).get("similarity_threshold", 0.8)
+                    
+                    if emb_cfg:
+                        from langchain_openai import OpenAIEmbeddings
+                        api_key = os.environ.get(emb_cfg.get("api_key_env_var", "DASHSCOPE_API_KEY"), "")
+                        if api_key:
+                            self.embeddings = OpenAIEmbeddings(
+                                model=emb_cfg.get("model_name", "text-embedding-v3"),
+                                api_key=api_key,
+                                base_url=emb_cfg.get("base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+                            )
+        except Exception as e:
+            logger.warning(f"Failed to load embedding config: {e}")
+
+    def _cosine_similarity(self, vec1, vec2):
+        v1, v2 = np.array(vec1), np.array(vec2)
+        norm = np.linalg.norm(v1) * np.linalg.norm(v2)
+        return float(np.dot(v1, v2) / norm) if norm > 0 else 0.0
+
     async def compute(self, hypothesis: HypothesisCard, knowledge_entries: List[KnowledgeEntry], **kwargs) -> float:
         evidence_graph = kwargs.get("evidence_graph")
         if not evidence_graph or not self._client:
@@ -349,16 +415,38 @@ class EvidenceConsistencyMetric(GraphMetricBase):
             return 0.0
             
         searchable_nodes = [n for n in evidence_graph.nodes if n.type in (EvidenceNodeType.CLAIM, EvidenceNodeType.EVIDENCE)]
-        
+        node_embeddings = []
+        if self.embeddings and searchable_nodes:
+            texts = [n.label for n in searchable_nodes]
+            try:
+                node_embeddings = await self.embeddings.aembed_documents(texts)
+            except Exception as e:
+                logger.warning(f"Embedding failed, falling back: {e}")
+                
         system_prompt = """You are a strict scientific reviewer.
 Determine if the 'Target Claim' directly violates or ignores the provided 'Threat Context' (known conflicts/limitations from literature).
 If the threat context is irrelevant to the claim, or if the claim successfully resolves the threat, there is no conflict.
 Output JSON: {"is_conflict": true/false, "rationale": "..."}"""
 
         consistent_count = 0
-        for claim in claims:
-            anchors = self._bm25_search(claim, searchable_nodes, top_k=3)
-            valid_anchors = [n for n, score in anchors if score > 0.0]
+        from pathlib import Path
+        for claim_obj in claims:
+            claim_text = claim_obj.get("claim", "")
+            valid_anchors = []
+            
+            if self.embeddings and node_embeddings:
+                try:
+                    claim_emb = await self.embeddings.aembed_query(claim_text)
+                    for n, n_emb in zip(searchable_nodes, node_embeddings):
+                        sim = self._cosine_similarity(claim_emb, n_emb)
+                        if sim >= self.similarity_threshold:
+                            valid_anchors.append(n)
+                except Exception as e:
+                    logger.warning(f"Query embedding failed: {e}")
+                    valid_anchors = self._keyword_search(claim_obj.get("subject", ""), searchable_nodes)
+            else:
+                valid_anchors = self._keyword_search(claim_obj.get("subject", ""), searchable_nodes)
+                
             if not valid_anchors:
                 consistent_count += 1
                 continue
@@ -374,11 +462,10 @@ Output JSON: {"is_conflict": true/false, "rationale": "..."}"""
             try:
                 res = await self._client.structured_chat(
                     system_prompt=system_prompt,
-                    user_prompt=f"Target Claim: {claim}\nThreat Context:\n{threat_context_str}",
+                    user_prompt=f"Target Claim: {claim_text}\nThreat Context:\n{threat_context_str}",
                     output_schema=schema,
                     temperature=0.0
                 )
-                # Not a conflict => consistent
                 if isinstance(res, dict) and not res.get("is_conflict", True):
                     consistent_count += 1
             except Exception:
