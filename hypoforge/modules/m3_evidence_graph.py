@@ -12,6 +12,11 @@ In ``mode="llm"``, after rule-based construction, Qwen is called to
 discover richer relationships: ``SUPPORTS``, ``CONTRADICTS``, ``EXTENDS``,
 ``LIMITS`` — producing a more semantically rich evidence graph.
 
+When ``grounding_enabled=True``, the M3 grounding workflow is run after the
+rule-based + LLM graph construction.  It consumes ``M2KnowledgeExport``
+from the agentic M2 pipeline and adds grounded claims + evidence relations
+to the graph without re-downloading papers.
+
 Output: ``evidence_graph`` in state.  Optionally persisted to disk via
 ``KnowledgeGraphManager`` when ``state.memory_cache_dir`` is set.
 """
@@ -38,10 +43,17 @@ from ..state import (
     EvidenceGraph,
     EvidenceNode,
     EvidenceNodeType,
+    GroundingReport,
     KnowledgeEntryType,
     PipelineState,
 )
 from ..tools.qwen_client import QwenClient
+from .m3_grounding import GroundingWorkflow
+from .m3_grounding.models import (
+    AtomicClaim,
+    EvidenceRecord,
+    EvidenceRelation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,10 +62,13 @@ logger = logging.getLogger(__name__)
 class M3EvidenceGraph(ModuleProtocol):
     """Build typed evidence graph from structured knowledge entries.
 
-    Two modes:
+    Two modes (plus optional grounding):
       - ``"rule"`` — fast, deterministic, no LLM calls (current behaviour).
       - ``"llm"`` — adds Qwen-powered cross-entry relation extraction on top
         of the rule-based graph.  Falls back to rule-only on failure.
+      - ``grounding_enabled=True`` — runs the M3 grounding workflow
+        (consuming ``M2KnowledgeExport``) and merges grounded claims +
+        relations into the evidence graph.
 
     TODO (组员可扩展):
         - **Incremental graph update**: 当前每次 M3 执行都重建整张图；
@@ -69,8 +84,11 @@ class M3EvidenceGraph(ModuleProtocol):
     """
 
     module_name = "m3"
-    module_version = "0.2.0"
-    description = "Build typed evidence graph + optional LLM relation extraction"
+    module_version = "0.3.0"
+    description = (
+        "Build typed evidence graph + optional LLM relation extraction "
+        "+ optional M3 grounding (consumes M2KnowledgeExport)"
+    )
 
     # ------------------------------------------------------------------
     # Configurable
@@ -86,6 +104,27 @@ class M3EvidenceGraph(ModuleProtocol):
         relation_max_tokens: int = 16384,
         enable_cross_batch: bool = True,
         bridge_batch_size: int = 10,
+        # ---- grounding settings ----
+        grounding_enabled: bool = False,
+        grounding_mode: str = "rule",
+        grounding_cache_dir: str = ".hypoforge_cache/m3_grounding",
+        grounding_embedding_model: str = "",
+        grounding_retrieve_k: int = 30,
+        grounding_evidence_k: int = 12,
+        grounding_min_relevance: float = 5.0,
+        grounding_max_queries: int = 16,
+        grounding_max_evidence_items: int = 200,
+        grounding_max_concurrency: int = 4,
+        grounding_relation_selection_mode: str = "direct",
+        grounding_relation_candidate_k: int = 12,
+        grounding_relation_max_pairs: int = 60,
+        grounding_relation_batch_size: int = 10,
+        grounding_relation_min_confidence: float = 0.65,
+        grounding_gams_iterations: int = 128,
+        grounding_gams_exploration_weight: float = 0.35,
+        grounding_gams_seed: int = 42,
+        grounding_llm_call_timeout: float = 120.0,
+        grounding_relation_judge_retries: int = 2,
         **kwargs,
     ):
         self.mode = mode
@@ -97,6 +136,33 @@ class M3EvidenceGraph(ModuleProtocol):
         self.enable_cross_batch = enable_cross_batch
         self.bridge_batch_size = max(1, bridge_batch_size)
         self.client = QwenClient.from_config(llm_config) if llm_config else None
+
+        # Grounding workflow (lazy — only built when enabled)
+        self.grounding_enabled = grounding_enabled
+        self._grounder: Optional[GroundingWorkflow] = None
+        if grounding_enabled:
+            self._grounder = GroundingWorkflow(
+                client=self.client,
+                mode=grounding_mode if grounding_mode in {"rule", "llm", "api", "direct"} else mode,
+                cache_dir=grounding_cache_dir,
+                embedding_model=grounding_embedding_model,
+                retrieve_k=grounding_retrieve_k,
+                evidence_k=grounding_evidence_k,
+                min_relevance=grounding_min_relevance,
+                max_queries=grounding_max_queries,
+                max_evidence_items=grounding_max_evidence_items,
+                max_concurrency=grounding_max_concurrency,
+                relation_selection_mode=grounding_relation_selection_mode,
+                relation_candidate_k=grounding_relation_candidate_k,
+                relation_max_pairs=grounding_relation_max_pairs,
+                relation_batch_size=grounding_relation_batch_size,
+                relation_min_confidence=grounding_relation_min_confidence,
+                evidence_gams_iterations=grounding_gams_iterations,
+                evidence_gams_exploration_weight=grounding_gams_exploration_weight,
+                evidence_gams_seed=grounding_gams_seed,
+                llm_call_timeout=grounding_llm_call_timeout,
+                relation_judge_retries=grounding_relation_judge_retries,
+            )
 
     # ------------------------------------------------------------------
     # ModuleProtocol implementation
@@ -123,13 +189,45 @@ class M3EvidenceGraph(ModuleProtocol):
             try:
                 graph = await self._enhance_with_llm_batched(graph, all_entries)
             except Exception as exc:
-                logger.warning("M3 LLM enhancement failed; using rule-only graph: %s", exc)
+                logger.warning(
+                    "M3 LLM enhancement failed; using rule-only graph: %s", exc
+                )
+
+        # --- Step 3: M3 grounding (optional — consumes M2KnowledgeExport) ---
+        result: Dict[str, Any] = {"evidence_graph": graph}
+        if self.grounding_enabled and self._grounder is not None:
+            if state.m2_knowledge_export is None:
+                logger.warning(
+                    "M3 grounding is enabled but m2_knowledge_export is None. "
+                    "Grounding requires the agentic M2 pipeline "
+                    "(search.implementation='agentic'). Skipping grounding."
+                )
+                result["errors"] = state.errors + [
+                    "[m3] grounding.enabled=True but no m2_knowledge_export "
+                    "available — run the agentic M2 pipeline first."
+                ]
+            else:
+                try:
+                    grounded = await self._grounder.run(state)
+                    graph = self._merge_grounding(
+                        graph,
+                        grounded.get("evidence_records", []),
+                        grounded.get("claims", []),
+                        grounded.get("relations", []),
+                        grounded.get("report"),
+                    )
+                    result["evidence_graph"] = graph
+                except Exception as exc:
+                    logger.exception(
+                        "M3 grounding workflow failed; retaining non-grounded graph: %s",
+                        exc,
+                    )
 
         # --- persist to disk (if enabled) ---
         if getattr(state, "memory_cache_dir", ""):
             self._persist_graph(graph, state.memory_cache_dir)
 
-        return {"evidence_graph": graph}
+        return result
 
     # ------------------------------------------------------------------
     # Step 1 — rule-based graph construction
@@ -490,6 +588,126 @@ class M3EvidenceGraph(ModuleProtocol):
             graph.conflicts = result["revised_conflicts"]
         if result.get("revised_knowledge_gaps"):
             graph.knowledge_gaps = result["revised_knowledge_gaps"]
+
+        return graph
+
+    # ------------------------------------------------------------------
+    # Step 3 — merge grounding results into the evidence graph
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _merge_grounding(
+        graph: EvidenceGraph,
+        records: List[EvidenceRecord],
+        claims: List[AtomicClaim],
+        relations: List[EvidenceRelation],
+        report: Any,
+    ) -> EvidenceGraph:
+        """Merge grounding workflow output into the existing evidence graph.
+
+        Creates CLAIM nodes for each ``AtomicClaim`` and adds provenance
+        edges (evidence → claim) and semantic relation edges (claim → claim).
+        The ``evidence_ids`` on both claims and relations point back to
+        ``M2EvidenceExport.evidence_id``, which is recorded in node metadata.
+        """
+        record_map = {record.evidence_id: record for record in records}
+        claim_map: Dict[str, str] = {}  # claim id → node id
+
+        # --- Create CLAIM nodes ---
+        for claim in claims:
+            node_id = "GCLM_" + claim.id.replace("CLM_", "")
+            claim_map[claim.id] = node_id
+            evidence_paper_ids: List[str] = []
+            for eid in claim.evidence_ids:
+                rec = record_map.get(eid)
+                if rec and rec.paper_id:
+                    evidence_paper_ids.append(rec.paper_id)
+            graph.nodes.append(EvidenceNode(
+                id=node_id,
+                type=EvidenceNodeType.CLAIM,
+                label=claim.statement[:200],
+                metadata={
+                    "claim_id": claim.id,
+                    "confidence": claim.confidence,
+                    "evidence_ids": claim.evidence_ids,
+                    "paper_ids": list(dict.fromkeys(evidence_paper_ids)),
+                    "entities": claim.entities,
+                    "provenance_level": "m2_fulltext_grounded",
+                },
+            ))
+
+        # --- Create EVIDENCE nodes for each EvidenceRecord ---
+        for record in records:
+            node_id = "GEV_" + record.evidence_id[:20]
+            graph.nodes.append(EvidenceNode(
+                id=node_id,
+                type=EvidenceNodeType.EVIDENCE,
+                label=record.summary[:200],
+                metadata={
+                    "evidence_id": record.evidence_id,
+                    "paper_id": record.paper_id,
+                    "section": record.section,
+                    "page": record.page,
+                    "quote": record.quote[:500],
+                    "normalized_claim": record.normalized_claim[:500],
+                    "relevance_score": record.relevance_score,
+                    "provenance_level": "m2_fulltext_grounded",
+                },
+            ))
+
+        # --- Add provenance edges (evidence → claim) ---
+        for claim in claims:
+            claim_node = claim_map.get(claim.id)
+            if not claim_node:
+                continue
+            for eid in claim.evidence_ids:
+                ev_node = "GEV_" + eid[:20]
+                # Avoid duplicates
+                already = any(
+                    e.source == ev_node and e.target == claim_node
+                    and e.relation == EvidenceEdgeRelation.SUPPORTS
+                    for e in graph.edges
+                )
+                if not already:
+                    graph.edges.append(EvidenceEdge(
+                        source=ev_node,
+                        target=claim_node,
+                        relation=EvidenceEdgeRelation.SUPPORTS,
+                        rationale="Atomic claim grounded in this M2 evidence item.",
+                        evidence_ids=[eid],
+                    ))
+
+        # --- Add semantic relation edges (claim → claim) ---
+        for rel in relations:
+            source_node = claim_map.get(rel.source)
+            target_node = claim_map.get(rel.target)
+            if not source_node or not target_node:
+                continue
+            try:
+                edge_rel = EvidenceEdgeRelation(rel.relation)
+            except ValueError:
+                continue
+            already = any(
+                e.source == source_node and e.target == target_node
+                and e.relation == edge_rel
+                for e in graph.edges
+            )
+            if not already:
+                graph.edges.append(EvidenceEdge(
+                    source=source_node,
+                    target=target_node,
+                    relation=edge_rel,
+                    confidence=rel.confidence,
+                    rationale=rel.rationale,
+                    evidence_ids=rel.evidence_ids,
+                ))
+
+        logger.info(
+            "M3 grounding: merged %d claims, %d evidence records, %d relations "
+            "(%d total nodes, %d total edges)",
+            len(claims), len(records), len(relations),
+            len(graph.nodes), len(graph.edges),
+        )
 
         return graph
 
