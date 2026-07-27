@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from hypoforge.literature.adapter import AgenticM2Module
+from hypoforge.literature.adapter import AgenticM2Adapter
 from hypoforge.literature.models import (
     CoverageReport,
     PaperReadingResult,
@@ -93,7 +93,7 @@ async def test_run_uses_integrated_adapter_once_and_returns_complete_trace(
     search_agent = FakeSearchAgent(search_result)
     reading_workflow = FakeReadingWorkflow(reading_result)
     budget = SearchBudget(max_rounds=2, max_queries=4)
-    base_adapter = AgenticM2Module(
+    base_adapter = AgenticM2Adapter(
         search_agent=search_agent,
         reading_workflow=reading_workflow,
         budget=budget,
