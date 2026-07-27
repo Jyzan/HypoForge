@@ -3,9 +3,17 @@ evaluation:
     model_name: "text-embedding-v3"
     api_key_env_var: "DASHSCOPE_API_KEY"
     base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
-  novelty:
-    # We will use simple BM25 keyword mapping, so no embedding threshold needed here.
-    pass
   consistency:
-    # Cosine similarity threshold for deciding if a graph node threatens the claim
     similarity_threshold: 0.8
+
+ablation:
+  questions:
+    - "Can CRISPR-Cas9 be used to treat Huntington's disease by targeting mutant HTT alleles?"
+    - "Does the gut microbiome influence the efficacy of PD-1 blockade immunotherapy?"
+    - "Can metformin extend lifespan by activating AMPK and inhibiting mTOR pathways?"
+    - "Is tau hyperphosphorylation a consequence rather than a cause of Alzheimer's disease pathology?"
+    - "Do specialized pro-resolving mediators (SPMs) prevent chronic inflammation in rheumatoid arthritis?"
+  configs_dir: "configs/ablation"
+  repeats: 3
+  max_budget_usd: 50.0
+  output_csv: "ablation_results.csv"

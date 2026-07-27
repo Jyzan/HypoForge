@@ -226,9 +226,10 @@ hypothesis into a list of independent, verifiable 'atomic claims'.
 Rules:
 1. An atomic claim must assert exactly ONE biological interaction, mechanism, or fact.
 2. Extract the 'subject' (e.g. 'Gene A') and the 'object' (e.g. 'Protein B') of the claim.
-3. Extract the 'relation' (e.g. 'inhibits').
-4. Include the full sentence as 'claim' (it must be self-contained).
-5. Output ONLY a JSON object with the key "claims" containing a list of these objects.
+3. IMPORTANT: For both subject and object, provide an array of synonyms ('subject_synonyms' and 'object_synonyms'). This array MUST include common English and Chinese translations, academic aliases, and abbreviations.
+4. Extract the 'relation' (e.g. 'inhibits').
+5. Include the full sentence as 'claim' (it must be self-contained).
+6. Output ONLY a JSON object with the key "claims" containing a list of these objects.
 """
 
 class GraphMetricBase(MetricProtocol):
@@ -252,11 +253,13 @@ class GraphMetricBase(MetricProtocol):
                         "type": "object",
                         "properties": {
                             "subject": {"type": "string"},
+                            "subject_synonyms": {"type": "array", "items": {"type": "string"}},
                             "relation": {"type": "string"},
                             "object": {"type": "string"},
+                            "object_synonyms": {"type": "array", "items": {"type": "string"}},
                             "claim": {"type": "string"}
                         },
-                        "required": ["subject", "relation", "object", "claim"]
+                        "required": ["subject", "subject_synonyms", "relation", "object", "object_synonyms", "claim"]
                     }
                 }
             }
@@ -276,14 +279,18 @@ class GraphMetricBase(MetricProtocol):
             logger.warning("Failed to decompose hypothesis: %s", exc)
             return [{"subject": "", "relation": "", "object": "", "claim": hypothesis.statement}]
             
-    def _keyword_search(self, query: str, nodes: List[EvidenceNode]) -> List[EvidenceNode]:
-        """Find all nodes that contain the keyword (substring match)."""
-        if not query:
+    def _keyword_search(self, queries: List[str], nodes: List[EvidenceNode]) -> List[EvidenceNode]:
+        """Find all nodes that contain any of the keywords (substring match)."""
+        if not queries:
             return []
-        query_lower = query.lower()
+        queries_lower = [q.lower() for q in queries if q]
+        if not queries_lower:
+            return []
+            
         matched = []
         for n in nodes:
-            if query_lower in n.label.lower():
+            label_lower = n.label.lower()
+            if any(q in label_lower for q in queries_lower):
                 matched.append(n)
         return matched
 
@@ -319,10 +326,15 @@ class NoveltyMetric(GraphMetricBase):
         total_score = 0.0
         for claim_obj in claims:
             subject_str = claim_obj.get("subject", "")
+            subject_synonyms = claim_obj.get("subject_synonyms", [])
             object_str = claim_obj.get("object", "")
+            object_synonyms = claim_obj.get("object_synonyms", [])
             
-            s_a = self._keyword_search(subject_str, searchable_nodes)
-            s_b = self._keyword_search(object_str, searchable_nodes)
+            s_a_queries = [subject_str] + subject_synonyms
+            s_b_queries = [object_str] + object_synonyms
+            
+            s_a = self._keyword_search(s_a_queries, searchable_nodes)
+            s_b = self._keyword_search(s_b_queries, searchable_nodes)
             
             if not s_a or not s_b:
                 total_score += 1.0  # Concept missing -> fully novel
