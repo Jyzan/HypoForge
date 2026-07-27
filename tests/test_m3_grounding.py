@@ -13,7 +13,17 @@ from hypoforge.modules.m3_grounding.models import (
     GroundingReport,
     RelationCandidate,
 )
+from hypoforge.modules.m3_evidence_graph import (
+    M3EvidenceGraph,
+    add_entity_synonym,
+    evidence_graph_to_mermaid,
+    normalize_entity,
+)
 from hypoforge.state import (
+    EvidenceEdgeRelation,
+    EvidenceGraph,
+    EvidenceNode,
+    EvidenceNodeType,
     M2EvidenceExport,
     M2KnowledgeExport,
     M2KnowledgeRun,
@@ -189,3 +199,145 @@ def test_unrelated_cannot_become_relation():
     )
     with pytest.raises(ValueError, match="unrelated"):
         candidate.to_relation()
+
+
+# ============================================================================
+# Entity normalisation tests
+# ============================================================================
+
+
+def test_normalize_entity_maps_synonyms():
+    """Known variants should map to the same canonical form."""
+    assert normalize_entity("Hsp70") == normalize_entity("HSP70")
+    assert normalize_entity("HSPA1A") == normalize_entity("hsp70")
+    assert normalize_entity("heat shock protein 70") == "hsp70"
+
+
+def test_normalize_entity_falls_back_to_cleaned():
+    """Unknown names should be lowercased and stripped but not lost."""
+    result = normalize_entity("  Unknown-Protein-X  ")
+    assert result == "unknown-protein-x"
+
+
+def test_normalize_entity_strips_punctuation():
+    """Trailing commas, periods should be removed."""
+    assert normalize_entity("Hsp70,") == "hsp70"
+    assert normalize_entity("(p53)") == "p53"
+
+
+def test_add_entity_synonym_runtime():
+    """Runtime-registered synonyms should be picked up immediately."""
+    add_entity_synonym("MyNewProtein", "MNP")
+    assert normalize_entity("MNP") == "mynewprotein"
+    assert normalize_entity("MyNewProtein") == "mynewprotein"
+
+
+# ============================================================================
+# Mermaid export tests
+# ============================================================================
+
+
+def test_evidence_graph_to_mermaid_produces_valid_structure():
+    """Mermaid output should have nodes, edges, and title."""
+    graph = EvidenceGraph(
+        nodes=[
+            EvidenceNode(id="N1", type=EvidenceNodeType.CLAIM, label="Claim A"),
+            EvidenceNode(id="N2", type=EvidenceNodeType.EVIDENCE, label="Evidence B"),
+            EvidenceNode(id="SRC_P1", type=EvidenceNodeType.SOURCE, label="Paper 1"),
+        ],
+        edges=[
+            EvidenceEdge(
+                source="N2", target="N1",
+                relation=EvidenceEdgeRelation.SUPPORTS,
+                confidence=0.88, rationale="Strong evidence.",
+            ),
+            EvidenceEdge(
+                source="SRC_P1", target="N2",
+                relation=EvidenceEdgeRelation.INVOLVES,
+            ),
+        ],
+    )
+    mermaid = evidence_graph_to_mermaid(graph)
+    assert "flowchart LR" in mermaid
+    assert "N1" in mermaid
+    assert "N2" in mermaid
+    assert "supports" in mermaid
+    assert "involves" in mermaid
+    assert "c=0.88" in mermaid
+
+
+def test_evidence_graph_to_mermaid_escapes_quotes():
+    """Double-quotes in labels should be escaped to single quotes."""
+    graph = EvidenceGraph(
+        nodes=[
+            EvidenceNode(
+                id="N1", type=EvidenceNodeType.CLAIM,
+                label='The "key" finding',
+            ),
+        ],
+    )
+    mermaid = evidence_graph_to_mermaid(graph)
+    assert '"' not in mermaid.split("N1")[1].split("]")[0]
+
+
+# ============================================================================
+# Incremental update tests
+# ============================================================================
+
+
+def test_find_new_entries_filters_existing():
+    """_find_new_entries should return only entries not already in the graph."""
+    from hypoforge.state import KnowledgeEntry, KnowledgeEntryType, ConfidenceLevel
+
+    existing = EvidenceGraph(
+        nodes=[
+            EvidenceNode(
+                id="N_K1", type=EvidenceNodeType.CLAIM,
+                label="Entry 1", metadata={"entry_type": "established_fact"},
+            ),
+            EvidenceNode(
+                id="N_K2", type=EvidenceNodeType.EVIDENCE,
+                label="Entry 2", metadata={"entry_type": "established_fact"},
+            ),
+        ],
+    )
+    entries = [
+        KnowledgeEntry(id="K1", type=KnowledgeEntryType.ESTABLISHED_FACT, content="old"),
+        KnowledgeEntry(id="K2", type=KnowledgeEntryType.ESTABLISHED_FACT, content="old"),
+        KnowledgeEntry(id="K3", type=KnowledgeEntryType.ESTABLISHED_FACT, content="new"),
+    ]
+    new_entries = M3EvidenceGraph._find_new_entries(entries, existing)
+    assert len(new_entries) == 1
+    assert new_entries[0].id == "K3"
+
+
+def test_merge_graphs_deduplicates():
+    """Merging two graphs should not create duplicate nodes or edges."""
+    base = EvidenceGraph(
+        nodes=[
+            EvidenceNode(id="N1", type=EvidenceNodeType.CLAIM, label="A"),
+        ],
+        edges=[
+            EvidenceEdge(source="SRC_P1", target="N1", relation=EvidenceEdgeRelation.INVOLVES),
+        ],
+        established_facts=["K1"],
+    )
+    additions = EvidenceGraph(
+        nodes=[
+            EvidenceNode(id="N1", type=EvidenceNodeType.CLAIM, label="A"),  # duplicate
+            EvidenceNode(id="N2", type=EvidenceNodeType.CLAIM, label="B"),  # new
+        ],
+        edges=[
+            EvidenceEdge(source="SRC_P1", target="N1", relation=EvidenceEdgeRelation.INVOLVES),  # dup
+            EvidenceEdge(source="N2", target="N1", relation=EvidenceEdgeRelation.EXTENDS),  # new
+        ],
+        established_facts=["K1", "K2"],
+    )
+    merged = M3EvidenceGraph._merge_graphs(base, additions)
+    # 2 unique nodes (N1, N2)
+    assert len(merged.nodes) == 2
+    # 2 unique edges
+    assert len(merged.edges) == 2
+    # 2 unique facts (K1, K2), no duplicates
+    assert len(merged.established_facts) == 2
+    assert set(merged.established_facts) == {"K1", "K2"}
