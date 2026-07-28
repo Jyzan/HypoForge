@@ -85,6 +85,26 @@ def _normalized_title(paper: PaperRecord) -> str:
     return "" if title in _UNTITLED else title
 
 
+def _metadata_conflicts(left: PaperRecord, right: PaperRecord) -> bool:
+    """Reject records whose stable identifiers explicitly disagree."""
+
+    pairs = (
+        (_normalize_doi(left.doi), _normalize_doi(right.doi)),
+        (
+            _normalize_identifier(left.pmid, "pmid:"),
+            _normalize_identifier(right.pmid, "pmid:"),
+        ),
+        (
+            _normalize_identifier(left.pmcid, "pmcid:"),
+            _normalize_identifier(right.pmcid, "pmcid:"),
+        ),
+    )
+    return any(
+        bool(left_value and right_value and left_value != right_value)
+        for left_value, right_value in pairs
+    )
+
+
 def _titles_match(left: PaperRecord, right: PaperRecord) -> bool:
     left_title = _normalized_title(left)
     right_title = _normalized_title(right)
@@ -94,7 +114,11 @@ def _titles_match(left: PaperRecord, right: PaperRecord) -> bool:
         return True
     if min(len(left_title), len(right_title)) < 20:
         return False
-    if left.year is not None and right.year is not None and abs(left.year - right.year) > 1:
+    if (
+        left.year is not None
+        and right.year is not None
+        and abs(left.year - right.year) > 1
+    ):
         return False
     ratio = SequenceMatcher(None, left_title, right_title).ratio()
     left_tokens = set(tokenize(left_title))
@@ -105,6 +129,8 @@ def _titles_match(left: PaperRecord, right: PaperRecord) -> bool:
 
 
 def _matches(left: PaperRecord, right: PaperRecord) -> bool:
+    if _metadata_conflicts(left, right):
+        return False
     if _identifier_keys(left) & _identifier_keys(right):
         return True
     return _titles_match(left, right)

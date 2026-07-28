@@ -227,6 +227,47 @@ async def test_agent_reranks_candidates_with_scout_relevance_before_final_k() ->
     assert "post_scout_total" in result.final_papers[0].rank_scores
 
 
+@pytest.mark.asyncio
+async def test_agent_excludes_not_applicable_papers_from_final_k_when_possible() -> None:
+    class SemanticScout(FakeScoutReader):
+        async def read(self, sub_question, papers):
+            return [
+                ScoutNote(
+                    paper_id=item.paper_id,
+                    relevance_to_question=0.9 if item.paper_id == "relevant" else 0.1,
+                    directness_to_question=0.8 if item.paper_id == "relevant" else 0.1,
+                )
+                for item in papers
+            ]
+
+    agent = IterativeSearchAgent(
+        query_planner=FakePlanner([[query("q-1", "core", "pubmed")]]),
+        sources=[
+            FakeSource(
+                "pubmed",
+                {
+                    "core": [
+                        paper("relevant", "pubmed"),
+                        paper("irrelevant-1", "pubmed"),
+                        paper("irrelevant-2", "pubmed"),
+                    ]
+                },
+            )
+        ],
+        deduplicator=FakeDeduplicator(),
+        ranker=FakeRanker(),
+        scout_reader=SemanticScout(),
+        coverage_evaluator=FakeCoverageEvaluator(
+            [CoverageReport(sufficient=True)]
+        ),
+        final_k=3,
+    )
+
+    result = await agent.run("question")
+
+    assert [item.paper_id for item in result.final_papers] == ["relevant"]
+
+
 def build_agent(
     *,
     planner: FakePlanner | None = None,

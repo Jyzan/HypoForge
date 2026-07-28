@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 
 import pytest
@@ -27,6 +28,44 @@ from hypoforge.state import PipelineState
 class FakeClient:
     async def structured_chat(self, **kwargs):
         properties = kwargs.get("output_schema", {}).get("properties", {})
+        if "notes" in properties:
+            payload = json.loads(
+                kwargs["user_prompt"].split("Papers to screen:\n", 1)[1]
+            )
+            return {
+                "notes": [
+                    {
+                        "paper_id": item["paper_id"],
+                        "relevance": 0.9,
+                        "directness": 0.8,
+                        "relation": "supports",
+                        "supporting_sentence_ids": [
+                            item["sentences"][0]["sentence_id"]
+                        ],
+                        "contradicting_sentence_ids": [],
+                        "study_type": "experimental",
+                        "mechanisms": ["Hippo signaling"],
+                        "entities": ["YAP", "TAZ"],
+                        "limitations": [],
+                    }
+                    for item in payload
+                    if item["sentences"]
+                ]
+            }
+        if "facets" in properties:
+            return {
+                "facets": [
+                    {
+                        "facet": "Hippo signaling mechanism",
+                        "status": "covered",
+                        "paper_ids": ["PMID:1"],
+                        "sentence_ids": ["PMID:1:S1"],
+                    }
+                ],
+                "missing_topics": [],
+                "sufficient": True,
+                "rationale": "The supplied abstracts ground the mechanism.",
+            }
         if "summary" in properties:
             evidence_ids = re.findall(
                 r"\[Evidence ID: ([^\]]+)\]", kwargs.get("user_prompt", "")
@@ -179,6 +218,9 @@ async def test_integrated_factory_runs_m2_without_minimal_fallback(tmp_path) -> 
         reading_cache_dir=tmp_path,
         pmc_backend=unavailable_pmc,
     )
+    # The factory's full-text wiring is covered separately.  Keep this
+    # end-to-end semantic/search/export test entirely thread- and network-free.
+    adapter.reading_workflow = AbstractReadingWorkflow()
     output = await adapter(PipelineState(input_question="Hippo YAP TAZ"))
 
     result = output["literature_results"][0]

@@ -114,7 +114,11 @@ class IterativeSearchAgent:
         limits = budget or SearchBudget()
         started_at = self.clock()
         deadline_started_at = time.monotonic()
-        state = SearchState()
+        state = SearchState(
+            question_type=question_type,
+            key_entities=set(key_entities),
+            domains=set(domains),
+        )
         state.remaining_budget = calculate_remaining(limits, state)
         all_queries: list[SearchQuery] = []
         query_history: set[tuple[str, str]] = set()
@@ -313,7 +317,11 @@ class IterativeSearchAgent:
                 for paper in ranked
                 if paper.paper_id in scout_by_paper
             ]
-            ranked = rerank_with_scout(ranked, scout_notes)
+            ranked = rerank_with_scout(
+                ranked,
+                scout_notes,
+                selection_limit=self.final_k,
+            )
             candidate_pool = {paper.paper_id: paper for paper in ranked}
             scout_notes = [
                 scout_by_paper[paper.paper_id]
@@ -377,13 +385,23 @@ class IterativeSearchAgent:
                 low_gain_round_limit=self.low_gain_round_limit,
             )
 
+        applicable_finalists = [
+            paper
+            for paper in ranked
+            if paper.rank_scores.get("semantic_not_applicable", 0.0) < 0.5
+        ]
+        final_papers = (
+            applicable_finalists[: self.final_k]
+            if applicable_finalists
+            else ranked[: self.final_k]
+        )
         return SearchRunResult(
             sub_question=sub_question,
             queries=all_queries,
             papers_found=papers_found,
             papers_after_dedup=len(canonical_history),
             candidates=ranked,
-            final_papers=ranked[: self.final_k],
+            final_papers=final_papers,
             coverage=coverage,
             failed_sources=failed_sources,
             iterations=state.round_index,

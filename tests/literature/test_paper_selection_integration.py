@@ -48,47 +48,60 @@ def paper(index: int, **kwargs: object) -> PaperRecord:
 
 
 class ScoutClient:
-    buckets = {
-        "paper-0": [EvidenceBucket.SUPPORTING, EvidenceBucket.RECENT],
-        "paper-1": [EvidenceBucket.SUPPORTING, EvidenceBucket.METHODOLOGICAL],
-        "paper-2": [EvidenceBucket.REVIEW],
-        "paper-3": [EvidenceBucket.SUPPORTING],
-        "paper-4": [EvidenceBucket.CONTRADICTING],
-        "paper-5": [EvidenceBucket.CLASSIC],
-    }
-
     async def structured_chat(self, **kwargs: Any) -> dict[str, Any]:
         payload = json.loads(kwargs["user_prompt"].split("Papers to screen:\n", 1)[1])
-        return {
-            "notes": [
+        notes = []
+        for item in payload:
+            paper_id = item["paper_id"]
+            relation = (
+                "contradicts" if paper_id == "paper-4"
+                else "insufficient" if paper_id == "paper-2"
+                else "supports"
+            )
+            notes.append(
                 {
-                    "paper_id": item["paper_id"],
-                    "main_topic": item["title"],
-                    "key_terms": ["Hsp70"],
-                    "entities": ["HSP70"],
+                    "paper_id": paper_id,
+                    "relevance": 0.9,
+                    "directness": 0.9,
+                    "relation": relation,
+                    "supporting_sentence_ids": (
+                        [f"{paper_id}:S1"] if relation == "supports" else []
+                    ),
+                    "contradicting_sentence_ids": (
+                        [f"{paper_id}:S1"] if relation == "contradicts" else []
+                    ),
+                    "study_type": (
+                        "review" if paper_id == "paper-2"
+                        else "method" if paper_id == "paper-1"
+                        else "experimental"
+                    ),
                     "mechanisms": ["Hsp70 regulation"],
-                    "important_authors": [],
-                    "controversies": [],
-                    "candidate_citations": [],
-                    "relevance_to_question": 0.9,
-                    "evidence_buckets": [
-                        bucket.value for bucket in self.buckets[item["paper_id"]]
-                    ],
-                    "study_design": "experimental study",
-                    "evidence_summary": f"Evidence from {item['paper_id']}.",
+                    "entities": ["HSP70"],
+                    "limitations": [],
                 }
-                for item in payload
-            ]
+            )
+        return {
+            "notes": notes
         }
 
 
 class CoverageClient:
     async def structured_chat(self, **kwargs: Any) -> dict[str, Any]:
-        payload = json.loads(kwargs["user_prompt"].split("Scout notes:\n", 1)[1])
+        payload = json.loads(
+            kwargs["user_prompt"].split("Grounded Scout judgments:\n", 1)[1]
+        )
         complete = any(item["paper_id"] == "paper-4" for item in payload)
         return {
-            "covered_topics": ["Hsp70 regulation"],
+            "facets": [
+                {
+                    "facet": "negative evidence",
+                    "status": "covered" if complete else "missing",
+                    "paper_ids": ["paper-4"] if complete else [],
+                    "sentence_ids": ["paper-4:S1"] if complete else [],
+                }
+            ],
             "missing_topics": [] if complete else ["negative evidence"],
+            "sufficient": complete,
             "rationale": (
                 "Positive and negative evidence are represented."
                 if complete

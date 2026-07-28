@@ -136,6 +136,7 @@ def test_scout_rerank_keeps_relevant_directional_primary_evidence_in_early_windo
         paper(
             f"review-{index}",
             f"Review of Hsp70 regulation {index}",
+            abstract=f"Review context {index}.",
             rank_scores={"total": 0.90 - index * 0.01},
         )
         for index in range(4)
@@ -143,11 +144,13 @@ def test_scout_rerank_keeps_relevant_directional_primary_evidence_in_early_windo
     supporting = paper(
         "supporting-primary",
         "Hsp70 ATPase assay supports the proposed mechanism",
+        abstract="Hsp70 directly increased ATPase activity.",
         rank_scores={"total": 0.73},
     )
     contradicting = paper(
         "contradicting-primary",
         "Hsp70 ATPase experiment finds no association during aging",
+        abstract="Hsp70 had no effect on ATPase activity during aging.",
         rank_scores={"total": 0.72},
     )
     papers = [*reviews, supporting, contradicting]
@@ -157,7 +160,7 @@ def test_scout_rerank_keeps_relevant_directional_primary_evidence_in_early_windo
             relevance_to_question=0.90,
             directness_to_question=0.25,
             evidence_buckets={EvidenceBucket.REVIEW},
-            study_design="review article",
+            study_design="review",
         )
         for item in reviews
     ]
@@ -168,14 +171,18 @@ def test_scout_rerank_keeps_relevant_directional_primary_evidence_in_early_windo
                 relevance_to_question=0.80,
                 directness_to_question=0.90,
                 evidence_buckets={EvidenceBucket.SUPPORTING},
-                study_design="in vitro study",
+                supporting_evidence=["Hsp70 directly increased ATPase activity."],
+                study_design="experimental",
             ),
             ScoutNote(
                 paper_id=contradicting.paper_id,
                 relevance_to_question=0.75,
                 directness_to_question=0.90,
                 evidence_buckets={EvidenceBucket.CONTRADICTING},
-                study_design="in vitro study",
+                contradicting_evidence=[
+                    "Hsp70 had no effect on ATPase activity during aging."
+                ],
+                study_design="experimental",
             ),
         ]
     )
@@ -233,7 +240,7 @@ def test_scout_rerank_builds_a_credible_final_set_not_a_review_list() -> None:
             relevance_to_question=0.90,
             directness_to_question=0.85,
             evidence_buckets={EvidenceBucket.REVIEW},
-            study_design="review article",
+            study_design="review",
         )
         for item in reviews
     ]
@@ -244,28 +251,34 @@ def test_scout_rerank_builds_a_credible_final_set_not_a_review_list() -> None:
                 relevance_to_question=0.80,
                 directness_to_question=0.90,
                 evidence_buckets={EvidenceBucket.SUPPORTING},
-                study_design="in vitro study",
+                supporting_evidence=[
+                    "An in vitro assay demonstrates the proposed Hsp70 mechanism."
+                ],
+                study_design="experimental",
             ),
             ScoutNote(
                 paper_id=contradicting.paper_id,
                 relevance_to_question=0.78,
                 directness_to_question=0.90,
                 evidence_buckets={EvidenceBucket.CONTRADICTING},
-                study_design="in vivo study",
+                contradicting_evidence=[
+                    "An in vivo experiment found no association during aging."
+                ],
+                study_design="experimental",
             ),
             ScoutNote(
                 paper_id=additional_primary.paper_id,
                 relevance_to_question=0.75,
                 directness_to_question=0.90,
                 evidence_buckets={EvidenceBucket.METHODOLOGICAL},
-                study_design="animal study",
+                study_design="observational",
             ),
             ScoutNote(
                 paper_id=low_relevance.paper_id,
                 relevance_to_question=0.50,
                 directness_to_question=0.80,
                 evidence_buckets={EvidenceBucket.REVIEW},
-                study_design="review article",
+                study_design="review",
             ),
         ]
     )
@@ -282,3 +295,35 @@ def test_scout_rerank_builds_a_credible_final_set_not_a_review_list() -> None:
         additional_primary.paper_id,
     }.issubset(early_ids)
     assert low_relevance.paper_id not in early_ids
+
+
+@pytest.mark.parametrize("final_k", [3, 5, 10])
+def test_scout_rerank_uses_the_requested_final_selection_window(final_k: int) -> None:
+    papers = [
+        paper(
+            f"paper-{index}",
+            f"Hsp70 study {index}",
+            rank_scores={"total": 1.0 - index * 0.02},
+        )
+        for index in range(12)
+    ]
+    notes = [
+        ScoutNote(
+            paper_id=item.paper_id,
+            relevance_to_question=0.8,
+            directness_to_question=0.6,
+            study_design="observational",
+        )
+        for item in papers
+    ]
+
+    reranked = rerank_with_scout(papers, notes, selection_limit=final_k)
+
+    assert all(
+        "diversity_selection_score" in item.rank_scores
+        for item in reranked[:final_k]
+    )
+    assert all(
+        "diversity_selection_score" not in item.rank_scores
+        for item in reranked[final_k:]
+    )

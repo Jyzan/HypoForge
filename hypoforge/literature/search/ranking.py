@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import re
 from collections import Counter
 from collections.abc import Sequence
 from datetime import datetime, timezone
@@ -31,15 +30,6 @@ _ACCESS_SCORE = {
     FulltextStatus.PDF_AVAILABLE: 0.80,
     FulltextStatus.DOWNLOADED: 1.0,
 }
-_REVIEW_PATTERN = re.compile(
-    r"\b(systematic review|meta-analysis|meta analysis|review article|review)\b",
-    re.IGNORECASE,
-)
-_NON_EMPIRICAL_PATTERN = re.compile(
-    r"\b(computational|computer[- ]?based|in silico|simulation|"
-    r"mathematical model|modeling|modelling|methodology|protocol|algorithm)\b",
-    re.IGNORECASE,
-)
 _DEFAULT_FINAL_SELECTION_WINDOW = 5
 _DIVERSITY_RELEVANCE_THRESHOLD = 0.55
 _DIRECTIONAL_DIRECTNESS_THRESHOLD = 0.45
@@ -81,17 +71,15 @@ def _safe_score(value: object, default: float) -> float:
 
 
 def _is_review(paper: PaperRecord, note: ScoutNote | None) -> bool:
-    return bool(
-        _REVIEW_PATTERN.search(
-            " ".join(
-                [
-                    paper.title,
-                    paper.publication_type,
-                    note.study_design if note is not None else "",
-                ]
-            )
-        )
-    )
+    if note is not None:
+        return note.study_design.casefold() == "review"
+    publication_type = paper.publication_type.casefold()
+    return publication_type in {
+        "review",
+        "review article",
+        "systematic review",
+        "meta-analysis",
+    }
 
 
 def _is_empirical(paper: PaperRecord, note: ScoutNote | None) -> bool:
@@ -103,17 +91,9 @@ def _is_empirical(paper: PaperRecord, note: ScoutNote | None) -> bool:
     question's claim.
     """
 
-    if _is_review(paper, note):
-        return False
-    return not _NON_EMPIRICAL_PATTERN.search(
-        " ".join(
-            [
-                paper.title,
-                paper.publication_type,
-                note.study_design if note is not None else "",
-            ]
-        )
-    )
+    if note is not None:
+        return note.study_design.casefold() in {"experimental", "observational"}
+    return not _is_review(paper, note)
 
 
 def _note_relevance(note: ScoutNote | None, default: float = 0.0) -> float:
@@ -147,6 +127,7 @@ def _is_direct_primary(paper: PaperRecord, note: ScoutNote | None) -> bool:
         note is not None
         and paper.abstract.strip()
         and _is_empirical(paper, note)
+        and bool(note.supporting_evidence or note.contradicting_evidence)
         and _meets_threshold(_note_relevance(note), _DIVERSITY_RELEVANCE_THRESHOLD)
         and _meets_threshold(_note_directness(note), _DIRECTIONAL_DIRECTNESS_THRESHOLD)
     )
@@ -164,12 +145,37 @@ def _credible_directional_roles(note: ScoutNote | None) -> set[str]:
         _note_directness(note), _DIRECTIONAL_DIRECTNESS_THRESHOLD
     ):
         return set()
-    directional = {
-        bucket.value
-        for bucket in note.evidence_buckets
-        if bucket in {EvidenceBucket.SUPPORTING, EvidenceBucket.CONTRADICTING}
-    }
-    return directional if len(directional) == 1 else set()
+    directional: set[str] = set()
+    if (
+        EvidenceBucket.SUPPORTING in note.evidence_buckets
+        and note.supporting_evidence
+    ):
+        directional.add(EvidenceBucket.SUPPORTING.value)
+    if (
+        EvidenceBucket.CONTRADICTING in note.evidence_buckets
+        and note.contradicting_evidence
+    ):
+        directional.add(EvidenceBucket.CONTRADICTING.value)
+    return directional
+
+
+def _semantic_relation(note: ScoutNote | None) -> str:
+    if note is None:
+        return "insufficient"
+    supporting = bool(note.supporting_evidence)
+    contradicting = bool(note.contradicting_evidence)
+    if supporting and contradicting:
+        return "mixed"
+    if supporting:
+        return "supports"
+    if contradicting:
+        return "contradicts"
+    if (
+        note.relevance_to_question <= 0.20
+        and (note.directness_to_question or 0.0) <= 0.20
+    ):
+        return "not_applicable"
+    return "insufficient"
 
 
 def _evidence_roles(paper: PaperRecord, note: ScoutNote | None) -> set[str]:
@@ -214,10 +220,10 @@ def _diversify_early_selection(
 ) -> list[PaperRecord]:
     """Select a credible, evidence-aware prefix of the ranked candidates.
 
-    ``IterativeSearchAgent`` returns the first ``final_k`` papers after Scout
-    reranking.  The Agent currently does not pass that setting into this B
-    helper, so the default matches the integrated factory's Final-K of five;
-    callers may supply another value without changing any Protocol signature.
+    ``IterativeSearchAgent`` passes its ``final_k`` setting as
+    ``selection_limit`` so diversity is optimized for the same window later
+    handed to the reading workflow.  Direct callers retain a default window
+    of five.
 
     The prefix is a set-selection problem rather than five independent score
     comparisons: it prioritizes direct primary evidence and distinct evidence
@@ -348,13 +354,27 @@ def rerank_with_scout(
             if note is not None
             else scout_relevance
         )
-        grounded_relevance = 0.75 * scout_relevance + 0.25 * scout_directness
+        relation = _semantic_relation(note)
+        relation_utility = {
+            "supports": 0.80,
+            "contradicts": 0.80,
+            "mixed": 1.0,
+            "insufficient": 0.30,
+            "not_applicable": 0.0,
+        }[relation]
+        grounded_relevance = (
+            0.55 * scout_relevance
+            + 0.30 * scout_directness
+            + 0.15 * relation_utility
+        )
         combined = (1.0 - scout_weight) * base + scout_weight * grounded_relevance
         scores = dict(paper.rank_scores)
         scores.update(
             {
                 "scout_relevance": scout_relevance,
                 "scout_directness": scout_directness,
+                "semantic_relation_utility": relation_utility,
+                "semantic_not_applicable": float(relation == "not_applicable"),
                 "post_scout_total": combined,
             }
         )
@@ -367,7 +387,14 @@ def rerank_with_scout(
             )
         )
 
-    reranked.sort(key=lambda item: (-item[0], item[1], item[2]))
+    reranked.sort(
+        key=lambda item: (
+            item[3].rank_scores.get("semantic_not_applicable", 0.0),
+            -item[0],
+            item[1],
+            item[2],
+        )
+    )
     return _diversify_early_selection(
         [item[3] for item in reranked],
         note_by_paper,
@@ -400,16 +427,18 @@ class PaperRanker(PaperRankerProtocol):
         max_citation = max(citation_raw, default=0.0)
 
         ranked: list[tuple[float, int, str, PaperRecord]] = []
-        paper_count = len(papers)
         for index, paper in enumerate(papers):
             relevance = lexical_relevance(sub_question, paper.title, paper.abstract)
             supplied_prior = paper.rank_scores.get("source_relevance")
-            if supplied_prior is not None and math.isfinite(supplied_prior):
+            has_retrieval_prior = (
+                supplied_prior is not None
+                and isinstance(supplied_prior, (int, float))
+                and math.isfinite(float(supplied_prior))
+            )
+            if has_retrieval_prior:
                 retrieval_prior = _clamp(float(supplied_prior))
-            elif paper_count == 1:
-                retrieval_prior = 1.0
             else:
-                retrieval_prior = 1.0 - index / (paper_count - 1)
+                retrieval_prior = 0.0
             citation_impact = (
                 citation_raw[index] / max_citation if max_citation > 0 else 0.0
             )
@@ -431,7 +460,10 @@ class PaperRanker(PaperRankerProtocol):
             active_weights = {
                 name: weight
                 for name, weight in _WEIGHTS.items()
-                if name != "citation_impact" or paper.citation_count is not None
+                if (
+                    (name != "citation_impact" or paper.citation_count is not None)
+                    and (name != "retrieval_prior" or has_retrieval_prior)
+                )
             }
             weight_sum = sum(active_weights.values())
             total = (

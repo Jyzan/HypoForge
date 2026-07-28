@@ -21,9 +21,17 @@ class FakeStructuredClient:
         error: Exception | None = None,
     ) -> None:
         self.response = response or {
-            "covered_topics": ["Hsp70 regulation"],
+            "facets": [
+                {
+                    "facet": "direct mechanism evidence",
+                    "status": "covered",
+                    "paper_ids": ["paper-0"],
+                    "sentence_ids": ["paper-0:S1"],
+                }
+            ],
             "missing_topics": [],
-            "rationale": "The essential topics are represented.",
+            "sufficient": True,
+            "rationale": "The necessary facet is grounded.",
         }
         self.error = error
         self.calls: list[dict[str, Any]] = []
@@ -39,7 +47,9 @@ def paper(index: int, **kwargs: object) -> PaperRecord:
     return PaperRecord(
         paper_id=f"paper-{index}",
         title=kwargs.pop("title", f"Paper {index}"),
-        abstract=kwargs.pop("abstract", "Abstract"),
+        abstract=kwargs.pop(
+            "abstract", f"Finding {index} directly addresses the question."
+        ),
         sources=["test"],
         **kwargs,
     )
@@ -47,289 +57,278 @@ def paper(index: int, **kwargs: object) -> PaperRecord:
 
 def note(
     index: int,
-    *buckets: EvidenceBucket,
+    *,
+    support: bool = False,
+    contradict: bool = False,
     relevance: float = 0.9,
-    **kwargs: object,
+    directness: float = 0.9,
+    study_type: str = "experimental",
+    methodological: bool = False,
 ) -> ScoutNote:
+    buckets: set[EvidenceBucket] = set()
+    supporting: list[str] = []
+    contradicting: list[str] = []
+    if support:
+        buckets.add(EvidenceBucket.SUPPORTING)
+        supporting = [f"Finding {index} directly addresses the question."]
+    if contradict:
+        buckets.add(EvidenceBucket.CONTRADICTING)
+        contradicting = [f"Finding {index} directly addresses the question."]
+    if methodological:
+        buckets.add(EvidenceBucket.METHODOLOGICAL)
     return ScoutNote(
         paper_id=f"paper-{index}",
-        main_topic=kwargs.pop("main_topic", f"Topic {index}"),
+        main_topic=f"Topic {index}",
         relevance_to_question=relevance,
-        evidence_buckets=set(buckets),
-        evidence_summary=kwargs.pop("evidence_summary", f"Evidence {index}"),
-        **kwargs,
+        directness_to_question=directness,
+        evidence_buckets=buckets,
+        supporting_evidence=supporting,
+        contradicting_evidence=contradicting,
+        study_design=study_type,
+        evidence_summary=f"Evidence {index}",
     )
 
 
-def balanced_inputs() -> tuple[list[PaperRecord], list[ScoutNote]]:
-    papers = [paper(index, year=2024) for index in range(5)]
-    notes = [
-        note(0, EvidenceBucket.SUPPORTING, EvidenceBucket.RECENT),
-        note(1, EvidenceBucket.CONTRADICTING, EvidenceBucket.METHODOLOGICAL),
-        note(2, EvidenceBucket.REVIEW),
-        note(3, EvidenceBucket.SUPPORTING),
-        note(4, EvidenceBucket.METHODOLOGICAL),
-    ]
+def mechanism_inputs(count: int = 3) -> tuple[list[PaperRecord], list[ScoutNote]]:
+    papers = [paper(index, year=2026) for index in range(count)]
+    notes = [note(0, support=True), *[note(index) for index in range(1, count)]]
     return papers, notes
 
 
 @pytest.mark.asyncio
-async def test_balanced_coverage_satisfies_deterministic_gate() -> None:
-    papers, notes = balanced_inputs()
+async def test_mechanism_coverage_requires_grounded_support_but_not_contradiction() -> None:
+    papers, notes = mechanism_inputs()
     client = FakeStructuredClient()
 
     report = await CoverageEvaluator(client, current_year=2026).evaluate(
-        "Does Hsp70 regulate folding?", papers, notes, SearchState()
+        "How does Hsp70 regulate folding?",
+        papers,
+        notes,
+        SearchState(question_type="mechanism_explanation"),
     )
 
     assert report.sufficient is True
-    assert len(report.covered_buckets) == 5
     assert EvidenceBucket.SUPPORTING in report.covered_buckets
-    assert EvidenceBucket.CONTRADICTING in report.covered_buckets
-    assert report.missing_buckets == {EvidenceBucket.CLASSIC}
-    assert report.missing_topics == []
-    assert report.covered_buckets.isdisjoint(report.missing_buckets)
-    assert "sufficient" not in client.calls[0]["output_schema"]["properties"]
+    assert EvidenceBucket.CONTRADICTING not in report.covered_buckets
     assert client.calls[0]["disable_thinking"] is True
+    assert "facets" in client.calls[0]["output_schema"]["properties"]
+    prompt = client.calls[0]["user_prompt"]
+    assert '"evidence_sentences"' in prompt
+    assert '"sentence_id": "paper-0:S1"' in prompt
+    assert "Finding 0 directly addresses the question." in prompt
 
 
 @pytest.mark.asyncio
-async def test_llm_critical_topic_gap_can_block_but_not_bypass_hard_gate() -> None:
-    papers, notes = balanced_inputs()
+async def test_method_profile_uses_methodological_directness() -> None:
+    papers = [paper(index, year=2024) for index in range(3)]
+    notes = [
+        note(
+            index,
+            study_type="method",
+            methodological=True,
+            directness=0.9,
+        )
+        for index in range(3)
+    ]
     client = FakeStructuredClient(
         {
-            "covered_topics": ["Hsp70 regulation"],
-            "missing_topics": ["direct ATPase measurements"],
-            "rationale": "A critical measurement is absent.",
+            "facets": [
+                {
+                    "facet": "ATPase assay design",
+                    "status": "covered",
+                    "paper_ids": ["paper-0"],
+                    "sentence_ids": [],
+                }
+            ],
+            "missing_topics": [],
             "sufficient": True,
+            "rationale": "The methodological facet is covered.",
+        }
+    )
+    report = await CoverageEvaluator(client, current_year=2026).evaluate(
+        "Develop an ATPase assay",
+        papers,
+        notes,
+        SearchState(question_type="method_development"),
+    )
+
+    assert report.sufficient is True
+    assert EvidenceBucket.METHODOLOGICAL in report.covered_buckets
+
+
+@pytest.mark.asyncio
+async def test_discovery_profile_requires_support_recent_and_two_papers() -> None:
+    papers = [paper(index, year=2026) for index in range(2)]
+    notes = [note(0, support=True), note(1)]
+    report = await CoverageEvaluator(
+        FakeStructuredClient(), current_year=2026
+    ).evaluate(
+        "Was the phenomenon observed?",
+        papers,
+        notes,
+        SearchState(question_type="phenomenon_discovery"),
+    )
+    assert report.sufficient is True
+
+    sparse = await CoverageEvaluator(
+        FakeStructuredClient(), current_year=2026
+    ).evaluate(
+        "Was the phenomenon observed?",
+        papers[:1],
+        notes[:1],
+        SearchState(question_type="phenomenon_discovery"),
+    )
+    assert sparse.sufficient is False
+    assert any("more needed" in gap for gap in sparse.missing_topics)
+
+
+@pytest.mark.asyncio
+async def test_unknown_question_type_uses_conservative_general_gate() -> None:
+    papers, notes = mechanism_inputs()
+    report = await CoverageEvaluator(
+        FakeStructuredClient(), current_year=2026
+    ).evaluate("question", papers, notes, SearchState())
+    assert report.sufficient is True
+
+
+@pytest.mark.asyncio
+async def test_invalid_facet_paper_or_sentence_ids_cannot_cover_facet() -> None:
+    papers, notes = mechanism_inputs()
+    client = FakeStructuredClient(
+        {
+            "facets": [
+                {
+                    "facet": "mechanism",
+                    "status": "covered",
+                    "paper_ids": ["invented-paper"],
+                    "sentence_ids": ["paper-99:S9"],
+                }
+            ],
+            "missing_topics": [],
+            "sufficient": True,
+            "rationale": "Invented evidence.",
         }
     )
 
     report = await CoverageEvaluator(client, current_year=2026).evaluate(
-        "Does Hsp70 regulate folding?", papers, notes, SearchState()
+        "question", papers, notes, SearchState()
     )
 
     assert report.sufficient is False
-    assert report.missing_topics == ["direct ATPase measurements"]
+    assert "mechanism" in report.missing_topics
 
-    sparse_report = await CoverageEvaluator(client, current_year=2026).evaluate(
-        "Does Hsp70 regulate folding?",
-        papers[:1],
-        notes[:1],
-        SearchState(),
+
+@pytest.mark.asyncio
+async def test_model_missing_topics_are_limited_and_preserve_previous_context() -> None:
+    papers, notes = mechanism_inputs()
+    state = SearchState(
+        missing_topics={"prior mechanism gap"},
+        key_entities={"HSP70"},
+        domains={"protein homeostasis"},
     )
-    assert sparse_report.sufficient is False
-    assert any("contradicting" in topic for topic in sparse_report.missing_topics)
+    client = FakeStructuredClient(
+        {
+            "facets": [
+                {
+                    "facet": "mechanism",
+                    "status": "partial",
+                    "paper_ids": ["paper-0"],
+                    "sentence_ids": [],
+                }
+            ],
+            "missing_topics": ["mechanism", "method", "result", "extra"],
+            "sufficient": False,
+            "rationale": "Gaps remain.",
+        }
+    )
+    report = await CoverageEvaluator(client).evaluate(
+        "How does the HSP70 mechanism work?", papers, notes, state
+    )
+
+    assert report.sufficient is False
+    assert len(report.missing_topics) <= 3
+    prompt = client.calls[0]["user_prompt"]
+    assert "prior mechanism gap" in prompt
+    assert "HSP70" in prompt
+    assert "protein homeostasis" in prompt
 
 
 @pytest.mark.asyncio
-async def test_later_round_keeps_new_model_gap_and_persistent_gap() -> None:
-    papers, notes = balanced_inputs()
-    previous_gap = "direct ATPase measurements"
-    state = SearchState(round_index=2, missing_topics={previous_gap})
+async def test_global_entities_not_present_in_subquestion_are_not_prompted() -> None:
+    papers, notes = mechanism_inputs()
+    state = SearchState(
+        key_entities={
+            "Hsp70",
+            "ATPase activity",
+            "J-domain proteins",
+            "post-translational modifications",
+        },
+    )
+    client = FakeStructuredClient()
 
-    new_gap_report = await CoverageEvaluator(
-        FakeStructuredClient(
-            {
-                "covered_topics": ["Hsp70 regulation"],
-                "missing_topics": ["new speculative gap"],
-                "rationale": "A new target appeared.",
-            }
-        ),
-        current_year=2026,
-    ).evaluate("question", papers, notes, state)
-    persistent_report = await CoverageEvaluator(
-        FakeStructuredClient(
-            {
-                "covered_topics": ["Hsp70 regulation"],
-                "missing_topics": [previous_gap],
-                "rationale": "The prior target remains absent.",
-            }
-        ),
-        current_year=2026,
-    ).evaluate("question", papers, notes, state)
+    await CoverageEvaluator(client).evaluate(
+        "How does Hsp70 ATPase activity affect protein aggregation?",
+        papers,
+        notes,
+        state,
+    )
 
-    assert new_gap_report.sufficient is False
-    assert new_gap_report.missing_topics == ["new speculative gap"]
-    assert persistent_report.sufficient is False
-    assert persistent_report.missing_topics == [previous_gap]
+    prompt = client.calls[0]["user_prompt"]
+    assert "Hsp70" in prompt
+    assert "ATPase activity" in prompt
+    assert "J-domain proteins" not in prompt
+    assert "post-translational modifications" not in prompt
 
 
 @pytest.mark.asyncio
-async def test_selection_limit_requires_final_window_to_cover_mandatory_buckets() -> (
-    None
-):
-    papers = [paper(index, year=2024) for index in range(6)]
-    notes = [
-        note(0, EvidenceBucket.SUPPORTING),
-        note(1, EvidenceBucket.REVIEW),
-        note(2, EvidenceBucket.METHODOLOGICAL),
-        note(3, EvidenceBucket.SUPPORTING),
-        note(4, EvidenceBucket.SUPPORTING),
-        note(5, EvidenceBucket.CONTRADICTING),
-    ]
+async def test_selection_limit_uses_only_final_window() -> None:
+    papers = [paper(index, year=2026) for index in range(4)]
+    notes = [note(index) for index in range(3)] + [note(3, support=True)]
 
     report = await CoverageEvaluator(
-        selection_limit=5,
-        current_year=2026,
+        FakeStructuredClient(), selection_limit=3, current_year=2026
     ).evaluate("question", papers, notes, SearchState())
 
     assert report.sufficient is False
-    assert EvidenceBucket.CONTRADICTING not in report.covered_buckets
-    assert EvidenceBucket.CONTRADICTING in report.missing_buckets
-    assert any("contradicting" in item for item in report.missing_topics)
+    assert EvidenceBucket.SUPPORTING not in report.covered_buckets
 
 
 @pytest.mark.asyncio
-async def test_known_indirect_notes_cannot_satisfy_direct_evidence_requirement() -> (
-    None
-):
-    papers, notes = balanced_inputs()
-    notes = [item.model_copy(update={"directness_to_question": 0.20}) for item in notes]
-
-    report = await CoverageEvaluator(current_year=2026).evaluate(
-        "Does Hsp70 ATPase activity change during aging?",
-        papers,
-        notes,
-        SearchState(),
+async def test_direction_bucket_without_exact_sentence_is_ignored() -> None:
+    papers, notes = mechanism_inputs()
+    notes[0] = notes[0].model_copy(
+        update={"supporting_evidence": ["A fabricated sentence."]}
     )
+
+    report = await CoverageEvaluator(
+        FakeStructuredClient(), current_year=2026
+    ).evaluate("question", papers, notes, SearchState())
 
     assert report.sufficient is False
-    assert any("direct evidence" in item for item in report.missing_topics)
+    assert EvidenceBucket.SUPPORTING not in report.covered_buckets
 
 
 @pytest.mark.asyncio
-async def test_contextual_reviews_do_not_count_as_direct_evidence_for_research_question() -> (
-    None
-):
-    papers = [
-        paper(index, title=f"Systematic review of Hsp70 mechanism {index}", year=2024)
-        for index in range(5)
-    ]
-    notes = [
-        note(
-            index,
-            *(
-                (EvidenceBucket.SUPPORTING, EvidenceBucket.REVIEW)
-                if index == 0
-                else (EvidenceBucket.CONTRADICTING, EvidenceBucket.METHODOLOGICAL)
-                if index == 1
-                else (EvidenceBucket.REVIEW,)
-            ),
-            directness_to_question=0.95,
-            study_design="systematic review",
-        )
-        for index in range(5)
-    ]
-
-    report = await CoverageEvaluator(current_year=2026).evaluate(
-        "Does Hsp70 directly regulate ATPase activity?",
-        papers,
-        notes,
-        SearchState(),
-    )
+async def test_llm_failure_is_conservative_and_does_not_fabricate_coverage() -> None:
+    papers, notes = mechanism_inputs()
+    report = await CoverageEvaluator(
+        FakeStructuredClient(error=RuntimeError("offline")), current_year=2026
+    ).evaluate("question", papers, notes, SearchState())
 
     assert report.sufficient is False
-    assert any("direct evidence" in item for item in report.missing_topics)
-
-
-@pytest.mark.asyncio
-async def test_single_dual_labeled_paper_cannot_supply_balanced_directional_evidence() -> (
-    None
-):
-    papers = [paper(index, year=2024) for index in range(5)]
-    notes = [
-        note(
-            0,
-            EvidenceBucket.SUPPORTING,
-            EvidenceBucket.CONTRADICTING,
-            directness_to_question=0.9,
-        ),
-        note(1, EvidenceBucket.REVIEW, directness_to_question=0.9),
-        note(2, EvidenceBucket.METHODOLOGICAL, directness_to_question=0.9),
-        note(3, EvidenceBucket.RECENT, directness_to_question=0.9),
-        note(4, EvidenceBucket.CLASSIC, directness_to_question=0.9),
-    ]
-
-    report = await CoverageEvaluator(current_year=2026).evaluate(
-        "Does Hsp70 directly regulate ATPase activity?",
-        papers,
-        notes,
-        SearchState(),
-    )
-
-    assert report.sufficient is False
-    assert any(
-        "independent directional evidence" in item for item in report.missing_topics
-    )
-
-
-@pytest.mark.asyncio
-async def test_metadata_supplements_review_recent_classic_and_method_buckets() -> None:
-    papers = [
-        paper(0, year=2026),
-        paper(1, year=2026),
-        paper(2, title="A systematic review of Hsp70", year=2020),
-        paper(3, year=2010, citation_count=150),
-        paper(4, publication_type="randomized trial", year=2020),
-    ]
-    notes = [
-        note(0, EvidenceBucket.SUPPORTING),
-        note(1, EvidenceBucket.CONTRADICTING),
-        note(2),
-        note(3),
-        note(4, study_design="randomized controlled trial"),
-    ]
-
-    report = await CoverageEvaluator(current_year=2026).evaluate(
-        "question", papers, notes, SearchState()
-    )
-
-    assert report.sufficient is True
-    assert report.covered_buckets == set(EvidenceBucket)
-
-
-@pytest.mark.asyncio
-async def test_irrelevant_and_duplicate_notes_do_not_inflate_paper_count() -> None:
-    papers, notes = balanced_inputs()
-    notes = [notes[0], notes[0], *notes[1:4], note(4, relevance=0.2)]
-
-    report = await CoverageEvaluator(current_year=2026).evaluate(
-        "question", papers, notes, SearchState()
-    )
-
-    assert report.sufficient is False
-    assert "1 more needed" in " ".join(report.missing_topics)
-
-
-@pytest.mark.asyncio
-async def test_llm_failure_uses_deterministic_coverage_fallback() -> None:
-    papers, notes = balanced_inputs()
-    client = FakeStructuredClient(error=RuntimeError("offline"))
-
-    report = await CoverageEvaluator(client, current_year=2026).evaluate(
-        "question", papers, notes, SearchState()
-    )
-
-    assert report.sufficient is True
-    assert report.missing_topics == []
-    assert "5 relevant papers" in report.rationale
+    assert "Semantic coverage was not confirmed" in report.rationale
 
 
 @pytest.mark.asyncio
 async def test_empty_input_reports_actionable_gaps_without_calling_llm() -> None:
     client = FakeStructuredClient()
-
-    report = await CoverageEvaluator(client, current_year=2026).evaluate(
+    report = await CoverageEvaluator(client).evaluate(
         "question", [], [], SearchState()
     )
 
     assert isinstance(report, CoverageReport)
     assert report.sufficient is False
     assert report.covered_buckets == set()
-    assert report.missing_buckets == set(EvidenceBucket)
-    assert any("supporting" in topic for topic in report.missing_topics)
-    assert any("contradicting" in topic for topic in report.missing_topics)
     assert client.calls == []
 
 

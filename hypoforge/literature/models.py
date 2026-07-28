@@ -162,6 +162,9 @@ class RemainingSearchBudget(LiteratureModel):
 
 
 class SearchState(LiteratureModel):
+    question_type: str = ""
+    key_entities: Set[str] = Field(default_factory=set)
+    domains: Set[str] = Field(default_factory=set)
     round_index: int = Field(default=0, ge=0)
     queries_used: List[SearchQuery] = Field(default_factory=list)
     known_terms: Set[str] = Field(default_factory=set)

@@ -106,6 +106,26 @@ async def test_similar_titles_with_distant_years_are_not_fuzzy_merged() -> None:
 
 
 @pytest.mark.asyncio
+async def test_conflicting_stable_identifiers_are_kept_separate() -> None:
+    first = paper(
+        "one",
+        "The same normalized title",
+        doi="10.1/first",
+        pmid="1",
+    )
+    second = paper(
+        "two",
+        "The same normalized title",
+        doi="10.1/second",
+        pmid="2",
+    )
+
+    result = await PaperDeduplicator().deduplicate([first, second])
+
+    assert [item.paper_id for item in result] == ["one", "two"]
+
+
+@pytest.mark.asyncio
 async def test_existing_catalog_record_remains_canonical_and_order_is_stable() -> None:
     catalog = paper(
         "catalog-id",

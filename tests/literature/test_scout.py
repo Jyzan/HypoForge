@@ -44,33 +44,47 @@ def payload_from_call(call: dict[str, Any]) -> list[dict[str, Any]]:
     return json.loads(call["user_prompt"].split(marker, 1)[1])
 
 
+def semantic_note(
+    paper_id: str,
+    *,
+    relevance: float = 0.9,
+    directness: float = 0.9,
+    relation: str = "insufficient",
+    supporting: list[str] | None = None,
+    contradicting: list[str] | None = None,
+    study_type: str = "experimental",
+) -> dict[str, Any]:
+    return {
+        "paper_id": paper_id,
+        "relevance": relevance,
+        "directness": directness,
+        "relation": relation,
+        "supporting_sentence_ids": supporting or [],
+        "contradicting_sentence_ids": contradicting or [],
+        "study_type": study_type,
+        "mechanisms": ["protein homeostasis"],
+        "entities": ["HSP70"],
+        "limitations": [],
+    }
+
+
 @pytest.mark.asyncio
 async def test_scout_batches_requests_and_restores_input_order() -> None:
     def respond(call: dict[str, Any]) -> dict[str, Any]:
         payload = payload_from_call(call)
         return {
             "notes": [
-                {
-                    "paper_id": item["paper_id"],
-                    "main_topic": item["title"],
-                    "key_terms": ["Hsp70"],
-                    "entities": ["HSP70"],
-                    "mechanisms": ["Hsp70 regulates folding."],
-                    "important_authors": [],
-                    "controversies": [],
-                    "candidate_citations": [],
-                    "relevance_to_question": 0.9,
-                    "evidence_buckets": ["supporting"],
-                    "study_design": "in vitro study",
-                    "evidence_summary": "The abstract supports the mechanism.",
-                }
+                semantic_note(
+                    item["paper_id"],
+                    relation="supports",
+                    supporting=[item["sentences"][0]["sentence_id"]],
+                )
                 for item in reversed(payload)
             ]
         }
 
     client = FakeStructuredClient(responder=respond)
     papers = [paper(index) for index in range(10)]
-
     notes = await ScoutReader(
         client, batch_size=4, max_concurrency=2, current_year=2026
     ).read("How does Hsp70 regulate folding?", papers)
@@ -78,221 +92,222 @@ async def test_scout_batches_requests_and_restores_input_order() -> None:
     assert [note.paper_id for note in notes] == [item.paper_id for item in papers]
     assert len(client.calls) == 3
     assert all(call["disable_thinking"] is True for call in client.calls)
-    assert all(call["temperature"] == 0.0 for call in client.calls)
     assert EvidenceBucket.SUPPORTING in notes[0].evidence_buckets
 
 
 @pytest.mark.asyncio
-async def test_scout_filters_unknown_and_duplicate_ids_and_fills_missing_notes() -> (
-    None
-):
+async def test_scout_invalid_duplicate_and_missing_results_fallback_per_paper() -> None:
     def respond(_: dict[str, Any]) -> dict[str, Any]:
         return {
             "notes": [
-                {
-                    "paper_id": "unknown",
-                    "relevance_to_question": 1,
-                    "evidence_buckets": ["supporting"],
-                },
-                {
-                    "paper_id": "paper-0",
-                    "main_topic": "Model topic",
-                    "relevance_to_question": 2,
-                    "evidence_buckets": ["review", "not-a-bucket"],
-                },
-                {
-                    "paper_id": "paper-0",
-                    "main_topic": "Duplicate should be ignored",
-                    "relevance_to_question": 0,
-                    "evidence_buckets": [],
-                },
+                semantic_note("unknown", relation="supports", supporting=["unknown:S1"]),
+                semantic_note(
+                    "paper-0",
+                    relevance=2,
+                    relation="supports",
+                    supporting=["paper-0:S1"],
+                    study_type="illegal-type",
+                ),
+                semantic_note("paper-0", relevance=0.0),
             ]
         }
 
-    client = FakeStructuredClient(responder=respond)
-    papers = [
-        paper(0),
-        paper(
-            1,
-            title="A cohort study of Hsp70",
-            abstract="The cohort found no association with Hsp70 activity.",
-        ),
-    ]
-
-    notes = await ScoutReader(client, current_year=2026).read("Hsp70 activity", papers)
-
-    assert [note.paper_id for note in notes] == ["paper-0", "paper-1"]
-    assert notes[0].main_topic == "Model topic"
-    assert notes[0].relevance_to_question == 1.0
-    assert EvidenceBucket.REVIEW in notes[0].evidence_buckets
-    assert all(bucket.value != "not-a-bucket" for bucket in notes[0].evidence_buckets)
-    assert notes[0].evidence_summary
-    assert notes[1].study_design == "cohort study"
-    assert EvidenceBucket.CONTRADICTING in notes[1].evidence_buckets
-
-
-@pytest.mark.asyncio
-async def test_scout_rejects_ungrounded_directional_labels_and_caps_relevance() -> None:
-    def respond(_: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "notes": [
-                {
-                    "paper_id": "paper-0",
-                    "relevance_to_question": 0.99,
-                    "directness_to_question": 0.99,
-                    "evidence_buckets": ["supporting", "contradicting"],
-                }
-            ]
-        }
-
-    source = paper(
-        0,
-        title="Hsp70 review in unrelated injury models",
-        abstract="However, mice recovered after an unrelated injury.",
-    )
+    papers = [paper(0), paper(1, year=2026)]
     notes = await ScoutReader(
-        FakeStructuredClient(responder=respond),
-        current_year=2026,
-    ).read(
-        "Does NAD+ depletion regulate Hsp70 ATPase activity during aging?",
-        [source],
-    )
+        FakeStructuredClient(responder=respond), current_year=2026
+    ).read("Hsp70 activity", papers)
 
-    assert notes[0].relevance_to_question < 0.55
-    assert notes[0].directness_to_question is not None
-    assert notes[0].directness_to_question < 0.55
+    assert [item.paper_id for item in notes] == ["paper-0", "paper-1"]
+    assert notes[0].relevance_to_question <= 0.49
     assert EvidenceBucket.SUPPORTING not in notes[0].evidence_buckets
-    assert EvidenceBucket.CONTRADICTING not in notes[0].evidence_buckets
+    assert notes[1].relevance_to_question <= 0.49
+    assert notes[1].evidence_buckets == {EvidenceBucket.RECENT}
 
 
 @pytest.mark.asyncio
-async def test_scout_does_not_treat_generic_however_as_contradictory_evidence() -> None:
-    def respond(_: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "notes": [
-                {
-                    "paper_id": "paper-0",
-                    "relevance_to_question": 0.9,
-                    "evidence_buckets": ["contradicting"],
-                }
-            ]
-        }
-
+async def test_generic_however_is_not_contradicting() -> None:
     source = paper(
         0,
-        title="Hsp70 ATPase activity during aging",
         abstract=(
             "Hsp70 ATPase activity was measured during aging. "
-            "However, the assay protocol required a separate calibration step."
+            "However, the assay protocol required calibration."
         ),
     )
+
     notes = await ScoutReader(
-        FakeStructuredClient(responder=respond),
-        current_year=2026,
+        FakeStructuredClient(
+            responder=lambda _: {"notes": [semantic_note("paper-0")]}
+        )
     ).read("Does aging regulate Hsp70 ATPase activity?", [source])
 
     assert EvidenceBucket.CONTRADICTING not in notes[0].evidence_buckets
 
 
 @pytest.mark.asyncio
-async def test_scout_keeps_only_exact_abstract_sentences_as_directional_evidence() -> (
-    None
-):
-    exact_sentence = "NAD+ depletion increased Hsp70 ATPase activity during aging."
-
-    def respond(_: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "notes": [
-                {
-                    "paper_id": "paper-0",
-                    "relevance_to_question": 0.9,
-                    "evidence_buckets": ["supporting"],
-                    "supporting_evidence": [exact_sentence],
-                },
-                {
-                    "paper_id": "paper-1",
-                    "relevance_to_question": 0.9,
-                    "evidence_buckets": ["supporting"],
-                    "supporting_evidence": [
-                        "NAD+ depletion directly increased Hsp70 ATPase activity."
-                    ],
-                },
-                {
-                    "paper_id": "paper-2",
-                    "relevance_to_question": 0.9,
-                    "evidence_buckets": ["supporting"],
-                    "supporting_evidence": [
-                        "The result was confirmed in a replicate assay."
-                    ],
-                },
-            ]
-        }
-
-    sources = [
-        paper(
-            0,
-            title="NAD+ depletion and Hsp70 ATPase activity during aging",
-            abstract=exact_sentence,
-        ),
-        paper(
-            1,
-            title="NAD+ depletion and Hsp70 ATPase activity during aging",
-            abstract="NAD+ depletion altered unrelated metabolite levels during aging.",
-        ),
-        paper(
-            2,
-            title="NAD+ depletion and Hsp70 ATPase activity during aging",
-            abstract="The result was confirmed in a replicate assay.",
-        ),
-    ]
+@pytest.mark.parametrize(
+    "abstract",
+    [
+        "The study did not test whether Hsp70 regulates ATPase activity.",
+        "Hsp70 was significantly elevated in aged cells.",
+    ],
+)
+async def test_non_directional_language_remains_insufficient(abstract: str) -> None:
     notes = await ScoutReader(
-        FakeStructuredClient(responder=respond),
-        current_year=2026,
-    ).read(
-        "Does NAD+ depletion regulate Hsp70 ATPase activity during aging?",
-        sources,
-    )
+        FakeStructuredClient(
+            responder=lambda _: {"notes": [semantic_note("paper-0")]}
+        )
+    ).read("Does Hsp70 regulate ATPase activity?", [paper(0, abstract=abstract)])
 
-    assert notes[0].supporting_evidence == [exact_sentence]
-    assert EvidenceBucket.SUPPORTING in notes[0].evidence_buckets
-    assert notes[1].supporting_evidence == []
-    assert EvidenceBucket.SUPPORTING not in notes[1].evidence_buckets
-    assert notes[2].supporting_evidence == []
-    assert EvidenceBucket.SUPPORTING not in notes[2].evidence_buckets
+    assert EvidenceBucket.SUPPORTING not in notes[0].evidence_buckets
+    assert EvidenceBucket.CONTRADICTING not in notes[0].evidence_buckets
 
 
 @pytest.mark.asyncio
-async def test_scout_uses_conservative_fallback_when_llm_fails() -> None:
+async def test_mixed_requires_valid_evidence_in_both_directions() -> None:
+    source = paper(
+        0,
+        abstract="Hsp70 increased ATPase activity. Hsp70 had no effect in aged cells.",
+    )
+    client = FakeStructuredClient(
+        responder=lambda _: {
+            "notes": [
+                semantic_note(
+                    "paper-0",
+                    relation="mixed",
+                    supporting=["paper-0:S1"],
+                    contradicting=["paper-0:S2"],
+                )
+            ]
+        }
+    )
+
+    note = (await ScoutReader(client).read("Does Hsp70 affect ATPase?", [source]))[0]
+
+    assert note.supporting_evidence == ["Hsp70 increased ATPase activity."]
+    assert note.contradicting_evidence == ["Hsp70 had no effect in aged cells."]
+    assert {
+        EvidenceBucket.SUPPORTING,
+        EvidenceBucket.CONTRADICTING,
+    }.issubset(note.evidence_buckets)
+
+
+@pytest.mark.asyncio
+async def test_invalid_or_cross_paper_sentence_ids_are_rejected() -> None:
+    sources = [
+        paper(0, abstract="Hsp70 increased ATPase activity."),
+        paper(1, abstract="A separate experiment found an effect."),
+    ]
+    client = FakeStructuredClient(
+        responder=lambda _: {
+            "notes": [
+                semantic_note(
+                    "paper-0",
+                    relation="supports",
+                    supporting=["paper-1:S1", "paper-0:S99"],
+                ),
+                semantic_note("paper-1"),
+            ]
+        }
+    )
+
+    notes = await ScoutReader(client).read("question", sources)
+
+    assert notes[0].supporting_evidence == []
+    assert EvidenceBucket.SUPPORTING not in notes[0].evidence_buckets
+
+
+@pytest.mark.asyncio
+async def test_llm_semantics_can_resolve_synonyms_without_lexical_cap() -> None:
+    source = paper(
+        0,
+        title="Acute myocardial infarction outcomes",
+        abstract="Mortality after acute myocardial infarction was measured.",
+    )
+    client = FakeStructuredClient(
+        responder=lambda _: {
+            "notes": [
+                semantic_note(
+                    "paper-0",
+                    relevance=0.95,
+                    directness=0.9,
+                    relation="supports",
+                    supporting=["paper-0:S1"],
+                    study_type="observational",
+                )
+            ]
+        }
+    )
+
+    note = (await ScoutReader(client).read("heart attack mortality", [source]))[0]
+
+    assert note.relevance_to_question == 0.95
+    assert note.directness_to_question == 0.9
+
+
+@pytest.mark.asyncio
+async def test_peer_review_words_do_not_force_review_article_type() -> None:
+    source = paper(
+        0,
+        title="Peer review comments on an ATPase assay",
+        abstract="We experimentally validated the revised ATPase assay.",
+    )
+    client = FakeStructuredClient(
+        responder=lambda _: {
+            "notes": [semantic_note("paper-0", study_type="experimental")]
+        }
+    )
+
+    note = (await ScoutReader(client).read("ATPase assay", [source]))[0]
+
+    assert note.study_design == "experimental"
+    assert EvidenceBucket.REVIEW not in note.evidence_buckets
+
+
+@pytest.mark.asyncio
+async def test_not_applicable_clamps_scores_and_has_no_direction() -> None:
+    client = FakeStructuredClient(
+        responder=lambda _: {
+            "notes": [
+                semantic_note(
+                    "paper-0",
+                    relevance=0.99,
+                    directness=0.99,
+                    relation="not_applicable",
+                )
+            ]
+        }
+    )
+    note = (await ScoutReader(client).read("unrelated question", [paper(0)]))[0]
+
+    assert note.relevance_to_question <= 0.2
+    assert note.directness_to_question <= 0.2
+    assert EvidenceBucket.SUPPORTING not in note.evidence_buckets
+
+
+@pytest.mark.asyncio
+async def test_scout_failure_fallback_is_metadata_only_and_non_directional() -> None:
     source = paper(
         0,
         title="Systematic review of Hsp70 assays",
-        abstract=(
-            "This systematic review found inconsistent results. "
-            "Several experiments did not support the proposed Hsp70 mechanism."
-        ),
+        abstract="However, experiments did not support the mechanism.",
         year=2026,
         citation_count=120,
     )
-    client = FakeStructuredClient(error=RuntimeError("offline"))
+    notes = await ScoutReader(
+        FakeStructuredClient(error=RuntimeError("offline")), current_year=2026
+    ).read("Hsp70 mechanism", [source])
 
-    notes = await ScoutReader(client, current_year=2026).read(
-        "Hsp70 mechanism", [source]
-    )
-
-    assert len(notes) == 1
-    assert notes[0].evidence_summary
-    assert EvidenceBucket.REVIEW in notes[0].evidence_buckets
-    assert EvidenceBucket.RECENT in notes[0].evidence_buckets
-    assert EvidenceBucket.CONTRADICTING in notes[0].evidence_buckets
+    assert notes[0].evidence_buckets == {EvidenceBucket.RECENT}
+    assert notes[0].relevance_to_question <= 0.49
+    assert notes[0].supporting_evidence == []
+    assert notes[0].contradicting_evidence == []
 
 
 @pytest.mark.asyncio
 async def test_scout_without_client_is_offline_and_empty_input_skips_calls() -> None:
     reader = ScoutReader(current_year=2026)
-
     assert await reader.read("question", []) == []
     notes = await reader.read("Hsp70", [paper(0)])
-
     assert len(notes) == 1
     assert notes[0].paper_id == "paper-0"
 

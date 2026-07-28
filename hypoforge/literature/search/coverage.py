@@ -1,4 +1,4 @@
-"""Evidence coverage aggregation and gap synthesis."""
+"""Evidence-matrix coverage assessment over grounded Scout judgments."""
 
 from __future__ import annotations
 
@@ -17,39 +17,86 @@ from ..models import (
     SearchState,
 )
 from ..protocols import CoverageEvaluatorProtocol
+from ._text import normalize_text, tokenize
 
 
 logger = logging.getLogger(__name__)
 
-
-_REVIEW_PATTERN = re.compile(
-    r"\b(systematic review|meta-analysis|meta analysis|review)\b", re.IGNORECASE
-)
-_METHOD_PATTERN = re.compile(
-    r"\b(randomi[sz]ed|cohort|case-control|cross-sectional|in vitro|in vivo|"
-    r"animal study|assay|trial|experiment|sequencing|proteomics|cryo-?em)\b",
-    re.IGNORECASE,
-)
-_NON_EMPIRICAL_PATTERN = re.compile(
-    r"\b(computational|computer[- ]?based|in silico|simulation|"
-    r"mathematical model|modeling|modelling|methodology|protocol|algorithm)\b",
-    re.IGNORECASE,
-)
-_SYNTHESIS_REQUEST_PATTERN = re.compile(
-    r"\b(review|overview|literature|state of (?:the )?art|"
-    r"summari[sz]|background|introduction|what is)\b",
-    re.IGNORECASE,
-)
-_MODELING_REQUEST_PATTERN = re.compile(
-    r"\b(computational|simulation|modeling|modelling|in silico)\b",
-    re.IGNORECASE,
-)
+COVERAGE_PROMPT_VERSION = "evidence-matrix-v5"
 _SYSTEM_PROMPT = """\
-You assess topic coverage from paper-level Scout notes. The caller computes
-evidence buckets and sufficiency deterministically. Return only concise covered
-topics, scientifically indispensable missing topics, and a rationale. Do not
-invent findings, do not request full-text details, and do not decide whether
-coverage is sufficient."""
+You assess whether a set of title-and-abstract Scout judgments covers the
+scientific sub-question. Build a compact evidence matrix. A covered facet must
+cite supplied paper IDs, and any directional claim must cite supplied sentence
+IDs. Do not invent papers, sentences, findings, or full-text details.
+
+Derive necessary facets from the exact current sub-question only. Key entities
+and domains are background context, not a checklist: an entity that is not
+required by the sub-question must not become a missing facet. Do not import
+sibling questions such as post-translational modifications or co-chaperones
+unless the current sub-question explicitly asks for them.
+
+Coverage is existential and may be distributed across papers: no single paper
+must cover every facet. Adding contextual or irrelevant papers cannot make a
+previously supported necessary facet missing unless valid contradictory
+evidence is supplied. Do not demand quantitative kinetics, a particular assay,
+or a specific regulator unless the exact sub-question requires it.
+
+Treat terms introduced by "e.g.", "for example", "such as", or "例如" as
+illustrative alternatives, not a checklist. For a "which factors" question,
+grounded identification of one or more valid factors and their relevant
+functional effect can be sufficient; exhaustive coverage of every example or
+factor class is not required. Evidence about an ATPase domain, nucleotide
+binding/exchange, or ATP-dependent function can establish modulation of an
+ATPase cycle without a numeric hydrolysis-rate measurement.
+
+Return at most three missing topics. A missing topic must be indispensable to
+the question, not merely a desirable evidence category. Preserve stable topics
+from the previous round when they remain unresolved."""
+_SCIENTIFIC_GAP_TERMS = {
+    "assay",
+    "cohort",
+    "effect",
+    "mechanism",
+    "entity",
+    "evidence",
+    "mechanism",
+    "method",
+    "measurement",
+    "outcome",
+    "pathway",
+    "phenomenon",
+    "phenotype",
+    "population",
+    "relation",
+    "relationship",
+    "result",
+    "target",
+    "机制",
+    "方法",
+    "结果",
+    "实体",
+    "效应",
+    "表型",
+    "测量",
+}
+_DIRECTIONAL_FACET_TERMS = {
+    "against",
+    "contradict",
+    "effect",
+    "negative",
+    "opposing",
+    "positive",
+    "refute",
+    "relation",
+    "relationship",
+    "support",
+    "反对",
+    "反驳",
+    "支持",
+    "效应",
+    "关系",
+    "机制",
+}
 
 
 def _clean_text(value: Any) -> str:
@@ -72,67 +119,136 @@ def _stable_strings(values: Any, *, limit: int = 20) -> list[str]:
     return output
 
 
-def _is_review_evidence(note: ScoutNote, paper: PaperRecord) -> bool:
+def _valid_missing_topic(
+    topic: str,
+    *,
+    context_tokens: set[str],
+    previous_topics: set[str],
+) -> bool:
+    normalized = normalize_text(topic)
+    if not normalized:
+        return False
+    if normalized in previous_topics:
+        return True
     return bool(
-        _REVIEW_PATTERN.search(
-            " ".join([paper.title, paper.publication_type, note.study_design])
-        )
+        set(tokenize(topic)) & (context_tokens | _SCIENTIFIC_GAP_TERMS)
     )
 
 
-def _is_non_empirical_evidence(note: ScoutNote, paper: PaperRecord) -> bool:
+def _directional_facet(facet: str) -> bool:
+    tokens = set(tokenize(facet))
     return bool(
-        _NON_EMPIRICAL_PATTERN.search(
-            " ".join([paper.title, paper.publication_type, note.study_design])
-        )
+        tokens & _DIRECTIONAL_FACET_TERMS
+        or any(term in normalize_text(facet) for term in _DIRECTIONAL_FACET_TERMS)
     )
 
 
-def _can_supply_direct_evidence(
+def _question_context_entities(
     sub_question: str,
+    entities: Sequence[str],
+) -> list[str]:
+    question = normalize_text(sub_question)
+    question_tokens = set(tokenize(sub_question))
+    selected: list[str] = []
+    for entity in entities:
+        normalized = normalize_text(entity)
+        entity_tokens = set(tokenize(entity))
+        acronym = "".join(
+            token[0]
+            for token in entity_tokens
+            if token not in {"and", "of", "the"}
+        )
+        if (
+            normalized in question
+            or bool(entity_tokens & question_tokens)
+            or acronym
+            and (
+                acronym in question_tokens
+                or f"{acronym}s" in question_tokens
+            )
+        ):
+            selected.append(entity)
+    return selected
+
+
+def _abstract_sentences(paper: PaperRecord) -> list[str]:
+    return [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?。！？])\s+", _clean_text(paper.abstract))
+        if sentence.strip()
+    ]
+
+
+def _sentence_lookup(papers: Sequence[PaperRecord]) -> dict[str, str]:
+    return {
+        f"{paper.paper_id}:S{index}": sentence
+        for paper in papers
+        for index, sentence in enumerate(_abstract_sentences(paper), start=1)
+    }
+
+
+def _evidence_sentence_ids(
+    note: ScoutNote,
+    paper: PaperRecord,
+    evidence: Sequence[str],
+) -> list[str]:
+    normalized_evidence = {normalize_text(item) for item in evidence if item}
+    return [
+        f"{paper.paper_id}:S{index}"
+        for index, sentence in enumerate(_abstract_sentences(paper), start=1)
+        if normalize_text(sentence) in normalized_evidence
+    ]
+
+
+def _validated_buckets(
     note: ScoutNote,
     paper: PaperRecord,
     *,
-    threshold: float,
-) -> bool:
-    """Recognize direct evidence without treating contextual reviews as tests.
-
-    ``ScoutNote.directness_to_question`` is additive and intentionally absent
-    from legacy notes.  For new notes, an ordinary research question needs a
-    high-directness non-review study before the coverage gate can say the
-    central relation is directly represented.  A request explicitly asking for
-    a review/synthesis may use review evidence; a modeling request may use a
-    computational study.  This is a coverage safeguard, not a change to the
-    public Tool protocol.
-    """
-
-    if note.directness_to_question is None:
-        return False
-    if note.directness_to_question < threshold:
-        return False
-    if _SYNTHESIS_REQUEST_PATTERN.search(sub_question):
-        return True
-    if _is_review_evidence(note, paper):
-        return False
-    if _is_non_empirical_evidence(note, paper) and not _MODELING_REQUEST_PATTERN.search(
-        sub_question
+    current_year: int,
+) -> tuple[set[EvidenceBucket], list[str], list[str]]:
+    buckets = {
+        bucket
+        for bucket in note.evidence_buckets
+        if bucket not in {EvidenceBucket.SUPPORTING, EvidenceBucket.CONTRADICTING}
+    }
+    supporting_ids = _evidence_sentence_ids(
+        note,
+        paper,
+        note.supporting_evidence,
+    )
+    contradicting_ids = _evidence_sentence_ids(
+        note,
+        paper,
+        note.contradicting_evidence,
+    )
+    if supporting_ids:
+        buckets.add(EvidenceBucket.SUPPORTING)
+    if contradicting_ids:
+        buckets.add(EvidenceBucket.CONTRADICTING)
+    if paper.year is not None and paper.year >= current_year - 3:
+        buckets.add(EvidenceBucket.RECENT)
+    if (
+        paper.year is not None
+        and paper.year <= current_year - 10
+        and (paper.citation_count or 0) >= 100
     ):
-        return False
-    return True
+        buckets.add(EvidenceBucket.CLASSIC)
+    return buckets, supporting_ids, contradicting_ids
 
 
 class CoverageEvaluator(CoverageEvaluatorProtocol):
-    """Combine Scout judgments under a deterministic balanced-coverage gate."""
+    """Combine a semantic evidence matrix with deterministic safety gates."""
 
     tool_name = "coverage_evaluator"
+    prompt_version = COVERAGE_PROMPT_VERSION
 
     def __init__(
         self,
         client: Any | None = None,
         *,
         relevance_threshold: float = 0.55,
-        min_relevant_papers: int = 5,
-        min_bucket_count: int = 4,
+        min_relevant_papers: int = 3,
+        min_bucket_count: int = 2,
         selection_limit: int | None = None,
         max_tokens: int = 2048,
         current_year: int | None = None,
@@ -162,211 +278,238 @@ class CoverageEvaluator(CoverageEvaluatorProtocol):
         scout_notes: Sequence[ScoutNote],
         state: SearchState,
     ) -> CoverageReport:
-        selected_papers = list(papers)
+        selected = list(papers)
         if self.selection_limit is not None:
-            selected_papers = selected_papers[: self.selection_limit]
+            selected = selected[: self.selection_limit]
         notes_by_id = {note.paper_id: note for note in scout_notes}
-        relevant: list[tuple[ScoutNote, PaperRecord]] = []
-        for paper in selected_papers:
-            note = notes_by_id.get(paper.paper_id)
-            if note is None or note.relevance_to_question < self.relevance_threshold:
-                continue
-            relevant.append((note, paper))
+        relevant = [
+            (notes_by_id[paper.paper_id], paper)
+            for paper in selected
+            if paper.paper_id in notes_by_id
+            and notes_by_id[paper.paper_id].relevance_to_question
+            >= self.relevance_threshold
+        ]
 
         covered: set[EvidenceBucket] = set()
-        fallback_topics: list[str] = []
-        supporting_ids: set[str] = set()
-        contradicting_ids: set[str] = set()
+        supporting_papers: set[str] = set()
+        directional_ids: set[str] = set()
         for note, paper in relevant:
-            buckets = set(note.evidence_buckets)
-            haystack = f"{paper.publication_type} {paper.title} {note.study_design}"
-            if paper.year is not None and paper.year >= self.current_year - 3:
-                buckets.add(EvidenceBucket.RECENT)
-            if (
-                paper.year is not None
-                and paper.year <= self.current_year - 10
-                and (paper.citation_count or 0) >= 100
-            ):
-                buckets.add(EvidenceBucket.CLASSIC)
-            if _REVIEW_PATTERN.search(haystack):
-                buckets.add(EvidenceBucket.REVIEW)
-            if _METHOD_PATTERN.search(haystack):
-                buckets.add(EvidenceBucket.METHODOLOGICAL)
-            covered.update(buckets)
-            if EvidenceBucket.SUPPORTING in buckets:
-                supporting_ids.add(paper.paper_id)
-            if EvidenceBucket.CONTRADICTING in buckets:
-                contradicting_ids.add(paper.paper_id)
-            fallback_topics.extend(
-                value for value in [note.main_topic, *note.mechanisms] if value
-            )
-
-        all_buckets = set(EvidenceBucket)
-        missing_buckets = all_buckets - covered
-        known_directness = any(
-            note.directness_to_question is not None for note, _ in relevant
-        )
-        direct_evidence_missing = known_directness and not any(
-            _can_supply_direct_evidence(
-                sub_question,
+            buckets, supporting_ids, contradicting_ids = _validated_buckets(
                 note,
                 paper,
-                threshold=self.relevance_threshold,
+                current_year=self.current_year,
             )
-            for note, paper in relevant
-        )
-        # A paper marked both supporting and contradicting is a useful signal
-        # of within-study nuance, but it cannot be the sole source for both
-        # sides of a balanced-evidence gate.  Require one unambiguous paper
-        # for each direction.
-        independent_directional_evidence = bool(
-            supporting_ids - contradicting_ids
-        ) and bool(contradicting_ids - supporting_ids)
-        hard_gaps = self._hard_gaps(
-            sub_question=sub_question,
-            relevant_count=len(relevant),
+            covered.update(buckets)
+            if supporting_ids:
+                supporting_papers.add(paper.paper_id)
+            directional_ids.update(supporting_ids)
+            directional_ids.update(contradicting_ids)
+
+        hard_gaps = self._profile_gaps(
+            state=state,
+            relevant=relevant,
             covered=covered,
-            direct_evidence_missing=direct_evidence_missing,
-            independent_directional_evidence=independent_directional_evidence,
+            supporting_papers=supporting_papers,
+            directional_ids=directional_ids,
         )
-        covered_topics = _stable_strings(fallback_topics)
+        covered_topics: list[str] = []
         model_missing: list[str] = []
         model_rationale = ""
+        semantic_sufficient = False
         if relevant and self.client is not None:
             try:
-                covered_topics, model_missing, model_rationale = await self._synthesize(
+                (
+                    covered_topics,
+                    model_missing,
+                    model_rationale,
+                    semantic_sufficient,
+                ) = await self._assess_matrix(
                     sub_question=sub_question,
                     relevant=relevant,
                     state=state,
-                    fallback_topics=covered_topics,
                 )
             except Exception as exc:
                 logger.warning(
-                    "Coverage synthesis failed; using deterministic fallback (%s)",
+                    "Coverage matrix failed; retaining conservative gaps (%s)",
                     type(exc).__name__,
                 )
 
-        missing_topics = _stable_strings([*model_missing, *hard_gaps])
-        hard_gate = (
-            len(relevant) >= self.min_relevant_papers
-            and len(covered) >= self.min_bucket_count
-            and EvidenceBucket.SUPPORTING in covered
-            and EvidenceBucket.CONTRADICTING in covered
-            and independent_directional_evidence
+        missing_topics = _stable_strings(
+            [*model_missing, *hard_gaps],
+            limit=3,
         )
-        sufficient = hard_gate and not model_missing and not direct_evidence_missing
+        hard_gate = not hard_gaps
+        sufficient = semantic_sufficient and hard_gate
         if sufficient:
             missing_topics = []
 
+        all_buckets = set(EvidenceBucket)
         summary = (
             f"{len(relevant)} relevant papers in the coverage selection; "
-            f"{len(covered)}/{len(EvidenceBucket)} evidence buckets covered."
+            f"{len(covered)}/{len(all_buckets)} evidence buckets covered."
         )
         rationale = f"{summary} {model_rationale}".strip()
         if not model_rationale:
             rationale = (
-                f"{summary} Balanced coverage requirements are "
-                f"{'satisfied' if sufficient else 'not yet satisfied'}."
+                f"{summary} Semantic coverage was not confirmed; "
+                "search remains conservative."
             )
         return CoverageReport(
             covered_buckets=covered,
-            missing_buckets=missing_buckets,
+            missing_buckets=all_buckets - covered,
             covered_topics=covered_topics,
             missing_topics=missing_topics,
             sufficient=sufficient,
             rationale=rationale,
         )
 
-    def _hard_gaps(
+    def _profile_gaps(
         self,
         *,
-        sub_question: str,
-        relevant_count: int,
+        state: SearchState,
+        relevant: list[tuple[ScoutNote, PaperRecord]],
         covered: set[EvidenceBucket],
-        direct_evidence_missing: bool,
-        independent_directional_evidence: bool,
+        supporting_papers: set[str],
+        directional_ids: set[str],
     ) -> list[str]:
         gaps: list[str] = []
-        if relevant_count < self.min_relevant_papers:
-            gaps.append(
-                f"additional relevant studies for {sub_question} "
-                f"({self.min_relevant_papers - relevant_count} more needed)"
-            )
-        if direct_evidence_missing:
-            gaps.append(f"direct evidence for {sub_question}")
-        mandatory = (
-            EvidenceBucket.SUPPORTING,
-            EvidenceBucket.CONTRADICTING,
+        question_type = state.question_type
+        required_count = (
+            2 if question_type == "phenomenon_discovery"
+            else self.min_relevant_papers
         )
-        missing_mandatory = 0
-        for bucket in mandatory:
-            if bucket not in covered:
-                gaps.append(f"{bucket.value} evidence for {sub_question}")
-                missing_mandatory += 1
-        if (
-            EvidenceBucket.SUPPORTING in covered
-            and EvidenceBucket.CONTRADICTING in covered
-            and not independent_directional_evidence
-        ):
-            gaps.append(f"independent directional evidence for {sub_question}")
-        if len(covered) < self.min_bucket_count:
-            needed = max(
-                0,
-                self.min_bucket_count - len(covered) - missing_mandatory,
+        if len(relevant) < required_count:
+            gaps.append(
+                f"additional relevant studies ({required_count - len(relevant)} more needed)"
             )
-            optional_missing = [
-                bucket
-                for bucket in EvidenceBucket
-                if bucket not in covered and bucket not in mandatory
-            ]
-            gaps.extend(
-                f"{bucket.value} evidence for {sub_question}"
-                for bucket in optional_missing[:needed]
-            )
-        return gaps
 
-    async def _synthesize(
+        direct = any(
+            (note.directness_to_question or 0.0) >= self.relevance_threshold
+            and (
+                note.study_design in {"experimental", "observational"}
+                or question_type == "method_development"
+                and note.study_design in {"method", "protocol", "computational"}
+            )
+            for note, _ in relevant
+        )
+        if question_type == "method_development":
+            if EvidenceBucket.METHODOLOGICAL not in covered:
+                gaps.append("direct methodological evidence")
+            if not direct:
+                gaps.append("a method directly addressing the sub-question")
+        elif question_type == "phenomenon_discovery":
+            if not supporting_papers:
+                gaps.append("evidence supporting the reported phenomenon")
+        else:
+            if not supporting_papers:
+                gaps.append("evidence supporting the proposed mechanism")
+            if not direct or not directional_ids:
+                gaps.append("direct mechanism evidence")
+
+        return _stable_strings(gaps)
+
+    async def _assess_matrix(
         self,
         *,
         sub_question: str,
         relevant: list[tuple[ScoutNote, PaperRecord]],
         state: SearchState,
-        fallback_topics: list[str],
-    ) -> tuple[list[str], list[str], str]:
-        payload = [
-            {
-                "paper_id": note.paper_id,
-                "main_topic": note.main_topic,
+    ) -> tuple[list[str], list[str], str, bool]:
+        context_entities = _question_context_entities(
+            sub_question,
+            sorted(state.key_entities),
+        )
+        sentence_lookup = _sentence_lookup([paper for _, paper in relevant])
+        valid_paper_ids = {paper.paper_id for _, paper in relevant}
+        payload: list[dict[str, Any]] = []
+        valid_sentence_ids: set[str] = set()
+        for note, paper in relevant:
+            supporting_ids = _evidence_sentence_ids(
+                note,
+                paper,
+                note.supporting_evidence,
+            )
+            contradicting_ids = _evidence_sentence_ids(
+                note,
+                paper,
+                note.contradicting_evidence,
+            )
+            valid_sentence_ids.update(supporting_ids)
+            valid_sentence_ids.update(contradicting_ids)
+            evidence_sentences = [
+                {
+                    "sentence_id": sentence_id,
+                    "direction": (
+                        "supporting"
+                        if sentence_id in supporting_ids
+                        else "contradicting"
+                    ),
+                    "text": sentence_lookup[sentence_id],
+                }
+                for sentence_id in [*supporting_ids, *contradicting_ids]
+                if sentence_id in sentence_lookup
+            ]
+            payload.append({
+                "paper_id": paper.paper_id,
+                "title": paper.title,
+                "relevance": note.relevance_to_question,
+                "directness": note.directness_to_question,
+                "study_type": note.study_design,
                 "mechanisms": note.mechanisms,
-                "controversies": note.controversies,
-                "study_design": note.study_design,
+                "supporting_sentence_ids": supporting_ids,
+                "contradicting_sentence_ids": contradicting_ids,
+                "evidence_sentences": evidence_sentences,
                 "evidence_summary": note.evidence_summary,
-                "directness_to_question": note.directness_to_question,
-                "supporting_evidence": note.supporting_evidence,
-                "contradicting_evidence": note.contradicting_evidence,
-                "evidence_buckets": sorted(
-                    bucket.value for bucket in note.evidence_buckets
-                ),
-            }
-            for note, _ in relevant
-        ]
+            })
         schema = {
             "type": "object",
             "properties": {
-                "covered_topics": {"type": "array", "items": {"type": "string"}},
-                "missing_topics": {"type": "array", "items": {"type": "string"}},
+                "facets": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "facet": {"type": "string"},
+                            "status": {
+                                "type": "string",
+                                "enum": ["covered", "partial", "missing"],
+                            },
+                            "paper_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "sentence_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": [
+                            "facet",
+                            "status",
+                            "paper_ids",
+                            "sentence_ids",
+                        ],
+                    },
+                },
+                "missing_topics": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 3,
+                },
+                "sufficient": {"type": "boolean"},
                 "rationale": {"type": "string"},
             },
-            "required": ["covered_topics", "missing_topics", "rationale"],
+            "required": ["facets", "missing_topics", "sufficient", "rationale"],
         }
         result = await self.client.structured_chat(
             system_prompt=_SYSTEM_PROMPT,
             user_prompt=(
-                f"Research sub-question:\n{sub_question}\n\n"
+                f"Research sub-question: {sub_question}\n"
+                f"Question type: {state.question_type or 'unknown'}\n"
+                f"Key entities present in this sub-question: {context_entities}\n"
+                f"Domains: {sorted(state.domains)}\n"
                 f"Previous missing topics: {sorted(state.missing_topics)}\n\n"
-                "Return missing_topics only for indispensable scientific topics, "
-                "not merely for optional evidence categories.\n\n"
-                f"Scout notes:\n{json.dumps(payload, ensure_ascii=False)}"
+                f"Grounded Scout judgments:\n{json.dumps(payload, ensure_ascii=False)}"
             ),
             output_schema=schema,
             max_tokens=self.max_tokens,
@@ -374,10 +517,88 @@ class CoverageEvaluator(CoverageEvaluatorProtocol):
             disable_thinking=True,
         )
         if not isinstance(result, dict):
-            return fallback_topics, [], ""
-        covered_topics = (
-            _stable_strings(result.get("covered_topics")) or fallback_topics
+            return [], [], "", False
+
+        validated_facets: list[tuple[str, str]] = []
+        for raw in result.get("facets", []):
+            if not isinstance(raw, dict):
+                continue
+            facet = _clean_text(raw.get("facet"))
+            status = _clean_text(raw.get("status")).casefold()
+            if not facet or status not in {"covered", "partial", "missing"}:
+                continue
+            raw_paper_ids = _stable_strings(raw.get("paper_ids"))
+            paper_ids = [
+                paper_id
+                for paper_id in raw_paper_ids
+                if paper_id in valid_paper_ids
+            ]
+            raw_sentence_ids = _stable_strings(raw.get("sentence_ids"))
+            sentence_ids = [
+                sentence_id
+                for sentence_id in raw_sentence_ids
+                if sentence_id in sentence_lookup
+                and sentence_id in valid_sentence_ids
+            ]
+            if status == "covered" and not paper_ids:
+                status = "partial"
+            if status == "covered" and raw_sentence_ids and not sentence_ids:
+                status = "partial"
+            if status == "covered" and _directional_facet(facet):
+                cited_papers = {
+                    sentence_id.rsplit(":S", 1)[0]
+                    for sentence_id in sentence_ids
+                }
+                if not sentence_ids or not cited_papers.issubset(set(paper_ids)):
+                    status = "partial"
+            validated_facets.append((facet, status))
+
+        covered_topics = [
+            facet for facet, status in validated_facets if status == "covered"
+        ]
+        facet_gaps = [
+            facet for facet, status in validated_facets if status != "covered"
+        ]
+        context_tokens = set(
+            tokenize(
+                " ".join(
+                    [
+                        sub_question,
+                        *context_entities,
+                        *state.domains,
+                        *(
+                            value
+                            for note, _ in relevant
+                            for value in [*note.entities, *note.mechanisms]
+                        ),
+                    ]
+                )
+            )
         )
-        missing_topics = _stable_strings(result.get("missing_topics"))
+        previous_topics = {
+            normalize_text(topic) for topic in state.missing_topics if topic
+        }
+        proposed_gaps = [
+            *_stable_strings(result.get("missing_topics"), limit=3),
+            *facet_gaps,
+        ]
+        missing_topics = _stable_strings(
+            [
+                topic
+                for topic in proposed_gaps
+                if _valid_missing_topic(
+                    topic,
+                    context_tokens=context_tokens,
+                    previous_topics=previous_topics,
+                )
+            ],
+            limit=3,
+        )
+        semantic_sufficient = bool(
+            result.get("sufficient")
+            and validated_facets
+            and all(status == "covered" for _, status in validated_facets)
+            and not missing_topics
+        )
         rationale = _clean_text(result.get("rationale"))[:1000]
-        return covered_topics, missing_topics, rationale
+        return covered_topics, missing_topics, rationale, semantic_sufficient
