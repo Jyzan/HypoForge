@@ -7,6 +7,7 @@ import re
 import time
 from collections.abc import Callable, Sequence
 
+from ...observability import emit_event
 from ..models import (
     CoverageReport,
     PaperRecord,
@@ -145,6 +146,14 @@ class IterativeSearchAgent:
 
         async def measure(stage: str, operation):
             stage_started_at = self.stage_clock()
+            emit_event(
+                "tool_started",
+                module="m2",
+                tool=stage,
+                status="running",
+                message=f"M2 Tool 开始：{stage}",
+                details={"round": state.round_index + 1},
+            )
             try:
                 remaining_seconds = limits.max_seconds - (
                     time.monotonic() - deadline_started_at
@@ -159,11 +168,34 @@ class IterativeSearchAgent:
                     raise _SearchTimeBudgetExpired(stage)
                 task = asyncio.ensure_future(operation)
                 try:
-                    return await asyncio.wait_for(task, timeout=remaining_seconds)
+                    result = await asyncio.wait_for(task, timeout=remaining_seconds)
+                    emit_event(
+                        "tool_completed",
+                        module="m2",
+                        tool=stage,
+                        status="completed",
+                        message=f"M2 Tool 完成：{stage}",
+                        elapsed_seconds=max(
+                            0.0, self.stage_clock() - stage_started_at
+                        ),
+                        details={"round": state.round_index + 1},
+                    )
+                    return result
                 except asyncio.TimeoutError as exc:
                     if task.done() and not task.cancelled():
                         raise
                     raise _SearchTimeBudgetExpired(stage) from exc
+            except BaseException as exc:
+                emit_event(
+                    "tool_failed",
+                    module="m2",
+                    tool=stage,
+                    status="failed",
+                    message=f"M2 Tool 失败：{stage}：{type(exc).__name__}: {exc}",
+                    elapsed_seconds=max(0.0, self.stage_clock() - stage_started_at),
+                    details={"round": state.round_index + 1},
+                )
+                raise
             finally:
                 elapsed = max(0.0, self.stage_clock() - stage_started_at)
                 stage_elapsed_seconds[stage] += elapsed
@@ -214,6 +246,24 @@ class IterativeSearchAgent:
                 errors.append("query planner produced no new executable queries")
                 stop_reason = StopReason.NO_RESULTS
                 break
+            emit_event(
+                "tool_result",
+                module="m2",
+                tool="query_planner",
+                status="completed",
+                message=f"第 {round_index} 轮生成 {len(queries)} 条检索式",
+                details={
+                    "round": round_index,
+                    "queries": [
+                        {
+                            "text": query.text,
+                            "source": query.target_source,
+                            "purpose": query.purpose,
+                        }
+                        for query in queries
+                    ],
+                },
+            )
 
             try:
                 search_results = await measure(
@@ -243,6 +293,18 @@ class IterativeSearchAgent:
                 raw_papers.extend(result)
 
             papers_found += len(raw_papers)
+            emit_event(
+                "tool_result",
+                module="m2",
+                tool="source_search",
+                status="completed",
+                message=f"第 {round_index} 轮检索获得 {len(raw_papers)} 篇记录",
+                details={
+                    "round": round_index,
+                    "source_result_counts": dict(source_result_counts),
+                    "failed_sources": list(failed_sources),
+                },
+            )
             all_queries.extend(queries)
             state.queries_used = list(all_queries)
             state.queries_executed += len(queries)
@@ -275,6 +337,14 @@ class IterativeSearchAgent:
                 candidate_pool[paper.paper_id] = paper
                 if paper.paper_id in existing_ids:
                     reused_ids.add(paper.paper_id)
+            emit_event(
+                "tool_result",
+                module="m2",
+                tool="paper_deduplicator",
+                status="completed",
+                message=f"去重后累计 {len(canonical_history)} 篇论文",
+                details={"round": round_index, "papers": len(canonical_history)},
+            )
 
             try:
                 ranked = await measure(
@@ -293,6 +363,17 @@ class IterativeSearchAgent:
                 stop_reason = StopReason.ERROR
                 break
             candidate_pool = {paper.paper_id: paper for paper in ranked}
+            emit_event(
+                "tool_result",
+                module="m2",
+                tool="paper_ranker",
+                status="completed",
+                message=f"排序后保留 {len(ranked)} 篇候选论文",
+                details={
+                    "round": round_index,
+                    "top_titles": [paper.title for paper in ranked[:5]],
+                },
+            )
             new_papers = len(set(canonical_history) - previous_ids)
             papers_needing_scout = [
                 paper for paper in ranked if paper.paper_id not in scout_by_paper
@@ -311,6 +392,14 @@ class IterativeSearchAgent:
                 break
             scout_by_paper.update(
                 {note.paper_id: note for note in new_scout_notes}
+            )
+            emit_event(
+                "tool_result",
+                module="m2",
+                tool="scout_reader",
+                status="completed",
+                message=f"快速阅读新增 {len(new_scout_notes)} 篇论文",
+                details={"round": round_index, "notes": len(new_scout_notes)},
             )
             scout_notes = [
                 scout_by_paper[paper.paper_id]
@@ -374,6 +463,24 @@ class IterativeSearchAgent:
                 stop_reason = StopReason.ERROR
                 break
             self._apply_coverage(state, coverage)
+            emit_event(
+                "tool_result",
+                module="m2",
+                tool="coverage_evaluator",
+                status="completed",
+                message=(
+                    "证据覆盖充分"
+                    if coverage.sufficient
+                    else "证据覆盖仍有缺口，将按预算决定是否迭代"
+                ),
+                details={
+                    "round": round_index,
+                    "sufficient": coverage.sufficient,
+                    "covered_topics": list(coverage.covered_topics),
+                    "missing_topics": list(coverage.missing_topics),
+                    "rationale": coverage.rationale,
+                },
+            )
             state.remaining_budget = calculate_remaining(limits, state)
             stop_reason = choose_stop_reason(
                 coverage=coverage,
@@ -420,10 +527,50 @@ class IterativeSearchAgent:
         source = self.sources.get(query.target_source.casefold())
         if source is None:
             raise LookupError(f"unknown literature source: {query.target_source}")
-        return await asyncio.wait_for(
-            source.search(query, limit=self.per_query_limit),
-            timeout=self.source_timeout_seconds,
+        started_at = self.stage_clock()
+        tool = f"source:{query.target_source}"
+        emit_event(
+            "tool_started",
+            module="m2",
+            tool=tool,
+            status="running",
+            message=f"检索 {query.target_source}",
+            details={
+                "query": query.text,
+                "round": query.round_index,
+                "limit": self.per_query_limit,
+            },
         )
+        try:
+            result = await asyncio.wait_for(
+                source.search(query, limit=self.per_query_limit),
+                timeout=self.source_timeout_seconds,
+            )
+        except BaseException as exc:
+            emit_event(
+                "tool_failed",
+                module="m2",
+                tool=tool,
+                status="failed",
+                message=f"{query.target_source} 检索失败：{type(exc).__name__}: {exc}",
+                elapsed_seconds=max(0.0, self.stage_clock() - started_at),
+                details={"query": query.text, "round": query.round_index},
+            )
+            raise
+        emit_event(
+            "tool_completed",
+            module="m2",
+            tool=tool,
+            status="completed",
+            message=f"{query.target_source} 返回 {len(result)} 篇记录",
+            elapsed_seconds=max(0.0, self.stage_clock() - started_at),
+            details={
+                "query": query.text,
+                "round": query.round_index,
+                "papers": len(result),
+            },
+        )
+        return result
 
     @staticmethod
     def _apply_coverage(state: SearchState, coverage: CoverageReport) -> None:

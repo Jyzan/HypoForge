@@ -7,6 +7,7 @@ import time
 from collections.abc import Awaitable, Callable, Sequence
 from typing import TypeVar
 
+from ...observability import emit_event
 from ..models import (
     ContentLevel,
     DocumentRecord,
@@ -143,10 +144,42 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
         timings: dict[str, float],
         stage: str,
         operation: Callable[[], Awaitable[T]],
+        *,
+        details: dict[str, object] | None = None,
     ) -> T:
         started = time.monotonic()
+        emit_event(
+            "tool_started",
+            module="m2",
+            tool=stage,
+            status="running",
+            message=f"M2 阅读 Tool 开始：{stage}",
+            details=details,
+        )
         try:
-            return await operation()
+            result = await operation()
+        except BaseException as exc:
+            emit_event(
+                "tool_failed",
+                module="m2",
+                tool=stage,
+                status="failed",
+                message=f"M2 阅读 Tool 失败：{stage}：{type(exc).__name__}: {exc}",
+                elapsed_seconds=time.monotonic() - started,
+                details=details,
+            )
+            raise
+        else:
+            emit_event(
+                "tool_completed",
+                module="m2",
+                tool=stage,
+                status="completed",
+                message=f"M2 阅读 Tool 完成：{stage}",
+                elapsed_seconds=time.monotonic() - started,
+                details=details,
+            )
+            return result
         finally:
             timings[stage] = timings.get(stage, 0.0) + (time.monotonic() - started)
 
@@ -174,6 +207,7 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
                     timings,
                     "fulltext_resolver",
                     lambda: self._resolve_with_timeout(paper),
+                    details={"paper_id": paper.paper_id, "title": paper.title},
                 )
         except asyncio.CancelledError:
             raise
@@ -191,6 +225,7 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
                     timings,
                     "abstract_fallback",
                     lambda: fallback(paper),
+                    details={"paper_id": paper.paper_id, "title": paper.title},
                 )
             except asyncio.CancelledError:
                 raise
@@ -227,7 +262,10 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
 
         try:
             chunks = await self._measure(
-                timings, "document_parser", lambda: self.parser.parse(document)
+                timings,
+                "document_parser",
+                lambda: self.parser.parse(document),
+                details={"paper_id": paper.paper_id, "title": paper.title},
             )
             self.store.replace(paper.paper_id, chunks)
         except asyncio.CancelledError:
@@ -251,6 +289,7 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
                     timings,
                     "abstract_fallback",
                     lambda: fallback(paper),
+                    details={"paper_id": paper.paper_id, "title": paper.title},
                 )
                 if (
                     fallback_document.content_level is not ContentLevel.ABSTRACT
@@ -261,6 +300,7 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
                     timings,
                     "document_parser",
                     lambda: self.parser.parse(fallback_document),
+                    details={"paper_id": paper.paper_id, "title": paper.title},
                 )
                 self.store.replace(paper.paper_id, chunks)
                 document = fallback_document
@@ -295,6 +335,11 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
                 lambda: self.retriever.retrieve(
                     retrieval_query, [paper.paper_id], top_k=self.top_k
                 ),
+                details={
+                    "paper_id": paper.paper_id,
+                    "title": paper.title,
+                    "top_k": self.top_k,
+                },
             )
         except asyncio.CancelledError:
             raise
@@ -318,6 +363,11 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
                         self.reader.read(sub_question, paper, evidence),
                         timeout=self.reader_timeout_seconds,
                     ),
+                    details={
+                        "paper_id": paper.paper_id,
+                        "title": paper.title,
+                        "evidence_chunks": len(evidence),
+                    },
                 )
         except asyncio.CancelledError:
             raise
@@ -381,6 +431,15 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
         search_context: SearchRunResult | None = None,
     ) -> list[PaperReadingResult]:
         query = _retrieval_query(sub_question, search_context)
+        started_at = time.monotonic()
+        emit_event(
+            "tool_started",
+            module="m2",
+            tool="reading_workflow",
+            status="running",
+            message=f"开始全文/RAG 阅读 {len(papers)} 篇入选论文",
+            details={"papers": len(papers), "sub_question": sub_question},
+        )
         fetch_semaphore = asyncio.Semaphore(self.fetch_concurrency)
         read_semaphore = asyncio.Semaphore(self.read_concurrency)
 
@@ -400,4 +459,33 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
                 )
             )
 
-        return await asyncio.wait_for(run_all(), timeout=self.workflow_timeout_seconds)
+        try:
+            results = await asyncio.wait_for(
+                run_all(), timeout=self.workflow_timeout_seconds
+            )
+        except BaseException as exc:
+            emit_event(
+                "tool_failed",
+                module="m2",
+                tool="reading_workflow",
+                status="failed",
+                message=f"全文/RAG 阅读流程失败：{type(exc).__name__}: {exc}",
+                elapsed_seconds=time.monotonic() - started_at,
+            )
+            raise
+        emit_event(
+            "tool_completed",
+            module="m2",
+            tool="reading_workflow",
+            status="completed",
+            message=f"全文/RAG 阅读完成：{len(results)} 篇",
+            elapsed_seconds=time.monotonic() - started_at,
+            details={
+                "papers": len(results),
+                "with_errors": sum(bool(result.errors) for result in results),
+                "knowledge_entries": sum(
+                    len(result.knowledge_entries) for result in results
+                ),
+            },
+        )
+        return results

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 
@@ -14,6 +15,98 @@ from hypoforge.literature.sources.pubmed_source import PubMedSource
 from hypoforge.tools import pubmed_search, semantic_scholar
 from hypoforge.tools.pubmed_search import PubMedTool
 from hypoforge.tools.semantic_scholar import SemanticScholarTool
+
+
+def test_semantic_scholar_keyed_requests_stay_below_one_request_per_second(
+    monkeypatch,
+) -> None:
+    """Catch S2 keyed requests accidentally reverting to the old 100 req/s assumption."""
+    sleeps: list[float] = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps({"data": []}).encode("utf-8")
+
+    monkeypatch.setattr(semantic_scholar, "_last_request_time", 100.0)
+    monkeypatch.setattr(semantic_scholar.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(semantic_scholar.time, "sleep", sleeps.append)
+    monkeypatch.setattr(
+        semantic_scholar.urllib.request,
+        "urlopen",
+        lambda request, timeout: FakeResponse(),
+    )
+
+    semantic_scholar._http_get_json(
+        "https://api.semanticscholar.org/graph/v1/paper/search",
+        s2_api_key="test-key",
+    )
+
+    assert len(sleeps) == 1
+    assert sleeps[0] >= 1.0
+
+
+def test_semantic_scholar_rate_limit_serializes_concurrent_requests(
+    monkeypatch,
+) -> None:
+    """Catch concurrent M2 workers bypassing the process-wide S2 request budget."""
+    original_sleep = time.sleep
+    start = threading.Barrier(3)
+    state_lock = threading.Lock()
+    active_sleepers = 0
+    max_active_sleepers = 0
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self) -> bytes:
+            return b'{"data": []}'
+
+    def tracked_sleep(seconds: float) -> None:
+        nonlocal active_sleepers, max_active_sleepers
+        with state_lock:
+            active_sleepers += 1
+            max_active_sleepers = max(max_active_sleepers, active_sleepers)
+        original_sleep(0.02)
+        with state_lock:
+            active_sleepers -= 1
+
+    def request() -> None:
+        start.wait()
+        semantic_scholar._http_get_json(
+            "https://api.semanticscholar.org/graph/v1/paper/search",
+            s2_api_key="test-key",
+        )
+
+    monkeypatch.setattr(
+        semantic_scholar,
+        "_last_request_time",
+        time.monotonic(),
+    )
+    monkeypatch.setattr(semantic_scholar.time, "sleep", tracked_sleep)
+    monkeypatch.setattr(
+        semantic_scholar.urllib.request,
+        "urlopen",
+        lambda request, timeout: FakeResponse(),
+    )
+    workers = [threading.Thread(target=request) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    start.wait()
+    for worker in workers:
+        worker.join(timeout=1)
+
+    assert not any(worker.is_alive() for worker in workers)
+    assert max_active_sleepers == 1
 
 
 class FakeStructuredClient:
@@ -79,6 +172,7 @@ async def test_openalex_instance_key_is_forwarded(monkeypatch) -> None:
         calls.append((query, limit, api_key))
         return []
 
+    monkeypatch.setattr(semantic_scholar, "_S2_API_KEY", "")
     monkeypatch.setattr(semantic_scholar, "_oa_search", search)
     tool = SemanticScholarTool(openalex_api_key="openalex-key")
 

@@ -156,6 +156,40 @@ def test_factory_wires_all_literature_sources() -> None:
     assert adapter.search_agent.query_planner.strict is True
 
 
+def test_factory_accepts_config_budget_and_source_filter() -> None:
+    adapter = build_integrated_search_adapter(
+        client=FakeClient(),
+        final_k=2,
+        per_query_limit=7,
+        enabled_sources=["pubmed", "arxiv"],
+        budget={
+            "max_rounds": 1,
+            "max_queries": 4,
+            "max_papers": 20,
+            "max_tokens": 30_000,
+            "max_seconds": 600,
+        },
+    )
+
+    assert adapter.budget.max_rounds == 1
+    assert adapter.search_agent.per_query_limit == 7
+    assert set(adapter.search_agent.sources) == {"pubmed", "arxiv"}
+    assert {
+        item["name"] for item in adapter.search_agent.query_planner._tool_definitions
+    } == {"pubmed", "arxiv"}
+
+
+def test_search_tool_accepts_per_instance_semantic_scholar_key() -> None:
+    tool = LiteratureSearchTool(
+        enabled_sources=["semantic_scholar"],
+        semantic_scholar_api_key="s2-memory-only",
+    )
+
+    [source] = tool.as_source_list()
+    assert source.backend_name == "semantic_scholar"
+    assert source._tool.api_key == "s2-memory-only"
+
+
 def test_factory_wires_real_paper_selection_tools() -> None:
     client = FakeClient()
     adapter = build_integrated_search_adapter(

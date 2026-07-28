@@ -21,10 +21,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
 from ..protocol import ModuleProtocol
+from ..observability import emit_event
 from ..prompts.m3_prompts import (
     M3_BATCH_RELATION_SYSTEM_PROMPT,
     M3_BATCH_RELATION_USER_TEMPLATE,
@@ -116,14 +118,55 @@ class M3EvidenceGraph(ModuleProtocol):
             return {"evidence_graph": EvidenceGraph()}
 
         # --- Step 1: rule-based graph construction (always runs) ---
+        rule_started_at = time.monotonic()
+        emit_event(
+            "tool_started",
+            module="m3",
+            tool="rule_graph_builder",
+            status="running",
+            message=f"开始将 {len(all_entries)} 条知识构造成基础证据图",
+        )
         graph = self._build_rule_graph(all_entries)
+        emit_event(
+            "tool_completed",
+            module="m3",
+            tool="rule_graph_builder",
+            status="completed",
+            message=f"基础证据图完成：{len(graph.nodes)} 节点 / {len(graph.edges)} 边",
+            elapsed_seconds=time.monotonic() - rule_started_at,
+        )
 
         # --- Step 2: LLM-enhanced relation extraction (optional) ---
         if self.mode in {"llm", "direct", "api"} and self.client:
+            llm_started_at = time.monotonic()
+            emit_event(
+                "tool_started",
+                module="m3",
+                tool="qwen_relation_extractor",
+                status="running",
+                message="开始抽取跨知识条目的语义关系",
+            )
             try:
                 graph = await self._enhance_with_llm_batched(graph, all_entries)
             except Exception as exc:
                 logger.warning("M3 LLM enhancement failed; using rule-only graph: %s", exc)
+                emit_event(
+                    "tool_failed",
+                    module="m3",
+                    tool="qwen_relation_extractor",
+                    status="failed",
+                    message=f"语义关系抽取失败，保留规则图：{type(exc).__name__}: {exc}",
+                    elapsed_seconds=time.monotonic() - llm_started_at,
+                )
+            else:
+                emit_event(
+                    "tool_completed",
+                    module="m3",
+                    tool="qwen_relation_extractor",
+                    status="completed",
+                    message=f"语义关系抽取完成：证据图现有 {len(graph.edges)} 条边",
+                    elapsed_seconds=time.monotonic() - llm_started_at,
+                )
 
         # --- persist to disk (if enabled) ---
         if getattr(state, "memory_cache_dir", ""):

@@ -136,6 +136,10 @@ class AgenticM2Module(ModuleProtocol):
         variant: str = "integrated",
         **kwargs,
     ) -> None:
+        # ModuleRegistry injects these orchestration-only values, while the
+        # Track A factories accept only concrete adapter construction args.
+        kwargs.pop("implementation", None)
+        kwargs.pop("query_llm_config", None)
         self.adapter = build_adapter_from_config(
             llm_config=llm_config,
             variant=variant,

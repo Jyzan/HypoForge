@@ -8,12 +8,14 @@ conditional iteration edges, and compiles the graph.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict
 
 from langgraph.graph import END, StateGraph
 
 from .config import PipelineConfig
 from .display.panels import render_module_result, render_phase_done, render_phase_header
+from .observability import RunEventRecorder, bind_recorder
 from .protocol import ModuleProtocol
 from .registry import ModuleRegistry, SkillRegistry
 from .state import PipelineState
@@ -46,10 +48,85 @@ class PipelineRunner:
         final_state = await runner.run("蛋白质如何折叠？")
     """
 
-    def __init__(self, config: PipelineConfig):
+    _MODULE_TOOLS = {
+        "m1": ["qwen_problem_understanding"],
+        "m2": ["agentic_literature_pipeline"],
+        "m3": ["rule_graph_builder", "qwen_relation_extractor"],
+        "m4": ["hypothesis_generator", "hypothesis_ranker"],
+        "m5": ["research_plan_designer"],
+        "m6": ["specialist_reviewers", "overall_score_aggregator"],
+    }
+
+    def __init__(
+        self,
+        config: PipelineConfig,
+        event_recorder: RunEventRecorder | None = None,
+    ):
         self.config = config
+        self.event_recorder = event_recorder
         self._graph = None
         self._skills = None
+
+    def _record_event(self, event_type: str, **kwargs: Any) -> None:
+        if self.event_recorder is not None:
+            self.event_recorder.emit(event_type, **kwargs)
+
+    @staticmethod
+    def _summarize_result(name: str, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a compact UI-friendly summary without duplicating full state."""
+
+        summary: Dict[str, Any] = {"output_fields": sorted(result)}
+        if name == "m1" and result.get("problem_card") is not None:
+            card = result["problem_card"]
+            summary.update(
+                {
+                    "sub_questions": len(card.sub_questions),
+                    "domains": list(card.domain),
+                    "key_entities": len(card.key_entities),
+                }
+            )
+        elif name == "m2":
+            literature = result.get("literature_results") or []
+            export = result.get("m2_knowledge_export")
+            summary.update(
+                {
+                    "sub_questions": len(literature),
+                    "papers_retrieved": sum(item.papers_retrieved for item in literature),
+                    "knowledge_entries": sum(
+                        len(item.knowledge_entries) for item in literature
+                    ),
+                    "export_runs": len(export.runs) if export is not None else 0,
+                }
+            )
+        elif name == "m3" and result.get("evidence_graph") is not None:
+            graph = result["evidence_graph"]
+            summary.update({"nodes": len(graph.nodes), "edges": len(graph.edges)})
+        elif name == "m4":
+            summary.update(
+                {
+                    "candidates": len(result.get("candidate_hypotheses") or []),
+                    "top_hypotheses": len(result.get("top_hypotheses") or []),
+                }
+            )
+        elif name == "m5":
+            summary["research_plans"] = len(result.get("research_plans") or [])
+        elif name == "m6":
+            reviews = result.get("reviews") or []
+            summary.update(
+                {
+                    "reviews": len(reviews),
+                    "iteration_count": result.get("iteration_count"),
+                    "overall_score": next(
+                        (
+                            review.score
+                            for review in reversed(reviews)
+                            if review.dimension.value == "overall"
+                        ),
+                        None,
+                    ),
+                }
+            )
+        return summary
 
     # ------------------------------------------------------------------
     # Graph construction
@@ -164,6 +241,13 @@ class PipelineRunner:
         async def node_fn(state: PipelineState) -> Dict:
             # --- Resume: skip already-completed modules ---
             if output_fields and self._should_skip_module(name, output_fields, state):
+                self._record_event(
+                    "module_skipped",
+                    module=name,
+                    status="skipped",
+                    message=f"{name.upper()} 已由 checkpoint 完成，跳过执行",
+                    details={"tools": self._MODULE_TOOLS.get(name, [])},
+                )
                 if self.config.verbose:
                     from .display import console, COLORS
                     console.print(
@@ -173,6 +257,18 @@ class PipelineRunner:
                 return {}
 
             try:
+                module_started_at = time.perf_counter()
+                self._record_event(
+                    "module_started",
+                    module=name,
+                    status="running",
+                    message=f"{name.upper()} 开始执行",
+                    details={
+                        "description": mod.description,
+                        "tools": self._MODULE_TOOLS.get(name, []),
+                        "iteration_count": state.iteration_count,
+                    },
+                )
                 # M4 collects interactive revision guidance before its phase
                 # header, so the UI reads: guidance -> M4 -> revised output.
                 pre_header_patch: Dict[str, Any] = {}
@@ -257,9 +353,52 @@ class PipelineRunner:
                     render_phase_done(name)
                 # --- checkpoint: save state after each successful module ---
                 self._save_checkpoint(name, state, final)
+                elapsed = time.perf_counter() - module_started_at
+                snapshot_path = None
+                if self.event_recorder is not None:
+                    merged_snapshot = state.model_dump(mode="json")
+                    for key, value in final.items():
+                        if hasattr(value, "model_dump"):
+                            merged_snapshot[key] = value.model_dump(mode="json")
+                        elif isinstance(value, list):
+                            merged_snapshot[key] = [
+                                item.model_dump(mode="json")
+                                if hasattr(item, "model_dump")
+                                else item
+                                for item in value
+                            ]
+                        else:
+                            merged_snapshot[key] = value
+                    snapshot_path = self.event_recorder.save_snapshot(
+                        f"{name}-iteration-{state.iteration_count}",
+                        merged_snapshot,
+                    )
+                details = self._summarize_result(name, final)
+                if snapshot_path is not None:
+                    details["snapshot"] = str(snapshot_path)
+                self._record_event(
+                    "module_completed",
+                    module=name,
+                    status="completed",
+                    message=f"{name.upper()} 执行完成",
+                    elapsed_seconds=elapsed,
+                    details=details,
+                )
                 return final
             except Exception as exc:
                 import traceback
+                elapsed = (
+                    time.perf_counter() - module_started_at
+                    if "module_started_at" in locals()
+                    else None
+                )
+                self._record_event(
+                    "module_failed",
+                    module=name,
+                    status="failed",
+                    message=f"{name.upper()} 执行失败：{type(exc).__name__}: {exc}",
+                    elapsed_seconds=elapsed,
+                )
                 if self.config.verbose:
                     from .display import console, COLORS
                     console.print(f"  [{COLORS['error']}][ERR] [{name.upper()}] ERROR: {exc}[/{COLORS['error']}]")
@@ -364,6 +503,17 @@ class PipelineRunner:
         if not run_id:
             run_id = f"hypoforge-{uuid.uuid4().hex[:8]}"
         self._current_run_id = run_id
+        run_started_at = time.perf_counter()
+        self._record_event(
+            "run_started",
+            status="running",
+            message="HypoForge M1-M6 流程开始",
+            details={
+                "question": question,
+                "enabled_modules": list(self.config.enabled_modules),
+                "model": self.config.qwen.plus.model,
+            },
+        )
 
         graph = self._build_graph()
 
@@ -404,12 +554,13 @@ class PipelineRunner:
 
         # Stream through the graph
         final_state_dict = None
-        async for chunk in graph.astream(
-            initial_state,
-            stream_mode="values",
-            config={"recursion_limit": 100},
-        ):
-            final_state_dict = chunk
+        with bind_recorder(self.event_recorder):
+            async for chunk in graph.astream(
+                initial_state,
+                stream_mode="values",
+                config={"recursion_limit": 100},
+            ):
+                final_state_dict = chunk
 
         if final_state_dict is None:
             raise RuntimeError("Pipeline produced no output.")
@@ -437,11 +588,28 @@ class PipelineRunner:
             # LLM-as-judge evaluations so they don't add meaningful latency.
             metric_llm_config = self.config.get_llm_for_tier("turbo")
             try:
+                score_started_at = time.perf_counter()
+                self._record_event(
+                    "scoring_started",
+                    module="m6",
+                    tool="posthoc_scorer",
+                    status="running",
+                    message="独立评分开始",
+                )
                 scores_path = await save_scoring_report_async(
                     final_state,
                     self.config.output_dir,
                     self.config.scoring.hypothesis_weights,
                     llm_config=metric_llm_config,
+                )
+                self._record_event(
+                    "scoring_completed",
+                    module="m6",
+                    tool="posthoc_scorer",
+                    status="completed",
+                    message="独立评分完成",
+                    elapsed_seconds=time.perf_counter() - score_started_at,
+                    details={"scores_path": str(scores_path)},
                 )
                 if self.config.verbose:
                     from .display import console, COLORS
@@ -451,6 +619,25 @@ class PipelineRunner:
             except Exception as exc:
                 import logging
                 logging.getLogger(__name__).warning("Scoring report failed: %s", exc)
+                self._record_event(
+                    "scoring_failed",
+                    module="m6",
+                    tool="posthoc_scorer",
+                    status="failed",
+                    message=f"独立评分失败：{type(exc).__name__}: {exc}",
+                )
+
+        self._record_event(
+            "run_completed",
+            status="completed" if not final_state.errors else "completed_with_errors",
+            message="HypoForge M1-M6 流程结束",
+            elapsed_seconds=time.perf_counter() - run_started_at,
+            details={
+                "errors": len(final_state.errors),
+                "input_tokens": final_state.total_input_tokens,
+                "output_tokens": final_state.total_output_tokens,
+            },
+        )
 
         return final_state
 

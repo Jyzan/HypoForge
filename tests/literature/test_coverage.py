@@ -219,6 +219,34 @@ async def test_invalid_facet_paper_or_sentence_ids_cannot_cover_facet() -> None:
 
 
 @pytest.mark.asyncio
+async def test_invalidated_coverage_does_not_keep_a_sufficient_rationale() -> None:
+    papers, notes = mechanism_inputs()
+    client = FakeStructuredClient(
+        {
+            "facets": [
+                {
+                    "facet": "mechanism",
+                    "status": "partial",
+                    "paper_ids": ["paper-0"],
+                    "sentence_ids": [],
+                }
+            ],
+            "missing_topics": ["mechanism"],
+            "sufficient": False,
+            "rationale": "The evidence is sufficiently complete.",
+        }
+    )
+
+    report = await CoverageEvaluator(client, current_year=2026).evaluate(
+        "question", papers, notes, SearchState()
+    )
+
+    assert report.sufficient is False
+    assert "sufficiently complete" not in report.rationale
+    assert "remains insufficient" in report.rationale
+
+
+@pytest.mark.asyncio
 async def test_model_missing_topics_are_limited_and_preserve_previous_context() -> None:
     papers, notes = mechanism_inputs()
     state = SearchState(

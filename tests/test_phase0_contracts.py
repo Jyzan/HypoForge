@@ -93,11 +93,14 @@ def test_custom_module_loader_validation():
         ModuleRegistry._load_module_class("not-a-dotted-path", "m1")
 
 
-def test_agentic_selection_has_clear_track_a_error():
+def test_agentic_selection_builds_track_a_module():
     from hypoforge import modules  # noqa: F401
+    from hypoforge.literature.adapter import AgenticM2Module
+
     config = PipelineConfig(search={"implementation": "agentic"})
-    with pytest.raises(ImportError, match="Track A"):
-        ModuleRegistry.build_all(config)
+    instances = ModuleRegistry.build_all(config)
+
+    assert isinstance(instances["m2"], AgenticM2Module)
 
 
 class BeforeSkill(SkillProtocol):

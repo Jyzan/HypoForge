@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 from ..tools.qwen_client import QwenClient
 from .adapter import AgenticM2Adapter
@@ -35,8 +37,11 @@ def build_integrated_search_adapter(
     client: QwenClient,
     search_tool: LiteratureSearchTool | None = None,
     final_k: int = 5,
+    per_query_limit: int | None = None,
+    enabled_sources: Sequence[str] | None = None,
+    semantic_scholar_api_key: str = "",
     source_timeout_seconds: float = 30.0,
-    budget: SearchBudget | None = None,
+    budget: SearchBudget | Mapping[str, Any] | None = None,
     reading_cache_dir: str | Path = ".cache/hypoforge/literature/documents",
     pmc_backend: FetchBackend | None = None,
     arxiv_pdf_backend: ArxivPDFFetchBackend | None = None,
@@ -50,17 +55,25 @@ def build_integrated_search_adapter(
         raise ValueError("final_k must be positive")
     if source_timeout_seconds <= 0:
         raise ValueError("source_timeout_seconds must be positive")
+    if per_query_limit is not None and per_query_limit <= 0:
+        raise ValueError("per_query_limit must be positive")
     if arxiv_max_pdf_bytes <= 0:
         raise ValueError("arxiv_max_pdf_bytes must be positive")
     if arxiv_download_timeout_seconds <= 0 or resolver_timeout_seconds <= 0:
         raise ValueError("reading timeouts must be positive")
 
-    tool = search_tool or LiteratureSearchTool()
-    resolved_budget = budget or SearchBudget(
-        max_rounds=3,
-        max_queries=12,
-        max_papers=max(100, final_k),
+    tool = search_tool or LiteratureSearchTool(
+        enabled_sources=enabled_sources,
+        semantic_scholar_api_key=semantic_scholar_api_key,
     )
+    if isinstance(budget, Mapping):
+        resolved_budget = SearchBudget.model_validate(dict(budget))
+    else:
+        resolved_budget = budget or SearchBudget(
+            max_rounds=3,
+            max_queries=12,
+            max_papers=max(100, final_k),
+        )
     planner = QueryPlanner(
         client=client,
         tool_definitions=tool.tool_definitions,
@@ -80,7 +93,7 @@ def build_integrated_search_adapter(
         coverage_evaluator=CoverageEvaluator(client, selection_limit=final_k),
         final_k=final_k,
         candidate_limit=max(20, final_k),
-        per_query_limit=final_k,
+        per_query_limit=per_query_limit or final_k,
         source_timeout_seconds=source_timeout_seconds,
     )
     store = InMemoryChunkStore()

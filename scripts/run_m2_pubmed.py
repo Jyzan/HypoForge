@@ -12,7 +12,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from hypoforge.literature.minimal import build_minimal_pubmed_adapter
-from hypoforge.modules.m2_literature_search import M2LiteratureSearch
 from hypoforge.state import PipelineState
 
 
@@ -30,11 +29,7 @@ async def _run(question: str, limit: int, timeout: float) -> dict:
         final_k=limit,
         source_timeout_seconds=timeout,
     )
-    module = M2LiteratureSearch(
-        implementation="agentic",
-        agentic_adapter=adapter,
-    )
-    output = await module(PipelineState(input_question=question))
+    output = await adapter(PipelineState(input_question=question))
     return {
         "status": "ok",
         "literature_results": [

@@ -51,6 +51,37 @@ def test_agentic_search_implementation_is_explicitly_supported() -> None:
 
     assert config.search.implementation == "agentic"
     assert config.get_module_kwargs("m2")["implementation"] == "agentic"
+    assert config.get_module_kwargs("m2")["budget"]["max_rounds"] == 3
+    assert config.get_module_kwargs("m2")["enabled_sources"] == [
+        "semantic_scholar",
+        "pubmed",
+    ]
+
+
+def test_agentic_search_config_is_forwarded_to_integrated_adapter() -> None:
+    config = PipelineConfig(
+        search={
+            "implementation": "agentic",
+            "tools": ["pubmed", "arxiv"],
+            "papers_per_sub_question": 7,
+            "max_papers_total": 23,
+            "max_rounds": 2,
+            "max_queries": 5,
+            "max_tokens": 4567,
+            "max_seconds": 89,
+        }
+    )
+
+    kwargs = config.get_module_kwargs("m2")
+    assert kwargs["enabled_sources"] == ["pubmed", "arxiv"]
+    assert kwargs["per_query_limit"] == 7
+    assert kwargs["budget"] == {
+        "max_rounds": 2,
+        "max_queries": 5,
+        "max_papers": 23,
+        "max_tokens": 4567,
+        "max_seconds": 89,
+    }
 
 
 def test_module_override_can_explicitly_override_search_implementation() -> None:

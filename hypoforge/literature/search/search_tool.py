@@ -9,12 +9,14 @@ implementations in ``hypoforge.literature.sources``.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Dict, List, Optional
 
 from hypoforge.literature.models import PaperRecord, SearchQuery
 from hypoforge.literature.sources.academic_source import AcademicSource
 from hypoforge.literature.sources.arxiv_source import ArxivSource
 from hypoforge.literature.sources.pubmed_source import PubMedSource
+from hypoforge.tools.semantic_scholar import SemanticScholarTool
 
 
 class LiteratureSearchTool:
@@ -78,16 +80,38 @@ class LiteratureSearchTool:
         pubmed: Optional[PubMedSource] = None,
         academic: Optional[AcademicSource] = None,
         arxiv_source: Optional[ArxivSource] = None,
+        enabled_sources: Sequence[str] | None = None,
+        semantic_scholar_api_key: str = "",
     ):
+        requested = {
+            str(name).strip().casefold()
+            for name in (enabled_sources or self._TOOL_NAME_SET)
+        }
+        unknown = requested - self._TOOL_NAME_SET
+        if unknown:
+            raise ValueError(f"Unknown literature sources: {sorted(unknown)}")
+        if not requested:
+            raise ValueError("At least one literature source must be enabled")
+        self._enabled_sources = requested
         self._pubmed_source = pubmed if pubmed is not None else PubMedSource()
-        self._academic_source = academic if academic is not None else AcademicSource()
+        self._academic_source = (
+            academic
+            if academic is not None
+            else AcademicSource(
+                tool=SemanticScholarTool(api_key=semantic_scholar_api_key)
+            )
+        )
         self._arxiv_source = (
             arxiv_source if arxiv_source is not None else ArxivSource()
         )
 
     @property
     def tool_definitions(self) -> List[Dict[str, Any]]:
-        return [dict(d) for d in self.TOOL_DEFINITIONS]
+        return [
+            dict(definition)
+            for definition in self.TOOL_DEFINITIONS
+            if definition["name"] in self._enabled_sources
+        ]
 
     @classmethod
     def is_valid_backend(cls, name: str) -> bool:
@@ -97,15 +121,22 @@ class LiteratureSearchTool:
         """Return individual ``LiteratureSourceProtocol`` implementations
         suitable for ``IterativeSearchAgent`` injection.
         """
+        source_map = {
+            "pubmed": self._pubmed_source,
+            "semantic_scholar": self._academic_source,
+            "arxiv": self._arxiv_source,
+        }
         return [
-            self._pubmed_source,
-            self._academic_source,
-            self._arxiv_source,
+            source_map[definition["name"]]
+            for definition in self.TOOL_DEFINITIONS
+            if definition["name"] in self._enabled_sources
         ]
 
     async def search(
         self, query_text: str, backend: str, limit: int = 20,
     ) -> List[PaperRecord]:
+        if backend not in self._enabled_sources:
+            raise ValueError(f"Backend {backend!r} is disabled")
         query = SearchQuery(
             query_id="_direct",
             text=query_text,
