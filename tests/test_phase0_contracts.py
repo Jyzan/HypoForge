@@ -73,6 +73,8 @@ def test_provenance_rejects_invalid_evidence(change):
 
 def test_all_yaml_configs_load():
     for path in Path("configs").glob("*.yaml"):
+        if path.name == "evaluation.yaml":
+            continue  # uses MasterEvaluationConfig, not PipelineConfig
         PipelineConfig.from_yaml(path)
 
 
