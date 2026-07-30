@@ -280,3 +280,58 @@ class PipelineConfig(BaseModel):
         if module_name == "m2":
             kwargs.setdefault("implementation", self.search.implementation)
         return kwargs
+
+
+# ============================================================================
+# Task C.5: Evaluation & Ablation Configs
+# ============================================================================
+
+class EmbeddingConfig(BaseModel):
+    model_name: str = "text-embedding-v3"
+    api_key_env_var: str = "DASHSCOPE_API_KEY"
+    base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+class ConsistencyConfig(BaseModel):
+    similarity_threshold: float = 0.8
+
+class EvaluationConfig(BaseModel):
+    """Configuration for metrics evaluation (Novelty, Consistency, etc)."""
+    model_config = ConfigDict(extra="forbid")
+
+    embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
+    consistency: ConsistencyConfig = Field(default_factory=ConsistencyConfig)
+
+class AblationConfig(BaseModel):
+    """Strict configuration for running the ablation matrix script."""
+    model_config = ConfigDict(extra="forbid")
+
+    questions: List[str] = Field(default_factory=list)
+    configs_dir: str = "configs/ablation"
+    repeats: int = Field(default=3, ge=1)
+    max_budget_usd: float = Field(default=10.0, gt=0.0)
+    output_csv: str = "ablation_results.csv"
+
+    @model_validator(mode="after")
+    def _validate_ablation(self) -> "AblationConfig":
+        if not self.questions:
+            raise ValueError("questions list cannot be empty in AblationConfig")
+        if self.max_budget_usd <= 0:
+            raise ValueError("max_budget_usd must be greater than 0")
+        return self
+
+class MasterEvaluationConfig(BaseModel):
+    """The root model for configs/evaluation.yaml"""
+    model_config = ConfigDict(extra="forbid")
+
+    evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
+    ablation: AblationConfig = Field(default_factory=AblationConfig)
+
+    @classmethod
+    def from_yaml(cls, path: str | Path) -> "MasterEvaluationConfig":
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"Evaluation config file not found: {path}")
+        import yaml
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = yaml.safe_load(fh) or {}
+        return cls.model_validate(raw)
