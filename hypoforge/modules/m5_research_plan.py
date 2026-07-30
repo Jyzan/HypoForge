@@ -11,8 +11,10 @@ Output: ``research_plans`` in state.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
+from ..observability import emit_event
 from ..protocol import ModuleProtocol
 from ..prompts.m5_prompts import M5_SYSTEM_PROMPT, M5_USER_TEMPLATE
 from ..registry import ModuleRegistry
@@ -54,6 +56,15 @@ class M5ResearchPlan(ModuleProtocol):
 
         plans: List[ResearchPlan] = []
         for h in state.top_hypotheses:
+            started_at = time.monotonic()
+            emit_event(
+                "tool_started",
+                module="m5",
+                tool="research_plan_designer",
+                status="running",
+                message=f"开始为假设 {h.hypothesis_id} 设计研究方案",
+                details={"hypothesis_id": h.hypothesis_id},
+            )
             payload = await self.client.structured_chat(
                 system_prompt=M5_SYSTEM_PROMPT,
                 user_prompt=M5_USER_TEMPLATE.format(
@@ -70,6 +81,19 @@ class M5ResearchPlan(ModuleProtocol):
             if not plan.hypothesis_id:
                 plan.hypothesis_id = h.hypothesis_id
             plans.append(plan)
+            emit_event(
+                "tool_completed",
+                module="m5",
+                tool="research_plan_designer",
+                status="completed",
+                message=f"假设 {h.hypothesis_id} 的研究方案完成",
+                elapsed_seconds=time.monotonic() - started_at,
+                details={
+                    "hypothesis_id": h.hypothesis_id,
+                    "procedures": len(plan.procedures),
+                    "analysis_methods": len(plan.analysis_methods),
+                },
+            )
 
         return {"research_plans": plans}
 

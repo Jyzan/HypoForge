@@ -279,6 +279,22 @@ class PipelineConfig(BaseModel):
         kwargs = dict(override.kwargs) if override is not None else {}
         if module_name == "m2":
             kwargs.setdefault("implementation", self.search.implementation)
+            if self.search.implementation == "agentic":
+                kwargs.setdefault(
+                    "budget",
+                    {
+                        "max_rounds": self.search.max_rounds,
+                        "max_queries": self.search.max_queries,
+                        "max_papers": self.search.max_papers_total,
+                        "max_tokens": self.search.max_tokens,
+                        "max_seconds": self.search.max_seconds,
+                    },
+                )
+                kwargs.setdefault(
+                    "per_query_limit",
+                    self.search.papers_per_sub_question,
+                )
+                kwargs.setdefault("enabled_sources", list(self.search.tools))
         return kwargs
 
 

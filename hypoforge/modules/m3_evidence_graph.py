@@ -31,10 +31,12 @@ import asyncio
 import json
 import logging
 import re
+import time
 import uuid
 from typing import Any, Dict, List, Optional, Set
 
 from ..protocol import ModuleProtocol
+from ..observability import emit_event
 from ..prompts.m3_prompts import (
     M3_BATCH_RELATION_SYSTEM_PROMPT,
     M3_BATCH_RELATION_USER_TEMPLATE,
@@ -356,7 +358,17 @@ class M3EvidenceGraph(ModuleProtocol):
         if not all_entries:
             return {"evidence_graph": EvidenceGraph()}
 
-        # --- Incremental update: reuse existing graph when present ---
+
+        # --- Step 1: rule-based graph construction (with incremental update) ---
+        rule_started_at = time.monotonic()
+        emit_event(
+            "tool_started",
+            module="m3",
+            tool="rule_graph_builder",
+            status="running",
+            message=f"开始将 {len(all_entries)} 条知识构造成基础证据图",
+        )
+
         existing_graph = state.evidence_graph
         if existing_graph is not None and existing_graph.nodes:
             new_entries = self._find_new_entries(all_entries, existing_graph)
@@ -365,6 +377,14 @@ class M3EvidenceGraph(ModuleProtocol):
                     "M3 incremental: no new entries; reusing existing graph "
                     "(%d nodes, %d edges)",
                     len(existing_graph.nodes), len(existing_graph.edges),
+                )
+                emit_event(
+                    "tool_completed",
+                    module="m3",
+                    tool="rule_graph_builder",
+                    status="completed",
+                    message=f"增量更新：无新条目，复用现有图 ({len(existing_graph.nodes)} 节点 / {len(existing_graph.edges)} 边)",
+                    elapsed_seconds=time.monotonic() - rule_started_at,
                 )
                 return {"evidence_graph": existing_graph}
             logger.info(
@@ -377,13 +397,47 @@ class M3EvidenceGraph(ModuleProtocol):
         else:
             graph = self._build_rule_graph(all_entries)
 
+        emit_event(
+            "tool_completed",
+            module="m3",
+            tool="rule_graph_builder",
+            status="completed",
+            message=f"基础证据图完成：{len(graph.nodes)} 节点 / {len(graph.edges)} 边",
+            elapsed_seconds=time.monotonic() - rule_started_at,
+        )
+
         # --- Step 2: LLM-enhanced relation extraction (optional) ---
         if self.mode in {"llm", "direct", "api"} and self.client:
+            llm_started_at = time.monotonic()
+            emit_event(
+                "tool_started",
+                module="m3",
+                tool="qwen_relation_extractor",
+                status="running",
+                message="开始抽取跨知识条目的语义关系",
+            )
             try:
                 graph = await self._enhance_with_llm_batched(graph, all_entries)
             except Exception as exc:
                 logger.warning(
                     "M3 LLM enhancement failed; using rule-only graph: %s", exc
+                )
+                emit_event(
+                    "tool_failed",
+                    module="m3",
+                    tool="qwen_relation_extractor",
+                    status="failed",
+                    message=f"语义关系抽取失败，保留规则图：{type(exc).__name__}: {exc}",
+                    elapsed_seconds=time.monotonic() - llm_started_at,
+                )
+            else:
+                emit_event(
+                    "tool_completed",
+                    module="m3",
+                    tool="qwen_relation_extractor",
+                    status="completed",
+                    message=f"语义关系抽取完成：证据图现有 {len(graph.edges)} 条边",
+                    elapsed_seconds=time.monotonic() - llm_started_at,
                 )
 
         # --- Step 3: Iterative refinement from M6 reviews ---

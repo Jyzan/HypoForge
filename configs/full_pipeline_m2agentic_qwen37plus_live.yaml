@@ -1,0 +1,83 @@
+# Live M1-M6 configuration for the combined Track A Agentic M2.
+
+run_name: hypoforge-m2-live-qwen37plus
+output_dir: ./output/m2_live_qwen37plus
+verbose: true
+log_level: INFO
+
+pipeline:
+  enabled_modules: ["m1", "m2", "m3", "m4", "m5", "m6"]
+  max_iterations: 2
+  enable_iteration: true
+  iteration_module_target: "m4"
+
+qwen:
+  base:
+    model: qwen3.7-plus
+    max_tokens: 4096
+    temperature: 0.1
+  max:
+    model: qwen3.7-plus
+    max_tokens: 4096
+    temperature: 0.1
+  plus:
+    model: qwen3.7-plus
+    max_tokens: 4096
+    temperature: 0.1
+  turbo:
+    model: qwen3.7-plus
+    max_tokens: 4096
+    temperature: 0.1
+
+search:
+  implementation: agentic
+  tools: ["pubmed", "semantic_scholar", "arxiv"]
+  papers_per_sub_question: 5
+  max_papers_total: 20
+  max_rounds: 1
+  max_queries: 4
+  max_papers: 20
+  max_tokens: 30000
+  max_seconds: 600
+
+module_overrides:
+  m1:
+    kwargs:
+      mode: "llm"
+      llm_tier: "base"
+      max_sub_questions: 2
+  m2:
+    kwargs:
+      variant: integrated
+      llm_tier: "plus"
+      final_k: 2
+      source_timeout_seconds: 45.0
+      arxiv_download_timeout_seconds: 90.0
+      resolver_timeout_seconds: 120.0
+      reader_timeout_seconds: 90.0
+      reading_workflow_timeout_seconds: 300.0
+  m3:
+    kwargs:
+      mode: "llm"
+      llm_tier: "plus"
+  m4:
+    kwargs:
+      num_candidates: 3
+      top_k: 1
+      mode: "multi_agent"
+      llm_tier: "plus"
+  m5:
+    kwargs:
+      mode: "llm"
+      llm_tier: "plus"
+  m6:
+    kwargs:
+      mode: "llm"
+      llm_tier: "plus"
+      reviewers:
+        - scientific_logic
+        - evidence_consistency
+        - method_feasibility
+        - overall
+
+enabled_skills: []

@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -55,26 +56,38 @@ def _resolve_config() -> tuple[str, str]:
 _S2_API_KEY, _BACKEND = _resolve_config()
 _OPENALEX_API_KEY = os.environ.get("OPENALEX_API_KEY", "")
 
-# Rate limits: S2 with key ≈ 100 req/s, without key ≈ 1 req/s (but we
-# require a key for S2).  OpenAlex ≈ 10 req/s.
-_RATE_LIMIT = 0.011 if _S2_API_KEY else 0.12  # seconds between requests
+# This project's approved S2 key is limited to one request per second,
+# cumulative across endpoints. Keep a safety margin above one second;
+# operators may increase it locally, but cannot configure an unsafe value.
+_S2_RATE_LIMIT = max(
+    1.0,
+    float(os.environ.get("SEMANTIC_SCHOLAR_MIN_INTERVAL_SECONDS", "1.1")),
+)
+_OPENALEX_RATE_LIMIT = 0.12
 _last_request_time: float = 0.0
+_rate_limit_lock = threading.Lock()
 
 
-def _rate_limit() -> None:
+def _rate_limit(min_interval: float) -> None:
     global _last_request_time
-    now = time.monotonic()
-    gap = _RATE_LIMIT - (now - _last_request_time)
-    if gap > 0:
-        time.sleep(gap)
-    _last_request_time = time.monotonic()
+    with _rate_limit_lock:
+        now = time.monotonic()
+        gap = min_interval - (now - _last_request_time)
+        if gap > 0:
+            time.sleep(gap)
+        _last_request_time = time.monotonic()
 
 
 def _http_get_json(url: str, *, s2_api_key: str = "") -> dict:
     """GET *url*, parse JSON, with rate-limit + retry on transient errors."""
     last_exc = None
+    request_interval = (
+        _S2_RATE_LIMIT
+        if s2_api_key and "semanticscholar.org" in url
+        else _OPENALEX_RATE_LIMIT
+    )
     for attempt in range(4):
-        _rate_limit()
+        _rate_limit(request_interval)
         req = urllib.request.Request(url)
         req.add_header("User-Agent", "HypoForge/0.1.0 (Academic Research)")
         if s2_api_key and "semanticscholar.org" in url:

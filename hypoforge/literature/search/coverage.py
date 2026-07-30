@@ -348,8 +348,13 @@ class CoverageEvaluator(CoverageEvaluatorProtocol):
             f"{len(relevant)} relevant papers in the coverage selection; "
             f"{len(covered)}/{len(all_buckets)} evidence buckets covered."
         )
-        rationale = f"{summary} {model_rationale}".strip()
-        if not model_rationale:
+        if sufficient:
+            rationale = f"{summary} {model_rationale}".strip()
+        elif model_rationale:
+            rationale = f"{summary} Validated coverage remains insufficient."
+            if missing_topics:
+                rationale += f" Outstanding gaps: {'; '.join(missing_topics)}."
+        else:
             rationale = (
                 f"{summary} Semantic coverage was not confirmed; "
                 "search remains conservative."
