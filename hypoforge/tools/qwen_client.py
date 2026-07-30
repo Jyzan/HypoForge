@@ -203,12 +203,11 @@ class QwenClient:
             Extra parameters merged into the API request body
             (e.g. ``response_format``, ``thinking`` control).
         """
-        merged_kwargs: Dict[str, Any] = dict(model_kwargs or {})
-        # ``thinking`` is not an OpenAI Chat Completions parameter, so passing
-        # it through model_kwargs makes the OpenAI SDK reject the request before
-        # it reaches DashScope.  Qwen's OpenAI-compatible endpoint accepts the
-        # provider-specific switch in ``extra_body`` instead.
-        extra_body = {"enable_thinking": False} if disable_thinking else None
+        merged_kwargs: Dict[str, Any] = {}
+        if disable_thinking:
+            merged_kwargs["thinking"] = {"type": "disabled"}
+        if model_kwargs:
+            merged_kwargs.update(model_kwargs)
 
         return ChatOpenAI(
             model=self.model,
@@ -217,7 +216,6 @@ class QwenClient:
             max_tokens=max_tokens,
             temperature=temperature,
             **(dict(model_kwargs=merged_kwargs) if merged_kwargs else {}),
-            **(dict(extra_body=extra_body) if extra_body else {}),
         )
 
     @classmethod
@@ -373,23 +371,20 @@ class QwenClient:
         )
 
         # Build kwargs shared across attempts
-        def _make_rfmt_kwargs() -> dict:
-            return {"response_format": {"type": "json_object"}}
+        def _make_rfmt_kwargs(include_thinking: bool) -> dict:
+            rfmt: Dict[str, Any] = {"response_format": {"type": "json_object"}}
+            if include_thinking and disable_thinking:
+                rfmt["thinking"] = {"type": "disabled"}
+            return rfmt
 
         response = None
         # Attempt 1: with response_format (+ optional thinking disable)
         try:
-            llm_with_format = ChatOpenAI(
-                model=self.model,
-                base_url=self.api_base,
-                api_key=self.api_key,
+            llm_with_format = self._build_llm(
                 max_tokens=max_tokens,
                 temperature=temperature,
-                model_kwargs=_make_rfmt_kwargs(),
-                **(
-                    {"extra_body": {"enable_thinking": False}}
-                    if disable_thinking else {}
-                ),
+                disable_thinking=False,  # handled in model_kwargs below
+                model_kwargs=_make_rfmt_kwargs(include_thinking=True),
             )
             response = await llm_with_format.ainvoke(messages)
             self._record_tokens(response)
@@ -402,13 +397,11 @@ class QwenClient:
                     self.model,
                 )
                 try:
-                    llm_rfmt = ChatOpenAI(
-                        model=self.model,
-                        base_url=self.api_base,
-                        api_key=self.api_key,
+                    llm_rfmt = self._build_llm(
                         max_tokens=max_tokens,
                         temperature=temperature,
-                        model_kwargs=_make_rfmt_kwargs(),
+                        disable_thinking=False,
+                        model_kwargs=_make_rfmt_kwargs(include_thinking=False),
                     )
                     response = await llm_rfmt.ainvoke(messages)
                     self._record_tokens(response)
