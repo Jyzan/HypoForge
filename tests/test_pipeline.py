@@ -68,9 +68,16 @@ def test_unknown_search_implementation_is_rejected() -> None:
 
 
 def test_yaml_config_loads():
-    """Every YAML config file should load."""
+    """Every PipelineConfig YAML file should load.
+
+    Skips ``evaluation.yaml`` — it uses MasterEvaluationConfig, not
+    PipelineConfig (by design; see TODO Task C.5).
+    """
     config_dir = Path(__file__).resolve().parent.parent / "configs"
+    skip = {"evaluation.yaml"}
     for yaml_file in config_dir.glob("*.yaml"):
+        if yaml_file.name in skip:
+            continue
         config = PipelineConfig.from_yaml(str(yaml_file))
         assert config.enabled_modules, f"{yaml_file.name}: no modules enabled"
 

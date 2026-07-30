@@ -20,6 +20,7 @@ from hypoforge.modules.m3_evidence_graph import (
     normalize_entity,
 )
 from hypoforge.state import (
+    EvidenceEdge,
     EvidenceEdgeRelation,
     EvidenceGraph,
     EvidenceNode,
@@ -27,6 +28,7 @@ from hypoforge.state import (
     M2EvidenceExport,
     M2KnowledgeExport,
     M2KnowledgeRun,
+    M2PaperExport,
     PipelineState,
     ProblemCard,
 )
@@ -39,10 +41,15 @@ def _make_m2_export(
 
     Each tuple: (evidence_id, paper_id, quote, normalized_claim)
     """
+    paper_ids = sorted({pid for (_, pid, _, _) in evidence_items})
     return M2KnowledgeExport(
         runs=[
             M2KnowledgeRun(
                 sub_question="test question",
+                papers=[
+                    M2PaperExport(paper_id=pid, title=f"Paper {pid}")
+                    for pid in paper_ids
+                ],
                 evidence=[
                     M2EvidenceExport(
                         evidence_id=eid,
@@ -62,10 +69,14 @@ def _make_m2_export(
 
 def test_collect_m2_evidence_filters_citable_only():
     """Evidence items with citable=False should be excluded."""
+    from hypoforge.state import M2PaperExport as Paper
     export = M2KnowledgeExport(
         runs=[
             M2KnowledgeRun(
                 sub_question="q",
+                papers=[
+                    Paper(paper_id="P1", title="Test Paper"),
+                ],
                 evidence=[
                     M2EvidenceExport(
                         evidence_id="E1", paper_id="P1",
@@ -111,17 +122,29 @@ def test_collect_m2_evidence_warns_on_empty_export():
 
 def test_plan_queries_harvests_m2_knowledge_gaps():
     """Gaps and conflicts from M2KnowledgeExport should become queries."""
+    from hypoforge.state import KnowledgeEntry, KnowledgeEntryType, M2PaperExport as Paper
     export = M2KnowledgeExport(
         runs=[
             M2KnowledgeRun(
                 sub_question="q",
+                papers=[
+                    Paper(paper_id="P1", title="Test Paper"),
+                ],
                 knowledge_entries=[
-                    # Manually create a minimal KnowledgeEntry with type gap
-                    __import__("hypoforge.state", fromlist=["KnowledgeEntry", "KnowledgeEntryType"]).KnowledgeEntry(
+                    KnowledgeEntry(
                         id="GAP1",
-                        type=__import__("hypoforge.state", fromlist=["KnowledgeEntryType"]).KnowledgeEntryType.KNOWLEDGE_GAP,
+                        type=KnowledgeEntryType.KNOWLEDGE_GAP,
                         content="Unknown interaction between X and Y remains to be explored.",
                         source_paper_id="P1",
+                        evidence_ids=["E1"],
+                    ),
+                ],
+                evidence=[
+                    M2EvidenceExport(
+                        evidence_id="E1", paper_id="P1",
+                        chunk_id="C1", quote="X interacts with Y is unknown.",
+                        normalized_claim="X-Y interaction unknown",
+                        relevance_score=0.8,
                     ),
                 ],
             )
@@ -267,7 +290,7 @@ def test_evidence_graph_to_mermaid_produces_valid_structure():
 
 
 def test_evidence_graph_to_mermaid_escapes_quotes():
-    """Double-quotes in labels should be escaped to single quotes."""
+    """Double-quotes in labels should be turned into single quotes."""
     graph = EvidenceGraph(
         nodes=[
             EvidenceNode(
@@ -277,7 +300,9 @@ def test_evidence_graph_to_mermaid_escapes_quotes():
         ],
     )
     mermaid = evidence_graph_to_mermaid(graph)
-    assert '"' not in mermaid.split("N1")[1].split("]")[0]
+    # The label's double-quotes become single quotes in the mermaid output
+    assert "\"key\"" not in mermaid
+    assert "'key'" in mermaid
 
 
 # ============================================================================

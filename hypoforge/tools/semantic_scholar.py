@@ -292,7 +292,14 @@ class SemanticScholarTool(ToolProtocol):
     def __init__(self, api_key: str = "", openalex_api_key: str = ""):
         self.api_key = api_key or _S2_API_KEY
         self.openalex_api_key = openalex_api_key or _OPENALEX_API_KEY
-        self._backend = "semantic_scholar" if self.api_key else "openalex"
+        # If caller explicitly chose openalex (no s2 key, but has openalex key),
+        # route to OpenAlex. Otherwise default to semantic_scholar if we have a key.
+        if not api_key and openalex_api_key:
+            self._backend = "openalex"
+        elif not api_key and not openalex_api_key:
+            self._backend = "openalex" if not _S2_API_KEY else "semantic_scholar"
+        else:
+            self._backend = "semantic_scholar" if self.api_key else "openalex"
 
     @property
     def backend_name(self) -> str:
