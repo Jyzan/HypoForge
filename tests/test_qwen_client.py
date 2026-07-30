@@ -23,7 +23,8 @@ class _CapturingChatOpenAI:
         return _FakeResponse()
 
 
-def test_build_llm_sends_qwen_thinking_control_through_extra_body() -> None:
+def test_build_llm_sends_thinking_control_through_model_kwargs() -> None:
+    """Track B: thinking control is passed via model_kwargs, not extra_body."""
     client = QwenClient(
         model="qwen3.6-plus",
         api_key="test-key",
@@ -32,14 +33,14 @@ def test_build_llm_sends_qwen_thinking_control_through_extra_body() -> None:
 
     llm = client._build_llm(disable_thinking=True)
 
-    assert llm.extra_body == {"enable_thinking": False}
-    assert "thinking" not in llm.model_kwargs
+    assert llm.model_kwargs == {"thinking": {"type": "disabled"}}
 
 
 @pytest.mark.asyncio
-async def test_structured_chat_keeps_provider_extras_out_of_model_kwargs(
+async def test_structured_chat_passes_thinking_in_model_kwargs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Track B: structured_chat uses _build_llm which puts thinking in model_kwargs."""
     _CapturingChatOpenAI.calls = []
     monkeypatch.setattr(qwen_client_module, "ChatOpenAI", _CapturingChatOpenAI)
     client = QwenClient(
@@ -60,9 +61,9 @@ async def test_structured_chat_keeps_provider_extras_out_of_model_kwargs(
 
     assert result == {"ok": True}
     assert len(_CapturingChatOpenAI.calls) == 2
+    # Track B: thinking is now inside model_kwargs, not extra_body
     for call in _CapturingChatOpenAI.calls:
-        assert call["extra_body"] == {"enable_thinking": False}
-        assert "thinking" not in call.get("model_kwargs", {})
+        assert call["model_kwargs"]["thinking"] == {"type": "disabled"}
     assert _CapturingChatOpenAI.calls[1]["model_kwargs"]["response_format"] == {
         "type": "json_object"
     }
