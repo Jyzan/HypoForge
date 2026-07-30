@@ -455,9 +455,11 @@ Output JSON: {"is_conflict": true/false, "rationale": "..."}"""
                             valid_anchors.append(n)
                 except Exception as e:
                     logger.warning(f"Query embedding failed: {e}")
-                    valid_anchors = self._keyword_search(claim_obj.get("subject", ""), searchable_nodes)
+                    subject_queries = [claim_obj.get("subject", "")] + claim_obj.get("subject_synonyms", [])
+                    valid_anchors = self._keyword_search(subject_queries, searchable_nodes)
             else:
-                valid_anchors = self._keyword_search(claim_obj.get("subject", ""), searchable_nodes)
+                subject_queries = [claim_obj.get("subject", "")] + claim_obj.get("subject_synonyms", [])
+                valid_anchors = self._keyword_search(subject_queries, searchable_nodes)
                 
             if not valid_anchors:
                 consistent_count += 1
