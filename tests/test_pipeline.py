@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 # Ensure HypoForge is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -42,12 +43,72 @@ def test_default_config_loads():
     config = PipelineConfig.from_defaults()
     assert config.enabled_modules == ["m1", "m2", "m3", "m4", "m5", "m6"]
     assert config.max_iterations == 3
+    assert config.search.implementation == "legacy"
+
+
+def test_agentic_search_implementation_is_explicitly_supported() -> None:
+    config = PipelineConfig(search={"implementation": "agentic"})
+
+    assert config.search.implementation == "agentic"
+    assert config.get_module_kwargs("m2")["implementation"] == "agentic"
+    assert config.get_module_kwargs("m2")["budget"]["max_rounds"] == 3
+    assert config.get_module_kwargs("m2")["enabled_sources"] == [
+        "semantic_scholar",
+        "pubmed",
+    ]
+
+
+def test_agentic_search_config_is_forwarded_to_integrated_adapter() -> None:
+    config = PipelineConfig(
+        search={
+            "implementation": "agentic",
+            "tools": ["pubmed", "arxiv"],
+            "papers_per_sub_question": 7,
+            "max_papers_total": 23,
+            "max_rounds": 2,
+            "max_queries": 5,
+            "max_tokens": 4567,
+            "max_seconds": 89,
+        }
+    )
+
+    kwargs = config.get_module_kwargs("m2")
+    assert kwargs["enabled_sources"] == ["pubmed", "arxiv"]
+    assert kwargs["per_query_limit"] == 7
+    assert kwargs["budget"] == {
+        "max_rounds": 2,
+        "max_queries": 5,
+        "max_papers": 23,
+        "max_tokens": 4567,
+        "max_seconds": 89,
+    }
+
+
+def test_module_override_can_explicitly_override_search_implementation() -> None:
+    config = PipelineConfig(
+        search={"implementation": "agentic"},
+        module_overrides={"m2": {"kwargs": {"implementation": "legacy"}}},
+    )
+
+    assert config.get_module_kwargs("m2")["implementation"] == "legacy"
+
+
+def test_unknown_search_implementation_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        PipelineConfig(search={"implementation": "automatic"})
 
 
 def test_yaml_config_loads():
-    """Every YAML config file should load."""
+    """Every PipelineConfig YAML file should load.
+
+    Skips ``evaluation.yaml`` — it uses MasterEvaluationConfig, not
+    PipelineConfig (by design; see TODO Task C.5).
+    """
     config_dir = Path(__file__).resolve().parent.parent / "configs"
+    skip = {"evaluation.yaml"}
     for yaml_file in config_dir.glob("*.yaml"):
+        if yaml_file.name in skip:
+            continue
         config = PipelineConfig.from_yaml(str(yaml_file))
         assert config.enabled_modules, f"{yaml_file.name}: no modules enabled"
 
@@ -118,8 +179,12 @@ async def test_scorer_report_structure_and_not_circular():
 
     h0 = report["hypothesis_scores"][0]
     assert {"self_reported", "independent", "composite"} <= set(h0)
-    assert "novelty" not in h0["independent"]              # not laundered
-    assert "evidence_consistency" not in h0["independent"]  # not laundered
+    # The metrics are now implemented, so they appear in independent.
+    # Verify they don't echo the self-reported 0.8 score.
+    assert "novelty" in h0["independent"]
+    assert h0["independent"]["novelty"] != 0.8
+    assert "evidence_consistency" in h0["independent"]
+    assert h0["independent"]["evidence_consistency"] != 0.8
     assert "testability" in h0["independent"]              # objectively recomputed
     assert abs(sum(report["rubric"]["weights"].values()) - 1.0) < 1e-6
 

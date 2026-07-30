@@ -60,6 +60,7 @@ async def score_hypothesis_async(
     knowledge_entries: List[KnowledgeEntry],
     weights: Optional[Mapping[str, float]] = None,
     llm_config: Any = None,
+    evidence_graph: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Score a single hypothesis.
 
@@ -83,7 +84,11 @@ async def score_hypothesis_async(
             # evaluate quality with a lightweight model rather than just
             # checking for non-empty fields.
             metric = metric_cls(llm_config=llm_config) if llm_config else metric_cls()
-            independent[name] = await metric.compute(hypothesis, knowledge_entries)
+            independent[name] = await metric.compute(
+                hypothesis, 
+                knowledge_entries, 
+                evidence_graph=evidence_graph
+            )
         except NotImplementedError:
             continue
 
@@ -185,7 +190,13 @@ async def score_pipeline_state_async(
     knowledge_entries = _collect_knowledge_entries(state)
 
     hypothesis_scores = [
-        await score_hypothesis_async(h, knowledge_entries, weights, llm_config=llm_config)
+        await score_hypothesis_async(
+            h, 
+            knowledge_entries, 
+            weights, 
+            llm_config=llm_config, 
+            evidence_graph=state.evidence_graph
+        )
         for h in state.top_hypotheses
     ]
     plan_scores = [

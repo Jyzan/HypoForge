@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
+from ..observability import emit_event
 from ..protocol import ModuleProtocol
 from ..prompts.m6_prompts import M6_REASON_FIRST, M6_REVIEWER_PROMPTS, M6_USER_TEMPLATE
 from ..evaluation.rubric import review_rubric_line
@@ -89,6 +91,15 @@ class M6ReviewIteration(ModuleProtocol):
             system_prompt = "\n\n".join(
                 p for p in (M6_REVIEWER_PROMPTS[dim], review_rubric_line(dim), M6_REASON_FIRST) if p
             )
+            started_at = time.monotonic()
+            emit_event(
+                "tool_started",
+                module="m6",
+                tool=f"reviewer:{dim}",
+                status="running",
+                message=f"评审 Agent 开始：{dim}",
+                details={"version": version},
+            )
             payload = await self.client.structured_chat(
                 system_prompt=system_prompt,
                 user_prompt=M6_USER_TEMPLATE.format(
@@ -106,10 +117,29 @@ class M6ReviewIteration(ModuleProtocol):
             payload = dict(payload)
             payload["dimension"] = dim
             payload["version"] = version
-            new_reviews.append(ReviewResult.model_validate(payload))
+            review = ReviewResult.model_validate(payload)
+            new_reviews.append(review)
+            emit_event(
+                "tool_completed",
+                module="m6",
+                tool=f"reviewer:{dim}",
+                status="completed",
+                message=f"评审 Agent 完成：{dim}，评分 {review.score:.1f}/5",
+                elapsed_seconds=time.monotonic() - started_at,
+                details={"version": version, "score": review.score},
+            )
 
         # Compute overall as the mean of the specialist scores.
         if "overall" in self.reviewer_dims and new_reviews:
+            overall_started_at = time.monotonic()
+            emit_event(
+                "tool_started",
+                module="m6",
+                tool="overall_score_aggregator",
+                status="running",
+                message="开始汇总总体评分",
+                details={"version": version},
+            )
             specialist_scores = [r.score for r in new_reviews if r.score > 0]
             avg = sum(specialist_scores) / len(specialist_scores) if specialist_scores else 3.0
             new_reviews.append(ReviewResult(
@@ -120,6 +150,15 @@ class M6ReviewIteration(ModuleProtocol):
                 suggestions="See individual dimension reviews for detailed suggestions.",
                 version=version,
             ))
+            emit_event(
+                "tool_completed",
+                module="m6",
+                tool="overall_score_aggregator",
+                status="completed",
+                message=f"总体评分 {avg:.1f}/5",
+                elapsed_seconds=time.monotonic() - overall_started_at,
+                details={"version": version, "score": round(avg, 1)},
+            )
 
         return {
             "reviews": state.reviews + new_reviews,

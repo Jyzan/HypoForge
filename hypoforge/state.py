@@ -15,7 +15,7 @@ import re
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # ============================================================================
@@ -394,7 +394,16 @@ class AtomicClaim(BaseModel):
 
 
 class EvidenceRelation(BaseModel):
-    """A judged semantic relation before conversion to an EvidenceEdge."""
+    """A judged semantic relation before conversion to an EvidenceEdge.
+
+    .. versionchanged:: 0.2.0
+        Added ``model_config`` with ``extra="allow"`` so M3 grounding can
+        pass through debug/trace fields (``retrieval_score``,
+        ``condition_comparability``, ``candidate_origin``) without
+        serialisation errors.
+    """
+
+    model_config = ConfigDict(extra="allow")
 
     id: str
     source: str
