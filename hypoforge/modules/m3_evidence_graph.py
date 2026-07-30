@@ -28,6 +28,7 @@ to the graph without re-downloading papers.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -61,6 +62,20 @@ from .m3_grounding.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Optional emit_event import (from feat/full-pipeline-web-ui)
+# ============================================================================
+
+try:
+    from ..observability import emit_event  # noqa: F401
+    HAS_EMIT_EVENT = True
+except ImportError:
+    HAS_EMIT_EVENT = False
+    # Define a no-op so callers don't need conditional guards at every site.
+    def emit_event(*args, **kwargs) -> None:  # type: ignore[no-redef]
+        pass
 
 
 # ============================================================================
@@ -348,12 +363,15 @@ class M3EvidenceGraph(ModuleProtocol):
         state: PipelineState,
         config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        emit_event("m3:start", {"mode": self.mode, "grounding": self.grounding_enabled})
+
         # --- collect all knowledge entries ---
         all_entries = []
         for lr in state.literature_results:
             all_entries.extend(lr.knowledge_entries)
 
         if not all_entries:
+            emit_event("m3:done", {"nodes": 0, "edges": 0, "reason": "no_entries"})
             return {"evidence_graph": EvidenceGraph()}
 
         # --- Incremental update: reuse existing graph when present ---
@@ -366,25 +384,44 @@ class M3EvidenceGraph(ModuleProtocol):
                     "(%d nodes, %d edges)",
                     len(existing_graph.nodes), len(existing_graph.edges),
                 )
+                emit_event("m3:done", {
+                    "nodes": len(existing_graph.nodes),
+                    "edges": len(existing_graph.edges),
+                    "reason": "incremental_no_new",
+                })
                 return {"evidence_graph": existing_graph}
             logger.info(
                 "M3 incremental: %d new entries; appending to existing graph "
                 "(%d nodes, %d edges)",
                 len(new_entries), len(existing_graph.nodes), len(existing_graph.edges),
             )
+            emit_event("m3:rule_graph_start", {
+                "new_entries": len(new_entries),
+                "existing_nodes": len(existing_graph.nodes),
+            })
             graph = self._build_rule_graph(new_entries)
             graph = self._merge_graphs(existing_graph, graph)
         else:
+            emit_event("m3:rule_graph_start", {"entries": len(all_entries)})
             graph = self._build_rule_graph(all_entries)
+
+        emit_event("m3:rule_graph_done", {
+            "nodes": len(graph.nodes), "edges": len(graph.edges),
+        })
 
         # --- Step 2: LLM-enhanced relation extraction (optional) ---
         if self.mode in {"llm", "direct", "api"} and self.client:
             try:
+                emit_event("m3:llm_enhance_start", {"mode": self.mode})
                 graph = await self._enhance_with_llm_batched(graph, all_entries)
+                emit_event("m3:llm_enhance_done", {
+                    "nodes": len(graph.nodes), "edges": len(graph.edges),
+                })
             except Exception as exc:
                 logger.warning(
                     "M3 LLM enhancement failed; using rule-only graph: %s", exc
                 )
+                emit_event("m3:llm_enhance_failed", {"error": str(exc)})
 
         # --- Step 3: Iterative refinement from M6 reviews ---
         if (
@@ -394,11 +431,16 @@ class M3EvidenceGraph(ModuleProtocol):
             and self.mode in {"llm", "direct", "api"}
         ):
             try:
+                emit_event("m3:refine_start", {"iteration": state.iteration_count})
                 graph = await self._refine_with_reviews(graph, state)
+                emit_event("m3:refine_done", {
+                    "nodes": len(graph.nodes), "edges": len(graph.edges),
+                })
             except Exception as exc:
                 logger.warning(
                     "M3 iterative refinement failed; keeping unrefined graph: %s", exc
                 )
+                emit_event("m3:refine_failed", {"error": str(exc)})
 
         # --- Step 4: M3 grounding (optional — consumes M2KnowledgeExport) ---
         result: Dict[str, Any] = {"evidence_graph": graph}
@@ -413,8 +455,10 @@ class M3EvidenceGraph(ModuleProtocol):
                     "[m3] grounding.enabled=True but no m2_knowledge_export "
                     "available — run the agentic M2 pipeline first."
                 ]
+                emit_event("m3:grounding_skipped", {"reason": "no_m2_knowledge_export"})
             else:
                 try:
+                    emit_event("m3:grounding_start", {})
                     grounded = await self._grounder.run(state)
                     graph = self._merge_grounding(
                         graph,
@@ -424,11 +468,18 @@ class M3EvidenceGraph(ModuleProtocol):
                         grounded.get("report"),
                     )
                     result["evidence_graph"] = graph
+                    emit_event("m3:grounding_done", {
+                        "nodes": len(graph.nodes),
+                        "edges": len(graph.edges),
+                        "claims": len(grounded.get("claims", [])),
+                        "relations": len(grounded.get("relations", [])),
+                    })
                 except Exception as exc:
                     logger.exception(
                         "M3 grounding workflow failed; retaining non-grounded graph: %s",
                         exc,
                     )
+                    emit_event("m3:grounding_failed", {"error": str(exc)})
 
         # Track existing IDs for next incremental run
         self._existing_node_ids = {n.id for n in graph.nodes}
@@ -439,6 +490,10 @@ class M3EvidenceGraph(ModuleProtocol):
         # --- persist to disk (if enabled) ---
         if getattr(state, "memory_cache_dir", ""):
             self._persist_graph(graph, state.memory_cache_dir)
+
+        emit_event("m3:done", {
+            "nodes": len(graph.nodes), "edges": len(graph.edges),
+        })
 
         return result
 
@@ -513,10 +568,15 @@ class M3EvidenceGraph(ModuleProtocol):
             if pid and pid not in seen_papers:
                 nid = f"SRC_{pid}"
                 seen_papers[pid] = nid
+                title = e.source_paper_title or pid
                 nodes.append(EvidenceNode(
                     id=nid,
                     type=EvidenceNodeType.SOURCE,
-                    label=e.source_paper_title or pid,
+                    label=title,
+                    metadata={
+                        "paper_id": pid,
+                        "searchable_text": title,
+                    },
                 ))
 
         # Track entity nodes to avoid duplicates
@@ -540,6 +600,13 @@ class M3EvidenceGraph(ModuleProtocol):
                 normalize_entity(name) for name in e.entities
             ]
 
+            # Build searchable_text aggregating all searchable fields
+            searchable_text = " ".join(filter(None, [
+                e.content,
+                " ".join(normalised_entities),
+                e.source_paper_title or "",
+            ]))
+
             nodes.append(EvidenceNode(
                 id=nid,
                 type=node_type,
@@ -548,6 +615,7 @@ class M3EvidenceGraph(ModuleProtocol):
                     "entry_type": e.type.value,
                     "confidence": e.confidence.value if e.confidence else None,
                     "entities": normalised_entities,
+                    "searchable_text": searchable_text,
                 },
             ))
 
@@ -564,11 +632,19 @@ class M3EvidenceGraph(ModuleProtocol):
                 if name not in seen_entities:
                     eid = f"ENT_{name}"
                     seen_entities[name] = eid
+                    # Include original entity names in searchable_text
+                    ent_searchable = " ".join(filter(None, [
+                        name,
+                        " ".join(e.entities),
+                    ]))
                     nodes.append(EvidenceNode(
                         id=eid,
                         type=EvidenceNodeType.ENTITY,
                         label=name,
-                        metadata={"normalised_from": e.entities},
+                        metadata={
+                            "normalised_from": e.entities,
+                            "searchable_text": ent_searchable,
+                        },
                     ))
                 entity_nid = seen_entities[name]
                 # Avoid duplicate entity→entry edges
@@ -1173,6 +1249,17 @@ class M3EvidenceGraph(ModuleProtocol):
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _make_gev_node_id(evidence_id: str) -> str:
+        """Create a collision-resistant GEV_ node ID from an evidence_id.
+
+        Uses SHA-256 hash (first 16 hex chars) instead of raw truncation
+        to avoid collisions when different evidence_ids share the same
+        first 20 characters.
+        """
+        suffix = hashlib.sha256(evidence_id.encode()).hexdigest()[:16]
+        return f"GEV_{suffix}"
+
+    @staticmethod
     def _merge_grounding(
         graph: EvidenceGraph,
         records: List[EvidenceRecord],
@@ -1183,12 +1270,38 @@ class M3EvidenceGraph(ModuleProtocol):
         """Merge grounding workflow output into the existing evidence graph.
 
         Creates CLAIM nodes for each ``AtomicClaim`` and adds provenance
-        edges (evidence → claim) and semantic relation edges (claim → claim).
-        The ``evidence_ids`` on both claims and relations point back to
-        ``M2EvidenceExport.evidence_id``, which is recorded in node metadata.
+        edges (evidence → claim), semantic relations (claim → claim),
+        and **bridge edges** connecting the grounding subgraph to the
+        rule-based subgraph so that BFS traversals (e.g. NoveltyMetric)
+        can reach nodes in both subgraphs.
+
+        .. versionchanged:: 0.4.1
+            - GEV_ node IDs use SHA-256 hash instead of ``evidence_id[:20]``.
+            - ``searchable_text`` is added to all new node metadata for
+              BM25 / keyword search compatibility (k1=0.5+).
+            - Bridge edges (SRC_ → GEV_, N_xxx → GCLM_) connect the two
+              previously disconnected subgraphs.
         """
         record_map = {record.evidence_id: record for record in records}
         claim_map: Dict[str, str] = {}
+        ev_node_map: Dict[str, str] = {}  # evidence_id → GEV_ node id
+
+        # --- Pre-compute rule-graph lookup tables for bridge edges ---
+        # SOURCE nodes indexed by paper_id
+        src_by_paper: Dict[str, str] = {}
+        # CLAIM/EVIDENCE rule-graph nodes with their normalised entities
+        rule_claim_nodes: List[Dict[str, Any]] = []
+        for node in graph.nodes:
+            if node.type == EvidenceNodeType.SOURCE:
+                pid = (node.metadata or {}).get("paper_id", "")
+                if pid:
+                    src_by_paper[pid] = node.id
+            if node.type in (EvidenceNodeType.CLAIM, EvidenceNodeType.EVIDENCE) and node.id.startswith("N_"):
+                rule_claim_nodes.append({
+                    "id": node.id,
+                    "label": node.label,
+                    "entities": set((node.metadata or {}).get("entities", [])),
+                })
 
         # --- Create CLAIM nodes ---
         for claim in claims:
@@ -1199,6 +1312,14 @@ class M3EvidenceGraph(ModuleProtocol):
                 rec = record_map.get(eid)
                 if rec and rec.paper_id:
                     evidence_paper_ids.append(rec.paper_id)
+            normalised_claim_entities = [
+                normalize_entity(name) for name in claim.entities
+            ]
+            # Build searchable_text for BM25/kw search compatibility
+            gclm_searchable = " ".join(filter(None, [
+                claim.statement,
+                " ".join(normalised_claim_entities),
+            ]))
             graph.nodes.append(EvidenceNode(
                 id=node_id,
                 type=EvidenceNodeType.CLAIM,
@@ -1208,17 +1329,22 @@ class M3EvidenceGraph(ModuleProtocol):
                     "confidence": claim.confidence,
                     "evidence_ids": claim.evidence_ids,
                     "paper_ids": list(dict.fromkeys(evidence_paper_ids)),
-                    "entities": [
-                        normalize_entity(name)
-                        for name in claim.entities
-                    ],
+                    "entities": normalised_claim_entities,
                     "provenance_level": "m2_fulltext_grounded",
+                    "searchable_text": gclm_searchable,
                 },
             ))
 
         # --- Create EVIDENCE nodes for each EvidenceRecord ---
         for record in records:
-            node_id = "GEV_" + record.evidence_id[:20]
+            node_id = M3EvidenceGraph._make_gev_node_id(record.evidence_id)
+            ev_node_map[record.evidence_id] = node_id
+            # Build searchable_text aggregating all searchable evidence fields
+            gev_searchable = " ".join(filter(None, [
+                record.summary,
+                record.quote[:500] if record.quote else "",
+                record.normalized_claim[:500] if record.normalized_claim else "",
+            ]))
             graph.nodes.append(EvidenceNode(
                 id=node_id,
                 type=EvidenceNodeType.EVIDENCE,
@@ -1232,8 +1358,63 @@ class M3EvidenceGraph(ModuleProtocol):
                     "normalized_claim": record.normalized_claim[:500],
                     "relevance_score": record.relevance_score,
                     "provenance_level": "m2_fulltext_grounded",
+                    "searchable_text": gev_searchable,
                 },
             ))
+
+        # --- Bridge edge type A: SRC_ → GEV_ (source paper contains evidence) ---
+        bridge_src_count = 0
+        for record in records:
+            if record.paper_id and record.paper_id in src_by_paper:
+                src_node = src_by_paper[record.paper_id]
+                gev_node = ev_node_map.get(record.evidence_id)
+                if gev_node:
+                    already = any(
+                        e.source == src_node and e.target == gev_node
+                        for e in graph.edges
+                    )
+                    if not already:
+                        graph.edges.append(EvidenceEdge(
+                            source=src_node,
+                            target=gev_node,
+                            relation=EvidenceEdgeRelation.INVOLVES,
+                            rationale=f"Source paper contains M2 evidence item {record.evidence_id}.",
+                        ))
+                        bridge_src_count += 1
+
+        # --- Bridge edge type B: N_xxx → GCLM_ (semantic SAME_AS via entity overlap) ---
+        bridge_sameas_count = 0
+        gclm_entities = {}
+        for claim in claims:
+            gclm_id = claim_map[claim.id]
+            gclm_entities[gclm_id] = set(
+                normalize_entity(name) for name in claim.entities
+            )
+
+        for gclm_id, gclm_ent_set in gclm_entities.items():
+            if not gclm_ent_set:
+                continue
+            for rcn in rule_claim_nodes:
+                if not rcn["entities"]:
+                    continue
+                overlap = len(gclm_ent_set & rcn["entities"])
+                # Require ≥2 shared entities OR ≥50% Jaccard for a match
+                jaccard = overlap / len(gclm_ent_set | rcn["entities"]) if overlap else 0
+                if overlap >= 2 or jaccard >= 0.5:
+                    already = any(
+                        e.source == rcn["id"] and e.target == gclm_id
+                        and e.relation == EvidenceEdgeRelation.SAME_AS
+                        for e in graph.edges
+                    )
+                    if not already:
+                        graph.edges.append(EvidenceEdge(
+                            source=rcn["id"],
+                            target=gclm_id,
+                            relation=EvidenceEdgeRelation.SAME_AS,
+                            confidence=min(0.9, 0.5 + jaccard),
+                            rationale=f"Semantic match: {overlap} shared entities (Jaccard={jaccard:.2f}).",
+                        ))
+                        bridge_sameas_count += 1
 
         # --- Add provenance edges (evidence → claim) ---
         for claim in claims:
@@ -1241,7 +1422,9 @@ class M3EvidenceGraph(ModuleProtocol):
             if not claim_node:
                 continue
             for eid in claim.evidence_ids:
-                ev_node = "GEV_" + eid[:20]
+                ev_node = ev_node_map.get(eid)
+                if not ev_node:
+                    continue
                 already = any(
                     e.source == ev_node and e.target == claim_node
                     and e.relation == EvidenceEdgeRelation.SUPPORTS
@@ -1283,9 +1466,11 @@ class M3EvidenceGraph(ModuleProtocol):
 
         logger.info(
             "M3 grounding: merged %d claims, %d evidence records, %d relations "
-            "(%d total nodes, %d total edges)",
+            "(%d total nodes, %d total edges). "
+            "Bridge edges: %d SRC→GEV, %d N→GCLM (SAME_AS).",
             len(claims), len(records), len(relations),
             len(graph.nodes), len(graph.edges),
+            bridge_src_count, bridge_sameas_count,
         )
 
         return graph

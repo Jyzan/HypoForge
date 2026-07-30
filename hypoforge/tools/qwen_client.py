@@ -364,62 +364,68 @@ class QwenClient:
             messages.append(SystemMessage(content=system_prompt))
         messages.append(HumanMessage(content=full_user))
 
-        # Build the base LLM (without response_format, for fallback)
-        llm = self._build_llm(
-            max_tokens=max_tokens, temperature=temperature,
-            disable_thinking=disable_thinking,
-        )
+        # Build model_kwargs for each attempt.
+        # We try three strategies in order, each catching its own errors:
+        #   1. response_format=json_object + thinking disabled (if requested)
+        #   2. response_format=json_object only (no thinking toggle)
+        #   3. plain chat (no response_format, no thinking toggle)
 
-        # Build kwargs shared across attempts
-        def _make_rfmt_kwargs(include_thinking: bool) -> dict:
-            rfmt: Dict[str, Any] = {"response_format": {"type": "json_object"}}
-            if include_thinking and disable_thinking:
-                rfmt["thinking"] = {"type": "disabled"}
-            return rfmt
+        def _build_rfmt_kwargs(*, with_thinking_disable: bool) -> Dict[str, Any]:
+            """Build model_kwargs dict for one structured_chat attempt."""
+            kw: Dict[str, Any] = {"response_format": {"type": "json_object"}}
+            if with_thinking_disable and disable_thinking:
+                kw["thinking"] = {"type": "disabled"}
+            return kw
 
         response = None
-        # Attempt 1: with response_format (+ optional thinking disable)
+
+        # ── Attempt 1: response_format + (optional) thinking disable ──
         try:
-            llm_with_format = self._build_llm(
+            llm_1 = self._build_llm(
                 max_tokens=max_tokens,
                 temperature=temperature,
-                disable_thinking=False,  # handled in model_kwargs below
-                model_kwargs=_make_rfmt_kwargs(include_thinking=True),
+                disable_thinking=False,  # handled in model_kwargs
+                model_kwargs=_build_rfmt_kwargs(with_thinking_disable=True),
             )
-            response = await llm_with_format.ainvoke(messages)
+            response = await llm_1.ainvoke(messages)
             self._record_tokens(response)
         except Exception:
-            if disable_thinking:
-                # Attempt 2: retry without thinking disable
-                # (the model / proxy may not support the parameter)
-                logger.debug(
-                    "Model %s may not support thinking disable; retrying without it.",
-                    self.model,
+            logger.debug(
+                "structured_chat attempt 1 (response_format%s) failed for model %s",
+                "+thinking_disabled" if disable_thinking else "",
+                self.model,
+            )
+
+        # ── Attempt 2: response_format only (skip thinking toggle) ──
+        if response is None and disable_thinking:
+            try:
+                llm_2 = self._build_llm(
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    disable_thinking=False,
+                    model_kwargs=_build_rfmt_kwargs(with_thinking_disable=False),
                 )
-                try:
-                    llm_rfmt = self._build_llm(
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        disable_thinking=False,
-                        model_kwargs=_make_rfmt_kwargs(include_thinking=False),
-                    )
-                    response = await llm_rfmt.ainvoke(messages)
-                    self._record_tokens(response)
-                except Exception:
-                    logger.debug(
-                        "Model %s may not support response_format; falling back to text parse.",
-                        self.model,
-                    )
-            else:
+                response = await llm_2.ainvoke(messages)
+                self._record_tokens(response)
+            except Exception:
                 logger.debug(
-                    "Model %s may not support response_format; falling back to text parse.",
+                    "structured_chat attempt 2 (response_format only) failed for model %s",
                     self.model,
                 )
 
-        # Attempt 3: plain chat fallback (no response_format)
+        # ── Attempt 3: plain chat (no response_format, no thinking) ──
         if response is None:
-            response = await llm.ainvoke(messages)
-            self._record_tokens(response)
+            try:
+                llm_3 = self._build_llm(
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    disable_thinking=False,
+                )
+                response = await llm_3.ainvoke(messages)
+                self._record_tokens(response)
+            except Exception as exc:
+                logger.error("structured_chat all attempts failed for model %s: %s", self.model, exc)
+                raise
 
         content = response.content
 
