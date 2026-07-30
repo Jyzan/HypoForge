@@ -291,8 +291,13 @@ class ScoutReader(ScoutReaderProtocol):
                     raise
                 except Exception as exc:
                     logger.warning(
-                        "Scout batch failed; using conservative fallback (%s)",
+                        "Scout batch failed; using conservative fallback (%s: %s)",
                         type(exc).__name__,
+                        exc,
+                    )
+                    logger.debug(
+                        "Scout batch failure traceback",
+                        exc_info=True,
                     )
                     return [
                         _fallback_note(
