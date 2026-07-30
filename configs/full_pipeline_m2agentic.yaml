@@ -1,0 +1,58 @@
+# HypoForge — Full Pipeline with Agentic M2
+# Uses the agentic literature search module (AgenticM2Module) for M2.
+
+run_name: hypoforge-agentic-m2
+output_dir: ./output/agentic_m2
+verbose: true
+log_level: INFO
+
+pipeline:
+  enabled_modules: ["m1", "m2"]
+  max_iterations: 1
+  enable_iteration: false
+
+qwen:
+  base:
+    model: qwen3.7-max
+    max_tokens: 8192
+    temperature: 0.1
+  max:
+    model: qwen3.7-max
+    max_tokens: 8192
+    temperature: 0.1
+  plus:
+    model: qwen3.7-plus
+    max_tokens: 4096
+    temperature: 0.1
+  turbo:
+    model: qwen3.6-flash
+    max_tokens: 4096
+    temperature: 0.3
+
+search:
+  implementation: agentic
+  tools: ["semantic_scholar", "pubmed"]
+  papers_per_sub_question: 15
+  max_papers_total: 80
+  max_rounds: 3
+  max_queries: 12
+  max_tokens: 100000
+  max_seconds: 900
+
+module_overrides:
+  m1:
+    kwargs:
+      mode: "llm"
+      llm_tier: "base"
+  m2:
+    kwargs:
+      mode: "llm"
+      llm_tier: "turbo"
+      # Agentic M2 budget parameters (passed to AgenticM2Module)
+      final_k: 5
+      max_rounds: 3
+      max_queries: 12
+      max_papers: 100
+      source_timeout_seconds: 30.0
+
+enabled_skills: []
