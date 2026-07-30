@@ -6,35 +6,20 @@
 
 ## 快速开始
 
-### Conda 环境（推荐）
+### 环境准备
 
 ```bash
 # 1. 创建 conda 环境（Python 3.11–3.13）
 conda create -n hypoforge python=3.11 -y
-
-# 2. 激活环境
 conda activate hypoforge
 
-# 3. 安装依赖
-pip install -r requirements.txt
-```
-
-如果希望从 `environment.yml` 一键重建：
-
-```bash
-conda env create -f environment.yml
-conda activate hypoforge
-```
-
-### pip 安装（备选）
-
-```bash
+# 2. 安装依赖
 pip install -r requirements.txt
 ```
 
 ### 配置 API Key
 
-在项目根目录创建 `.env` 文件（可参考 `.env_template`）：
+在项目根目录创建 `.env` 文件：
 
 ```bash
 OPENAI_API_KEY=your_api_key_here
@@ -44,38 +29,41 @@ OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 ### 运行
 
 ```bash
-# 完整运行（调用 Qwen + PubMed + OpenAlex）
-python run_hypoforge.py -q "蛋白质如何折叠及错误折叠导致疾病的机制？"
+# 完整 Pipeline（legacy M2 双后端检索）
+python run_hypoforge.py -q "蛋白质如何折叠及错误折叠导致疾病的机制？" -c configs/full_pipeline.yaml
 
-# 快速端到端 smoke（真实调用，但缩小每个模块的工作量）
-python scripts/smoke_pipeline.py -q "蛋白质如何折叠及错误折叠导致疾病的机制？"
+# Agentic M2 — 迭代搜索 + 全文阅读 + 知识导出（Track A）
+python run_hypoforge.py -q "蛋白质如何折叠及错误折叠导致疾病的机制？" -c configs/m2_agentic.yaml
 
-# 用不同配置跑消融实验
-python run_hypoforge.py -q "..." -c configs/baseline_b0.yaml
-python run_hypoforge.py -q "..." -c configs/full_pipeline.yaml
+# Agentic M2 轻量版 — PubMed only
+python run_hypoforge.py -q "蛋白质如何折叠？" -c configs/m2_minimal_pubmed.yaml
 
-# 指定自定义 run-id
-python run_hypoforge.py -q "..." --run-id my_experiment_01
+# M3 Grounding — 全文证据接地 + 关系抽取（Track B）
+python run_hypoforge.py -q "CRISPR能治疗亨廷顿病吗？" -c configs/m3_grounding.yaml
+
+# 消融基线
+python run_hypoforge.py -q "衰老的生物学基础是什么？" -c configs/baseline_b0.yaml
+
+# 断点续跑
+python run_hypoforge.py -q "..." --run-id my_experiment --resume
 ```
 
-运行后终端会输出 Rich 美化的六模块执行过程。
-
-### 快速 Smoke Pipeline
-
-`scripts/smoke_pipeline.py` 会运行真实的 M1→M6 链路，但将子问题、论文数、候选假设数和迭代次数压缩到最小，适合在修改代码后快速检查 API、检索、结构化输出和模块连接是否正常：
+### Web 仪表盘
 
 ```bash
-# 默认使用 direct 模式
-python scripts/smoke_pipeline.py
+# 启动 M1-M6 实时进度仪表盘（默认 http://127.0.0.1:7860）
+python scripts/run_pipeline_ui.py
 
-# 自定义问题
-python scripts/smoke_pipeline.py -q "衰老的生物学基础是什么？"
-
-# 同时验证 M4 Ranker
-python scripts/smoke_pipeline.py --m4-mode multi_agent
+# 自定义端口和配置
+python scripts/run_pipeline_ui.py --port 8080 --config configs/m2_agentic.yaml
 ```
 
-> Smoke 中的 M2 会先使用 `qwen3.7-plus` 将中文问题改写为英文检索词，再查询 PubMed 与 OpenAlex。查询生成关闭隐藏思考、使用 2048 token 上限，并在空响应时重试一次；连续失败会报告明确错误，不会静默退回中文整句检索。
+### Smoke 测试
+
+```bash
+python scripts/smoke_pipeline.py
+python scripts/smoke_pipeline.py -q "衰老的生物学基础是什么？"
+```
 
 ## CLI 参考
 
@@ -87,155 +75,159 @@ python run_hypoforge.py [OPTIONS]
 |------|------|------|--------|------|
 | `--question` | `-q` | ✅ | — | 待分析的前沿科学问题 |
 | `--config` | `-c` | ❌ | `configs/default.yaml` | YAML 配置文件路径 |
-| `--output-dir` | `-o` | ❌ | `./output` | 输出目录（会覆盖配置文件中的设置） |
-| `--run-id` | | ❌ | 自动生成 | 自定义运行标识符，用于输出文件命名和 checkpoint |
-| `--resume` | | ❌ | `false` | 从已有 `--run-id` 的 checkpoint 断点续跑 |
-| `--quiet` | | ❌ | `false` | 静默模式，关闭 Rich 终端美化输出 |
-
-### 使用示例
-
-```bash
-# 最简用法（使用默认配置）
-python run_hypoforge.py -q "衰老的生物学基础是什么？"
-
-# 指定配置和输出目录
-python run_hypoforge.py -q "..." -c configs/full_pipeline.yaml -o output/experiment_01
-
-# 指定自定义 run-id
-python run_hypoforge.py -q "..." --run-id my_custom_run
-
-# 静默模式
-python run_hypoforge.py -q "..." --quiet
-```
+| `--output-dir` | `-o` | ❌ | `./output` | 输出目录 |
+| `--run-id` | | ❌ | 自动生成 | 自定义运行标识符 |
+| `--resume` | | ❌ | `false` | 从 checkpoint 断点续跑 |
+| `--quiet` | | ❌ | `false` | 静默模式 |
 
 ## 输出文件
 
-每次运行会在 `<output_dir>/` 下保存完整结果，并在各模块完成后更新 checkpoint；启用自动评分时还会生成评分报告：
-
 ```
 <output_dir>/
-├── <run_id>.json
-├── <run_id>_checkpoint.json
-└── <run_id>_scores.json
+├── <run_id>.json           # PipelineState 完整序列化
+├── <run_id>_checkpoint.json # 断点续跑 checkpoint
+└── <run_id>_scores.json    # 自动评分报告
 ```
 
-- **`output_dir`**：由 `--output-dir`（或配置文件中的 `output_dir`）指定，默认为 `./output`
-- **`run_id`**：由 `--run-id` 指定；若未指定则自动生成，例如 `hypoforge-a1b2c3d4`
+## Pipeline 架构
 
-JSON 文件包含 PipelineState 的完整序列化结果，涵盖所有六个模块的输出、迭代历史和错误信息。
+```
+用户输入科学问题
+       │
+       ▼
+  ┌──────────────┐
+  │ M1: 问题理解   │ → ProblemCard: domain, sub_questions, key_entities, question_type
+  └──────┬───────┘
+         ▼
+  ┌──────────────┐
+  │ M2: 文献检索   │ → PubMed / SemanticScholar(OpenAlex) / ArXiv 多源搜索
+  │   与全文获取   │ → 全文获取 → 分块 → 可引用证据导出
+  └──────┬───────┘   → 输出: LiteratureResult + M2KnowledgeExport
+         ▼
+  ┌──────────────┐
+  │ M3: 证据图谱   │ → 消费 M2KnowledgeExport.evidence，不做联网下载
+  │   构建        │ → 规则构建 + 原子声明合成 + 关系检测
+  └──────┬───────┘   → 输出: EvidenceGraph + GroundingReport
+         ▼
+  ┌──────────────┐
+  │ M4: 假设生成   │ → Multi-Agent: Generator → Critic → Falsifiability Checker → Ranker
+  │   与筛选      │ → 四维评分: novelty / scientific_soundness / testability / evidence_consistency
+  └──────┬───────┘
+         ▼
+  ┌──────────────┐
+  │ M5: 研究计划   │ → 11 要素结构化研究计划
+  │   设计        │
+  └──────┬───────┘
+         ▼
+  ┌──────────────┐
+  │ M6: 评审与     │ → 三维 Specialist Reviewer + overall 计算值
+  │   迭代更新    │ → 反馈回 M4/M5，循环 ≤ max_iterations
+  └──────────────┘
+```
 
-## Checkpoint / 断点续跑
+### M2/M3 职责边界
 
-Pipeline 每完成一个模块就自动保存 checkpoint 到 `<output_dir>/<run_id>_checkpoint.json`。
-如果运行中断（网络超时、API 限流等），可以用相同的 `--run-id` + `--resume` 从断点继续，
-已完成的模块会被跳过：
+```
+M2 职责：
+  检索论文 → 获取全文 → 分块 → 提取 M2EvidenceExport（可引用文本片段）
+  输出: LiteratureResult + M2KnowledgeExport（含 evidence + provenance）
 
+M3 职责：
+  消费 M2KnowledgeExport.evidence → 原子声明合成 → 关系判断 → 证据图构建
+  M3 不联网下载论文
+```
+
+## M2 搜索模式
+
+| 模式 | 实现 | 说明 |
+|------|------|------|
+| `legacy` | `m2_literature_search.py` | PubMed + OpenAlex 双后端，直接检索 + 批量知识提取 |
+| `agentic` | `literature/search/agent.py` | 迭代搜索代理：QueryPlanner → 多源搜索 → 去重 → Scout → 排序 → Coverage 检查 |
+| `agentic` + reading | `literature/reading/workflow.py` | 完整管线：全文解析 → 分块 → BM25 检索 → Qwen LLM 阅读 → 证据导出 |
+
+切换方式：在配置文件中设置 `search.implementation: agentic`，默认 `legacy`。
+
+## M3 Grounding 模式
+
+| 模式 | 配置 | 说明 |
+|------|------|------|
+| 规则图 | 默认 | 基于 KnowledgeEntry 类型和实体共现构建 EvidenceGraph |
+| Direct Grounding | `grounding.enabled: true` | 消费 M2KnowledgeExport.evidence → 原子声明合成 → LLM 关系判断 |
+| GAMS（实验性） | `grounding.enable_gams: true` | 蒙特卡洛关系搜索，默认关闭 |
+
+## 评估指标
+
+| 指标 | 状态 | 说明 |
+|------|------|------|
+| NoveltyMetric | ✅ 已实现 | LLM 声明分解 + 证据图 BFS 路径距离判定新颖性 |
+| EvidenceConsistencyMetric | ✅ 已实现 | Embedding 匹配 + LLM-as-judge 冲突检测 |
+| TestabilityMetric | ✅ 已实现 | LLM-as-judge 评估可预测性和可证伪性 |
+
+消融矩阵脚本：
 ```bash
-# 首次运行（假设在 M4 时网络中断）
-python run_hypoforge.py -q "..." --run-id my_experiment
-
-# 从 M4 断点恢复（M1/M2/M3 自动跳过）
-python run_hypoforge.py -q "..." --run-id my_experiment --resume
-```
-
-注意事项：
-- M1–M3 有产出即跳过；M4/M5/M6 在迭代未完成时仍会重新运行
-- 如果更改了 `--question` 或配置文件，建议使用新的 `--run-id` 而非 resume
-
-## 持久化知识图谱
-
-在配置文件中设置 `memory_cache_dir`（或通过 `configs/*.yaml` 的顶层字段）即可启用 JSONL 持久化知识图谱：
-
-```yaml
-# configs/full_pipeline.yaml
-memory_cache_dir: "./kg_cache"
-```
-
-启用后，M3 模块执行时会自动将证据图谱（Entity + Relation）写入 `{memory_cache_dir}/memory-evidence_graph.jsonl`，支持：
-- **跨运行复用**：后续运行可加载已持久化的图谱
-- **BM25 语义搜索**：通过 `KnowledgeGraphManager.search_nodes()` 检索相关实体
-- **增量更新**：追加新 Entity/Relation 无需全量重写
-
-如果留空（默认），图谱仅在内存中保留，运行结束后丢弃。
-
-## 模块结构
-
-```
-M1 → M2 → M3 → M4 → M5 → M6 → (loop to M4)
-│     │     │     │     │     │
-问题  文献  证据  假设  研究  评审
-理解  检索  图谱  生成  计划  迭代
+python scripts/run_ablation_matrix.py
 ```
 
 ## 运行测试
 
 ```bash
-# pytest 模式
+# 全部测试
 python -m pytest tests -q
 
-# 直接运行
-python tests/test_pipeline.py
-```
+# 仅核心测试（无网络）
+python -m pytest tests/test_pipeline.py tests/test_qwen_client.py -q
 
-测试为离线逻辑检查，不调用 LLM 或文献检索 API。真实端到端验证请使用 `scripts/smoke_pipeline.py`。
+# 文献模块测试
+python -m pytest tests/literature/ -q --timeout=30
+
+# M3 Grounding 测试
+python -m pytest tests/test_m3_*.py -q
+```
 
 ## 配置文件
 
 | 配置 | 说明 |
 |------|------|
 | `configs/default.yaml` | 默认（全模块 + 迭代） |
+| `configs/full_pipeline.yaml` | 完整系统 + 持久化 KG |
 | `configs/baseline_b0.yaml` | B0：千问直出 |
 | `configs/baseline_b1.yaml` | B1：+ web search |
 | `configs/baseline_b2.yaml` | B2：+ 结构化提取 |
 | `configs/baseline_b3.yaml` | B3：+ 多 Agent |
-| `configs/full_pipeline.yaml` | 完整系统 + 持久化 KG |
-
-> 在配置文件中设置 `memory_cache_dir` 可启用持久化知识图谱（跨运行复用 + BM25 搜索），详见上方「持久化知识图谱」章节。
+| `configs/m2_agentic.yaml` | Agentic M2（迭代搜索 + 全文阅读） |
+| `configs/m2_minimal_pubmed.yaml` | Agentic M2 轻量版（PubMed only） |
+| `configs/m3_grounding.yaml` | M3 Direct Grounding |
+| `configs/m3_evidence_gams.yaml` | M3 GAMS 实验性 |
+| `configs/evaluation.yaml` | 评估 / 消融矩阵配置 |
+| `configs/full_pipeline_m2agentic.yaml` | 完整系统 + Agentic M2 |
 
 ## 项目状态
 
-当前处于 **LLM 真实调用阶段**。M1–M6 端到端 pipeline 可跑通；全部模块均已接入 Qwen，检索层已对接 PubMed + OpenAlex 真实 API，证据图谱支持 LLM 语义关系抽取。配置文件默认开启 LLM mode。
+当前已合并 **Track A + B + C + Web UI**，具备完整的 agentic 文献搜索、全文证据接地、自动评估和实时进度仪表盘能力。
 
-| 模块 | 状态 | 说明 |
-|------|------|------|
-| M1 问题理解 | ✅ 已实现 | 调用 Qwen `structured_chat` 完成问题分解，并支持限制 smoke 的子问题数量 |
-| M2 文献检索 | ✅ 已实现 | 中文问题改写为英文检索词 → PubMed + OpenAlex 双后端检索 → DOI/title 去重 → Qwen 批量知识提取；查询生成支持关闭思考、token 配置与空响应重试 |
-| M3 证据图谱 | ✅ 已实现 | 规则构建节点 + `INVOLVES` 边；`mode="llm"` 时 Qwen 批量提取跨 Entry 语义边（SUPPORTS / CONTRADICTS / EXTENDS / LIMITS），含跨批 bridge 任务和 thinking 控制防止截断 |
-| M4 假设生成 | 🟡 LLM 就绪 | 支持 `direct` / `multi_agent` 模式（Generator + Ranker 调 Qwen）；composite score 由四维加权重算；Critic / Falsifiability Checker 待补 |
-| M5 研究计划 | 🟡 LLM 就绪 | `mode="llm"` 时调 Qwen `structured_chat` 生成含 11 项要素的结构化研究计划 |
-| M6 评审迭代 | 🟡 LLM 就绪 | 三维 Reviewer（scientific_logic / evidence_consistency / method_feasibility）各调 Qwen；overall 由 specialist 分数平均计算 |
-| Semantic Scholar | ✅ 已实现 | 双后端自动切换：有 key → Semantic Scholar；无 key → OpenAlex |
-| PubMed | ✅ 已实现 | NCBI E-utilities（esearch + efetch 两步流程）|
-| QwenClient | ✅ 完成 | 完整 async wrapper（`chat` / `structured_chat` / `list_models` / `disable_thinking` 推理控制 / 3 层 API 回退） |
-| 持久化 KG | ✅ 完成 | JSONL-backed KnowledgeGraphManager（Entity/Relation CRUD + BM25 搜索） |
-| Pipeline 编排 | ✅ 完成 | LangGraph StateGraph + 条件迭代 + checkpoint/resume + Rich 终端输出 |
-| 配置系统 | ✅ 完成 | YAML + 环境变量 + 6 套 baseline 配置 |
-| Prompt 模板 | ✅ 完成 | M1–M6 全部 prompt 已就绪，M3 含专用 batch edge-only prompt |
+| 模块 / 系统 | 状态 | 说明 |
+|-------------|------|------|
+| M1 问题理解 | ✅ | Qwen `structured_chat` 多尺度问题分解 |
+| M2 文献检索 (legacy) | ✅ | PubMed + OpenAlex 双后端，中文→英文改写 |
+| M2 文献检索 (agentic) | ✅ | 迭代搜索代理 + Scout + Coverage + 全文阅读管线 |
+| M3 证据图谱 (规则) | ✅ | 规则构建 + LLM 跨条目语义边 |
+| M3 Grounding | ✅ | 消费 M2KnowledgeExport → 原子声明 → 关系判断 |
+| M4 假设生成 | 🟡 | direct / multi_agent 模式，四维加权评分 |
+| M5 研究计划 | 🟡 | 11 要素结构化输出 |
+| M6 评审迭代 | 🟡 | 三维 Specialist Reviewer + 迭代循环 |
+| QwenClient | ✅ | async wrapper + 3 层 API 回退 + thinking 控制 |
+| 持久化 KG | ✅ | JSONL CRUD + BM25 检索 + 增量更新 + entity linking |
+| Pipeline 编排 | ✅ | LangGraph + 条件迭代 + checkpoint/resume + Skill hooks |
+| 评估系统 | ✅ | Novelty / EvidenceConsistency / Testability + 消融矩阵 |
+| Web 仪表盘 | ✅ | FastAPI + SSE M1-M6 实时进度 |
+| 配置系统 | ✅ | YAML + 环境变量，14 套配置 |
 
 详细开发计划见 [TODO.md](TODO.md)。
 
 ## 离线预览终端输出
 
-修改终端展示代码后，可以使用离线预览脚本检查布局，无需调用 LLM 或检索 API：
-
 ```bash
-# 预览全部模块
-python scripts/preview_terminal.py
-
-# 模拟不同终端宽度
-python scripts/preview_terminal.py --width 80
-python scripts/preview_terminal.py --width 120
-
-# 只预览指定模块
-python scripts/preview_terminal.py --section m5
-# M6 会在评审结果后等待输入人工指导
-python scripts/preview_terminal.py --section m6
-
-# 只查看 M6 guidance 提示，不阻塞 stdin
-python scripts/preview_terminal.py --section m6 --no-input
-
-# 单独预览 M6 多轮评审与交互提示（不读取输入）
-python scripts/preview_m6.py --width 100 --no-input
+python scripts/preview_terminal.py            # 预览全部模块
+python scripts/preview_terminal.py --width 120 # 模拟不同终端宽度
+python scripts/preview_terminal.py --section m5 # 只预览指定模块
 ```
-
-支持的模块选项为 `m1`–`m6` 和 `all`，默认宽度为 100 列。

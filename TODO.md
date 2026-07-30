@@ -1,8 +1,8 @@
 # HypoForge — 开发路线图
 
 > 挑战杯 2026 · 赛题A：科学假设生成与研究计划设计
-> 当前状态：**LLM 全模块端到端可跑 + 4 条 feature branch 待移植**
-> 最后更新：2026-07-21
+> 当前状态：**Track A/B/C + Web UI 已合并** · 具备完整的 agentic 搜索、全文 grounding、评估和仪表盘
+> 最后更新：2026-07-30
 
 ---
 
@@ -77,22 +77,22 @@ M1-M6 全部 LLM 就绪，端到端可跑：
 
 ---
 
-## 三、Feature Branches（待移植到 main）
+## 三、Feature Branches（移植状态）
 
-> ⚠️ 所有分支基于旧 merge-base `88ad23d`（落后 main 9 个提交）。**必须从 main 开新分支做移植，不能直接 merge。**
+> ✅ **Track A / B / C + Web UI 已合并至 `integration/merge-track-a-b-c`**（2026-07-30）。
+> 详见分支 `integration/merge-track-a-b-c`，待 PR 合入 `main`。
 
-| 分支 | 提交 | 改动 | 核心内容 |
-|------|------|------|---------|
-| `feat/m2-integrated-search-v2` | 20 | +20K lines, 97 files | M2 agentic 搜索 + 全文阅读管线 + 多源集成 + 知识导出 |
-| `M3_EvidenceGraph` | 3 | +1.9K lines, 16 files | PaperQA 风格全文 evidence grounding + PDF/thinking 修复 |
-| `feature/m3-evidence-gams` | 2 | +3.4K lines, 21 files | Evidence-GAMS 蒙特卡洛关系搜索（实验性） |
-| `develop/m2-agentic` | 8 | +5.7K lines, 38 files | M2 核心代理框架（已被 v2 完全包含，忽略） |
+| 分支 | 状态 | 说明 |
+|------|------|------|
+| `feat/m2-integrated-search-v2` | ✅ 已移植 (Track A) | M2 agentic 搜索 + 全文阅读管线 + 多源集成 + 知识导出 |
+| `M3_EvidenceGraph` | ✅ 已移植 (Track B) | PaperQA 风格全文 evidence grounding + PDF/thinking 修复 |
+| `feature/m3-evidence-gams` | ✅ 已移植 (Track B) | Evidence-GAMS 蒙特卡洛关系搜索（实验性，默认关闭） |
+| `feat/full-pipeline-web-ui` | ✅ 已移植 | FastAPI + SSE M1-M6 实时进度仪表盘 |
+| `develop/m2-agentic` | ❌ 忽略 | M2 核心代理框架（已被 v2 完全包含） |
 
-### 移植时需解决的架构问题
+### 合并要点
 
-**M2 和 M3 在当前设计中存在全文阅读职责重叠。** 两个分支各自实现了 PDF 下载→解析→分块→检索→证据抽取。如果直接合入，同一篇论文会被下载和解析两次，产生两套不兼容的 chunk/evidence 数据模型，且 M2 和 M3 的证据无法对齐。
-
-**解决方案（本 TODO 采用）：明确 M2/M3 边界。**
+**M2/M3 边界已明确：**
 
 ```
 M2 职责（Track A）：
@@ -103,6 +103,15 @@ M3 职责（Track B）：
   消费 M2KnowledgeExport.evidence → 原子声明合成 → 关系判断 → 证据图构建
   M3 不联网下载论文
 ```
+
+### 合并冲突与解决
+
+| 冲突 | 严重度 | 解决 |
+|------|--------|------|
+| `qwen_client.py` — Track A test vs Track B impl | 🔴 严重 | Track B 将 thinking 控制从 `extra_body` 迁移到 `model_kwargs`；重写测试 |
+| `m3_evidence_graph.py` — Track B vs Web UI | 🟡 中等 | 合并增量更新逻辑 + emit_event 观测调用；两方均保留 `import re` + `import time` |
+| `config.py` — Track A vs Track C | 🟡 中等 | 保留 Track A 的 `get_module_kwargs` + 追加 Track C 评估配置类 |
+| NoveltyMetric BFS 断开子图 | 🔴 设计 | 不连通子图评分改为 0.5（概念存在但未连接），修复 `_keyword_search` 搜索 metadata |
 
 ---
 
