@@ -12,6 +12,10 @@ pypdf>=5.0
 # LLM (OpenAI-compatible client for Qwen / DeepSeek / GLM etc.)
 langchain-openai>=0.2.0
 
+# Evaluation metrics (hypoforge/evaluation/metrics.py)
+numpy>=1.24
+networkx>=3.0
+
 # Development / testing
 pytest>=8.0
 pytest-asyncio>=0.23
