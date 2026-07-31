@@ -46,13 +46,13 @@ module_overrides:
       llm_tier: "base"
   m2:
     kwargs:
-      mode: "llm"
+      # Agentic M2 adapter args only. Search budget (max_rounds/max_queries/
+      # max_papers) is injected automatically from the top-level `search:`
+      # block by config.get_module_kwargs — do NOT duplicate it here or the
+      # integrated factory raises TypeError on unexpected kwargs.
+      variant: integrated
       llm_tier: "turbo"
-      # Agentic M2 budget parameters (passed to AgenticM2Module)
       final_k: 5
-      max_rounds: 3
-      max_queries: 12
-      max_papers: 100
       source_timeout_seconds: 30.0
 
 enabled_skills: []

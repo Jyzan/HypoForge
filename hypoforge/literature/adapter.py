@@ -196,12 +196,39 @@ def build_adapter_from_config(
         from .integrated import build_integrated_search_adapter
 
         client = QwenClient.from_config(llm_config)
-        return build_integrated_search_adapter(client=client, **kwargs)
+        return _build_or_explain(
+            build_integrated_search_adapter, variant, client=client, **kwargs
+        )
 
     if variant == "minimal":
         from .minimal import build_minimal_pubmed_adapter
-        return build_minimal_pubmed_adapter(**kwargs)
+        return _build_or_explain(build_minimal_pubmed_adapter, variant, **kwargs)
 
     raise ValueError(
         f"Unknown variant {variant!r}; expected 'integrated' or 'minimal'"
     )
+
+
+def _build_or_explain(factory, variant: str, **kwargs) -> AgenticM2Adapter:
+    """Call *factory* and turn a cryptic ``unexpected keyword argument``
+    ``TypeError`` into an actionable message.
+
+    The agentic M2 factories declare explicit parameters (no ``**kwargs``),
+    so a stray config key — typically a leftover *legacy* M2 kwarg such as
+    ``mode`` / ``max_papers_per_query`` / ``batch_size`` — fails fast rather
+    than being silently ignored.  We surface the offending key and the
+    variant instead of the raw factory signature error.
+    """
+    try:
+        return factory(**kwargs)
+    except TypeError as exc:
+        if "unexpected keyword argument" in str(exc):
+            raise TypeError(
+                f"Agentic M2 (variant={variant!r}) received an unsupported "
+                f"config kwarg: {exc}. Check module_overrides.m2.kwargs — "
+                f"legacy M2 keys (mode/max_papers_per_query/batch_size) and "
+                f"search-budget keys (max_rounds/max_queries/max_papers) are "
+                f"not accepted here; budget is set via the top-level `search:` "
+                f"block."
+            ) from exc
+        raise
