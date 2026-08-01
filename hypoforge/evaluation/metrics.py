@@ -495,7 +495,12 @@ Output JSON: {"is_conflict": true/false, "rationale": "..."}"""
         threat_node_ids = set()
         
         threat_rels = {EvidenceEdgeRelation.CONTRADICTS, EvidenceEdgeRelation.LIMITS}
-        ally_rels = {EvidenceEdgeRelation.SUPPORTS, EvidenceEdgeRelation.SAME_AS}
+        ally_rels = {
+            EvidenceEdgeRelation.SUPPORTS, 
+            EvidenceEdgeRelation.SAME_AS,
+            EvidenceEdgeRelation.EXTENDS,
+            EvidenceEdgeRelation.REFINES
+        }
         
         for edge in graph.edges:
             # 1-hop threats
