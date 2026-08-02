@@ -343,7 +343,7 @@ class NoveltyMetric(GraphMetricBase):
             s_b = self._keyword_search(s_b_queries, searchable_nodes)
             
             if not s_a or not s_b:
-                total_score += 0.5  # Concept missing -> partially novel (changed from 1.0)
+                total_score += 1.0  # Concept missing -> fully novel
                 continue
                 
             s_a_ids = {n.id for n in s_a}
@@ -367,7 +367,7 @@ class NoveltyMetric(GraphMetricBase):
             
             # Map distance to novelty score
             if min_dist == float('inf'):
-                score = 0.5
+                score = 1.0
             elif min_dist == 0 or min_dist == 1:
                 score = 0.0
             elif min_dist == 2:
