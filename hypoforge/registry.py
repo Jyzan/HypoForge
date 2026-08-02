@@ -165,10 +165,22 @@ class ModuleRegistry:
                     )
 
             # ---- M3 grounding config injection ----
+            # The top-level `grounding:` block (GroundingConfig) is the single
+            # master switch for the feature; flat `grounding_*` keys in
+            # module_overrides.m3.kwargs remain fine-grained tuning knobs.
+            # We force the master flags from config.grounding so the config
+            # validator ("grounding.enabled requires agentic M2") and the
+            # module can never disagree. (The old code injected a
+            # `grounding_config=` kwarg that M3EvidenceGraph silently swallowed
+            # via **kwargs — a dead wire.)
             if name == "m3":
                 grounding = getattr(config, "grounding", None)
                 if grounding is not None:
-                    kwargs.setdefault("grounding_config", grounding)
+                    kwargs["grounding_enabled"] = grounding.enabled
+                    if grounding.enabled:
+                        kwargs["grounding_relation_selection_mode"] = (
+                            "evidence_gams" if grounding.enable_gams else "direct"
+                        )
 
             # Inject scoring weights into M4 so the composite formula has a
             # single source of truth (PipelineConfig.scoring → rubric defaults).

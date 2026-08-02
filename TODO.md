@@ -1,8 +1,8 @@
 # HypoForge — 开发路线图
 
 > 挑战杯 2026 · 赛题A：科学假设生成与研究计划设计
-> 当前状态：**LLM 全模块端到端可跑 + 4 条 feature branch 待移植**
-> 最后更新：2026-07-21
+> 当前状态：**Track A/B/C + Web UI 已合并** · 具备完整的 agentic 搜索、全文 grounding、评估和仪表盘
+> 最后更新：2026-07-30
 
 ---
 
@@ -73,26 +73,26 @@ M1-M6 全部 LLM 就绪，端到端可跑：
 | M5 | `modules/m5_research_plan.py` | ✅ 11 要素 structured_chat | `plus` |
 | M6 | `modules/m6_review_iteration.py` | ✅ 三维 Specialist + overall 计算值 | `plus` |
 
-**附加系统：** scoring (rubric + scorer + TestabilityMetric) ✅ · 持久化 KG (JSONL + BM25) ✅ · Checkpoint/Resume ✅ · 6 套 config ✅
+**附加系统：** scoring (rubric + scorer + TestabilityMetric) ✅ · 持久化 KG 写入 (JSONL) ✅ / 读取与 BM25 检索路径未接入主流程 ⚠️（详见 Track B.9-B.11） · Checkpoint/Resume ✅ · 6 套 config ✅
 
 ---
 
-## 三、Feature Branches（待移植到 main）
+## 三、Feature Branches（移植状态）
 
-> ⚠️ 所有分支基于旧 merge-base `88ad23d`（落后 main 9 个提交）。**必须从 main 开新分支做移植，不能直接 merge。**
+> ✅ **Track A / B / C + Web UI 已合并至 `integration/merge-track-a-b-c`**（2026-07-30）。
+> 详见分支 `integration/merge-track-a-b-c`，待 PR 合入 `main`。
 
-| 分支 | 提交 | 改动 | 核心内容 |
-|------|------|------|---------|
-| `feat/m2-integrated-search-v2` | 20 | +20K lines, 97 files | M2 agentic 搜索 + 全文阅读管线 + 多源集成 + 知识导出 |
-| `M3_EvidenceGraph` | 3 | +1.9K lines, 16 files | PaperQA 风格全文 evidence grounding + PDF/thinking 修复 |
-| `feature/m3-evidence-gams` | 2 | +3.4K lines, 21 files | Evidence-GAMS 蒙特卡洛关系搜索（实验性） |
-| `develop/m2-agentic` | 8 | +5.7K lines, 38 files | M2 核心代理框架（已被 v2 完全包含，忽略） |
+| 分支 | 状态 | 说明 |
+|------|------|------|
+| `feat/m2-integrated-search-v2` | ✅ 已移植 (Track A) | M2 agentic 搜索 + 全文阅读管线 + 多源集成 + 知识导出 |
+| `M3_EvidenceGraph` | ✅ 已移植 (Track B) | PaperQA 风格全文 evidence grounding + PDF/thinking 修复 |
+| `feature/m3-evidence-gams` | ✅ 已移植 (Track B) | Evidence-GAMS 蒙特卡洛关系搜索（实验性，默认关闭） |
+| `feat/full-pipeline-web-ui` | ✅ 已移植 | FastAPI + SSE M1-M6 实时进度仪表盘 |
+| `develop/m2-agentic` | ❌ 忽略 | M2 核心代理框架（已被 v2 完全包含） |
 
-### 移植时需解决的架构问题
+### 合并要点
 
-**M2 和 M3 在当前设计中存在全文阅读职责重叠。** 两个分支各自实现了 PDF 下载→解析→分块→检索→证据抽取。如果直接合入，同一篇论文会被下载和解析两次，产生两套不兼容的 chunk/evidence 数据模型，且 M2 和 M3 的证据无法对齐。
-
-**解决方案（本 TODO 采用）：明确 M2/M3 边界。**
+**M2/M3 边界已明确：**
 
 ```
 M2 职责（Track A）：
@@ -103,6 +103,15 @@ M3 职责（Track B）：
   消费 M2KnowledgeExport.evidence → 原子声明合成 → 关系判断 → 证据图构建
   M3 不联网下载论文
 ```
+
+### 合并冲突与解决
+
+| 冲突 | 严重度 | 解决 |
+|------|--------|------|
+| `qwen_client.py` — Track A test vs Track B impl | 🔴 严重 | Track B 将 thinking 控制从 `extra_body` 迁移到 `model_kwargs`；重写测试 |
+| `m3_evidence_graph.py` — Track B vs Web UI | 🟡 中等 | 合并增量更新逻辑 + emit_event 观测调用；两方均保留 `import re` + `import time` |
+| `config.py` — Track A vs Track C | 🟡 中等 | 保留 Track A 的 `get_module_kwargs` + 追加 Track C 评估配置类 |
+| NoveltyMetric BFS 断开子图 | 🔴 设计 | 不连通子图评分改为 0.5（概念存在但未连接），修复 `_keyword_search` 搜索 metadata |
 
 ---
 
@@ -607,6 +616,58 @@ tests/test_m3_gams_integration.py               [NEW]
 - **GAMS 对比测试**（人工标注关系集）：验证 precision/recall 对比 baselines
 - **验证**：`python -m pytest tests/test_m3_*.py -q`
 
+#### Task B.9: 持久化知识图谱的增量更新 + 读取接入
+
+> 来源：`m3_evidence_graph.py:58` 类文档字符串内联 TODO（长期未被排期，本次补录）。
+> **现状**：`M3EvidenceGraph._persist_graph()` 每次运行都会把当次构建的整张图整体覆盖写入
+> `{memory_cache_dir}/memory-evidence_graph.jsonl`；`KnowledgeGraphManager.load_to_evidence_graph()` /
+> `search_nodes()`（BM25 检索）已经实现，但**没有任何模块调用它们**——README 中
+> "跨运行复用 + BM25 语义搜索" 的描述目前只是能力具备，未接通。
+
+- **文件**：`hypoforge/modules/m3_evidence_graph.py`（唯一编辑者）
+- **操作**：
+  1. `__call__` 开头，当 `state.memory_cache_dir` 非空时，先调用
+     `KnowledgeGraphManager.load_to_evidence_graph()` 加载历史图谱。
+  2. 本次新构建的节点/边与历史图谱合并（按节点 `id` 去重；跨 run 的 `SRC_*`/`N_KE_*` id
+     需保持稳定，可复用已有的 paper-id/entry-id 哈希方案，避免同一篇论文重复建节点）。
+  3. `_persist_graph` 改为增量落盘（复用 `KnowledgeGraphManager.create_entities` /
+     `create_relations` 的流式追加路径），不再是整图覆盖重写。
+  4. 明确合并策略：新证据与历史证据冲突时如何处理（例如同一 claim 的置信度更新）——
+     必须在实现前用一两句话写清楚规则，不能隐式覆盖。
+- **配置开关**：新增 `M3EvidenceGraph.__init__(reuse_persisted_graph: bool = False, ...)`，
+  默认关闭，避免默认行为突变影响现有 baseline 配置的可重复性。
+- **验证**：连续两次以不同问题运行同一 `memory_cache_dir`，确认第二次运行的图中包含
+  第一次的节点，且 `KnowledgeGraphManager.search_nodes()` 能检索到第一次运行写入的实体。
+
+#### Task B.10: Entity Linking（实体归一化）
+
+> 来源：`m3_evidence_graph.py:58` 内联 TODO。
+
+- **文件**：`hypoforge/modules/m3_evidence_graph.py`
+- **问题**：同一实体的不同写法（如 "Hsp70" / "HSP70" / "HSPA1A"）当前被视为不同节点，
+  导致图谱碎片化、跨论文关系检测漏检。
+- **实现范围（最小可行）**：不要求接入 UMLS/Gene Ontology 完整本体，先做基于字符串
+  规范化 + 别名表（大小写/连字符归一化 + 手工维护的常见生物医学同义词表）的轻量归一化；
+  完整本体链接作为后续可选项标注在代码注释中，不阻塞本任务验收。
+- **验证**：构造含同一实体三种写法的 fixture，确认建图后只产生一个规范节点，
+  三处引用都指向该节点。
+
+#### Task B.11: Iterative Graph Refinement（M6 反馈回补）
+
+> 来源：`m3_evidence_graph.py:58` 内联 TODO。
+
+- **文件**：`hypoforge/modules/m3_evidence_graph.py`、`hypoforge/pipeline.py`（如需新增回边）
+- **现状**：`EvidenceGraph` 在 M3 首次构建后保持不变，M6 的评审反馈只影响 M4/M5，
+  不会回补或修正图中的关系边（例如评审指出某条 `supports` 边方向或强度有问题时，
+  图谱本身不会被修正）。
+- **实现范围**：定义 M3 的一个可选 `refine(graph, review_feedback) -> EvidenceGraph` 入口，
+  在迭代循环（M6→M4）中，如果 reviewer 反馈明确指向某条边的问题，允许对该边打标记
+  （例如 `EvidenceEdge.metadata` 记录 "disputed_by_reviewer"）或调整 `confidence`；
+  不要求自动重新跑一遍 LLM 关系抽取。
+- **依赖**：需要 Phase 0 `PipelineState`/`pipeline.py` 的迭代边保持不变，本任务只在
+  M3 内部新增方法，不改变图的调用时序。
+- **验证**：模拟一轮 M6 评审反馈含边修正建议，确认下一轮 `evidence_graph` 中对应边已更新。
+
 ---
 
 ### Track C: 评估与指标（1 人，1 周）
@@ -810,6 +871,59 @@ scripts/smoke_pipeline.py            [EDIT]
 
 ---
 
+### Track I: M2 检索质量与成本优化（1 人，3-5 天）
+
+> **分支名**：`track/i-m2-search-quality`
+> **来源**：`m2_literature_search.py:154` 类文档字符串内联 TODO，长期未被排期，本次补录。
+> **依赖**：与 Track A（agentic M2）互斥——两者是同一个 `search.implementation` 开关下的
+> 不同实现路径。本 Track 只优化 **legacy M2**（`search.implementation="legacy"`），
+> 不影响 Track A 的 agentic 实现。若 Track A 合入后 legacy 路径被判定为不再维护，
+> 本 Track 可降级为可选项或直接关闭。
+
+#### Track I 文件清单
+
+```
+hypoforge/modules/m2_literature_search.py   [EDIT] — 唯一编辑者（与 Track A 不冲突，A 只加新文件）
+hypoforge/prompts/m2_prompts.py             [EDIT] — 若涉及查询扩写 prompt，需与 Track D 协调排期先后
+tests/test_m2_search_quality.py             [NEW]
+```
+
+#### Task I.1: Query Expansion（查询扩写）
+
+- **文件**：`hypoforge/modules/m2_literature_search.py`
+- **现状**：直接用 `sub_question` 原文搜索，未生成变体查询。
+- **实现**：为每个 `sub_question` 调 Qwen 生成 2-3 个变体查询（MeSH 术语、同义词），
+  合并多路检索结果后去重。
+- **成本控制**：变体查询数量可配置（默认 0 = 关闭，向后兼容现有 baseline）。
+- **验证**：对同一 sub_question 开启/关闭 query expansion 对比召回的论文数量变化。
+
+#### Task I.2: Citation-aware Relevance（引用感知排序）
+
+- **文件**：`hypoforge/modules/m2_literature_search.py`
+- **现状**：仅按 `citation_count` 降序排列。
+- **实现**：加入与查询的语义相似度（复用 `memory/bm25_index.py` 的 BM25 或轻量 embedding），
+  与引用数做加权组合排序；权重可配置。
+- **验证**：构造高引用但低相关 + 低引用但高相关的 fixture，确认排序结果符合权重预期。
+
+#### Task I.3: Result Caching（检索结果缓存）
+
+- **文件**：`hypoforge/modules/m2_literature_search.py`
+- **现状**：相同查询会重复调用 PubMed / OpenAlex，两者均有速率限制，重复调用有失败风险。
+- **实现**：按 query 文本 hash 做本地缓存（文件或 sqlite，落盘位置遵循现有 `output_dir` /
+  `memory_cache_dir` 约定），带 TTL；测试/CI 环境默认关闭真实网络调用不受影响。
+- **验证**：同一查询连续调用两次，第二次命中缓存不发起网络请求（mock 网络层验证）。
+
+#### Task I.4: Query Type Routing（按问题类型路由检索源）
+
+- **文件**：`hypoforge/modules/m2_literature_search.py`
+- **现状**：无差别调用 PubMed + OpenAlex 两个后端。
+- **实现**：依据 `problem_card.question_type` 或 `domain` 做简单路由（临床问题优先
+  PubMed，工程/CS 问题优先 OpenAlex），路由规则需可配置、可关闭（默认双跑，保持向后兼容）。
+- **验证**：分别构造临床类和工程类 `problem_card` fixture，确认路由结果符合预期且
+  默认配置下行为不变（回归测试防止破坏现有 baseline）。
+
+---
+
 ### Track H: 文档与提交（全员，Phase 3，2 周）
 
 > **分支名**：`track/h-docs`
@@ -831,8 +945,10 @@ scripts/smoke_pipeline.py            [EDIT]
 | Gate 0：契约 | 源分支 exporter fixture 可无损构造/序列化 M2KnowledgeExport；Skill before patch 对模块可见；全部 config 校验通过 | 不允许其他 Track 基于 Phase 0 开分支 |
 | Gate 1：M2 | legacy 与 agentic M2 均通过；证据 quote 可追溯到 chunk；KnowledgeEntry.evidence_ids 全部有效；搜索超时可降级 | 不合入 Track A |
 | Gate 2：M3 | M3 不发起全文下载；claim/edge 均引用有效 evidence ID；direct baseline 在人工样本上达到约定 precision | 不合入 Track B |
+| Gate 2b：持久化 KG（B.9-B.11） | 增量更新/读取路径接入且有跨 run 测试证明可检索历史节点；entity linking 至少覆盖 fixture 场景；两者均可选关闭不影响默认 baseline | 不合入对应子任务，但不阻塞 Gate 2 主体 |
 | Gate 3：评估 | 独立指标有人工标注校准集；消融脚本支持重复、resume、预算和版本记录 | 不开始 Prompt 优化结论和最终实验 |
 | Gate 4：GAMS | 在同一候选集上显著优于 confidence threshold 与规则基线，并报告 precision/recall/成本 | 保持实验代码或不合入默认流程 |
+| Gate 4b：M2 检索优化（Track I） | 每项优化默认关闭时行为与现有 baseline 完全一致（回归测试通过）；开启后有对比数据支撑（召回/排序/缓存命中率） | 保持默认关闭，不合入 baseline 配置 |
 | Gate 5：发布 | 离线测试、live smoke、checkpoint/resume、文档安装流程均通过 | 不制作最终演示/提交包 |
 
 ---
@@ -854,6 +970,8 @@ scripts/smoke_pipeline.py            [EDIT]
 
   [Track B] 完成 direct relation baseline、M3 接入和测试（GAMS 默认关闭）
   Gate 2: M3 全程不联网；所有 claim/edge 可追溯到 M2 evidence ID
+  [Track B] Tasks B.9-B.11（持久化 KG 增量/读取接入、entity linking、迭代图修正，均默认关闭）
+  [Track I] 可与 Track B 并行开发（M2 legacy 检索优化，默认关闭，不阻塞其他 Track）
 
   [Track C] 完成独立指标、冻结基线和第一轮消融
   [Track D] 基于冻结基线优化 prompts
@@ -872,7 +990,9 @@ scripts/smoke_pipeline.py            [EDIT]
 1. Phase 0 + Track F contract tests → main
 2. Track A Agentic M2              → main
 3. Track B M3 direct grounding     → main（GAMS 关闭）
+3b. Track B.9-B.11 持久化 KG 增量/读取 + entity linking → main（默认关闭，随 Track B 主体或单独 PR）
 4. Track C evaluation baseline     → main
+4b. Track I M2 检索质量优化         → main（默认关闭，不早于 Track A 稳定，可晚至此步之后任意时点）
 5. Track D prompt improvements     → main（必须附基线对比）
 6. Track E observability skills    → main
 7. Track F remaining integration tests 随对应实现 PR 一同合入
@@ -901,10 +1021,12 @@ scripts/smoke_pipeline.py            [EDIT]
 | `configs/m2_*.yaml` (2 files) | Track A | |
 | `tests/literature/**` | Track A | |
 | `hypoforge/modules/m3_grounding/**` (5 files) | Track B | |
-| `hypoforge/modules/m3_evidence_graph.py` | Track B | ⚠️ 唯一编辑者 |
+| `hypoforge/modules/m3_evidence_graph.py` | Track B | ⚠️ 唯一编辑者（含 B.9-B.11：增量图更新/entity linking/迭代修正） |
 | `hypoforge/tools/qwen_client.py` | Track B | ⚠️ 唯一编辑者 |
 | `configs/m3_*.yaml` (2 files) | Track B | |
 | `tests/test_m3_*.py` (4 files) | Track B | |
+| `hypoforge/modules/m2_literature_search.py` | Track I | ⚠️ 唯一编辑者（仅 legacy 路径优化，不与 Track A 新增文件冲突） |
+| `tests/test_m2_search_quality.py` | Track I | |
 | `hypoforge/evaluation/metrics.py` | Track C | ⚠️ 唯一编辑者 |
 | `hypoforge/evaluation/scorer.py` | Track C | ⚠️ 唯一编辑者 |
 | `configs/evaluation.yaml` | Track C | |
@@ -1025,6 +1147,9 @@ python hypoforge/app.py
 | 改终端颜色 | `hypoforge/display/__init__.py` → `COLORS` |
 | 改迭代逻辑 | `hypoforge/pipeline.py` → `_should_continue_iterating()` |
 | 操作持久化 KG | `hypoforge/memory/graph_manager.py` |
+| 持久化 KG 增量更新/读取接入 | Track B.9 → `hypoforge/modules/m3_evidence_graph.py`（当前只写不读，见 Gate 2b） |
+| M3 实体归一化 / 迭代图修正 | Track B.10-B.11 → `hypoforge/modules/m3_evidence_graph.py` |
+| M2 检索优化（query expansion/缓存/路由/引用排序） | Track I → `hypoforge/modules/m2_literature_search.py`（legacy 路径，见 Gate 4b） |
 
 ---
 

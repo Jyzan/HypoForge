@@ -1,0 +1,98 @@
+# HypoForge — M3 Evidence-GAMS experimental configuration.
+#
+# Same as m3_grounding.yaml but uses Monte Carlo Tree Search (Evidence-GAMS)
+# to select the best subset of relation candidates instead of simple
+# confidence-threshold filtering.
+#
+# GAMS is EXPERIMENTAL — default OFF.  Enable only after the comparison
+# framework in Track B.8 validates it against simpler baselines.
+
+run_name: m3-evidence-gams
+output_dir: ./output/m3_evidence_gams
+verbose: true
+log_level: INFO
+
+pipeline:
+  enabled_modules: ["m1", "m2", "m3", "m4"]
+  max_iterations: 0
+  enable_iteration: false
+
+qwen:
+  base:
+    model: qwen3.7-max
+    max_tokens: 8192
+    temperature: 0.1
+  max:
+    model: qwen3.7-max
+    max_tokens: 8192
+    temperature: 0.1
+  plus:
+    model: qwen3.7-plus
+    max_tokens: 4096
+    temperature: 0.0
+  turbo:
+    model: qwen3.6-flash
+    max_tokens: 4096
+    temperature: 0.1
+
+search:
+  implementation: "agentic"
+  tools: ["pubmed", "semantic_scholar"]
+  papers_per_sub_question: 10
+  max_papers_total: 30
+
+# Master switch for M3 evidence grounding. enable_gams=true routes relation
+# selection through the experimental Evidence-GAMS Monte Carlo search; the
+# registry maps it onto M3's grounding_relation_selection_mode="evidence_gams".
+grounding:
+  enabled: true
+  enable_gams: true
+
+module_overrides:
+  m1:
+    kwargs:
+      mode: "llm"
+      llm_tier: "base"
+  m2:
+    kwargs:
+      # Agentic M2 integrated adapter args only. Search budget is injected
+      # from the top-level `search:` block; do NOT pass legacy M2 kwargs
+      # (mode/max_papers_per_query/batch_size) — the integrated factory has
+      # no **kwargs and raises TypeError on unexpected keys.
+      variant: integrated
+      llm_tier: "turbo"
+      final_k: 5
+      source_timeout_seconds: 30.0
+  m3:
+    kwargs:
+      mode: "llm"
+      llm_tier: "plus"
+      # --- M3 grounding fine-tuning (master switch is top-level `grounding:`)
+      # grounding_enabled + grounding_relation_selection_mode are injected by
+      # the registry from config.grounding (enable_gams=true → evidence_gams);
+      # do not set them here.
+      grounding_mode: "llm"
+      grounding_cache_dir: ".hypoforge_cache/m3_evidence_gams"
+      grounding_embedding_model: ""
+      grounding_retrieve_k: 30
+      grounding_evidence_k: 12
+      grounding_min_relevance: 5.0
+      grounding_max_queries: 16
+      grounding_max_evidence_items: 200
+      grounding_max_concurrency: 4
+      # --- Evidence-GAMS (experimental) ---
+      grounding_relation_candidate_k: 12
+      grounding_relation_max_pairs: 60
+      grounding_relation_batch_size: 10
+      grounding_relation_min_confidence: 0.35
+      grounding_gams_iterations: 128
+      grounding_gams_exploration_weight: 0.35
+      grounding_gams_seed: 42
+  m4:
+    kwargs:
+      mode: "direct"
+      llm_tier: "base"
+      num_candidates: 5
+      top_k: 2
+
+enabled_skills: []

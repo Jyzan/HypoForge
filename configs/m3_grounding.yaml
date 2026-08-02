@@ -1,0 +1,92 @@
+# HypoForge — M3 Grounding (direct selection mode).
+# Requires agentic M2 pipeline (search.implementation = "agentic") to produce
+# M2KnowledgeExport consumed by the grounding workflow.
+#
+# The grounding workflow does NOT download papers — it consumes M2EvidenceExport
+# items that Track A's FullTextReadingWorkflow has already extracted.
+
+run_name: m3-grounding
+output_dir: ./output/m3_grounding
+verbose: true
+log_level: INFO
+
+pipeline:
+  enabled_modules: ["m1", "m2", "m3", "m4"]
+  max_iterations: 0
+  enable_iteration: false
+
+qwen:
+  base:
+    model: qwen3.7-max
+    max_tokens: 8192
+    temperature: 0.1
+  max:
+    model: qwen3.7-max
+    max_tokens: 8192
+    temperature: 0.1
+  plus:
+    model: qwen3.7-plus
+    max_tokens: 4096
+    temperature: 0.0
+  turbo:
+    model: qwen3.6-flash
+    max_tokens: 4096
+    temperature: 0.1
+
+search:
+  implementation: "agentic"
+  tools: ["pubmed", "semantic_scholar"]
+  papers_per_sub_question: 10
+  max_papers_total: 30
+
+# Master switch for M3 evidence grounding. `enabled` is the single source of
+# truth (the config validator requires agentic M2 when it is on, and the
+# registry maps it onto M3's grounding_enabled). enable_gams stays OFF here;
+# see configs/m3_evidence_gams.yaml for the experimental GAMS path.
+grounding:
+  enabled: true
+  enable_gams: false
+
+module_overrides:
+  m1:
+    kwargs:
+      mode: "llm"
+      llm_tier: "base"
+  m2:
+    kwargs:
+      # Agentic M2 integrated adapter args only. Search budget is injected
+      # from the top-level `search:` block; do NOT pass legacy M2 kwargs
+      # (mode/max_papers_per_query/batch_size) — the integrated factory has
+      # no **kwargs and raises TypeError on unexpected keys.
+      variant: integrated
+      llm_tier: "turbo"
+      final_k: 5
+      source_timeout_seconds: 30.0
+  m3:
+    kwargs:
+      mode: "llm"
+      llm_tier: "plus"
+      # --- M3 grounding fine-tuning (master switch is top-level `grounding:`)
+      # grounding_enabled + grounding_relation_selection_mode are injected by
+      # the registry from config.grounding; do not set them here.
+      grounding_mode: "llm"
+      grounding_cache_dir: ".hypoforge_cache/m3_grounding"
+      grounding_embedding_model: ""
+      grounding_retrieve_k: 30
+      grounding_evidence_k: 12
+      grounding_min_relevance: 5.0
+      grounding_max_queries: 16
+      grounding_max_evidence_items: 200
+      grounding_max_concurrency: 4
+      grounding_relation_candidate_k: 12
+      grounding_relation_max_pairs: 60
+      grounding_relation_batch_size: 10
+      grounding_relation_min_confidence: 0.65
+  m4:
+    kwargs:
+      mode: "direct"
+      llm_tier: "base"
+      num_candidates: 5
+      top_k: 2
+
+enabled_skills: []

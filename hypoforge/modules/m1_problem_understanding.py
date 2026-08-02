@@ -10,8 +10,10 @@ Output: ``ProblemCard`` in ``state.problem_card``.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
+from ..observability import emit_event
 from ..protocol import ModuleProtocol
 from ..prompts.m1_prompts import M1_SYSTEM_PROMPT, M1_USER_TEMPLATE
 from ..registry import ModuleRegistry
@@ -56,18 +58,50 @@ class M1ProblemUnderstanding(ModuleProtocol):
             )
 
         question = state.input_question
-        payload = await self.client.structured_chat(
-            system_prompt=M1_SYSTEM_PROMPT,
-            user_prompt=M1_USER_TEMPLATE.format(question=question),
-            output_schema=ProblemCard.model_json_schema(),
-            max_tokens=8192,
-            temperature=getattr(self.llm_config, "temperature", 0.1),
+        started_at = time.monotonic()
+        emit_event(
+            "tool_started",
+            module="m1",
+            tool="qwen_problem_understanding",
+            status="running",
+            message="Qwen 开始拆分科学问题",
         )
+        try:
+            payload = await self.client.structured_chat(
+                system_prompt=M1_SYSTEM_PROMPT,
+                user_prompt=M1_USER_TEMPLATE.format(question=question),
+                output_schema=ProblemCard.model_json_schema(),
+                max_tokens=8192,
+                temperature=getattr(self.llm_config, "temperature", 0.1),
+            )
+        except BaseException as exc:
+            emit_event(
+                "tool_failed",
+                module="m1",
+                tool="qwen_problem_understanding",
+                status="failed",
+                message=f"问题拆分失败：{type(exc).__name__}: {exc}",
+                elapsed_seconds=time.monotonic() - started_at,
+            )
+            raise
         card = ProblemCard.model_validate(payload)
         if not card.original_question:
             card.original_question = question
         if self.max_sub_questions and self.max_sub_questions > 0:
             card.sub_questions = card.sub_questions[: self.max_sub_questions]
+        emit_event(
+            "tool_completed",
+            module="m1",
+            tool="qwen_problem_understanding",
+            status="completed",
+            message=f"问题拆分完成：{len(card.sub_questions)} 个子问题",
+            elapsed_seconds=time.monotonic() - started_at,
+            details={
+                "sub_questions": list(card.sub_questions),
+                "domains": list(card.domain),
+                "key_entities": list(card.key_entities),
+            },
+        )
         return {"problem_card": card}
 
     @classmethod

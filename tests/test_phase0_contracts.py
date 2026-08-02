@@ -73,6 +73,8 @@ def test_provenance_rejects_invalid_evidence(change):
 
 def test_all_yaml_configs_load():
     for path in Path("configs").glob("*.yaml"):
+        if path.name == "evaluation.yaml":
+            continue  # uses MasterEvaluationConfig, not PipelineConfig
         PipelineConfig.from_yaml(path)
 
 
@@ -93,11 +95,14 @@ def test_custom_module_loader_validation():
         ModuleRegistry._load_module_class("not-a-dotted-path", "m1")
 
 
-def test_agentic_selection_has_clear_track_a_error():
+def test_agentic_selection_builds_track_a_module():
     from hypoforge import modules  # noqa: F401
+    from hypoforge.literature.adapter import AgenticM2Module
+
     config = PipelineConfig(search={"implementation": "agentic"})
-    with pytest.raises(ImportError, match="Track A"):
-        ModuleRegistry.build_all(config)
+    instances = ModuleRegistry.build_all(config)
+
+    assert isinstance(instances["m2"], AgenticM2Module)
 
 
 class BeforeSkill(SkillProtocol):

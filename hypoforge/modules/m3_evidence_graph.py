@@ -10,10 +10,19 @@ limited to the ``INVOLVES`` type.
 
 In ``mode="llm"``, after rule-based construction, Qwen is called to
 discover richer relationships: ``SUPPORTS``, ``CONTRADICTS``, ``EXTENDS``,
-``LIMITS`` — producing a more semantically rich evidence graph.
+``LIMITS`` — with confidence scores and rationales.
 
-Output: ``evidence_graph`` in state.  Optionally persisted to disk via
-``KnowledgeGraphManager`` when ``state.memory_cache_dir`` is set.
+When ``grounding_enabled=True``, the M3 grounding workflow is run after the
+rule-based + LLM graph construction.  It consumes ``M2KnowledgeExport``
+from the agentic M2 pipeline and adds grounded claims + evidence relations
+to the graph without re-downloading papers.
+
+.. versionchanged:: 0.4.0
+    - Incremental graph update (new entries appended, existing graph reused)
+    - Entity normalisation (synonym map + case folding)
+    - Confidence-weighted LLM edges (confidence + rationale in schema)
+    - Mermaid diagram export (``evidence_graph_to_mermaid``)
+    - Iterative graph refinement from M6 review feedback
 """
 
 from __future__ import annotations
@@ -21,10 +30,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from ..protocol import ModuleProtocol
+from ..observability import emit_event
 from ..prompts.m3_prompts import (
     M3_BATCH_RELATION_SYSTEM_PROMPT,
     M3_BATCH_RELATION_USER_TEMPLATE,
@@ -38,39 +50,218 @@ from ..state import (
     EvidenceGraph,
     EvidenceNode,
     EvidenceNodeType,
+    GroundingReport,
     KnowledgeEntryType,
     PipelineState,
 )
 from ..tools.qwen_client import QwenClient
+from .m3_grounding import GroundingWorkflow
+from .m3_grounding.models import (
+    AtomicClaim,
+    EvidenceRecord,
+    EvidenceRelation,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Entity synonym map — normalises common biomedical name variants
+# ============================================================================
+
+# Canonical → {variants}.  Keys are lowercase; values are sets of known
+# aliases (also lowercase).  组员可扩展: add UMLS / MeSH / GO lookups here.
+ENTITY_SYNONYMS: Dict[str, Set[str]] = {
+    "hsp70": {"hsp70", "hspa1a", "hspa1b", "hsp72", "hsp70-1", "heat shock protein 70"},
+    "hsp90": {"hsp90", "hsp90aa1", "hsp90ab1", "hspc1", "heat shock protein 90"},
+    "p53": {"p53", "tp53", "tumor protein p53", "tumour protein p53"},
+    "nf-kb": {"nf-kb", "nfkb", "nf-κb", "nuclear factor kappa b", "nuclear factor κb"},
+    "tnf-α": {"tnf-α", "tnf-alpha", "tnfa", "tnfα", "tumor necrosis factor alpha"},
+    "il-6": {"il-6", "il6", "interleukin-6", "interleukin 6"},
+    "akt": {"akt", "akt1", "pkb", "protein kinase b", "rac-alpha"},
+    "mtor": {"mtor", "mtorc1", "mtorc2", "mammalian target of rapamycin", "frap1"},
+    "ampk": {"ampk", "amp-activated protein kinase", "prkaa1", "prkaa2"},
+    "mapk": {"mapk", "map kinase", "mitogen-activated protein kinase", "erk", "erk1", "erk2"},
+    "nad+": {"nad+", "nad", "nicotinamide adenine dinucleotide"},
+    "ros": {"ros", "reactive oxygen species", "oxidative stress"},
+    "caspase-3": {"caspase-3", "casp3", "caspase 3"},
+    "bcl-2": {"bcl-2", "bcl2", "b-cell lymphoma 2"},
+    "vegf": {"vegf", "vegf-a", "vascular endothelial growth factor"},
+    "egfr": {"egfr", "epidermal growth factor receptor", "erbb1", "her1"},
+    "pi3k": {"pi3k", "phosphatidylinositol 3-kinase", "pi3 kinase", "pik3ca"},
+    "wnt": {"wnt", "wingless", "wnt/β-catenin", "wnt/beta-catenin"},
+    "notch": {"notch", "notch1", "notch signaling"},
+    "hedgehog": {"hedgehog", "shh", "sonic hedgehog", "hh signaling"},
+}
+
+
+def _build_entity_index() -> Dict[str, str]:
+    """Build a lookup mapping every variant → canonical form."""
+    index: Dict[str, str] = {}
+    for canonical, variants in ENTITY_SYNONYMS.items():
+        for variant in variants:
+            index[variant] = canonical
+    return index
+
+
+_ENTITY_INDEX: Dict[str, str] = _build_entity_index()
+
+
+def normalize_entity(name: str) -> str:
+    """Normalize a biomedical entity name to its canonical form.
+
+    Steps:
+    1. Strip whitespace and lowercase.
+    2. Remove trailing punctuation (commas, periods, semicolons).
+    3. Look up in the synonym index.
+    4. Fall back to the cleaned original if no synonym match.
+    """
+    cleaned = name.strip().lower().rstrip(".,;:)-]")
+    # Remove leading punctuation like opening parens
+    cleaned = cleaned.lstrip("([")
+    if cleaned in _ENTITY_INDEX:
+        return _ENTITY_INDEX[cleaned]
+    return cleaned
+
+
+def add_entity_synonym(canonical: str, variant: str) -> None:
+    """Register a new entity synonym at runtime (no restart needed)."""
+    canonical_lower = canonical.strip().lower()
+    variant_lower = variant.strip().lower()
+    ENTITY_SYNONYMS.setdefault(canonical_lower, set()).add(variant_lower)
+    _ENTITY_INDEX[variant_lower] = canonical_lower
+
+
+# ============================================================================
+# Mermaid export
+# ============================================================================
+
+_RELATION_STYLE: Dict[str, str] = {
+    "supports": "-->|supports|",
+    "contradicts": "-->|contradicts|",
+    "extends": "-->|extends|",
+    "limits": "-->|limits|",
+    "involves": "-->|involves|",
+    "same_as": "-->|same_as|",
+    "refines": "-->|refines|",
+}
+
+_NODE_SHAPE: Dict[str, tuple[str, str]] = {
+    "claim": ("[", "]"),
+    "evidence": ("(", ")"),
+    "source": ("{", "}"),
+    "limitation": ("[/", "/]"),
+    "conflict": ("{{", "}}"),
+    "entity": ("[(", ")]"),
+}
+
+
+def _mermaid_safe(text: str, max_len: int = 60) -> str:
+    """Escape Mermaid-unfriendly characters and truncate."""
+    safe = text.replace('"', "'").replace("\n", " ").replace("\r", "")
+    return safe[:max_len] + ("…" if len(safe) > max_len else "")
+
+
+def evidence_graph_to_mermaid(graph: EvidenceGraph, title: str = "Evidence Graph") -> str:
+    """Export an EvidenceGraph as a Mermaid flowchart diagram.
+
+    Returns a Mermaid string suitable for embedding in markdown (`` ```mermaid``)
+    or rendering via https://mermaid.live.
+
+    Node shapes encode type:
+      - claim: [rectangle]
+      - evidence: (rounded)
+      - source: {hexagon}
+      - limitation: [/parallelogram/]
+      - conflict: {{double-brace}}
+      - entity: [(cylinder)]
+    """
+    lines: List[str] = [
+        "flowchart LR",
+        f"    title[{_mermaid_safe(title)}]",
+        "",
+        "    %% ── Nodes ──",
+    ]
+
+    id_map: Dict[str, str] = {}
+    for idx, node in enumerate(graph.nodes):
+        safe_id = re.sub(r"[^a-zA-Z0-9_]", "_", node.id)
+        id_map[node.id] = safe_id
+        label = _mermaid_safe(node.label or node.id, 50)
+        open_shape, close_shape = _NODE_SHAPE.get(node.type.value, ("[", "]"))
+        lines.append(
+            f"    {safe_id}{open_shape}\"{label}\"{close_shape}"
+        )
+
+    lines.append("")
+    lines.append("    %% ── Edges ──")
+
+    for edge in graph.edges:
+        src = id_map.get(edge.source, edge.source)
+        tgt = id_map.get(edge.target, edge.target)
+        rel_str = _RELATION_STYLE.get(edge.relation.value, "-->")
+        label_parts: List[str] = []
+        if edge.confidence is not None:
+            label_parts.append(f"c={edge.confidence:.2f}")
+        if edge.rationale:
+            label_parts.append(_mermaid_safe(edge.rationale, 30))
+        if label_parts:
+            lines.append(f"    {src} {rel_str} {tgt}")
+            lines.append(f"    %%      {' | '.join(label_parts)}")
+        else:
+            lines.append(f"    {src} {rel_str} {tgt}")
+
+    lines.append("")
+    lines.append("    %% ── Buckets ──")
+    if graph.established_facts:
+        facts = ", ".join(graph.established_facts[:10])
+        lines.append(f"    %% established: {facts}")
+    if graph.conflicts:
+        conflicts = ", ".join(graph.conflicts[:10])
+        lines.append(f"    %% conflicts: {conflicts}")
+    if graph.knowledge_gaps:
+        gaps = ", ".join(graph.knowledge_gaps[:10])
+        lines.append(f"    %% gaps: {gaps}")
+
+    return "\n".join(lines)
+
+
+# ============================================================================
+# M3EvidenceGraph Module
+# ============================================================================
 
 
 @ModuleRegistry.register
 class M3EvidenceGraph(ModuleProtocol):
     """Build typed evidence graph from structured knowledge entries.
 
-    Two modes:
+    Two modes (plus optional grounding):
       - ``"rule"`` — fast, deterministic, no LLM calls (current behaviour).
       - ``"llm"`` — adds Qwen-powered cross-entry relation extraction on top
         of the rule-based graph.  Falls back to rule-only on failure.
+      - ``grounding_enabled=True`` — runs the M3 grounding workflow
+        (consuming ``M2KnowledgeExport``) and merges grounded claims +
+        relations into the evidence graph.
 
-    TODO (组员可扩展):
-        - **Incremental graph update**: 当前每次 M3 执行都重建整张图；
-          可改为增量更新——仅处理 M2 新产出的条目，追加到已有图中。
-        - **Entity linking**: 用 UMLS / MeSH / Gene Ontology 做实体归一化，
-          将 "Hsp70", "HSP70", "HSPA1A" 映射到同一规范 ID。
-        - **Confidence-weighted edges**: Qwen 提取关系时可同时输出置信度分数，
-          用于下游假设生成时的证据权重计算。
-        - **Graph visualisation export**: 将 EvidenceGraph 导出为 Cytoscape.js
-          或 Mermaid 格式，便于前端 Demo 可视化。
-        - **Iterative graph refinement**: 在 M6 评审反馈后，回补或修正图中的
-          关系边（当前图在首次构建后保持不变）。
+    .. versionchanged:: 0.4.0
+        - Incremental graph update: existing ``evidence_graph`` in state
+          is reused; only new entries trigger node/edge construction.
+        - Entity normalisation: ``normalize_entity()`` maps common gene/
+          protein name variants to canonical forms.
+        - Confidence-weighted edges: LLM extraction now requests
+          ``confidence`` and ``rationale`` per edge.
+        - Mermaid export: ``evidence_graph_to_mermaid(graph)`` produces
+          a flowchart diagram string.
+        - Iterative refinement: M6 reviews are used to prompt the LLM
+          for graph corrections when ``iteration_count > 0``.
     """
 
     module_name = "m3"
-    module_version = "0.2.0"
-    description = "Build typed evidence graph + optional LLM relation extraction"
+    module_version = "0.4.0"
+    description = (
+        "Build typed evidence graph + optional LLM relation extraction "
+        "+ optional M3 grounding + incremental update + entity linking"
+    )
 
     # ------------------------------------------------------------------
     # Configurable
@@ -86,6 +277,27 @@ class M3EvidenceGraph(ModuleProtocol):
         relation_max_tokens: int = 16384,
         enable_cross_batch: bool = True,
         bridge_batch_size: int = 10,
+        # ---- grounding settings ----
+        grounding_enabled: bool = False,
+        grounding_mode: str = "rule",
+        grounding_cache_dir: str = ".hypoforge_cache/m3_grounding",
+        grounding_embedding_model: str = "",
+        grounding_retrieve_k: int = 30,
+        grounding_evidence_k: int = 12,
+        grounding_min_relevance: float = 5.0,
+        grounding_max_queries: int = 16,
+        grounding_max_evidence_items: int = 200,
+        grounding_max_concurrency: int = 4,
+        grounding_relation_selection_mode: str = "direct",
+        grounding_relation_candidate_k: int = 12,
+        grounding_relation_max_pairs: int = 60,
+        grounding_relation_batch_size: int = 10,
+        grounding_relation_min_confidence: float = 0.65,
+        grounding_gams_iterations: int = 128,
+        grounding_gams_exploration_weight: float = 0.35,
+        grounding_gams_seed: int = 42,
+        grounding_llm_call_timeout: float = 120.0,
+        grounding_relation_judge_retries: int = 2,
         **kwargs,
     ):
         self.mode = mode
@@ -97,6 +309,37 @@ class M3EvidenceGraph(ModuleProtocol):
         self.enable_cross_batch = enable_cross_batch
         self.bridge_batch_size = max(1, bridge_batch_size)
         self.client = QwenClient.from_config(llm_config) if llm_config else None
+
+        # Grounding workflow (lazy — only built when enabled)
+        self.grounding_enabled = grounding_enabled
+        self._grounder: Optional[GroundingWorkflow] = None
+        if grounding_enabled:
+            self._grounder = GroundingWorkflow(
+                client=self.client,
+                mode=grounding_mode if grounding_mode in {"rule", "llm", "api", "direct"} else mode,
+                cache_dir=grounding_cache_dir,
+                embedding_model=grounding_embedding_model,
+                retrieve_k=grounding_retrieve_k,
+                evidence_k=grounding_evidence_k,
+                min_relevance=grounding_min_relevance,
+                max_queries=grounding_max_queries,
+                max_evidence_items=grounding_max_evidence_items,
+                max_concurrency=grounding_max_concurrency,
+                relation_selection_mode=grounding_relation_selection_mode,
+                relation_candidate_k=grounding_relation_candidate_k,
+                relation_max_pairs=grounding_relation_max_pairs,
+                relation_batch_size=grounding_relation_batch_size,
+                relation_min_confidence=grounding_relation_min_confidence,
+                evidence_gams_iterations=grounding_gams_iterations,
+                evidence_gams_exploration_weight=grounding_gams_exploration_weight,
+                evidence_gams_seed=grounding_gams_seed,
+                llm_call_timeout=grounding_llm_call_timeout,
+                relation_judge_retries=grounding_relation_judge_retries,
+            )
+
+        # Track existing node/edge IDs for incremental updates
+        self._existing_node_ids: Set[str] = set()
+        self._existing_entry_ids: Set[str] = set()
 
     # ------------------------------------------------------------------
     # ModuleProtocol implementation
@@ -115,21 +358,194 @@ class M3EvidenceGraph(ModuleProtocol):
         if not all_entries:
             return {"evidence_graph": EvidenceGraph()}
 
-        # --- Step 1: rule-based graph construction (always runs) ---
-        graph = self._build_rule_graph(all_entries)
+
+        # --- Step 1: rule-based graph construction (with incremental update) ---
+        rule_started_at = time.monotonic()
+        emit_event(
+            "tool_started",
+            module="m3",
+            tool="rule_graph_builder",
+            status="running",
+            message=f"开始将 {len(all_entries)} 条知识构造成基础证据图",
+        )
+
+        existing_graph = state.evidence_graph
+        if existing_graph is not None and existing_graph.nodes:
+            new_entries = self._find_new_entries(all_entries, existing_graph)
+            if not new_entries:
+                logger.info(
+                    "M3 incremental: no new entries; reusing existing graph "
+                    "(%d nodes, %d edges)",
+                    len(existing_graph.nodes), len(existing_graph.edges),
+                )
+                emit_event(
+                    "tool_completed",
+                    module="m3",
+                    tool="rule_graph_builder",
+                    status="completed",
+                    message=f"增量更新：无新条目，复用现有图 ({len(existing_graph.nodes)} 节点 / {len(existing_graph.edges)} 边)",
+                    elapsed_seconds=time.monotonic() - rule_started_at,
+                )
+                return {"evidence_graph": existing_graph}
+            logger.info(
+                "M3 incremental: %d new entries; appending to existing graph "
+                "(%d nodes, %d edges)",
+                len(new_entries), len(existing_graph.nodes), len(existing_graph.edges),
+            )
+            graph = self._build_rule_graph(new_entries)
+            graph = self._merge_graphs(existing_graph, graph)
+        else:
+            graph = self._build_rule_graph(all_entries)
+
+        emit_event(
+            "tool_completed",
+            module="m3",
+            tool="rule_graph_builder",
+            status="completed",
+            message=f"基础证据图完成：{len(graph.nodes)} 节点 / {len(graph.edges)} 边",
+            elapsed_seconds=time.monotonic() - rule_started_at,
+        )
 
         # --- Step 2: LLM-enhanced relation extraction (optional) ---
         if self.mode in {"llm", "direct", "api"} and self.client:
+            llm_started_at = time.monotonic()
+            emit_event(
+                "tool_started",
+                module="m3",
+                tool="qwen_relation_extractor",
+                status="running",
+                message="开始抽取跨知识条目的语义关系",
+            )
             try:
                 graph = await self._enhance_with_llm_batched(graph, all_entries)
             except Exception as exc:
-                logger.warning("M3 LLM enhancement failed; using rule-only graph: %s", exc)
+                logger.warning(
+                    "M3 LLM enhancement failed; using rule-only graph: %s", exc
+                )
+                emit_event(
+                    "tool_failed",
+                    module="m3",
+                    tool="qwen_relation_extractor",
+                    status="failed",
+                    message=f"语义关系抽取失败，保留规则图：{type(exc).__name__}: {exc}",
+                    elapsed_seconds=time.monotonic() - llm_started_at,
+                )
+            else:
+                emit_event(
+                    "tool_completed",
+                    module="m3",
+                    tool="qwen_relation_extractor",
+                    status="completed",
+                    message=f"语义关系抽取完成：证据图现有 {len(graph.edges)} 条边",
+                    elapsed_seconds=time.monotonic() - llm_started_at,
+                )
+
+        # --- Step 3: Iterative refinement from M6 reviews ---
+        if (
+            state.iteration_count > 0
+            and state.reviews
+            and self.client
+            and self.mode in {"llm", "direct", "api"}
+        ):
+            try:
+                graph = await self._refine_with_reviews(graph, state)
+            except Exception as exc:
+                logger.warning(
+                    "M3 iterative refinement failed; keeping unrefined graph: %s", exc
+                )
+
+        # --- Step 4: M3 grounding (optional — consumes M2KnowledgeExport) ---
+        result: Dict[str, Any] = {"evidence_graph": graph}
+        if self.grounding_enabled and self._grounder is not None:
+            if state.m2_knowledge_export is None:
+                logger.warning(
+                    "M3 grounding is enabled but m2_knowledge_export is None. "
+                    "Grounding requires the agentic M2 pipeline "
+                    "(search.implementation='agentic'). Skipping grounding."
+                )
+                result["errors"] = state.errors + [
+                    "[m3] grounding.enabled=True but no m2_knowledge_export "
+                    "available — run the agentic M2 pipeline first."
+                ]
+            else:
+                try:
+                    grounded = await self._grounder.run(state)
+                    graph = self._merge_grounding(
+                        graph,
+                        grounded.get("evidence_records", []),
+                        grounded.get("claims", []),
+                        grounded.get("relations", []),
+                        grounded.get("report"),
+                    )
+                    result["evidence_graph"] = graph
+                except Exception as exc:
+                    logger.exception(
+                        "M3 grounding workflow failed; retaining non-grounded graph: %s",
+                        exc,
+                    )
+
+        # Track existing IDs for next incremental run
+        self._existing_node_ids = {n.id for n in graph.nodes}
+        self._existing_entry_ids = {
+            n.id[2:] for n in graph.nodes if n.id.startswith("N_")
+        }
 
         # --- persist to disk (if enabled) ---
         if getattr(state, "memory_cache_dir", ""):
             self._persist_graph(graph, state.memory_cache_dir)
 
-        return {"evidence_graph": graph}
+        return result
+
+    # ------------------------------------------------------------------
+    # Incremental update helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _find_new_entries(
+        all_entries: list,
+        existing_graph: EvidenceGraph,
+    ) -> list:
+        """Return entries whose IDs are not already represented in the graph."""
+        existing_entry_ids: Set[str] = set()
+        for node in existing_graph.nodes:
+            # Rule-built nodes have id "N_{entry_id}"
+            if node.id.startswith("N_"):
+                existing_entry_ids.add(node.id[2:])
+            # Also check metadata for grounding nodes
+            entry_id = (node.metadata or {}).get("entry_id", "")
+            if entry_id:
+                existing_entry_ids.add(entry_id)
+        return [e for e in all_entries if e.id not in existing_entry_ids]
+
+    @staticmethod
+    def _merge_graphs(base: EvidenceGraph, additions: EvidenceGraph) -> EvidenceGraph:
+        """Merge *additions* into *base*, deduplicating nodes and edges."""
+        existing_node_ids = {n.id for n in base.nodes}
+        for node in additions.nodes:
+            if node.id not in existing_node_ids:
+                base.nodes.append(node)
+                existing_node_ids.add(node.id)
+
+        existing_edges = {
+            (e.source, e.target, e.relation.value) for e in base.edges
+        }
+        for edge in additions.edges:
+            key = (edge.source, edge.target, edge.relation.value)
+            if key not in existing_edges:
+                base.edges.append(edge)
+                existing_edges.add(key)
+
+        # Merge bucket lists (deduplicate)
+        base.established_facts = list(dict.fromkeys(
+            base.established_facts + additions.established_facts
+        ))
+        base.conflicts = list(dict.fromkeys(
+            base.conflicts + additions.conflicts
+        ))
+        base.knowledge_gaps = list(dict.fromkeys(
+            base.knowledge_gaps + additions.knowledge_gaps
+        ))
+        return base
 
     # ------------------------------------------------------------------
     # Step 1 — rule-based graph construction
@@ -138,7 +554,8 @@ class M3EvidenceGraph(ModuleProtocol):
     def _build_rule_graph(self, all_entries: list) -> EvidenceGraph:
         """Build nodes and ``INVOLVES`` edges from entry metadata.
 
-        This is the deterministic baseline that always runs — no LLM needed.
+        Entities are normalised through ``normalize_entity()`` so that
+        "Hsp70", "HSP70", and "HSPA1A" all map to the same canonical name.
         """
         nodes: List[EvidenceNode] = []
         edges: List[EvidenceEdge] = []
@@ -156,6 +573,9 @@ class M3EvidenceGraph(ModuleProtocol):
                     label=e.source_paper_title or pid,
                 ))
 
+        # Track entity nodes to avoid duplicates
+        seen_entities: Dict[str, str] = {}
+
         # Claim / Evidence / … nodes (one per entry)
         for e in all_entries:
             nid = f"N_{e.id}" if e.id else f"N_{uuid.uuid4().hex[:6]}"
@@ -169,6 +589,11 @@ class M3EvidenceGraph(ModuleProtocol):
                 KnowledgeEntryType.KEY_ENTITY: EvidenceNodeType.ENTITY,
             }.get(e.type, EvidenceNodeType.EVIDENCE)
 
+            # Normalise entities in metadata
+            normalised_entities = [
+                normalize_entity(name) for name in e.entities
+            ]
+
             nodes.append(EvidenceNode(
                 id=nid,
                 type=node_type,
@@ -176,6 +601,7 @@ class M3EvidenceGraph(ModuleProtocol):
                 metadata={
                     "entry_type": e.type.value,
                     "confidence": e.confidence.value if e.confidence else None,
+                    "entities": normalised_entities,
                 },
             ))
 
@@ -186,6 +612,31 @@ class M3EvidenceGraph(ModuleProtocol):
                     target=nid,
                     relation=EvidenceEdgeRelation.INVOLVES,
                 ))
+
+            # Entity nodes + involves edges (deduplicated)
+            for name in normalised_entities:
+                if name not in seen_entities:
+                    eid = f"ENT_{name}"
+                    seen_entities[name] = eid
+                    nodes.append(EvidenceNode(
+                        id=eid,
+                        type=EvidenceNodeType.ENTITY,
+                        label=name,
+                        metadata={"normalised_from": e.entities},
+                    ))
+                entity_nid = seen_entities[name]
+                # Avoid duplicate entity→entry edges
+                ent_edge_key = (entity_nid, nid, EvidenceEdgeRelation.INVOLVES.value)
+                if not any(
+                    eg.source == entity_nid and eg.target == nid
+                    and eg.relation == EvidenceEdgeRelation.INVOLVES
+                    for eg in edges
+                ):
+                    edges.append(EvidenceEdge(
+                        source=entity_nid,
+                        target=nid,
+                        relation=EvidenceEdgeRelation.INVOLVES,
+                    ))
 
         # Categorise entries
         established = []
@@ -216,7 +667,12 @@ class M3EvidenceGraph(ModuleProtocol):
         graph: EvidenceGraph,
         all_entries: list,
     ) -> EvidenceGraph:
-        """Extract semantic relations concurrently in bounded batches."""
+        """Extract semantic relations concurrently in bounded batches.
+
+        .. versionchanged:: 0.4.0
+            Edge schema now includes optional ``confidence`` (0–1) and
+            ``rationale`` (string) fields for confidence-weighted edges.
+        """
         assert self.client is not None
 
         node_id_map = {
@@ -251,10 +707,16 @@ class M3EvidenceGraph(ModuleProtocol):
         for index, result in enumerate(results):
             job_type, job_entries = jobs[index]
             if isinstance(result, Exception):
-                logger.warning("M3 %s relation batch %d failed: %s", job_type, index + 1, result)
+                logger.warning(
+                    "M3 %s relation batch %d failed: %s",
+                    job_type, index + 1, result,
+                )
                 continue
             if not isinstance(result, dict) or result.get("_parse_error"):
-                logger.warning("M3 %s relation batch %d returned invalid JSON", job_type, index + 1)
+                logger.warning(
+                    "M3 %s relation batch %d returned invalid JSON",
+                    job_type, index + 1,
+                )
                 continue
             successful += 1
             valid_ids = {entry.id for entry in job_entries}
@@ -270,19 +732,20 @@ class M3EvidenceGraph(ModuleProtocol):
         return graph
 
     async def _extract_relation_batch(self, entries: list) -> dict:
-        """Call the model for one small batch so JSON stays within budget.
+        """Call the model for one small batch.
 
-        Uses an edge-only prompt + thinking-disabled mode so that reasoning
-        models (Qwen3, DeepSeek-R1, …) reserve the full ``max_tokens``
-        budget for the visible JSON output instead of spending it on
-        internal chain-of-thought.
+        .. versionchanged:: 0.4.0
+            Schema now requests optional ``confidence`` (0–1) and
+            ``rationale`` per edge.  Model output is validated and
+            confidence scores are attached to the resulting
+            ``EvidenceEdge`` objects.
         """
         entries_json = [
             {
                 "entry_id": entry.id,
                 "type": entry.type.value,
                 "content": entry.content[:600],
-                "entities": entry.entities,
+                "entities": [normalize_entity(name) for name in entry.entities],
                 "source": entry.source_paper_id,
             }
             for entry in entries
@@ -300,17 +763,31 @@ class M3EvidenceGraph(ModuleProtocol):
                             "target": {"type": "string"},
                             "relation": {
                                 "type": "string",
-                                "enum": ["supports", "contradicts", "extends", "limits"],
+                                "enum": [
+                                    "supports", "contradicts",
+                                    "extends", "limits",
+                                ],
+                            },
+                            "confidence": {
+                                "type": "number",
+                                "minimum": 0,
+                                "maximum": 1,
+                                "description": "How confident the model is that this edge is correct",
+                            },
+                            "rationale": {
+                                "type": "string",
+                                "description": "One-sentence justification for this edge",
                             },
                         },
                         "required": ["source", "target", "relation"],
                     },
                 },
             },
-            "required": ["edges"],
         }
         user_prompt = M3_BATCH_RELATION_USER_TEMPLATE.format(
-            knowledge_entries_json=json.dumps(entries_json, ensure_ascii=False, indent=2),
+            knowledge_entries_json=json.dumps(
+                entries_json, ensure_ascii=False, indent=2,
+            ),
         )
         return await self.client.structured_chat(
             system_prompt=M3_BATCH_RELATION_SYSTEM_PROMPT,
@@ -328,7 +805,12 @@ class M3EvidenceGraph(ModuleProtocol):
         raw_edges: list,
         valid_ids: set,
     ) -> int:
-        """Validate and deduplicate edges returned by one batch."""
+        """Validate and deduplicate edges returned by one batch.
+
+        .. versionchanged:: 0.4.0
+            Attaches ``confidence`` and ``rationale`` from the LLM output
+            when the fields are present and valid.
+        """
         added = 0
         for raw_edge in raw_edges:
             if not isinstance(raw_edge, dict):
@@ -350,10 +832,21 @@ class M3EvidenceGraph(ModuleProtocol):
                 for edge in graph.edges
             ):
                 continue
+            # ---- confidence + rationale (optional, v0.4.0) ----
+            confidence: Optional[float] = None
+            raw_conf = raw_edge.get("confidence")
+            if isinstance(raw_conf, (int, float)) and 0 <= raw_conf <= 1:
+                confidence = float(raw_conf)
+            rationale: Optional[str] = None
+            raw_rationale = raw_edge.get("rationale", "")
+            if isinstance(raw_rationale, str) and raw_rationale.strip():
+                rationale = raw_rationale.strip()[:500]
             graph.edges.append(EvidenceEdge(
                 source=src_node,
                 target=tgt_node,
                 relation=relation,
+                confidence=confidence,
+                rationale=rationale,
             ))
             added += 1
         return added
@@ -365,35 +858,31 @@ class M3EvidenceGraph(ModuleProtocol):
     ) -> EvidenceGraph:
         """Call Qwen to discover SUPPORTS / CONTRADICTS / EXTENDS / LIMITS edges.
 
-        The LLM sees all knowledge entries (id, type, content, entities) and
-        returns a list of cross-entry relationships.  We merge these into the
-        existing rule-based graph.
+        .. versionchanged:: 0.4.0
+            Schema extended with optional ``confidence`` and ``rationale``.
         """
         assert self.client is not None
 
-        # Serialize entries for the prompt — keep it compact
         entries_json = []
-        node_id_map: Dict[str, str] = {}  # entry_id → node_id
+        node_id_map: Dict[str, str] = {}
         for n in graph.nodes:
-            # Extract entry_id from node id (N_KE001 → KE001)
             if n.id.startswith("N_"):
                 node_id_map[n.id[2:]] = n.id
 
-        # Relation extraction is the expensive part. Keep the deterministic
-        # graph complete, but cap the semantic-extraction payload so the model
-        # can return valid JSON within its completion budget.
         relation_entries = all_entries[: self.max_relation_entries]
         for e in relation_entries:
             entries_json.append({
                 "entry_id": e.id,
                 "type": e.type.value,
                 "content": e.content[:600],
-                "entities": e.entities,
+                "entities": [normalize_entity(name) for name in e.entities],
                 "source": e.source_paper_id,
             })
 
         user_prompt = M3_RELATION_USER_TEMPLATE.format(
-            knowledge_entries_json=json.dumps(entries_json, ensure_ascii=False, indent=2),
+            knowledge_entries_json=json.dumps(
+                entries_json, ensure_ascii=False, indent=2,
+            ),
         )
 
         schema = {
@@ -405,12 +894,27 @@ class M3EvidenceGraph(ModuleProtocol):
                     "items": {
                         "type": "object",
                         "properties": {
-                            "source": {"type": "string", "description": "entry_id of source"},
-                            "target": {"type": "string", "description": "entry_id of target"},
+                            "source": {
+                                "type": "string",
+                                "description": "entry_id of source",
+                            },
+                            "target": {
+                                "type": "string",
+                                "description": "entry_id of target",
+                            },
                             "relation": {
                                 "type": "string",
-                                "enum": ["supports", "contradicts", "extends", "limits"],
+                                "enum": [
+                                    "supports", "contradicts",
+                                    "extends", "limits",
+                                ],
                             },
+                            "confidence": {
+                                "type": "number",
+                                "minimum": 0,
+                                "maximum": 1,
+                            },
+                            "rationale": {"type": "string"},
                         },
                         "required": ["source", "target", "relation"],
                     },
@@ -441,10 +945,11 @@ class M3EvidenceGraph(ModuleProtocol):
             return graph
 
         if not isinstance(result, dict) or result.get("_parse_error"):
-            logger.warning("M3 LLM returned unparseable result; keeping rule-based graph")
+            logger.warning(
+                "M3 LLM returned unparseable result; keeping rule-based graph"
+            )
             return graph
 
-        # --- Merge LLM edges into the graph ---
         llm_edges = result.get("edges") or []
         edge_count = 0
         for raw_edge in llm_edges:
@@ -454,7 +959,6 @@ class M3EvidenceGraph(ModuleProtocol):
             tgt_entry = raw_edge.get("target", "")
             rel_str = raw_edge.get("relation", "")
 
-            # Map entry_id → node_id
             src_node = node_id_map.get(src_entry, f"N_{src_entry}")
             tgt_node = node_id_map.get(tgt_entry, f"N_{tgt_entry}")
 
@@ -463,33 +967,380 @@ class M3EvidenceGraph(ModuleProtocol):
             except ValueError:
                 continue
 
-            # Avoid duplicate edges
             already_exists = any(
-                e.source == src_node and e.target == tgt_node and e.relation == relation
+                e.source == src_node
+                and e.target == tgt_node
+                and e.relation == relation
                 for e in graph.edges
             )
             if already_exists:
                 continue
 
+            confidence: Optional[float] = None
+            raw_conf = raw_edge.get("confidence")
+            if isinstance(raw_conf, (int, float)) and 0 <= raw_conf <= 1:
+                confidence = float(raw_conf)
+            rationale: Optional[str] = None
+            raw_rationale = raw_edge.get("rationale", "")
+            if isinstance(raw_rationale, str) and raw_rationale.strip():
+                rationale = raw_rationale.strip()[:500]
+
             graph.edges.append(EvidenceEdge(
                 source=src_node,
                 target=tgt_node,
                 relation=relation,
+                confidence=confidence,
+                rationale=rationale,
             ))
             edge_count += 1
 
         logger.info(
-            "M3 LLM enhancement: added %d cross-entry edges (%d nodes, %d total edges)",
+            "M3 LLM enhancement: added %d cross-entry edges "
+            "(%d nodes, %d total edges)",
             edge_count, len(graph.nodes), len(graph.edges),
         )
 
-        # --- Optionally adopt LLM-revised categorisations ---
         if result.get("revised_established_facts"):
             graph.established_facts = result["revised_established_facts"]
         if result.get("revised_conflicts"):
             graph.conflicts = result["revised_conflicts"]
         if result.get("revised_knowledge_gaps"):
             graph.knowledge_gaps = result["revised_knowledge_gaps"]
+
+        return graph
+
+    # ------------------------------------------------------------------
+    # Step 3 — iterative refinement from M6 reviews
+    # ------------------------------------------------------------------
+
+    async def _refine_with_reviews(
+        self,
+        graph: EvidenceGraph,
+        state: PipelineState,
+    ) -> EvidenceGraph:
+        """Use M6 review feedback to correct or augment the evidence graph.
+
+        Only runs when ``iteration_count > 0`` (i.e., M6 has already
+        produced reviews in a previous iteration).  The LLM receives the
+        current graph summary + reviewer critiques and returns a list of
+        edge additions, removals, or re-classifications.
+        """
+        assert self.client is not None
+
+        # Summarise the current graph
+        node_summary = []
+        for n in graph.nodes[:80]:
+            node_summary.append(
+                f"  {n.id} [{n.type.value}] {n.label[:100]}"
+            )
+        edge_summary = []
+        for e in graph.edges[:120]:
+            conf_str = f" c={e.confidence:.2f}" if e.confidence is not None else ""
+            rat_str = f" ({e.rationale[:60]})" if e.rationale else ""
+            edge_summary.append(
+                f"  {e.source} --[{e.relation.value}{conf_str}]--> {e.target}{rat_str}"
+            )
+
+        review_text = "\n".join(
+            f"[{r.dimension.value}] score={r.score:.1f} "
+            f"comments={r.comments[:200]} suggestions={r.suggestions[:200]}"
+            for r in state.reviews[-4:]  # last 4 reviews
+        )
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "add_edges": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "source": {"type": "string"},
+                            "target": {"type": "string"},
+                            "relation": {
+                                "type": "string",
+                                "enum": [
+                                    "supports", "contradicts",
+                                    "extends", "limits",
+                                ],
+                            },
+                            "confidence": {
+                                "type": "number", "minimum": 0, "maximum": 1,
+                            },
+                            "rationale": {"type": "string"},
+                        },
+                        "required": ["source", "target", "relation"],
+                    },
+                },
+                "remove_edges": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "source": {"type": "string"},
+                            "target": {"type": "string"},
+                            "reason": {"type": "string"},
+                        },
+                        "required": ["source", "target"],
+                    },
+                },
+                "reclassify_edges": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "source": {"type": "string"},
+                            "target": {"type": "string"},
+                            "new_relation": {
+                                "type": "string",
+                                "enum": [
+                                    "supports", "contradicts",
+                                    "extends", "limits",
+                                ],
+                            },
+                            "rationale": {"type": "string"},
+                        },
+                        "required": ["source", "target", "new_relation"],
+                    },
+                },
+                "refinement_summary": {"type": "string"},
+            },
+        }
+
+        prompt = (
+            "You are reviewing an evidence graph that was used to generate "
+            "scientific hypotheses.  Reviewer feedback suggests improvements. "
+            "Your task: suggest concrete edge corrections to improve the graph.\n\n"
+            f"## Review Feedback\n{review_text}\n\n"
+            f"## Current Graph Nodes ({len(graph.nodes)} total, showing first 80)\n"
+            + "\n".join(node_summary)
+            + f"\n\n## Current Graph Edges ({len(graph.edges)} total, showing first 120)\n"
+            + "\n".join(edge_summary)
+            + "\n\nSuggest edge additions, removals, and reclassifications "
+            "based on the reviewer feedback.  Be conservative — only suggest "
+            "changes directly motivated by reviewer comments."
+        )
+
+        try:
+            result = await self.client.structured_chat(
+                system_prompt=(
+                    "You are a biomedical knowledge graph curator. "
+                    "Given reviewer feedback, suggest targeted corrections "
+                    "to an evidence graph. Be precise: use exact node IDs. "
+                    "Only suggest changes with clear scientific justification."
+                ),
+                user_prompt=prompt,
+                output_schema=schema,
+                max_tokens=8192,
+                temperature=0.1,
+                disable_thinking=True,
+            )
+        except Exception:
+            logger.exception("M3 refinement LLM call failed")
+            return graph
+
+        if not isinstance(result, dict) or result.get("_parse_error"):
+            return graph
+
+        # Apply removals
+        remove_keys = {
+            (r.get("source", ""), r.get("target", ""))
+            for r in (result.get("remove_edges") or [])
+            if isinstance(r, dict)
+        }
+        if remove_keys:
+            before = len(graph.edges)
+            graph.edges = [
+                e for e in graph.edges
+                if (e.source, e.target) not in remove_keys
+            ]
+            logger.info(
+                "M3 refinement: removed %d edges", before - len(graph.edges)
+            )
+
+        # Apply reclassifications
+        reclassify = [
+            r for r in (result.get("reclassify_edges") or [])
+            if isinstance(r, dict)
+        ]
+        for rc in reclassify:
+            src = rc.get("source", "")
+            tgt = rc.get("target", "")
+            new_rel_str = rc.get("new_relation", "")
+            try:
+                new_rel = EvidenceEdgeRelation(new_rel_str)
+            except ValueError:
+                continue
+            rationale = str(rc.get("rationale", "") or "")[:500]
+            for edge in graph.edges:
+                if edge.source == src and edge.target == tgt:
+                    edge.relation = new_rel
+                    if rationale:
+                        edge.rationale = rationale
+                    break
+        if reclassify:
+            logger.info("M3 refinement: reclassified %d edges", len(reclassify))
+
+        # Apply additions
+        add_edges = [
+            a for a in (result.get("add_edges") or [])
+            if isinstance(a, dict)
+        ]
+        added = 0
+        for ae in add_edges:
+            src = ae.get("source", "")
+            tgt = ae.get("target", "")
+            rel_str = ae.get("relation", "")
+            try:
+                rel = EvidenceEdgeRelation(rel_str)
+            except ValueError:
+                continue
+            if any(
+                e.source == src and e.target == tgt and e.relation == rel
+                for e in graph.edges
+            ):
+                continue
+            confidence: Optional[float] = None
+            raw_conf = ae.get("confidence")
+            if isinstance(raw_conf, (int, float)) and 0 <= raw_conf <= 1:
+                confidence = float(raw_conf)
+            rationale = str(ae.get("rationale", "") or "")[:500] or None
+            graph.edges.append(EvidenceEdge(
+                source=src,
+                target=tgt,
+                relation=rel,
+                confidence=confidence,
+                rationale=rationale,
+            ))
+            added += 1
+        if added:
+            logger.info("M3 refinement: added %d edges", added)
+
+        summary = str(result.get("refinement_summary", "") or "")
+        if summary:
+            logger.info("M3 refinement summary: %s", summary[:200])
+
+        return graph
+
+    # ------------------------------------------------------------------
+    # Step 4 — merge grounding results into the evidence graph
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _merge_grounding(
+        graph: EvidenceGraph,
+        records: List[EvidenceRecord],
+        claims: List[AtomicClaim],
+        relations: List[EvidenceRelation],
+        report: Any,
+    ) -> EvidenceGraph:
+        """Merge grounding workflow output into the existing evidence graph.
+
+        Creates CLAIM nodes for each ``AtomicClaim`` and adds provenance
+        edges (evidence → claim) and semantic relation edges (claim → claim).
+        The ``evidence_ids`` on both claims and relations point back to
+        ``M2EvidenceExport.evidence_id``, which is recorded in node metadata.
+        """
+        record_map = {record.evidence_id: record for record in records}
+        claim_map: Dict[str, str] = {}
+
+        # --- Create CLAIM nodes ---
+        for claim in claims:
+            node_id = "GCLM_" + claim.id.replace("CLM_", "")
+            claim_map[claim.id] = node_id
+            evidence_paper_ids: List[str] = []
+            for eid in claim.evidence_ids:
+                rec = record_map.get(eid)
+                if rec and rec.paper_id:
+                    evidence_paper_ids.append(rec.paper_id)
+            graph.nodes.append(EvidenceNode(
+                id=node_id,
+                type=EvidenceNodeType.CLAIM,
+                label=claim.statement[:200],
+                metadata={
+                    "claim_id": claim.id,
+                    "confidence": claim.confidence,
+                    "evidence_ids": claim.evidence_ids,
+                    "paper_ids": list(dict.fromkeys(evidence_paper_ids)),
+                    "entities": [
+                        normalize_entity(name)
+                        for name in claim.entities
+                    ],
+                    "provenance_level": "m2_fulltext_grounded",
+                },
+            ))
+
+        # --- Create EVIDENCE nodes for each EvidenceRecord ---
+        for record in records:
+            node_id = "GEV_" + record.evidence_id[:20]
+            graph.nodes.append(EvidenceNode(
+                id=node_id,
+                type=EvidenceNodeType.EVIDENCE,
+                label=record.summary[:200],
+                metadata={
+                    "evidence_id": record.evidence_id,
+                    "paper_id": record.paper_id,
+                    "section": record.section,
+                    "page": record.page,
+                    "quote": record.quote[:500],
+                    "normalized_claim": record.normalized_claim[:500],
+                    "relevance_score": record.relevance_score,
+                    "provenance_level": "m2_fulltext_grounded",
+                },
+            ))
+
+        # --- Add provenance edges (evidence → claim) ---
+        for claim in claims:
+            claim_node = claim_map.get(claim.id)
+            if not claim_node:
+                continue
+            for eid in claim.evidence_ids:
+                ev_node = "GEV_" + eid[:20]
+                already = any(
+                    e.source == ev_node and e.target == claim_node
+                    and e.relation == EvidenceEdgeRelation.SUPPORTS
+                    for e in graph.edges
+                )
+                if not already:
+                    graph.edges.append(EvidenceEdge(
+                        source=ev_node,
+                        target=claim_node,
+                        relation=EvidenceEdgeRelation.SUPPORTS,
+                        rationale="Atomic claim grounded in this M2 evidence item.",
+                        evidence_ids=[eid],
+                    ))
+
+        # --- Add semantic relation edges (claim → claim) ---
+        for rel in relations:
+            source_node = claim_map.get(rel.source)
+            target_node = claim_map.get(rel.target)
+            if not source_node or not target_node:
+                continue
+            try:
+                edge_rel = EvidenceEdgeRelation(rel.relation)
+            except ValueError:
+                continue
+            already = any(
+                e.source == source_node and e.target == target_node
+                and e.relation == edge_rel
+                for e in graph.edges
+            )
+            if not already:
+                graph.edges.append(EvidenceEdge(
+                    source=source_node,
+                    target=target_node,
+                    relation=edge_rel,
+                    confidence=rel.confidence,
+                    rationale=rel.rationale,
+                    evidence_ids=rel.evidence_ids,
+                ))
+
+        logger.info(
+            "M3 grounding: merged %d claims, %d evidence records, %d relations "
+            "(%d total nodes, %d total edges)",
+            len(claims), len(records), len(relations),
+            len(graph.nodes), len(graph.edges),
+        )
 
         return graph
 
@@ -517,7 +1368,7 @@ class M3EvidenceGraph(ModuleProtocol):
 
     @classmethod
     def get_input_fields(cls) -> List[str]:
-        return ["literature_results"]
+        return ["literature_results", "evidence_graph", "reviews", "iteration_count"]
 
     @classmethod
     def get_output_fields(cls) -> List[str]:

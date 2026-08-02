@@ -280,17 +280,28 @@ class GraphMetricBase(MetricProtocol):
             return [{"subject": "", "relation": "", "object": "", "claim": hypothesis.statement}]
             
     def _keyword_search(self, queries: List[str], nodes: List[EvidenceNode]) -> List[EvidenceNode]:
-        """Find all nodes that contain any of the keywords (substring match)."""
+        """Find all nodes that contain any of the keywords in label or metadata fields.
+
+        Search both ``n.label`` and key text metadata fields (searchable_text,
+        quote, summary, normalized_claim) — not just label — so nodes whose
+        label is a single word (ENTITY) or a paper title (SOURCE) still match
+        when their metadata carries the evidence content.
+        """
         if not queries:
             return []
         queries_lower = [q.lower() for q in queries if q]
         if not queries_lower:
             return []
-            
+
         matched = []
         for n in nodes:
-            label_lower = n.label.lower()
-            if any(q in label_lower for q in queries_lower):
+            searchable_parts = [n.label.lower()]
+            for key in ("searchable_text", "quote", "summary", "normalized_claim"):
+                value = n.metadata.get(key, "")
+                if isinstance(value, str) and value:
+                    searchable_parts.append(value.lower())
+            combined = " ".join(searchable_parts)
+            if any(q in combined for q in queries_lower):
                 matched.append(n)
                 continue
                 
@@ -343,34 +354,47 @@ class NoveltyMetric(GraphMetricBase):
             s_b = self._keyword_search(s_b_queries, searchable_nodes)
             
             if not s_a or not s_b:
-                total_score += 1.0  # Concept missing -> fully novel
+                total_score += 1.0  # Concept truly missing from the literature
                 continue
-                
+
+            # Both subject and object nodes exist in the graph.
+            # If they are in disconnected subgraphs (rule-graph vs grounding-graph),
+            # BFS will find no path, but the concepts clearly exist — score
+            # moderately novel, not fully novel.
+            if not s_a or not s_b:
+                total_score += 1.0
+                continue
+
             s_a_ids = {n.id for n in s_a}
             s_b_ids = {n.id for n in s_b}
-            
+
             # Shortest path between any node in s_a and any node in s_b
             min_dist = float('inf')
             queue = deque([(node_id, 0) for node_id in s_a_ids])
             visited = set(s_a_ids)
-            
+
             while queue:
                 current_id, dist = queue.popleft()
                 if current_id in s_b_ids:
                     min_dist = dist
                     break
-                    
+
                 for neighbor in G.neighbors(current_id):
                     if neighbor not in visited:
                         visited.add(neighbor)
                         queue.append((neighbor, dist + 1))
-            
-            # Map distance to novelty score
+
+            # Map distance to novelty score.
+            # disconnected subgraphs → 0.5 (concepts exist, not yet linked)
+            # short paths → low novelty (already well-explored)
+            # long paths → higher novelty (novel connection between distant concepts)
             if min_dist == float('inf'):
-                score = 1.0
-            elif min_dist == 0 or min_dist == 1:
+                score = 0.5
+            elif min_dist <= 1:
                 score = 0.0
             elif min_dist == 2:
+                score = 0.4
+            elif min_dist == 3:
                 score = 0.6
             else:
                 score = 0.8

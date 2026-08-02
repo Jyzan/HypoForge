@@ -14,8 +14,10 @@ import asyncio
 import json
 import logging
 import sys
+import time
 from typing import Any, Dict, List, Optional
 
+from ..observability import emit_event
 from ..protocol import ModuleProtocol
 from ..prompts.m4_prompts import (
     M4_CRITIC_SYSTEM_PROMPT,
@@ -81,6 +83,46 @@ class M4HypothesisGeneration(ModuleProtocol):
     # ------------------------------------------------------------------
     # LLM helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _observe_tool(
+        tool: str,
+        operation,
+        *,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        started_at = time.monotonic()
+        emit_event(
+            "tool_started",
+            module="m4",
+            tool=tool,
+            status="running",
+            message=f"M4 Agent 开始：{tool}",
+            details=details,
+        )
+        try:
+            result = await operation
+        except BaseException as exc:
+            emit_event(
+                "tool_failed",
+                module="m4",
+                tool=tool,
+                status="failed",
+                message=f"M4 Agent 失败：{tool}：{type(exc).__name__}: {exc}",
+                elapsed_seconds=time.monotonic() - started_at,
+                details=details,
+            )
+            raise
+        emit_event(
+            "tool_completed",
+            module="m4",
+            tool=tool,
+            status="completed",
+            message=f"M4 Agent 完成：{tool}",
+            elapsed_seconds=time.monotonic() - started_at,
+            details=details,
+        )
+        return result
 
     def _entry_lookup(self, state: PipelineState) -> Dict[str, str]:
         entries: Dict[str, str] = {}
@@ -216,22 +258,29 @@ class M4HypothesisGeneration(ModuleProtocol):
             "type": "array",
             "items": HypothesisCard.model_json_schema(),
         }
-        generated = await self.client.structured_chat(
-            system_prompt=M4_GENERATOR_SYSTEM_PROMPT.format(
-                num_candidates=self.num_candidates,
-                rubric_block=rubric_block,
+        generated = await self._observe_tool(
+            "hypothesis_generator",
+            self.client.structured_chat(
+                system_prompt=M4_GENERATOR_SYSTEM_PROMPT.format(
+                    num_candidates=self.num_candidates,
+                    rubric_block=rubric_block,
+                ),
+                user_prompt=M4_GENERATOR_USER_TEMPLATE.format(
+                    knowledge_gaps=self._graph_bucket_text(state, "knowledge_gaps"),
+                    established_facts=self._graph_bucket_text(state, "established_facts"),
+                    conflicts=self._graph_bucket_text(state, "conflicts"),
+                    original_question=question,
+                    num_candidates=self.num_candidates,
+                    feedback_context=feedback_context,
+                ),
+                output_schema=generator_schema,
+                max_tokens=16384,
+                temperature=max(getattr(self.llm_config, "temperature", 0.1), 0.4),
             ),
-            user_prompt=M4_GENERATOR_USER_TEMPLATE.format(
-                knowledge_gaps=self._graph_bucket_text(state, "knowledge_gaps"),
-                established_facts=self._graph_bucket_text(state, "established_facts"),
-                conflicts=self._graph_bucket_text(state, "conflicts"),
-                original_question=question,
-                num_candidates=self.num_candidates,
-                feedback_context=feedback_context,
-            ),
-            output_schema=generator_schema,
-            max_tokens=16384,
-            temperature=max(getattr(self.llm_config, "temperature", 0.1), 0.4),
+            details={
+                "requested_candidates": self.num_candidates,
+                "iteration": state.iteration_count + 1,
+            },
         )
         candidates = self._normalise_hypotheses(generated)
         if not candidates:
@@ -270,23 +319,27 @@ class M4HypothesisGeneration(ModuleProtocol):
             ],
         }
         ranker_schema = {"type": "array", "items": ranker_item_schema}
-        ranked = await ranker_client.structured_chat(
-            system_prompt=M4_RANKER_SYSTEM_PROMPT.format(
-                top_k=self.top_k,
-                weights_formula=weights_summary(self.weights),
-                rubric_block=hypothesis_rubric_block(),
-            ),
-            user_prompt=M4_RANKER_USER_TEMPLATE.format(
-                hypotheses_json=json.dumps(
-                    [h.model_dump(mode="json") for h in candidates],
-                    ensure_ascii=False,
-                    indent=2,
+        ranked = await self._observe_tool(
+            "hypothesis_ranker",
+            ranker_client.structured_chat(
+                system_prompt=M4_RANKER_SYSTEM_PROMPT.format(
+                    top_k=self.top_k,
+                    weights_formula=weights_summary(self.weights),
+                    rubric_block=hypothesis_rubric_block(),
                 ),
-                top_k=self.top_k,
+                user_prompt=M4_RANKER_USER_TEMPLATE.format(
+                    hypotheses_json=json.dumps(
+                        [h.model_dump(mode="json") for h in candidates],
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    top_k=self.top_k,
+                ),
+                output_schema=ranker_schema,
+                max_tokens=8192,
+                temperature=getattr(self.llm_config, "temperature", 0.1),
             ),
-            output_schema=ranker_schema,
-            max_tokens=8192,
-            temperature=getattr(self.llm_config, "temperature", 0.1),
+            details={"candidates": len(candidates), "top_k": self.top_k},
         )
         top = self._normalise_hypotheses(ranked)
         required_scores = {
@@ -332,19 +385,23 @@ class M4HypothesisGeneration(ModuleProtocol):
             },
         }
         try:
-            result = await self.client.structured_chat(
-                system_prompt=M4_CRITIC_SYSTEM_PROMPT,
-                user_prompt=M4_CRITIC_USER_TEMPLATE.format(
-                    established_facts=self._graph_bucket_text(state, "established_facts"),
-                    hypotheses_json=json.dumps(
-                        [h.model_dump(mode="json") for h in candidates],
-                        ensure_ascii=False,
-                        indent=2,
+            result = await self._observe_tool(
+                "hypothesis_critic",
+                self.client.structured_chat(
+                    system_prompt=M4_CRITIC_SYSTEM_PROMPT,
+                    user_prompt=M4_CRITIC_USER_TEMPLATE.format(
+                        established_facts=self._graph_bucket_text(state, "established_facts"),
+                        hypotheses_json=json.dumps(
+                            [h.model_dump(mode="json") for h in candidates],
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
                     ),
+                    output_schema=critic_schema,
+                    max_tokens=8192,
+                    temperature=getattr(self.llm_config, "temperature", 0.1),
                 ),
-                output_schema=critic_schema,
-                max_tokens=8192,
-                temperature=getattr(self.llm_config, "temperature", 0.1),
+                details={"candidates": len(candidates)},
             )
         except Exception as exc:
             logger.warning("M4 critic failed (%s); keeping all candidates", exc)
@@ -399,18 +456,22 @@ class M4HypothesisGeneration(ModuleProtocol):
             },
         }
         try:
-            result = await self.client.structured_chat(
-                system_prompt=M4_FALSIFIABILITY_SYSTEM_PROMPT,
-                user_prompt=M4_FALSIFIABILITY_USER_TEMPLATE.format(
-                    hypotheses_json=json.dumps(
-                        [h.model_dump(mode="json") for h in candidates],
-                        ensure_ascii=False,
-                        indent=2,
+            result = await self._observe_tool(
+                "falsifiability_checker",
+                self.client.structured_chat(
+                    system_prompt=M4_FALSIFIABILITY_SYSTEM_PROMPT,
+                    user_prompt=M4_FALSIFIABILITY_USER_TEMPLATE.format(
+                        hypotheses_json=json.dumps(
+                            [h.model_dump(mode="json") for h in candidates],
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
                     ),
+                    output_schema=falsifiability_schema,
+                    max_tokens=8192,
+                    temperature=getattr(self.llm_config, "temperature", 0.1),
                 ),
-                output_schema=falsifiability_schema,
-                max_tokens=8192,
-                temperature=getattr(self.llm_config, "temperature", 0.1),
+                details={"candidates": len(candidates)},
             )
         except Exception as exc:
             logger.warning("M4 falsifiability checker failed (%s); keeping all candidates", exc)

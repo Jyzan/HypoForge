@@ -276,9 +276,33 @@ class PipelineConfig(BaseModel):
     def get_module_kwargs(self, module_name: str) -> Dict[str, Any]:
         """Return the override kwargs dict for *module_name*, or {}."""
         override = self.module_overrides.get(module_name)
-        if override is None:
-            return {}
-        return override.kwargs
+        kwargs = dict(override.kwargs) if override is not None else {}
+        if module_name == "m2":
+            kwargs.setdefault("implementation", self.search.implementation)
+            if self.search.implementation == "agentic":
+                # Only the integrated variant's factory accepts search-budget
+                # wiring. The minimal (PubMed-only, rule-based) factory hard-
+                # codes its own budget/sources and takes only final_k +
+                # source_timeout_seconds, so injecting these would raise
+                # TypeError on unexpected kwargs.
+                variant = kwargs.get("variant", "integrated")
+                if variant == "integrated":
+                    kwargs.setdefault(
+                        "budget",
+                        {
+                            "max_rounds": self.search.max_rounds,
+                            "max_queries": self.search.max_queries,
+                            "max_papers": self.search.max_papers_total,
+                            "max_tokens": self.search.max_tokens,
+                            "max_seconds": self.search.max_seconds,
+                        },
+                    )
+                    kwargs.setdefault(
+                        "per_query_limit",
+                        self.search.papers_per_sub_question,
+                    )
+                    kwargs.setdefault("enabled_sources", list(self.search.tools))
+        return kwargs
 
 
 # ============================================================================
@@ -294,22 +318,22 @@ class ConsistencyConfig(BaseModel):
     similarity_threshold: float = 0.8
 
 class EvaluationConfig(BaseModel):
-    """Configuration for metrics execution (Novelty, Consistency, etc)."""
+    """Configuration for metrics evaluation (Novelty, Consistency, etc)."""
     model_config = ConfigDict(extra="forbid")
-    
+
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     consistency: ConsistencyConfig = Field(default_factory=ConsistencyConfig)
 
 class AblationConfig(BaseModel):
     """Strict configuration for running the ablation matrix script."""
     model_config = ConfigDict(extra="forbid")
-    
+
     questions: List[str] = Field(default_factory=list)
     configs_dir: str = "configs/ablation"
     repeats: int = Field(default=3, ge=1)
     max_budget_usd: float = Field(default=10.0, gt=0.0)
     output_csv: str = "ablation_results.csv"
-    
+
     @model_validator(mode="after")
     def _validate_ablation(self) -> "AblationConfig":
         if not self.questions:
@@ -321,7 +345,7 @@ class AblationConfig(BaseModel):
 class MasterEvaluationConfig(BaseModel):
     """The root model for configs/evaluation.yaml"""
     model_config = ConfigDict(extra="forbid")
-    
+
     evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
     ablation: AblationConfig = Field(default_factory=AblationConfig)
 
