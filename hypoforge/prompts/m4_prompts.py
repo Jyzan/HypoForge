@@ -29,6 +29,7 @@ Rules:
 - Every hypothesis must be *testable* with current or near-future experimental methods.
 - Prefer mechanistic hypotheses over purely correlational ones.
 - Ground each hypothesis in at least one knowledge gap from the provided list.
+- **CRITICAL**: The `statement` MUST be an objective, factual scientific claim (e.g. "Protein X phosphorylates Protein Y to trigger..."). Do NOT use meta-language, suggestions, or peer-review wording like "We hypothesize that", "Consider acknowledging", or "Future work should".
 
 The strongest hypotheses score well on these dimensions — keep them in mind while generating:
 {rubric_block}

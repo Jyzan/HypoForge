@@ -205,9 +205,20 @@ class QwenClient:
         """
         merged_kwargs: Dict[str, Any] = {}
         if disable_thinking:
-            merged_kwargs["thinking"] = {"type": "disabled"}
+            # Must use extra_body to pass custom parameters via the official openai SDK
+            merged_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         if model_kwargs:
+            if "extra_body" in model_kwargs and "extra_body" in merged_kwargs:
+                merged_kwargs["extra_body"].update(model_kwargs.pop("extra_body"))
             merged_kwargs.update(model_kwargs)
+
+        extra_body = merged_kwargs.pop("extra_body", None)
+        
+        chat_kwargs = {}
+        if merged_kwargs:
+            chat_kwargs["model_kwargs"] = merged_kwargs
+        if extra_body:
+            chat_kwargs["extra_body"] = extra_body
 
         return ChatOpenAI(
             model=self.model,
@@ -215,7 +226,7 @@ class QwenClient:
             api_key=self.api_key,
             max_tokens=max_tokens,
             temperature=temperature,
-            **(dict(model_kwargs=merged_kwargs) if merged_kwargs else {}),
+            **chat_kwargs,
         )
 
     @classmethod
@@ -373,8 +384,6 @@ class QwenClient:
         # Build kwargs shared across attempts
         def _make_rfmt_kwargs(include_thinking: bool) -> dict:
             rfmt: Dict[str, Any] = {"response_format": {"type": "json_object"}}
-            if include_thinking and disable_thinking:
-                rfmt["thinking"] = {"type": "disabled"}
             return rfmt
 
         response = None

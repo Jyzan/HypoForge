@@ -185,8 +185,8 @@ Falsification conditions:
                 falsification=falsification_text,
             ),
             output_schema=schema,
-            max_tokens=512,
-            temperature=0.0,
+            max_tokens=2048,
+            temperature=0.1,
         )
         result = result if isinstance(result, dict) else {}
         p_score = max(0.0, min(0.5, float(result.get("predictions_score", 0.0))))
@@ -269,14 +269,33 @@ class GraphMetricBase(MetricProtocol):
                 system_prompt=DECOMPOSE_SYSTEM_PROMPT,
                 user_prompt=f"Hypothesis: {hypothesis.statement}\nMechanism: {hypothesis.mechanism}",
                 output_schema=schema,
-                max_tokens=512,
-                temperature=0.0
+                max_tokens=2048,
+                temperature=0.1
             )
-            if isinstance(result, dict) and "claims" in result:
+            if isinstance(result, dict) and "claims" in result and result["claims"]:
                 return result["claims"]
+        except Exception as exc:
+            logger.warning("Structured chat failed: %s. Attempting manual fallback.", exc)
+            
+        # Fallback to manual parsing
+        try:
+            import json
+            import re
+            raw_res = await self._client.chat(
+                system_prompt=DECOMPOSE_SYSTEM_PROMPT,
+                user_prompt=f"Hypothesis: {hypothesis.statement}\nMechanism: {hypothesis.mechanism}\n\nOUTPUT EXACTLY ONE JSON OBJECT WITH A 'claims' ARRAY.",
+                max_tokens=2048,
+                temperature=0.1
+            )
+            match = re.search(r'\{.*\}', raw_res, re.DOTALL)
+            if match:
+                parsed = json.loads(match.group(0))
+                if "claims" in parsed and parsed["claims"]:
+                    return parsed["claims"]
+            logger.warning("Manual fallback failed to find valid claims array.")
             return [{"subject": "", "relation": "", "object": "", "claim": hypothesis.statement}]
         except Exception as exc:
-            logger.warning("Failed to decompose hypothesis: %s", exc)
+            logger.warning("Failed to decompose hypothesis during fallback: %s", exc)
             return [{"subject": "", "relation": "", "object": "", "claim": hypothesis.statement}]
             
     def _keyword_search(self, queries: List[str], nodes: List[EvidenceNode]) -> List[EvidenceNode]:
@@ -328,7 +347,8 @@ class NoveltyMetric(GraphMetricBase):
         if not claims:
             return 0.0
             
-        searchable_nodes = [n for n in evidence_graph.nodes if n.type in (EvidenceNodeType.CLAIM, EvidenceNodeType.EVIDENCE, EvidenceNodeType.ENTITY)]
+        # [FIX]: Only use ENTITY nodes for keyword matching to avoid false positives and hub short-circuits.
+        searchable_nodes = [n for n in evidence_graph.nodes if n.type == EvidenceNodeType.ENTITY]
         
         # Build networkx graph for fast BFS, omitting conflict edges
         G = nx.Graph()
@@ -341,6 +361,7 @@ class NoveltyMetric(GraphMetricBase):
                 G.add_edge(edge.source, edge.target)
                 
         total_score = 0.0
+        trace_data = {"claims_novelty": []}
         for claim_obj in claims:
             subject_str = claim_obj.get("subject", "")
             subject_synonyms = claim_obj.get("subject_synonyms", [])
@@ -355,6 +376,7 @@ class NoveltyMetric(GraphMetricBase):
             
             if not s_a or not s_b:
                 total_score += 1.0  # Concept truly missing from the literature
+                trace_data["claims_novelty"].append({"claim": claim_obj.get("claim", ""), "start_set": [], "end_set": [], "distance": float('inf'), "score": 1.0})
                 continue
 
             # Both subject and object nodes exist in the graph.
@@ -363,6 +385,7 @@ class NoveltyMetric(GraphMetricBase):
             # moderately novel, not fully novel.
             if not s_a or not s_b:
                 total_score += 1.0
+                trace_data["claims_novelty"].append({"claim": claim_obj.get("claim", ""), "start_set": [], "end_set": [], "distance": float('inf'), "score": 1.0})
                 continue
 
             s_a_ids = {n.id for n in s_a}
@@ -400,8 +423,15 @@ class NoveltyMetric(GraphMetricBase):
                 score = 0.8
                 
             total_score += score
+            trace_data["claims_novelty"].append({
+                "claim": claim_obj.get("claim", ""),
+                "start_set": [{"id": n.id, "label": n.label} for n in s_a],
+                "end_set": [{"id": n.id, "label": n.label} for n in s_b],
+                "distance": min_dist,
+                "score": score
+            })
             
-        return round(total_score / len(claims), 4)
+        return round(total_score / len(claims), 4), trace_data
 
     async def batch_compute(self, hypotheses: List[HypothesisCard], knowledge_entries: List[KnowledgeEntry], **kwargs) -> List[float]:
         return [await self.compute(h, knowledge_entries, **kwargs) for h in hypotheses]
@@ -456,7 +486,8 @@ class EvidenceConsistencyMetric(GraphMetricBase):
         if not claims:
             return 0.0
             
-        searchable_nodes = [n for n in evidence_graph.nodes if n.type in (EvidenceNodeType.CLAIM, EvidenceNodeType.EVIDENCE)]
+        # [FIX]: Only use ENTITY nodes as anchors.
+        searchable_nodes = [n for n in evidence_graph.nodes if n.type == EvidenceNodeType.ENTITY]
         node_embeddings = []
         if self.embeddings and searchable_nodes:
             texts = [n.label for n in searchable_nodes]
@@ -471,6 +502,7 @@ If the threat context is irrelevant to the claim, or if the claim successfully r
 Output JSON: {"is_conflict": true/false, "rationale": "..."}"""
 
         consistent_count = 0
+        trace_data = {"atomic_claims": []}
         from pathlib import Path
         for claim_obj in claims:
             claim_text = claim_obj.get("claim", "")
@@ -493,11 +525,13 @@ Output JSON: {"is_conflict": true/false, "rationale": "..."}"""
                 
             if not valid_anchors:
                 consistent_count += 1
+                trace_data["atomic_claims"].append({"claim": claim_text, "matched_anchors": [], "threat_context": [], "conflict_evaluation": None})
                 continue
                 
             threat_nodes = self._build_threat_context(valid_anchors, evidence_graph)
             if not threat_nodes:
                 consistent_count += 1
+                trace_data["atomic_claims"].append({"claim": claim_text, "matched_anchors": [n.id for n in valid_anchors], "threat_context": [], "conflict_evaluation": None})
                 continue
                 
             threat_context_str = "\n".join(f"- {n.label}" for n in threat_nodes)
@@ -508,14 +542,17 @@ Output JSON: {"is_conflict": true/false, "rationale": "..."}"""
                     system_prompt=system_prompt,
                     user_prompt=f"Target Claim: {claim_text}\nThreat Context:\n{threat_context_str}",
                     output_schema=schema,
-                    temperature=0.0
+                    max_tokens=2048,
+            temperature=0.1
                 )
                 if isinstance(res, dict) and not res.get("is_conflict", True):
                     consistent_count += 1
-            except Exception:
+                trace_data["atomic_claims"].append({"claim": claim_text, "matched_anchors": [n.id for n in valid_anchors], "threat_context": [n.id for n in threat_nodes], "conflict_evaluation": res})
+            except Exception as e:
                 consistent_count += 1
+                trace_data["atomic_claims"].append({"claim": claim_text, "error": str(e)})
                 
-        return round(consistent_count / len(claims), 4)
+        return round(consistent_count / len(claims), 4), trace_data
 
     async def batch_compute(self, hypotheses: List[HypothesisCard], knowledge_entries: List[KnowledgeEntry], **kwargs) -> List[float]:
         return [await self.compute(h, knowledge_entries, **kwargs) for h in hypotheses]

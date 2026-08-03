@@ -9,7 +9,7 @@ full LLM-powered implementation without changing any orchestration code.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union, Tuple
 
 from .state import HypothesisCard, KnowledgeEntry, PipelineState
 
@@ -212,7 +212,7 @@ class MetricProtocol(ABC):
         hypothesis: HypothesisCard,
         knowledge_entries: List[KnowledgeEntry],
         **kwargs,
-    ) -> float:
+    ) -> Union[float, Tuple[float, Dict[str, Any]]]:
         """Compute the metric score for a single hypothesis."""
         ...
 

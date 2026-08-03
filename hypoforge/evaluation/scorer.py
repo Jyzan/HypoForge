@@ -71,6 +71,7 @@ async def score_hypothesis_async(
     self_reported = dict(hypothesis.scores or {})
 
     independent: Dict[str, float] = {}
+    traces: Dict[str, Any] = {}
     for name in MetricRegistry.list_all():
         metric_cls = MetricRegistry.get(name)
         if metric_cls is None:
@@ -84,11 +85,17 @@ async def score_hypothesis_async(
             # evaluate quality with a lightweight model rather than just
             # checking for non-empty fields.
             metric = metric_cls(llm_config=llm_config) if llm_config else metric_cls()
-            independent[name] = await metric.compute(
+            result = await metric.compute(
                 hypothesis, 
                 knowledge_entries, 
                 evidence_graph=evidence_graph
             )
+            if isinstance(result, tuple) and len(result) == 2:
+                independent[name] = float(result[0])
+                traces[name] = result[1]
+            else:
+                independent[name] = float(result)
+                traces[name] = None
         except NotImplementedError:
             continue
 
@@ -97,6 +104,7 @@ async def score_hypothesis_async(
         "self_reported": self_reported,
         "independent": independent,
         "composite": composite_score(self_reported, weights) if self_reported else None,
+        "traces": traces,
     }
 
 
