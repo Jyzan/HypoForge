@@ -338,7 +338,12 @@ class NoveltyMetric(GraphMetricBase):
     independent = True
     implemented = True
 
-    async def compute(self, hypothesis: HypothesisCard, knowledge_entries: List[KnowledgeEntry], **kwargs) -> float:
+    async def compute(
+        self,
+        hypothesis: HypothesisCard,
+        knowledge_entries: List[KnowledgeEntry],
+        **kwargs,
+    ) -> float | Tuple[float, Dict[str, Any]]:
         evidence_graph = kwargs.get("evidence_graph")
         if not evidence_graph or not self._client:
             return 0.0
@@ -376,18 +381,19 @@ class NoveltyMetric(GraphMetricBase):
             
             if not s_a or not s_b:
                 total_score += 1.0  # Concept truly missing from the literature
-                trace_data["claims_novelty"].append({"claim": claim_obj.get("claim", ""), "start_set": [], "end_set": [], "distance": float('inf'), "score": 1.0})
+                trace_data["claims_novelty"].append({
+                    "claim": claim_obj.get("claim", ""),
+                    "start_set": [{"id": n.id, "label": n.label} for n in s_a],
+                    "end_set": [{"id": n.id, "label": n.label} for n in s_b],
+                    "distance": None,
+                    "score": 1.0,
+                })
                 continue
 
             # Both subject and object nodes exist in the graph.
             # If they are in disconnected subgraphs (rule-graph vs grounding-graph),
             # BFS will find no path, but the concepts clearly exist — score
             # moderately novel, not fully novel.
-            if not s_a or not s_b:
-                total_score += 1.0
-                trace_data["claims_novelty"].append({"claim": claim_obj.get("claim", ""), "start_set": [], "end_set": [], "distance": float('inf'), "score": 1.0})
-                continue
-
             s_a_ids = {n.id for n in s_a}
             s_b_ids = {n.id for n in s_b}
 
@@ -411,7 +417,7 @@ class NoveltyMetric(GraphMetricBase):
             # disconnected subgraphs → 0.5 (concepts exist, not yet linked)
             # short paths → low novelty (already well-explored)
             # long paths → higher novelty (novel connection between distant concepts)
-            if min_dist == float('inf'):
+            if math.isinf(min_dist):
                 score = 0.5
             elif min_dist <= 1:
                 score = 0.0
@@ -427,14 +433,16 @@ class NoveltyMetric(GraphMetricBase):
                 "claim": claim_obj.get("claim", ""),
                 "start_set": [{"id": n.id, "label": n.label} for n in s_a],
                 "end_set": [{"id": n.id, "label": n.label} for n in s_b],
-                "distance": min_dist,
+                # ``None`` serializes as JSON null; Infinity is not valid JSON.
+                "distance": None if math.isinf(min_dist) else min_dist,
                 "score": score
             })
             
         return round(total_score / len(claims), 4), trace_data
 
     async def batch_compute(self, hypotheses: List[HypothesisCard], knowledge_entries: List[KnowledgeEntry], **kwargs) -> List[float]:
-        return [await self.compute(h, knowledge_entries, **kwargs) for h in hypotheses]
+        results = [await self.compute(h, knowledge_entries, **kwargs) for h in hypotheses]
+        return [float(result[0] if isinstance(result, tuple) else result) for result in results]
 
 
 @MetricRegistry.register
@@ -477,7 +485,12 @@ class EvidenceConsistencyMetric(GraphMetricBase):
         norm = np.linalg.norm(v1) * np.linalg.norm(v2)
         return float(np.dot(v1, v2) / norm) if norm > 0 else 0.0
 
-    async def compute(self, hypothesis: HypothesisCard, knowledge_entries: List[KnowledgeEntry], **kwargs) -> float:
+    async def compute(
+        self,
+        hypothesis: HypothesisCard,
+        knowledge_entries: List[KnowledgeEntry],
+        **kwargs,
+    ) -> float | Tuple[float, Dict[str, Any]]:
         evidence_graph = kwargs.get("evidence_graph")
         if not evidence_graph or not self._client:
             return 0.0
@@ -503,7 +516,6 @@ Output JSON: {"is_conflict": true/false, "rationale": "..."}"""
 
         consistent_count = 0
         trace_data = {"atomic_claims": []}
-        from pathlib import Path
         for claim_obj in claims:
             claim_text = claim_obj.get("claim", "")
             valid_anchors = []
@@ -543,7 +555,7 @@ Output JSON: {"is_conflict": true/false, "rationale": "..."}"""
                     user_prompt=f"Target Claim: {claim_text}\nThreat Context:\n{threat_context_str}",
                     output_schema=schema,
                     max_tokens=2048,
-            temperature=0.1
+                    temperature=0.1,
                 )
                 if isinstance(res, dict) and not res.get("is_conflict", True):
                     consistent_count += 1
@@ -555,7 +567,8 @@ Output JSON: {"is_conflict": true/false, "rationale": "..."}"""
         return round(consistent_count / len(claims), 4), trace_data
 
     async def batch_compute(self, hypotheses: List[HypothesisCard], knowledge_entries: List[KnowledgeEntry], **kwargs) -> List[float]:
-        return [await self.compute(h, knowledge_entries, **kwargs) for h in hypotheses]
+        results = [await self.compute(h, knowledge_entries, **kwargs) for h in hypotheses]
+        return [float(result[0] if isinstance(result, tuple) else result) for result in results]
         
     def _build_threat_context(self, anchors: List[EvidenceNode], graph: EvidenceGraph) -> List[EvidenceNode]:
         anchor_ids = {n.id for n in anchors}

@@ -203,18 +203,18 @@ class QwenClient:
             Extra parameters merged into the API request body
             (e.g. ``response_format``, ``thinking`` control).
         """
-        merged_kwargs: Dict[str, Any] = {}
+        # ``thinking`` is provider-specific, so the OpenAI SDK only accepts it
+        # through ``extra_body``.  Copy the caller's mappings before merging so
+        # a reusable ``model_kwargs`` dictionary is never mutated in-place.
+        merged_kwargs: Dict[str, Any] = dict(model_kwargs or {})
+        caller_extra_body = merged_kwargs.pop("extra_body", None)
+        extra_body: Dict[str, Any] = {}
         if disable_thinking:
-            # Must use extra_body to pass custom parameters via the official openai SDK
-            merged_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-        if model_kwargs:
-            if "extra_body" in model_kwargs and "extra_body" in merged_kwargs:
-                merged_kwargs["extra_body"].update(model_kwargs.pop("extra_body"))
-            merged_kwargs.update(model_kwargs)
+            extra_body["thinking"] = {"type": "disabled"}
+        if caller_extra_body:
+            extra_body.update(dict(caller_extra_body))
 
-        extra_body = merged_kwargs.pop("extra_body", None)
-        
-        chat_kwargs = {}
+        chat_kwargs: Dict[str, Any] = {}
         if merged_kwargs:
             chat_kwargs["model_kwargs"] = merged_kwargs
         if extra_body:
@@ -375,25 +375,18 @@ class QwenClient:
             messages.append(SystemMessage(content=system_prompt))
         messages.append(HumanMessage(content=full_user))
 
-        # Build the base LLM (without response_format, for fallback)
-        llm = self._build_llm(
-            max_tokens=max_tokens, temperature=temperature,
-            disable_thinking=disable_thinking,
-        )
-
-        # Build kwargs shared across attempts
-        def _make_rfmt_kwargs(include_thinking: bool) -> dict:
-            rfmt: Dict[str, Any] = {"response_format": {"type": "json_object"}}
-            return rfmt
+        response_format_kwargs: Dict[str, Any] = {
+            "response_format": {"type": "json_object"}
+        }
 
         response = None
-        # Attempt 1: with response_format (+ optional thinking disable)
+        # Attempt 1: request JSON mode and, when requested, disable thinking.
         try:
             llm_with_format = self._build_llm(
                 max_tokens=max_tokens,
                 temperature=temperature,
-                disable_thinking=False,  # handled in model_kwargs below
-                model_kwargs=_make_rfmt_kwargs(include_thinking=True),
+                disable_thinking=disable_thinking,
+                model_kwargs=response_format_kwargs,
             )
             response = await llm_with_format.ainvoke(messages)
             self._record_tokens(response)
@@ -410,7 +403,7 @@ class QwenClient:
                         max_tokens=max_tokens,
                         temperature=temperature,
                         disable_thinking=False,
-                        model_kwargs=_make_rfmt_kwargs(include_thinking=False),
+                        model_kwargs=response_format_kwargs,
                     )
                     response = await llm_rfmt.ainvoke(messages)
                     self._record_tokens(response)
@@ -425,8 +418,14 @@ class QwenClient:
                     self.model,
                 )
 
-        # Attempt 3: plain chat fallback (no response_format)
+        # Attempt 3: plain chat fallback.  Leave provider-specific thinking
+        # control off here because a previous failure may have rejected it.
         if response is None:
+            llm = self._build_llm(
+                max_tokens=max_tokens,
+                temperature=temperature,
+                disable_thinking=False,
+            )
             response = await llm.ainvoke(messages)
             self._record_tokens(response)
 
