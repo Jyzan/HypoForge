@@ -44,6 +44,29 @@ class M5ResearchPlan(ModuleProtocol):
         self.llm_config = llm_config
         self.client = QwenClient.from_config(llm_config) if llm_config else None
 
+    @staticmethod
+    def _build_feedback_context(state: PipelineState) -> str:
+        """Route the latest method-feasibility review to plan revision."""
+        if state.iteration_count <= 0 or not state.reviews:
+            return ""
+        latest = max(review.version for review in state.reviews)
+        feedback = [
+            review.suggestions or review.comments or ""
+            for review in state.reviews
+            if review.version == latest
+            and review.dimension.value == "method_feasibility"
+        ]
+        feedback = [item.strip() for item in feedback if item.strip()]
+        if not feedback:
+            return ""
+        lines = [
+            "",
+            "Research-plan revision guidance from the latest method-feasibility review:",
+            *[f"- {item}" for item in feedback],
+            "Apply only suggestions relevant to this hypothesis and keep them in the research plan, not the hypothesis statement.",
+        ]
+        return "\n".join(lines)
+
     async def __call__(
         self,
         state: PipelineState,
@@ -72,6 +95,7 @@ class M5ResearchPlan(ModuleProtocol):
                     mechanism=h.mechanism,
                     predictions="\n".join(h.observable_predictions),
                     falsification_conditions="\n".join(h.falsification_conditions),
+                    feedback_context=self._build_feedback_context(state),
                 ),
                 output_schema=ResearchPlan.model_json_schema(),
                 max_tokens=16384,  # ResearchPlan has 11 fields — needs headroom
@@ -99,7 +123,7 @@ class M5ResearchPlan(ModuleProtocol):
 
     @classmethod
     def get_input_fields(cls) -> List[str]:
-        return ["top_hypotheses"]
+        return ["top_hypotheses", "reviews", "iteration_count"]
 
     @classmethod
     def get_output_fields(cls) -> List[str]:

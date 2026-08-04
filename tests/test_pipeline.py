@@ -232,13 +232,24 @@ async def test_m4_feedback_loop_and_no_hang():
     state = PipelineState(
         input_question="q",
         iteration_count=1,
-        reviews=[ReviewResult(
-            dimension=ReviewerDimension("method_feasibility"),
-            score=3.0, suggestions="add a power analysis", version=1,
-        )],
+        reviews=[
+            ReviewResult(
+                dimension=ReviewerDimension("scientific_logic"),
+                score=3.0,
+                suggestions="clarify the causal mechanism",
+                version=1,
+            ),
+            ReviewResult(
+                dimension=ReviewerDimension("method_feasibility"),
+                score=3.0,
+                suggestions="add a power analysis",
+                version=1,
+            ),
+        ],
     )
     block = m4._build_feedback_context(state, ["prefer in-vivo models"])
-    assert "power analysis" in block
+    assert "causal mechanism" in block
+    assert "power analysis" not in block
     assert "prefer in-vivo models" in block
 
     # prompting is a no-op when non-interactive (must not read stdin / hang)

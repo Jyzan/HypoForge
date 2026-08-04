@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sys
 import time
 from typing import Any, Dict, List, Optional
@@ -41,6 +42,24 @@ from ..state import HypothesisCard, PipelineState
 from ..tools.qwen_client import QwenClient
 
 logger = logging.getLogger(__name__)
+
+
+_EDITORIAL_STATEMENT_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:please\s+)?consider\b|"
+    r"to\s+(?:better\s+)?(?:strengthen|improve|clarify|address|validate)\b|"
+    r"(?:we|the authors?)\s+(?:hypothesize|suggest|recommend|propose|should|need\s+to)\b|"
+    r"(?:this|the)\s+hypothesis\s+(?:should|must|needs?\s+to|would\s+benefit)\b|"
+    r"(?:a|the)\s+(?:stronger|revised)\s+hypothesis\s+(?:would|should)\b|"
+    r"it\s+(?:is|would\s+be)\s+(?:important|helpful|useful|necessary|recommended)\b|"
+    r"it\s+would\s+(?:strengthen|improve|clarify|address|validate)\b|"
+    r"(?:future|further)\s+(?:work|research)\b|"
+    r"(?:add|include|provide|clarify|acknowledge|discuss|investigate|explore)\b|"
+    r"(?:建议|请考虑|考虑(?:增加|加入|补充)|应当|应该|需要(?:增加|加入|补充)|"
+    r"为(?:了)?(?:加强|增强|改进|验证)|未来(?:工作|研究)|(?:本|该)假设(?:应|应该|需要))"
+    r")",
+    re.IGNORECASE,
+)
 
 
 @ModuleRegistry.register
@@ -131,6 +150,19 @@ class M4HypothesisGeneration(ModuleProtocol):
                 entries[entry.id] = entry.content
         return entries
 
+    @staticmethod
+    def _is_scientific_statement(statement: str) -> bool:
+        """Return whether *statement* has the form of a scientific claim.
+
+        This is deliberately a narrow guard against editorial instructions,
+        not a substitute for scientific evaluation.  It protects state
+        boundaries even when an LLM ignores prompt-level requirements.
+        """
+        text = str(statement or "").strip().lstrip("-*•").strip()
+        if not text or text.endswith(("?", "？")):
+            return False
+        return _EDITORIAL_STATEMENT_RE.match(text) is None
+
     def _graph_bucket_text(self, state: PipelineState, bucket: str) -> str:
         graph = state.evidence_graph
         entry_text = self._entry_lookup(state)
@@ -150,8 +182,15 @@ class M4HypothesisGeneration(ModuleProtocol):
             item.setdefault("hypothesis_id", f"H{idx}")
             item.setdefault("scores", {})
             card = HypothesisCard.model_validate(item)
-            # The ranker may omit composite or return an inconsistent value.
-            # Recompute it from the four dimension scores via the shared rubric
+            if not self._is_scientific_statement(card.statement):
+                logger.warning(
+                    "M4 discarded editorial/non-claim statement for %s: %s",
+                    card.hypothesis_id,
+                    card.statement[:160],
+                )
+                continue
+            # A generator payload may contain preliminary scores. Recompute any
+            # composite from the four dimensions via the shared rubric
             # (single source of truth for the weights) whenever they are all
             # present, so the displayed score and ranking match the documented
             # formula.
@@ -166,6 +205,50 @@ class M4HypothesisGeneration(ModuleProtocol):
             key=lambda h: h.scores.get("composite", 0),
             reverse=True,
         )[: self.top_k]
+
+    def _attach_rankings(
+        self,
+        candidates: List[HypothesisCard],
+        payload: Any,
+    ) -> List[HypothesisCard]:
+        """Attach ranker-only output to the original candidate objects.
+
+        The ranker is intentionally not trusted to return hypothesis content.
+        This makes statements, mechanisms, predictions, and evidence immutable
+        across the ranking boundary.
+        """
+        if isinstance(payload, dict):
+            payload = payload.get("rankings") or payload.get("items") or payload.get("data") or []
+
+        by_id = {card.hypothesis_id: card for card in candidates}
+        ranked_cards: List[HypothesisCard] = []
+        seen: set[str] = set()
+        for item in payload or []:
+            if not isinstance(item, dict):
+                continue
+            hypothesis_id = str(item.get("hypothesis_id") or "")
+            if hypothesis_id in seen or hypothesis_id not in by_id:
+                continue
+            raw_scores = item.get("scores")
+            if not isinstance(raw_scores, dict):
+                continue
+            try:
+                scores = {
+                    dimension: float(raw_scores[dimension])
+                    for dimension in HYPOTHESIS_DIMENSIONS
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not all(0.0 <= value <= 1.0 for value in scores.values()):
+                continue
+            scores["composite"] = composite_score(scores, self.weights)
+            ranked_cards.append(by_id[hypothesis_id].model_copy(update={
+                "ranking_rationale": str(item.get("ranking_rationale") or "").strip(),
+                "scores": scores,
+            }))
+            seen.add(hypothesis_id)
+
+        return self._rank_top(ranked_cards)
 
     # ------------------------------------------------------------------
     # Iteration feedback loop (C): reviews + human guidance → next round
@@ -214,14 +297,20 @@ class M4HypothesisGeneration(ModuleProtocol):
 
         parts: List[str] = [f"\n--- Revision guidance (iteration {state.iteration_count}) ---"]
 
-        if state.top_hypotheses:
+        prior_top = [
+            hypothesis
+            for hypothesis in state.top_hypotheses
+            if self._is_scientific_statement(hypothesis.statement)
+        ]
+        if prior_top:
             parts.append("Prior top hypotheses (revise these, don't restart):")
-            parts.extend(f"- [{h.hypothesis_id}] {h.statement}" for h in state.top_hypotheses)
+            parts.extend(f"- [{h.hypothesis_id}] {h.statement}" for h in prior_top)
 
         latest = max((r.version for r in state.reviews), default=0)
         recent = [
             r for r in state.reviews
-            if r.version == latest and r.dimension.value != "overall"
+            if r.version == latest
+            and r.dimension.value in {"scientific_logic", "evidence_consistency"}
         ]
         if recent:
             parts.append("\nReviewer feedback (address these):")
@@ -239,7 +328,11 @@ class M4HypothesisGeneration(ModuleProtocol):
     def _update_best(self, state: PipelineState, top: List[HypothesisCard]) -> List[HypothesisCard]:
         """Keep the best hypotheses seen across all iterations, so a weaker
         revision cannot discard a stronger earlier result."""
-        pool = list(top) + list(state.best_hypotheses or [])
+        pool = [
+            card
+            for card in list(top) + list(state.best_hypotheses or [])
+            if self._is_scientific_statement(card.statement)
+        ]
         dedup: Dict[str, HypothesisCard] = {}
         for card in pool:
             key = card.statement.strip()
@@ -301,22 +394,21 @@ class M4HypothesisGeneration(ModuleProtocol):
 
         # ── Step 4: Ranker (separate model tier) ───────────────────────
         ranker_client = self.ranker_client or self.client
-        ranker_item_schema = HypothesisCard.model_json_schema()
-        ranker_item_schema["properties"]["scores"] = {
+        ranker_item_schema = {
             "type": "object",
             "properties": {
-                "novelty": {"type": "number", "minimum": 0, "maximum": 1},
-                "scientific_soundness": {"type": "number", "minimum": 0, "maximum": 1},
-                "testability": {"type": "number", "minimum": 0, "maximum": 1},
-                "evidence_consistency": {"type": "number", "minimum": 0, "maximum": 1},
-                "composite": {"type": "number", "minimum": 0, "maximum": 1},
+                "hypothesis_id": {"type": "string"},
+                "ranking_rationale": {"type": "string"},
+                "scores": {
+                    "type": "object",
+                    "properties": {
+                        dimension: {"type": "number", "minimum": 0, "maximum": 1}
+                        for dimension in HYPOTHESIS_DIMENSIONS
+                    },
+                    "required": list(HYPOTHESIS_DIMENSIONS),
+                },
             },
-            "required": [
-                "novelty",
-                "scientific_soundness",
-                "testability",
-                "evidence_consistency",
-            ],
+            "required": ["hypothesis_id", "ranking_rationale", "scores"],
         }
         ranker_schema = {"type": "array", "items": ranker_item_schema}
         ranked = await self._observe_tool(
@@ -341,14 +433,8 @@ class M4HypothesisGeneration(ModuleProtocol):
             ),
             details={"candidates": len(candidates), "top_k": self.top_k},
         )
-        top = self._normalise_hypotheses(ranked)
-        required_scores = {
-            "novelty",
-            "scientific_soundness",
-            "testability",
-            "evidence_consistency",
-        }
-        if not top or not all(required_scores.issubset(h.scores) for h in top):
+        top = self._attach_rankings(candidates, ranked)
+        if not top:
             logger.warning("M4 ranker returned incomplete scores; ranking generated candidates instead")
             top = self._rank_top(candidates)
 
@@ -366,8 +452,9 @@ class M4HypothesisGeneration(ModuleProtocol):
     ) -> List[HypothesisCard]:
         """Filter candidates through the Critic agent.
 
-        Drops hypotheses with logical gaps or external inconsistencies,
-        and applies any ``suggested_revision`` to the surviving statements.
+        Drops hypotheses with logical gaps or external inconsistencies.  The
+        critic cannot rewrite candidate content; revisions belong to the next
+        Generator pass.
         Falls back to the original list if every candidate is rejected.
         """
         critic_schema = {
@@ -379,7 +466,6 @@ class M4HypothesisGeneration(ModuleProtocol):
                     "pass": {"type": "boolean"},
                     "critique": {"type": "string"},
                     "issues": {"type": "array", "items": {"type": "string"}},
-                    "suggested_revision": {"type": "string"},
                 },
                 "required": ["hypothesis_id", "pass", "critique", "issues"],
             },
@@ -421,10 +507,6 @@ class M4HypothesisGeneration(ModuleProtocol):
             card = id_to_candidate.get(hid)
             if card is None:
                 continue
-            # Apply suggested revision when provided (non-empty, differs from original)
-            revision = (review.get("suggested_revision") or "").strip()
-            if revision and revision != card.statement.strip():
-                card = card.model_copy(update={"statement": revision})
             survivors.append(card)
 
         if len(survivors) < 2:

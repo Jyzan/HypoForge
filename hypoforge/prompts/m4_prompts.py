@@ -64,6 +64,10 @@ M4_CRITIC_SYSTEM_PROMPT = """\
 You are a rigorous scientific critic. Your job is to evaluate each candidate \
 hypothesis for logical soundness and consistency with known facts.
 
+You are an evaluator, not a rewriter. Do not replace or rewrite the hypothesis \
+statement. Put every proposed improvement in `issues` or `critique`; the Generator \
+is solely responsible for producing revised hypothesis text on the next iteration.
+
 For each hypothesis, assess:
 
 1. **Internal consistency** — does the causal chain make sense?
@@ -76,8 +80,7 @@ Output a JSON object for each hypothesis:
   "hypothesis_id": "H1",
   "pass": true/false,
   "critique": "brief explanation of the decision",
-  "issues": ["issue 1", "issue 2"],
-  "suggested_revision": "optional improved statement"
+  "issues": ["issue 1", "issue 2"]
 }
 """
 
@@ -98,6 +101,11 @@ You are an experimental biologist assessing whether a hypothesis can be \
 empirically falsified.
 
 For each hypothesis, determine:
+
+Before scoring, verify that the statement itself is a scientific claim. \
+Editorial instructions such \
+as "Consider adding...", "To strengthen the hypothesis...", or "Future work \
+should..." are not hypotheses and must be marked non-falsifiable.
 
 1. **Is it falsifiable?** — could a conceivable experiment prove it wrong?
 2. **Are predictions specific?** — do they specify direction, magnitude, or \
@@ -132,16 +140,20 @@ dimensions, each scored 0.0–1.0, against these explicit anchors:
 For EACH hypothesis, first write a brief `ranking_rationale` justifying how it rates \
 on each dimension, and ONLY THEN assign the four numeric scores (reason before you score).
 
-Then compute a weighted composite:
+Use this weighted composite formula to guide the ordering; the application will \
+recompute the composite from your dimension scores:
   {weights_formula}
 
-Return the top {top_k} hypotheses, each with its ranking_rationale and scores, sorted \
-by composite descending.
+Return the top {top_k} evaluations, each containing only `hypothesis_id`, \
+`ranking_rationale`, and `scores`, sorted by composite descending. Do not restate, \
+rewrite, or otherwise modify any hypothesis content. The application will attach \
+your scores to the original hypothesis objects.
 """
 
 M4_RANKER_USER_TEMPLATE = """\
 Hypotheses to rank:
 {hypotheses_json}
 
-Return the top {top_k}, with all four dimension scores and the composite.
+Return the top {top_k} hypothesis IDs, with a ranking rationale and all four \
+dimension scores.
 """
