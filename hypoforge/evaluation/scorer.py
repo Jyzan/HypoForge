@@ -60,6 +60,7 @@ async def score_hypothesis_async(
     knowledge_entries: List[KnowledgeEntry],
     weights: Optional[Mapping[str, float]] = None,
     llm_config: Any = None,
+    embed_config: Any = None,
     evidence_graph: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Score a single hypothesis.
@@ -84,7 +85,10 @@ async def score_hypothesis_async(
             # Metrics that accept an LLM client receive one so they can
             # evaluate quality with a lightweight model rather than just
             # checking for non-empty fields.
-            metric = metric_cls(llm_config=llm_config) if llm_config else metric_cls()
+            kwargs = {}
+            if llm_config: kwargs['llm_config'] = llm_config
+            if embed_config: kwargs['embed_config'] = embed_config
+            metric = metric_cls(**kwargs)
             result = await metric.compute(
                 hypothesis, 
                 knowledge_entries, 
@@ -193,16 +197,18 @@ async def score_pipeline_state_async(
     state: PipelineState,
     weights: Optional[Mapping[str, float]] = None,
     llm_config: Any = None,
+    embed_config: Any = None,
 ) -> Dict[str, Any]:
     """Produce a full scoring report (async — the canonical entry point)."""
     knowledge_entries = _collect_knowledge_entries(state)
 
     hypothesis_scores = [
         await score_hypothesis_async(
-            h, 
-            knowledge_entries, 
-            weights, 
-            llm_config=llm_config, 
+            h,
+            knowledge_entries,
+            weights,
+            llm_config=llm_config,
+            embed_config=embed_config,
             evidence_graph=state.evidence_graph
         )
         for h in state.top_hypotheses
@@ -240,9 +246,12 @@ async def save_scoring_report_async(
     output_dir: str = "./output",
     weights: Optional[Mapping[str, float]] = None,
     llm_config: Any = None,
+    embed_config: Any = None,
 ) -> Path:
-    """Score the pipeline state and save the report as ``{run_id}_scores.json``."""
-    report = await score_pipeline_state_async(state, weights, llm_config=llm_config)
+    """Convenience wrapper to score a state and write the JSON report."""
+    report = await score_pipeline_state_async(
+        state, weights=weights, llm_config=llm_config, embed_config=embed_config
+    )
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{state.run_id}_scores.json"
