@@ -148,6 +148,27 @@ class ScoringConfig(BaseModel):
     auto_score: bool = True  # write {run_id}_scores.json after each run
 
 
+class EmbeddingConfig(BaseModel):
+    """Embedding endpoint used by evidence-consistency evaluation."""
+
+    model_name: str = "text-embedding-v3"
+    api_key_env_var: str = "OPENAI_API_KEY"
+    base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+
+class ConsistencyConfig(BaseModel):
+    similarity_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class EvaluationConfig(BaseModel):
+    """Configuration for novelty and evidence-consistency metrics."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
+    consistency: ConsistencyConfig = Field(default_factory=ConsistencyConfig)
+
+
 class GroundingConfig(BaseModel):
     """Configuration for M3 evidence grounding (full-text → claims → relations).
 
@@ -207,6 +228,7 @@ class PipelineConfig(BaseModel):
 
     # ---- scoring / evaluation ----
     scoring: ScoringConfig = Field(default_factory=ScoringConfig)
+    evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
 
     # ---- persistence ----
     memory_cache_dir: str = ""  # if non-empty, M3 persists knowledge graph here
@@ -306,23 +328,8 @@ class PipelineConfig(BaseModel):
 
 
 # ============================================================================
-# Task C.5: Evaluation & Ablation Configs
+# Task C.5: Ablation Configs
 # ============================================================================
-
-class EmbeddingConfig(BaseModel):
-    model_name: str = "text-embedding-v3"
-    api_key_env_var: str = "OPENAI_API_KEY"
-    base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-
-class ConsistencyConfig(BaseModel):
-    similarity_threshold: float = 0.5
-
-class EvaluationConfig(BaseModel):
-    """Configuration for metrics evaluation (Novelty, Consistency, etc)."""
-    model_config = ConfigDict(extra="forbid")
-
-    embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
-    consistency: ConsistencyConfig = Field(default_factory=ConsistencyConfig)
 
 class AblationConfig(BaseModel):
     """Strict configuration for running the ablation matrix script."""

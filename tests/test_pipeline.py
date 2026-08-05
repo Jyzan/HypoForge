@@ -44,6 +44,22 @@ def test_default_config_loads():
     assert config.enabled_modules == ["m1", "m2", "m3", "m4", "m5", "m6"]
     assert config.max_iterations == 3
     assert config.search.implementation == "legacy"
+    assert config.evaluation.embedding.model_name == "text-embedding-v3"
+    assert config.evaluation.consistency.similarity_threshold == 0.5
+
+
+def test_pipeline_evaluation_config_is_validated() -> None:
+    config = PipelineConfig(evaluation={
+        "embedding": {"model_name": "custom-embedding"},
+        "consistency": {"similarity_threshold": 0.42},
+    })
+
+    assert config.evaluation.embedding.model_name == "custom-embedding"
+    assert config.evaluation.consistency.similarity_threshold == 0.42
+    with pytest.raises(ValidationError):
+        PipelineConfig(evaluation={
+            "consistency": {"similarity_threshold": 1.1},
+        })
 
 
 def test_agentic_search_implementation_is_explicitly_supported() -> None:
