@@ -326,13 +326,14 @@ class GraphMetricBase(MetricProtocol):
             logger.warning("Failed to decompose hypothesis during fallback: %s", exc)
             return [{"subject": "", "relation": "", "object": "", "claim": hypothesis.statement}]
             
-    def _keyword_search(self, queries: List[str], nodes: List[EvidenceNode]) -> List[EvidenceNode]:
+    def _keyword_search(self, queries: List[str], nodes: List[EvidenceNode], search_metadata: bool = True) -> List[EvidenceNode]:
         """Find all nodes that contain any of the keywords in label or metadata fields.
 
-        Search both ``n.label`` and key text metadata fields (searchable_text,
+        If search_metadata is True, search both ``n.label`` and key text metadata fields (searchable_text,
         quote, summary, normalized_claim) — not just label — so nodes whose
         label is a single word (ENTITY) or a paper title (SOURCE) still match
         when their metadata carries the evidence content.
+        If search_metadata is False, only search the label (useful for strict entity matching).
         """
         if not queries:
             return []
@@ -343,10 +344,11 @@ class GraphMetricBase(MetricProtocol):
         matched = []
         for n in nodes:
             searchable_parts = [n.label.lower()]
-            for key in ("searchable_text", "quote", "summary", "normalized_claim"):
-                value = n.metadata.get(key, "")
-                if isinstance(value, str) and value:
-                    searchable_parts.append(value.lower())
+            if search_metadata:
+                for key in ("searchable_text", "quote", "summary", "normalized_claim"):
+                    value = n.metadata.get(key, "")
+                    if isinstance(value, str) and value:
+                        searchable_parts.append(value.lower())
             
             combined = " ".join(searchable_parts)
             
@@ -425,7 +427,7 @@ class NoveltyMetric(GraphMetricBase):
                 # Remove empty strings from comp
                 comp_clean = [c for c in comp if c]
                 if comp_clean:
-                    matched = self._keyword_search(comp_clean, searchable_nodes)
+                    matched = self._keyword_search(comp_clean, searchable_nodes, search_metadata=False)
                     for n in matched:
                         s_a[n.id] = n
                     start_components_trace.append({
@@ -440,7 +442,7 @@ class NoveltyMetric(GraphMetricBase):
             for comp in object_components:
                 comp_clean = [c for c in comp if c]
                 if comp_clean:
-                    matched = self._keyword_search(comp_clean, searchable_nodes)
+                    matched = self._keyword_search(comp_clean, searchable_nodes, search_metadata=False)
                     group_dict = {n.id: n for n in matched}
                     s_b_groups.append(group_dict)
                     s_b_all.update(group_dict)
@@ -581,7 +583,8 @@ class EvidenceConsistencyMetric(GraphMetricBase):
         super().__init__(llm_config, embed_config)
         self._embed_config = embed_config
         self.embeddings = None
-        self.similarity_threshold = 0.8
+        # Consistency configuration
+        self.similarity_threshold = 0.5
         self._load_embedding_config()
         
     def _load_embedding_config(self):
@@ -665,14 +668,14 @@ Output JSON: {"is_conflict": true/false, "rationale": "..."}"""
                         comp_queries.extend([c for c in comp if isinstance(c, str)])
                     for comp in claim_obj.get("object_components", []):
                         comp_queries.extend([c for c in comp if isinstance(c, str)])
-                    valid_anchors = self._keyword_search(comp_queries, searchable_nodes)
+                    valid_anchors = self._keyword_search(comp_queries, searchable_nodes, search_metadata=True)
             else:
                 comp_queries = []
                 for comp in claim_obj.get("subject_components", []):
                     comp_queries.extend([c for c in comp if isinstance(c, str)])
                 for comp in claim_obj.get("object_components", []):
                     comp_queries.extend([c for c in comp if isinstance(c, str)])
-                valid_anchors = self._keyword_search(comp_queries, searchable_nodes)
+                valid_anchors = self._keyword_search(comp_queries, searchable_nodes, search_metadata=True)
                 
             if not valid_anchors:
                 consistent_count += 1

@@ -4,7 +4,7 @@ evaluation:
     api_key_env_var: "OPENAI_API_KEY"
     base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
   consistency:
-    similarity_threshold: 0.8
+    similarity_threshold: 0.5
 
 ablation:
   questions:
