@@ -601,6 +601,7 @@ class PipelineRunner:
                     self.config.output_dir,
                     self.config.scoring.hypothesis_weights,
                     llm_config=metric_llm_config,
+                    embed_config=self.config.evaluation.model_dump(),
                 )
                 self._record_event(
                     "scoring_completed",

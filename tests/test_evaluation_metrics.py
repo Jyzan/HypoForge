@@ -5,7 +5,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from hypoforge.evaluation.metrics import EvidenceConsistencyMetric, NoveltyMetric
+from hypoforge.evaluation.metrics import (
+    AsyncMaaSEmbeddings,
+    EvidenceConsistencyMetric,
+    NoveltyMetric,
+)
 from hypoforge.state import EvidenceGraph, EvidenceNode, EvidenceNodeType, HypothesisCard
 
 
@@ -43,9 +47,112 @@ async def test_novelty_trace_for_disconnected_entities_is_strict_json() -> None:
 
     assert isinstance(result, tuple)
     score, trace = result
-    assert score == 0.5
+    assert score == 1.0
     assert trace["claims_novelty"][0]["distance"] is None
     json.dumps(trace, allow_nan=False)
+
+
+def test_keyword_search_can_disable_metadata_matching() -> None:
+    metric = NoveltyMetric()
+    node = EvidenceNode(
+        id="A",
+        type=EvidenceNodeType.ENTITY,
+        label="Unrelated entity",
+        metadata={"searchable_text": "Protein A regulates survival"},
+    )
+
+    assert metric._keyword_search(["Protein A"], [node], search_metadata=False) == []
+    assert metric._keyword_search(["Protein A"], [node], search_metadata=True) == [node]
+
+
+@pytest.mark.asyncio
+async def test_novelty_requires_every_composite_entity_component() -> None:
+    metric = NoveltyMetric()
+    metric._client = object()
+    claim = _claim()
+    claim["subject_components"] = [["Protein A"], ["Kinase X"]]
+    claim["object_components"] = [["Protein B"]]
+    metric._decompose_hypothesis = AsyncMock(return_value=[claim])
+    graph = EvidenceGraph(
+        nodes=[
+            EvidenceNode(id="A", type=EvidenceNodeType.ENTITY, label="Protein A"),
+            EvidenceNode(id="B", type=EvidenceNodeType.ENTITY, label="Protein B"),
+        ]
+    )
+
+    score, trace = await metric.compute(_hypothesis(), [], evidence_graph=graph)
+
+    assert score == 1.0
+    assert trace["claims_novelty"][0]["distance"] is None
+    assert trace["claims_novelty"][0]["start_components"][1]["matched_nodes"] == []
+    json.dumps(trace, allow_nan=False)
+
+
+def test_component_queries_fall_back_to_legacy_subject_object_fields() -> None:
+    assert EvidenceConsistencyMetric._claim_component_queries(_claim()) == [
+        "Protein A",
+        "Protein B",
+    ]
+
+
+def test_full_evaluation_config_controls_embedding_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEST_EMBEDDING_API_KEY", "test-key")
+    metric = EvidenceConsistencyMetric(embed_config={
+        "embedding": {
+            "model_name": "embedding-model",
+            "api_key_env_var": "TEST_EMBEDDING_API_KEY",
+            "base_url": "https://embedding.example/v1/",
+        },
+        "consistency": {"similarity_threshold": 0.42},
+    })
+
+    assert metric.similarity_threshold == 0.42
+    assert isinstance(metric.embeddings, AsyncMaaSEmbeddings)
+    assert metric.embeddings.model == "embedding-model"
+    assert metric.embeddings.base_url == "https://embedding.example/v1"
+
+
+@pytest.mark.asyncio
+async def test_embedding_client_replaces_blank_inputs_and_sorts_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    calls: list[dict[str, object]] = []
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "data": [
+                    {"index": 1, "embedding": [2.0]},
+                    {"index": 0, "embedding": [1.0]},
+                ]
+            }
+
+    class _AsyncClient:
+        async def __aenter__(self) -> "_AsyncClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def post(self, url: str, **kwargs: object) -> _Response:
+            calls.append({"url": url, **kwargs})
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _AsyncClient)
+    client = AsyncMaaSEmbeddings("model", "key", "https://example.test/v1/")
+
+    embeddings = await client._call_api(["", "Protein A"])
+
+    assert embeddings == [[1.0], [2.0]]
+    assert calls[0]["url"] == "https://example.test/v1/embeddings"
+    assert calls[0]["json"] == {"model": "model", "input": [" ", "Protein A"]}
 
 
 @pytest.mark.asyncio

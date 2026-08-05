@@ -166,8 +166,9 @@ async def main():
                     # 4. Score State using Track C Scorer
                     try:
                         report = await score_pipeline_state_async(
-                            final_state, 
-                            llm_config=pipeline_cfg.qwen.plus.model_dump()
+                            final_state,
+                            llm_config=pipeline_cfg.qwen.plus.model_dump(),
+                            embed_config=pipeline_cfg.evaluation.model_dump(),
                         )
                     except Exception as e:
                         print(f"      ❌ Scorer crashed: {e}")

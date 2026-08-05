@@ -311,11 +311,11 @@ class PipelineConfig(BaseModel):
 
 class EmbeddingConfig(BaseModel):
     model_name: str = "text-embedding-v3"
-    api_key_env_var: str = "DASHSCOPE_API_KEY"
+    api_key_env_var: str = "OPENAI_API_KEY"
     base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 class ConsistencyConfig(BaseModel):
-    similarity_threshold: float = 0.8
+    similarity_threshold: float = 0.5
 
 class EvaluationConfig(BaseModel):
     """Configuration for metrics evaluation (Novelty, Consistency, etc)."""

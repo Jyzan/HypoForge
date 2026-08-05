@@ -132,7 +132,7 @@ Falsification conditions:
 
     # ── construction ─────────────────────────────────────────────────
 
-    def __init__(self, llm_config: Any = None):
+    def __init__(self, llm_config: Any = None, **kwargs):
         # Lazy import to avoid circularity at module level
         from ..tools.qwen_client import QwenClient  # noqa: F811
         self._client = QwenClient.from_config(llm_config) if llm_config else None
@@ -220,27 +220,32 @@ Falsification conditions:
 # ============================================================================
 
 DECOMPOSE_SYSTEM_PROMPT = """\
-You are a scientific logic analyzer. Your task is to decompose a complex scientific \
-hypothesis into a list of independent, verifiable 'atomic claims'.
+You are a scientific logic analyzer. Your task is to decompose a complex scientific hypothesis into a list of independent, verifiable 'atomic claims'.
 
 Rules:
 1. An atomic claim must assert exactly ONE biological interaction, mechanism, or fact.
 2. Extract the 'subject' (e.g. 'Gene A') and the 'object' (e.g. 'Protein B') of the claim.
 3. IMPORTANT: For both subject and object, provide an array of synonyms ('subject_synonyms' and 'object_synonyms'). This array MUST include common English and Chinese translations, academic aliases, and abbreviations.
-4. Extract the 'relation' (e.g. 'inhibits').
-5. Include the full sentence as 'claim' (it must be self-contained).
-6. Output ONLY a JSON object with the key "claims" containing a list of these objects.
+4. IMPORTANT: The 'subject' and 'object' might be composite phrases (e.g. 'Tau spread to posterior brain regions'). You MUST ALSO break them down into an array of irreducible core conceptual components ('subject_components' and 'object_components'). Each component should be an array of strings representing that core component and its synonyms (including common English/Chinese aliases).
+5. CRITICAL REQUIREMENT FOR COMPONENTS: When extracting components, ONLY extract the CORE biological/physical entities (e.g. specific proteins, genes, cells, brain regions, diseases). You MUST DISCARD granular, meaningless attributes, modifiers, or generic state words such as 'levels', 'concentration', 'activity', 'enzymatic activity', 'pathway', 'accumulation', 'spread', 'vulnerability', 'regional', 'amount', 'expression', etc. For example:
+   - "Aβ42 concentration" -> Core component is ONLY [["Aβ42", "amyloid-beta 42", "淀粉样蛋白β42"]]. Discard "concentration".
+   - "Neuronal cathepsin B activity" -> Core components are [["neuronal", "神经元"], ["cathepsin B", "CatB", "组织蛋白酶B"]]. Discard "activity".
+   - "Tau spread to posterior brain regions" -> Core components are [["Tau", "Tau蛋白"], ["posterior brain regions", "cortex", "后脑区域"]]. Discard "spread".
+6. Extract the 'relation' (e.g. 'inhibits').
+7. Include the full sentence as 'claim' (it must be self-contained).
+8. Output ONLY a JSON object with the key "claims" containing a list of these objects.
 """
 
 class GraphMetricBase(MetricProtocol):
     """Base class for metrics that require the evidence graph and LLM."""
     
-    def __init__(self, llm_config: Any = None):
+    def __init__(self, llm_config: Any = None, embed_config: Any = None):
         # Lazy import to avoid circularity
         from ..tools.qwen_client import QwenClient  # noqa: F811
         self._client = QwenClient.from_config(llm_config) if llm_config else None
+        self._embed_config = embed_config
         
-    async def _decompose_hypothesis(self, hypothesis: HypothesisCard) -> List[Dict[str, str]]:
+    async def _decompose_hypothesis(self, hypothesis: HypothesisCard) -> List[Dict[str, Any]]:
         if not self._client:
             return [{"subject": "", "relation": "", "object": "", "claim": hypothesis.statement}]
             
@@ -254,12 +259,14 @@ class GraphMetricBase(MetricProtocol):
                         "properties": {
                             "subject": {"type": "string"},
                             "subject_synonyms": {"type": "array", "items": {"type": "string"}},
+                            "subject_components": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
                             "relation": {"type": "string"},
                             "object": {"type": "string"},
                             "object_synonyms": {"type": "array", "items": {"type": "string"}},
+                            "object_components": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
                             "claim": {"type": "string"}
                         },
-                        "required": ["subject", "subject_synonyms", "relation", "object", "object_synonyms", "claim"]
+                        "required": ["subject", "subject_synonyms", "subject_components", "relation", "object", "object_synonyms", "object_components", "claim"]
                     }
                 }
             }
@@ -270,7 +277,8 @@ class GraphMetricBase(MetricProtocol):
                 user_prompt=f"Hypothesis: {hypothesis.statement}\nMechanism: {hypothesis.mechanism}",
                 output_schema=schema,
                 max_tokens=2048,
-                temperature=0.1
+                temperature=0.1,
+                disable_thinking=True,
             )
             if isinstance(result, dict) and "claims" in result and result["claims"]:
                 return result["claims"]
@@ -280,53 +288,130 @@ class GraphMetricBase(MetricProtocol):
         # Fallback to manual parsing
         try:
             import json
-            import re
             raw_res = await self._client.chat(
                 system_prompt=DECOMPOSE_SYSTEM_PROMPT,
                 user_prompt=f"Hypothesis: {hypothesis.statement}\nMechanism: {hypothesis.mechanism}\n\nOUTPUT EXACTLY ONE JSON OBJECT WITH A 'claims' ARRAY.",
                 max_tokens=2048,
-                temperature=0.1
+                temperature=0.1,
+                disable_thinking=True
             )
-            match = re.search(r'\{.*\}', raw_res, re.DOTALL)
-            if match:
-                parsed = json.loads(match.group(0))
-                if "claims" in parsed and parsed["claims"]:
-                    return parsed["claims"]
+
+            raw_text = str(raw_res or "").strip()
+            try:
+                parsed = json.loads(raw_text)
+            except json.JSONDecodeError:
+                start_idx = raw_text.find('{')
+                end_idx = raw_text.rfind('}')
+                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                    try:
+                        parsed = json.loads(raw_text[start_idx:end_idx + 1])
+                    except json.JSONDecodeError:
+                        parsed = {}
+                else:
+                    parsed = {}
+
+            if isinstance(parsed, dict) and "claims" in parsed and parsed["claims"]:
+                return parsed["claims"]
             logger.warning("Manual fallback failed to find valid claims array.")
             return [{"subject": "", "relation": "", "object": "", "claim": hypothesis.statement}]
         except Exception as exc:
             logger.warning("Failed to decompose hypothesis during fallback: %s", exc)
             return [{"subject": "", "relation": "", "object": "", "claim": hypothesis.statement}]
+
+    @staticmethod
+    def _claim_components(claim: Dict[str, Any], side: str) -> List[List[str]]:
+        """Return normalized component/synonym groups for one claim side."""
+        groups: List[List[str]] = []
+        raw_components = claim.get(f"{side}_components") or []
+        if isinstance(raw_components, (str, bytes)):
+            raw_components = [raw_components]
+        for component in raw_components:
+            values = [component] if isinstance(component, str) else component
+            if not isinstance(values, (list, tuple, set)):
+                continue
+            cleaned = []
+            for value in values:
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if text:
+                    cleaned.append(text)
+            if cleaned:
+                groups.append(cleaned)
+
+        if groups:
+            return groups
+
+        primary = claim.get(f"extracted_{side}", claim.get(side, ""))
+        synonyms = claim.get(f"{side}_synonyms") or []
+        if isinstance(synonyms, str):
+            synonyms = [synonyms]
+        fallback = [primary, *synonyms]
+        cleaned = []
+        for value in fallback:
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                cleaned.append(text)
+        return [cleaned] if cleaned else []
+
+    @classmethod
+    def _claim_component_queries(cls, claim: Dict[str, Any]) -> List[str]:
+        queries: List[str] = []
+        for side in ("subject", "object"):
+            for component in cls._claim_components(claim, side):
+                queries.extend(component)
+        return list(dict.fromkeys(queries))
             
-    def _keyword_search(self, queries: List[str], nodes: List[EvidenceNode]) -> List[EvidenceNode]:
+    def _keyword_search(self, queries: List[str], nodes: List[EvidenceNode], search_metadata: bool = True) -> List[EvidenceNode]:
         """Find all nodes that contain any of the keywords in label or metadata fields.
 
-        Search both ``n.label`` and key text metadata fields (searchable_text,
+        If search_metadata is True, search both ``n.label`` and key text metadata fields (searchable_text,
         quote, summary, normalized_claim) — not just label — so nodes whose
         label is a single word (ENTITY) or a paper title (SOURCE) still match
         when their metadata carries the evidence content.
+        If search_metadata is False, only search the label (useful for strict entity matching).
         """
         if not queries:
             return []
-        queries_lower = [q.lower() for q in queries if q]
+        queries_lower = []
+        for query in queries:
+            if query is None:
+                continue
+            text = str(query).strip().lower()
+            if text:
+                queries_lower.append(text)
         if not queries_lower:
             return []
 
         matched = []
         for n in nodes:
             searchable_parts = [n.label.lower()]
-            for key in ("searchable_text", "quote", "summary", "normalized_claim"):
-                value = n.metadata.get(key, "")
-                if isinstance(value, str) and value:
-                    searchable_parts.append(value.lower())
+            if search_metadata:
+                for key in ("searchable_text", "quote", "summary", "normalized_claim"):
+                    value = n.metadata.get(key, "")
+                    if isinstance(value, str) and value:
+                        searchable_parts.append(value.lower())
+
             combined = " ".join(searchable_parts)
-            if any(q in combined for q in queries_lower):
+
+            # Match Condition 1: Query is a substring of the Node (Query "tau" -> Node "tau pathology")
+            match_q_in_n = any(q in combined for q in queries_lower)
+
+            # Match Condition 2: Node label is a substring of the Query (Query "tau spread..." -> Node "tau")
+            # Only do this for the label itself to prevent massive metadata blocks from matching everything.
+            node_label_lower = n.label.lower()
+            match_n_in_q = any(node_label_lower in q for q in queries_lower) and len(node_label_lower) > 2
+
+            if match_q_in_n or match_n_in_q:
                 matched.append(n)
                 continue
-                
-            meta_str = str(n.metadata).lower()
-            if any(q in meta_str for q in queries_lower):
-                matched.append(n)
+
+            if search_metadata:
+                meta_str = str(n.metadata).lower()
+                if any(q in meta_str for q in queries_lower):
+                    matched.append(n)
                 
         return matched
 
@@ -353,7 +438,10 @@ class NoveltyMetric(GraphMetricBase):
             return 0.0
             
         # [FIX]: Only use ENTITY nodes for keyword matching to avoid false positives and hub short-circuits.
-        searchable_nodes = [n for n in evidence_graph.nodes if n.type == EvidenceNodeType.ENTITY]
+        searchable_nodes = [
+            n for n in evidence_graph.nodes
+            if n.type == EvidenceNodeType.ENTITY
+        ]
         
         # Build networkx graph for fast BFS, omitting conflict edges
         G = nx.Graph()
@@ -368,57 +456,108 @@ class NoveltyMetric(GraphMetricBase):
         total_score = 0.0
         trace_data = {"claims_novelty": []}
         for claim_obj in claims:
-            subject_str = claim_obj.get("subject", "")
-            subject_synonyms = claim_obj.get("subject_synonyms", [])
-            object_str = claim_obj.get("object", "")
-            object_synonyms = claim_obj.get("object_synonyms", [])
+            subject_str = claim_obj.get("extracted_subject", claim_obj.get("subject", ""))
+            object_str = claim_obj.get("extracted_object", claim_obj.get("object", ""))
+
+            subject_components = self._claim_components(claim_obj, "subject")
+            object_components = self._claim_components(claim_obj, "object")
+
+            # 1. Match subject nodes, retaining each required component group.
+            s_a_groups = []
+            s_a_all = {}
+            start_components_trace = []
+            for comp in subject_components:
+                matched = self._keyword_search(
+                    comp, searchable_nodes, search_metadata=False
+                )
+                group = {node.id: node for node in matched}
+                s_a_groups.append(group)
+                s_a_all.update(group)
+                start_components_trace.append({
+                    "component": comp,
+                    "matched_nodes": [
+                        {"id": node.id, "label": node.label} for node in matched
+                    ],
+                })
             
-            s_a_queries = [subject_str] + subject_synonyms
-            s_b_queries = [object_str] + object_synonyms
-            
-            s_a = self._keyword_search(s_a_queries, searchable_nodes)
-            s_b = self._keyword_search(s_b_queries, searchable_nodes)
-            
-            if not s_a or not s_b:
+            # 2. Match s_b nodes grouped by components
+            s_b_groups = []
+            s_b_all = {}
+            end_components_trace = []
+            for comp in object_components:
+                matched = self._keyword_search(
+                    comp, searchable_nodes, search_metadata=False
+                )
+                group = {node.id: node for node in matched}
+                s_b_groups.append(group)
+                s_b_all.update(group)
+                end_components_trace.append({
+                    "component": comp,
+                    "matched_nodes": [
+                        {"id": node.id, "label": node.label} for node in matched
+                    ],
+                })
+
+            missing_component = (
+                not s_a_groups
+                or any(not group for group in s_a_groups)
+                or not s_b_groups
+                or any(not group for group in s_b_groups)
+            )
+            if missing_component:
                 total_score += 1.0  # Concept truly missing from the literature
                 trace_data["claims_novelty"].append({
                     "claim": claim_obj.get("claim", ""),
-                    "start_set": [{"id": n.id, "label": n.label} for n in s_a],
-                    "end_set": [{"id": n.id, "label": n.label} for n in s_b],
+                    "extracted_subject": subject_str,
+                    "extracted_object": object_str,
+                    "start_set": [
+                        {"id": n.id, "label": n.label} for n in s_a_all.values()
+                    ],
+                    "end_set": [
+                        {"id": n.id, "label": n.label} for n in s_b_all.values()
+                    ],
+                    "start_components": start_components_trace,
+                    "end_components": end_components_trace,
                     "distance": None,
                     "score": 1.0,
                 })
                 continue
 
-            # Both subject and object nodes exist in the graph.
-            # If they are in disconnected subgraphs (rule-graph vs grounding-graph),
-            # BFS will find no path, but the concepts clearly exist — score
-            # moderately novel, not fully novel.
-            s_a_ids = {n.id for n in s_a}
-            s_b_ids = {n.id for n in s_b}
+            s_a_ids = set(s_a_all.keys())
 
-            # Shortest path between any node in s_a and any node in s_b
-            min_dist = float('inf')
+            # Shortest path from the start set (s_a) to all reachable nodes
+            distances = {}
             queue = deque([(node_id, 0) for node_id in s_a_ids])
             visited = set(s_a_ids)
+            for node_id in s_a_ids:
+                distances[node_id] = 0
 
             while queue:
                 current_id, dist = queue.popleft()
-                if current_id in s_b_ids:
-                    min_dist = dist
-                    break
 
                 for neighbor in G.neighbors(current_id):
                     if neighbor not in visited:
                         visited.add(neighbor)
+                        distances[neighbor] = dist + 1
                         queue.append((neighbor, dist + 1))
+            # 3. For each group in s_b_groups, find the MIN distance to any node in that group.
+            # Then the overall distance is the MAX of these minimum distances.
+            group_min_distances = []
+            for group in s_b_groups:
+                if not group:
+                    # If a required component is completely missing from the graph
+                    group_min_distances.append(float('inf'))
+                else:
+                    g_min = min((distances.get(node_id, float('inf')) for node_id in group.keys()), default=float('inf'))
+                    group_min_distances.append(g_min)
 
+            min_dist = max(group_min_distances) if group_min_distances else float('inf')
             # Map distance to novelty score.
-            # disconnected subgraphs → 0.5 (concepts exist, not yet linked)
+            # disconnected subgraphs → 1.0 (the proposed relation is absent)
             # short paths → low novelty (already well-explored)
             # long paths → higher novelty (novel connection between distant concepts)
             if math.isinf(min_dist):
-                score = 0.5
+                score = 1.0
             elif min_dist <= 1:
                 score = 0.0
             elif min_dist == 2:
@@ -431,8 +570,16 @@ class NoveltyMetric(GraphMetricBase):
             total_score += score
             trace_data["claims_novelty"].append({
                 "claim": claim_obj.get("claim", ""),
-                "start_set": [{"id": n.id, "label": n.label} for n in s_a],
-                "end_set": [{"id": n.id, "label": n.label} for n in s_b],
+                "extracted_subject": subject_str,
+                "extracted_object": object_str,
+                "start_set": [
+                    {"id": n.id, "label": n.label} for n in s_a_all.values()
+                ],
+                "end_set": [
+                    {"id": n.id, "label": n.label} for n in s_b_all.values()
+                ],
+                "start_components": start_components_trace,
+                "end_components": end_components_trace,
                 # ``None`` serializes as JSON null; Infinity is not valid JSON.
                 "distance": None if math.isinf(min_dist) else min_dist,
                 "score": score
@@ -445,6 +592,61 @@ class NoveltyMetric(GraphMetricBase):
         return [float(result[0] if isinstance(result, tuple) else result) for result in results]
 
 
+class AsyncMaaSEmbeddings:
+    """Minimal async client for OpenAI-compatible embedding endpoints."""
+
+    def __init__(self, model: str, api_key: str, base_url: str):
+        self.model = model
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+
+    async def _call_api(self, inputs: List[str]) -> List[List[float]]:
+        # DashScope rejects perfectly empty input strings with HTTP 400.
+        safe_inputs = []
+        for text in inputs:
+            value = "" if text is None else str(text)
+            safe_inputs.append(value if value.strip() else " ")
+        import httpx
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "input": safe_inputs,
+        }
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self.base_url}/embeddings",
+                headers=headers,
+                json=payload,
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+            # Sort by index just in case
+            embeddings = sorted(data["data"], key=lambda x: x["index"])
+            return [x["embedding"] for x in embeddings]
+
+    async def aembed_query(self, text: str) -> List[float]:
+        res = await self._call_api([text])
+        return res[0]
+
+    async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
+        if not texts:
+            return []
+
+        # Stay comfortably below provider batch limits.
+        batch_size = 5
+        all_embeddings: List[List[float]] = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i+batch_size]
+            res = await self._call_api(batch)
+            all_embeddings.extend(res)
+        return all_embeddings
+
+
 @MetricRegistry.register
 class EvidenceConsistencyMetric(GraphMetricBase):
     metric_name = "evidence_consistency"
@@ -452,31 +654,52 @@ class EvidenceConsistencyMetric(GraphMetricBase):
     independent = True
     implemented = True
 
-    def __init__(self, llm_config: Any = None):
-        super().__init__(llm_config)
+    def __init__(self, llm_config: Any = None, embed_config: Any = None):
+        super().__init__(llm_config, embed_config)
+        self._embed_config = embed_config
         self.embeddings = None
-        self.similarity_threshold = 0.8
+        # Consistency configuration
+        self.similarity_threshold = 0.5
         self._load_embedding_config()
         
     def _load_embedding_config(self):
         try:
-            from pathlib import Path
-            config_path = Path("configs/evaluation.yaml")
-            if config_path.exists():
-                with open(config_path, "r", encoding="utf-8") as f:
-                    cfg = yaml.safe_load(f)
-                    emb_cfg = cfg.get("evaluation", {}).get("embedding", {})
-                    self.similarity_threshold = cfg.get("evaluation", {}).get("consistency", {}).get("similarity_threshold", 0.8)
-                    
-                    if emb_cfg:
-                        from langchain_openai import OpenAIEmbeddings
-                        api_key = os.environ.get(emb_cfg.get("api_key_env_var", "DASHSCOPE_API_KEY"), "")
-                        if api_key:
-                            self.embeddings = OpenAIEmbeddings(
-                                model=emb_cfg.get("model_name", "text-embedding-v3"),
-                                api_key=api_key,
-                                base_url=emb_cfg.get("base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-                            )
+            raw_config = self._embed_config or {}
+            if hasattr(raw_config, "model_dump"):
+                raw_config = raw_config.model_dump()
+            raw_config = raw_config if isinstance(raw_config, dict) else {}
+            if "embedding" in raw_config:
+                emb_cfg = raw_config.get("embedding") or {}
+                consistency_cfg = raw_config.get("consistency") or {}
+                self.similarity_threshold = float(
+                    consistency_cfg.get("similarity_threshold", self.similarity_threshold)
+                )
+            else:
+                emb_cfg = raw_config
+
+            # Fallback to config file if not provided
+            if not emb_cfg:
+                from pathlib import Path
+                config_path = Path("configs/evaluation.yaml")
+                if config_path.exists():
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        cfg = yaml.safe_load(f) or {}
+                        emb_cfg = cfg.get("evaluation", {}).get("embedding", {})
+                        self.similarity_threshold = float(
+                            cfg.get("evaluation", {})
+                            .get("consistency", {})
+                            .get("similarity_threshold", self.similarity_threshold)
+                        )
+
+            if emb_cfg:
+                env_var = emb_cfg.get("api_key_env_var", "OPENAI_API_KEY")
+                api_key = os.environ.get(env_var, "")
+                if api_key:
+                    self.embeddings = AsyncMaaSEmbeddings(
+                        model=emb_cfg.get("model_name", "text-embedding-v3"),
+                        api_key=api_key,
+                        base_url=emb_cfg.get("base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+                    )
         except Exception as e:
             logger.warning(f"Failed to load embedding config: {e}")
 
@@ -499,8 +722,9 @@ class EvidenceConsistencyMetric(GraphMetricBase):
         if not claims:
             return 0.0
             
-        # [FIX]: Only use ENTITY nodes as anchors.
-        searchable_nodes = [n for n in evidence_graph.nodes if n.type == EvidenceNodeType.ENTITY]
+        # We use long sentence nodes (CLAIM, EVIDENCE, LIMITATION, CONFLICT) as anchors to compare against the atomic claims.
+        sentence_types = {EvidenceNodeType.CLAIM, EvidenceNodeType.EVIDENCE, EvidenceNodeType.LIMITATION, EvidenceNodeType.CONFLICT}
+        searchable_nodes = [n for n in evidence_graph.nodes if n.type in sentence_types]
         node_embeddings = []
         if self.embeddings and searchable_nodes:
             texts = [n.label for n in searchable_nodes]
@@ -523,17 +747,21 @@ Output JSON: {"is_conflict": true/false, "rationale": "..."}"""
             if self.embeddings and node_embeddings:
                 try:
                     claim_emb = await self.embeddings.aembed_query(claim_text)
+                    scored_nodes = []
                     for n, n_emb in zip(searchable_nodes, node_embeddings):
                         sim = self._cosine_similarity(claim_emb, n_emb)
                         if sim >= self.similarity_threshold:
-                            valid_anchors.append(n)
+                            scored_nodes.append((sim, n))
+                    # Sort by similarity descending and take top 5
+                    scored_nodes.sort(key=lambda x: x[0], reverse=True)
+                    valid_anchors = [node for sim, node in scored_nodes[:5]]
                 except Exception as e:
                     logger.warning(f"Query embedding failed: {e}")
-                    subject_queries = [claim_obj.get("subject", "")] + claim_obj.get("subject_synonyms", [])
-                    valid_anchors = self._keyword_search(subject_queries, searchable_nodes)
+                    comp_queries = self._claim_component_queries(claim_obj)
+                    valid_anchors = self._keyword_search(comp_queries, searchable_nodes, search_metadata=True)
             else:
-                subject_queries = [claim_obj.get("subject", "")] + claim_obj.get("subject_synonyms", [])
-                valid_anchors = self._keyword_search(subject_queries, searchable_nodes)
+                comp_queries = self._claim_component_queries(claim_obj)
+                valid_anchors = self._keyword_search(comp_queries, searchable_nodes, search_metadata=True)
                 
             if not valid_anchors:
                 consistent_count += 1
