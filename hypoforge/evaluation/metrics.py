@@ -364,9 +364,10 @@ class GraphMetricBase(MetricProtocol):
                 matched.append(n)
                 continue
 
-            meta_str = str(n.metadata).lower()
-            if any(q in meta_str for q in queries_lower):
-                matched.append(n)
+            if search_metadata:
+                meta_str = str(n.metadata).lower()
+                if any(q in meta_str for q in queries_lower):
+                    matched.append(n)
                 
         return matched
 
