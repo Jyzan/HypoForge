@@ -55,6 +55,11 @@ from ..state import (
     PipelineState,
 )
 from ..tools.qwen_client import QwenClient
+from ..vocabulary import (
+    add_runtime_alias,
+    legacy_synonym_map,
+    normalize_entity,
+)
 from .m3_grounding import GroundingWorkflow
 from .m3_grounding.models import (
     AtomicClaim,
@@ -69,59 +74,10 @@ logger = logging.getLogger(__name__)
 # Entity synonym map — normalises common biomedical name variants
 # ============================================================================
 
-# Canonical → {variants}.  Keys are lowercase; values are sets of known
-# aliases (also lowercase).  组员可扩展: add UMLS / MeSH / GO lookups here.
-ENTITY_SYNONYMS: Dict[str, Set[str]] = {
-    "hsp70": {"hsp70", "hspa1a", "hspa1b", "hsp72", "hsp70-1", "heat shock protein 70"},
-    "hsp90": {"hsp90", "hsp90aa1", "hsp90ab1", "hspc1", "heat shock protein 90"},
-    "p53": {"p53", "tp53", "tumor protein p53", "tumour protein p53"},
-    "nf-kb": {"nf-kb", "nfkb", "nf-κb", "nuclear factor kappa b", "nuclear factor κb"},
-    "tnf-α": {"tnf-α", "tnf-alpha", "tnfa", "tnfα", "tumor necrosis factor alpha"},
-    "il-6": {"il-6", "il6", "interleukin-6", "interleukin 6"},
-    "akt": {"akt", "akt1", "pkb", "protein kinase b", "rac-alpha"},
-    "mtor": {"mtor", "mtorc1", "mtorc2", "mammalian target of rapamycin", "frap1"},
-    "ampk": {"ampk", "amp-activated protein kinase", "prkaa1", "prkaa2"},
-    "mapk": {"mapk", "map kinase", "mitogen-activated protein kinase", "erk", "erk1", "erk2"},
-    "nad+": {"nad+", "nad", "nicotinamide adenine dinucleotide"},
-    "ros": {"ros", "reactive oxygen species", "oxidative stress"},
-    "caspase-3": {"caspase-3", "casp3", "caspase 3"},
-    "bcl-2": {"bcl-2", "bcl2", "b-cell lymphoma 2"},
-    "vegf": {"vegf", "vegf-a", "vascular endothelial growth factor"},
-    "egfr": {"egfr", "epidermal growth factor receptor", "erbb1", "her1"},
-    "pi3k": {"pi3k", "phosphatidylinositol 3-kinase", "pi3 kinase", "pik3ca"},
-    "wnt": {"wnt", "wingless", "wnt/β-catenin", "wnt/beta-catenin"},
-    "notch": {"notch", "notch1", "notch signaling"},
-    "hedgehog": {"hedgehog", "shh", "sonic hedgehog", "hh signaling"},
-}
-
-
-def _build_entity_index() -> Dict[str, str]:
-    """Build a lookup mapping every variant → canonical form."""
-    index: Dict[str, str] = {}
-    for canonical, variants in ENTITY_SYNONYMS.items():
-        for variant in variants:
-            index[variant] = canonical
-    return index
-
-
-_ENTITY_INDEX: Dict[str, str] = _build_entity_index()
-
-
-def normalize_entity(name: str) -> str:
-    """Normalize a biomedical entity name to its canonical form.
-
-    Steps:
-    1. Strip whitespace and lowercase.
-    2. Remove trailing punctuation (commas, periods, semicolons).
-    3. Look up in the synonym index.
-    4. Fall back to the cleaned original if no synonym match.
-    """
-    cleaned = name.strip().lower().rstrip(".,;:)-]")
-    # Remove leading punctuation like opening parens
-    cleaned = cleaned.lstrip("([")
-    if cleaned in _ENTITY_INDEX:
-        return _ENTITY_INDEX[cleaned]
-    return cleaned
+# Backward-compatible view.  The source of truth now lives in
+# ``hypoforge/data/science125_vocabulary.json`` and spans all 12 Science-125
+# domains.  Related (but non-equivalent) terms are intentionally excluded.
+ENTITY_SYNONYMS: Dict[str, Set[str]] = legacy_synonym_map()
 
 
 def add_entity_synonym(canonical: str, variant: str) -> None:
@@ -129,7 +85,7 @@ def add_entity_synonym(canonical: str, variant: str) -> None:
     canonical_lower = canonical.strip().lower()
     variant_lower = variant.strip().lower()
     ENTITY_SYNONYMS.setdefault(canonical_lower, set()).add(variant_lower)
-    _ENTITY_INDEX[variant_lower] = canonical_lower
+    add_runtime_alias(canonical_lower, variant_lower)
 
 
 # ============================================================================

@@ -12,6 +12,7 @@ import re
 from collections import Counter
 from typing import Dict, Iterable, List, Sequence, Set
 
+from ...vocabulary import normalize_entity
 from .models import AtomicClaim, EvidenceRecord, RelationPair
 
 
@@ -25,7 +26,9 @@ def _tokens(text: str) -> List[str]:
 
 
 def _normalise_entity(value: str) -> str:
-    return re.sub(r"[^a-z0-9一-鿿]+", "", (value or "").lower())
+    # Reuse M3's central vocabulary so rule-graph deduplication and Track B
+    # relation recall agree on entity identity.
+    return normalize_entity(value)
 
 
 def _normalise(values: Sequence[float]) -> List[float]:

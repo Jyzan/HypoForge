@@ -1,0 +1,2869 @@
+{
+  "version": "2026.08-science125-v1",
+  "policy": "Only aliases are identity-equivalent; related_terms never merge graph nodes.",
+  "entries": [
+    {
+      "id": "mathematics:prime_number",
+      "domain": "mathematics",
+      "preferred": "prime number",
+      "preferred_zh": "素数",
+      "aliases": [
+        "primes",
+        "质数"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        1
+      ],
+      "source_family": "OpenMath"
+    },
+    {
+      "id": "mathematics:navier_stokes_equations",
+      "domain": "mathematics",
+      "preferred": "Navier-Stokes equations",
+      "preferred_zh": "纳维-斯托克斯方程",
+      "aliases": [
+        "N-S equations",
+        "Navier Stokes equations",
+        "NS equations",
+        "纳维-斯托克斯方程组"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        2
+      ],
+      "source_family": "OpenMath"
+    },
+    {
+      "id": "mathematics:riemann_hypothesis",
+      "domain": "mathematics",
+      "preferred": "Riemann hypothesis",
+      "preferred_zh": "黎曼猜想",
+      "aliases": [
+        "RH"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        3
+      ],
+      "source_family": "OpenMath"
+    },
+    {
+      "id": "chemistry:pigment",
+      "domain": "chemistry",
+      "preferred": "pigment",
+      "preferred_zh": "颜料",
+      "aliases": [
+        "colorant",
+        "colouring agent"
+      ],
+      "related_terms": [
+        "色素"
+      ],
+      "question_numbers": [
+        4
+      ],
+      "source_family": "ChEBI/IUPAC"
+    },
+    {
+      "id": "chemistry:periodic_table",
+      "domain": "chemistry",
+      "preferred": "periodic table",
+      "preferred_zh": "元素周期表",
+      "aliases": [
+        "periodic table of elements"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        5
+      ],
+      "source_family": "ChEBI/IUPAC"
+    },
+    {
+      "id": "chemistry:interface",
+      "domain": "chemistry",
+      "preferred": "interface",
+      "preferred_zh": "界面",
+      "aliases": [
+        "相界面"
+      ],
+      "related_terms": [
+        "boundary surface",
+        "interphase"
+      ],
+      "question_numbers": [
+        6
+      ],
+      "source_family": "ChEBI/IUPAC"
+    },
+    {
+      "id": "chemistry:energy_storage",
+      "domain": "chemistry",
+      "preferred": "energy storage",
+      "preferred_zh": "储能",
+      "aliases": [
+        "能量存储"
+      ],
+      "related_terms": [
+        "electrochemical energy storage"
+      ],
+      "question_numbers": [
+        7
+      ],
+      "source_family": "ChEBI/IUPAC"
+    },
+    {
+      "id": "chemistry:chirality",
+      "domain": "chemistry",
+      "preferred": "chirality",
+      "preferred_zh": "手性",
+      "aliases": [
+        "手性"
+      ],
+      "related_terms": [
+        "handedness",
+        "optical activity",
+        "旋光性"
+      ],
+      "question_numbers": [
+        8
+      ],
+      "source_family": "ChEBI/IUPAC"
+    },
+    {
+      "id": "chemistry:plastic_waste",
+      "domain": "chemistry",
+      "preferred": "plastic waste",
+      "preferred_zh": "塑料废弃物",
+      "aliases": [
+        "polymer waste",
+        "塑料垃圾"
+      ],
+      "related_terms": [
+        "plastic pollution"
+      ],
+      "question_numbers": [
+        9
+      ],
+      "source_family": "ChEBI/IUPAC"
+    },
+    {
+      "id": "chemistry:artificial_intelligence",
+      "domain": "chemistry",
+      "preferred": "artificial intelligence",
+      "preferred_zh": "人工智能",
+      "aliases": [
+        "AI"
+      ],
+      "related_terms": [
+        "machine learning in chemistry"
+      ],
+      "question_numbers": [
+        10
+      ],
+      "source_family": "ChEBI/IUPAC"
+    },
+    {
+      "id": "chemistry:living_material",
+      "domain": "chemistry",
+      "preferred": "living material",
+      "preferred_zh": "生命材料",
+      "aliases": [
+        "ELM",
+        "engineered living material",
+        "engineered living materials",
+        "living materials"
+      ],
+      "related_terms": [
+        "活性材料"
+      ],
+      "question_numbers": [
+        11
+      ],
+      "source_family": "ChEBI/IUPAC"
+    },
+    {
+      "id": "chemistry:reproduction",
+      "domain": "chemistry",
+      "preferred": "reproduction",
+      "preferred_zh": "繁殖",
+      "aliases": [],
+      "related_terms": [
+        "biological reproduction",
+        "self-replication",
+        "生殖"
+      ],
+      "question_numbers": [
+        12
+      ],
+      "source_family": "ChEBI/IUPAC"
+    },
+    {
+      "id": "medicine_health:disease_prediction",
+      "domain": "medicine_health",
+      "preferred": "disease prediction",
+      "preferred_zh": "疾病预测",
+      "aliases": [],
+      "related_terms": [
+        "epidemic forecasting",
+        "outbreak prediction"
+      ],
+      "question_numbers": [
+        13
+      ],
+      "source_family": "UMLS/MeSH"
+    },
+    {
+      "id": "medicine_health:pandemic",
+      "domain": "medicine_health",
+      "preferred": "pandemic",
+      "preferred_zh": "大流行病",
+      "aliases": [
+        "pandemics"
+      ],
+      "related_terms": [
+        "global epidemic"
+      ],
+      "question_numbers": [
+        13
+      ],
+      "source_family": "UMLS/MeSH"
+    },
+    {
+      "id": "medicine_health:drug_design",
+      "domain": "medicine_health",
+      "preferred": "drug design",
+      "preferred_zh": "药物设计",
+      "aliases": [
+        "computer-aided drug design",
+        "rational drug design"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        14
+      ],
+      "source_family": "UMLS/MeSH"
+    },
+    {
+      "id": "medicine_health:personalized_medicine",
+      "domain": "medicine_health",
+      "preferred": "personalized medicine",
+      "preferred_zh": "个性化医疗",
+      "aliases": [
+        "individualized medicine",
+        "个体化医疗"
+      ],
+      "related_terms": [
+        "customized medicine",
+        "precision medicine"
+      ],
+      "question_numbers": [
+        14
+      ],
+      "source_family": "UMLS/MeSH"
+    },
+    {
+      "id": "medicine_health:common_cold",
+      "domain": "medicine_health",
+      "preferred": "common cold",
+      "preferred_zh": "普通感冒",
+      "aliases": [
+        "acute coryza"
+      ],
+      "related_terms": [
+        "nasopharyngitis"
+      ],
+      "question_numbers": [
+        15
+      ],
+      "source_family": "UMLS/MeSH"
+    },
+    {
+      "id": "medicine_health:organ_regeneration",
+      "domain": "medicine_health",
+      "preferred": "organ regeneration",
+      "preferred_zh": "器官再生",
+      "aliases": [],
+      "related_terms": [],
+      "question_numbers": [
+        16
+      ],
+      "source_family": "UMLS/MeSH"
+    },
+    {
+      "id": "medicine_health:tissue_regeneration",
+      "domain": "medicine_health",
+      "preferred": "tissue regeneration",
+      "preferred_zh": "组织再生",
+      "aliases": [],
+      "related_terms": [
+        "biological regeneration",
+        "regeneration"
+      ],
+      "question_numbers": [
+        16
+      ],
+      "source_family": "UMLS/MeSH"
+    },
+    {
+      "id": "medicine_health:immune_homeostasis",
+      "domain": "medicine_health",
+      "preferred": "immune homeostasis",
+      "preferred_zh": "免疫稳态",
+      "aliases": [
+        "immunologic homeostasis"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        17
+      ],
+      "source_family": "UMLS/MeSH"
+    },
+    {
+      "id": "medicine_health:vaccines",
+      "domain": "medicine_health",
+      "preferred": "vaccines",
+      "preferred_zh": "疫苗",
+      "aliases": [
+        "vaccine"
+      ],
+      "related_terms": [
+        "immunization agents"
+      ],
+      "question_numbers": [
+        18
+      ],
+      "source_family": "UMLS/MeSH"
+    },
+    {
+      "id": "medicine_health:autism_spectrum_disorder",
+      "domain": "medicine_health",
+      "preferred": "autism spectrum disorder",
+      "preferred_zh": "自闭症谱系障碍",
+      "aliases": [
+        "ASD"
+      ],
+      "related_terms": [
+        "autism",
+        "autistic disorder"
+      ],
+      "question_numbers": [
+        19
+      ],
+      "source_family": "UMLS/MeSH"
+    },
+    {
+      "id": "medicine_health:etiology",
+      "domain": "medicine_health",
+      "preferred": "etiology",
+      "preferred_zh": "病因学",
+      "aliases": [
+        "aetiology"
+      ],
+      "related_terms": [
+        "causation"
+      ],
+      "question_numbers": [
+        19
+      ],
+      "source_family": "UMLS/MeSH"
+    },
+    {
+      "id": "medicine_health:drug_resistance_microbial",
+      "domain": "medicine_health",
+      "preferred": "drug resistance, microbial",
+      "preferred_zh": "微生物耐药性",
+      "aliases": [
+        "AMR",
+        "antimicrobial resistance"
+      ],
+      "related_terms": [
+        "antibiotic resistance"
+      ],
+      "question_numbers": [
+        20
+      ],
+      "source_family": "UMLS/MeSH"
+    },
+    {
+      "id": "medicine_health:medicine_traditional_chinese",
+      "domain": "medicine_health",
+      "preferred": "medicine, traditional chinese",
+      "preferred_zh": "中医学",
+      "aliases": [
+        "TCM",
+        "traditional chinese medicine"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        21
+      ],
+      "source_family": "UMLS/MeSH"
+    },
+    {
+      "id": "medicine_health:meridians",
+      "domain": "medicine_health",
+      "preferred": "meridians",
+      "preferred_zh": "经络",
+      "aliases": [],
+      "related_terms": [
+        "jing-luo",
+        "meridian system"
+      ],
+      "question_numbers": [
+        21
+      ],
+      "source_family": "UMLS/MeSH"
+    },
+    {
+      "id": "medicine_health:microbiota",
+      "domain": "medicine_health",
+      "preferred": "microbiota",
+      "preferred_zh": "微生物群",
+      "aliases": [
+        "微生物群落"
+      ],
+      "related_terms": [
+        "gut flora",
+        "human microbiome",
+        "microbiome"
+      ],
+      "question_numbers": [
+        22
+      ],
+      "source_family": "UMLS/MeSH"
+    },
+    {
+      "id": "medicine_health:tissue_and_organ_procurement",
+      "domain": "medicine_health",
+      "preferred": "tissue and organ procurement",
+      "preferred_zh": "组织和器官获取",
+      "aliases": [],
+      "related_terms": [
+        "donor organs",
+        "organ donation"
+      ],
+      "question_numbers": [
+        23
+      ],
+      "source_family": "UMLS/MeSH"
+    },
+    {
+      "id": "medicine_health:xenotransplantation",
+      "domain": "medicine_health",
+      "preferred": "xenotransplantation",
+      "preferred_zh": "异种移植",
+      "aliases": [
+        "heterotransplantation"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        23
+      ],
+      "source_family": "UMLS/MeSH"
+    },
+    {
+      "id": "biology:ocean_conservation",
+      "domain": "biology",
+      "preferred": "ocean conservation",
+      "preferred_zh": "海洋保护",
+      "aliases": [],
+      "related_terms": [
+        "marine conservation",
+        "ocean preservation",
+        "海洋保育",
+        "海洋生态保护"
+      ],
+      "question_numbers": [
+        24
+      ],
+      "source_family": "GO/ChEBI/NCBI"
+    },
+    {
+      "id": "biology:aging",
+      "domain": "biology",
+      "preferred": "aging",
+      "preferred_zh": "衰老",
+      "aliases": [
+        "ageing",
+        "biological aging",
+        "老化"
+      ],
+      "related_terms": [
+        "cellular senescence",
+        "senescence",
+        "细胞衰老"
+      ],
+      "question_numbers": [
+        25
+      ],
+      "source_family": "GO/ChEBI/NCBI"
+    },
+    {
+      "id": "biology:genome_size",
+      "domain": "biology",
+      "preferred": "genome size",
+      "preferred_zh": "基因组大小",
+      "aliases": [
+        "C-value",
+        "C值"
+      ],
+      "related_terms": [
+        "genome size variation",
+        "基因组规模"
+      ],
+      "question_numbers": [
+        26
+      ],
+      "source_family": "GO/ChEBI/NCBI"
+    },
+    {
+      "id": "biology:cell_differentiation",
+      "domain": "biology",
+      "preferred": "cell differentiation",
+      "preferred_zh": "细胞分化",
+      "aliases": [
+        "cellular differentiation"
+      ],
+      "related_terms": [
+        "cell fate determination",
+        "细胞命运决定",
+        "细胞特化"
+      ],
+      "question_numbers": [
+        27
+      ],
+      "source_family": "GO/ChEBI/NCBI"
+    },
+    {
+      "id": "biology:human_specific_gene",
+      "domain": "biology",
+      "preferred": "human-specific gene",
+      "preferred_zh": "人类特有基因",
+      "aliases": [],
+      "related_terms": [
+        "HAR",
+        "human accelerated region",
+        "human lineage-specific gene",
+        "人科特有基因",
+        "人类加速区"
+      ],
+      "question_numbers": [
+        28
+      ],
+      "source_family": "GO/ChEBI/NCBI"
+    },
+    {
+      "id": "biology:cancer_therapy",
+      "domain": "biology",
+      "preferred": "cancer therapy",
+      "preferred_zh": "癌症治疗",
+      "aliases": [
+        "tumor therapy",
+        "tumour therapy",
+        "肿瘤疗法"
+      ],
+      "related_terms": [
+        "oncology treatment",
+        "抗癌治疗"
+      ],
+      "question_numbers": [
+        29
+      ],
+      "source_family": "GO/ChEBI/NCBI"
+    },
+    {
+      "id": "biology:animal_migration",
+      "domain": "biology",
+      "preferred": "animal migration",
+      "preferred_zh": "动物迁徙",
+      "aliases": [
+        "migratory behavior",
+        "migratory behaviour",
+        "迁徙行为"
+      ],
+      "related_terms": [
+        "navigation",
+        "导航"
+      ],
+      "question_numbers": [
+        30
+      ],
+      "source_family": "GO/ChEBI/NCBI"
+    },
+    {
+      "id": "biology:gigantism",
+      "domain": "biology",
+      "preferred": "gigantism",
+      "preferred_zh": "巨大化",
+      "aliases": [],
+      "related_terms": [
+        "body size evolution",
+        "dinosaur gigantism",
+        "体型演化",
+        "恐龙巨大化"
+      ],
+      "question_numbers": [
+        31
+      ],
+      "source_family": "GO/ChEBI/NCBI"
+    },
+    {
+      "id": "biology:species_richness",
+      "domain": "biology",
+      "preferred": "species richness",
+      "preferred_zh": "物种丰富度",
+      "aliases": [
+        "species count",
+        "物种数量"
+      ],
+      "related_terms": [
+        "biodiversity",
+        "生物多样性"
+      ],
+      "question_numbers": [
+        32
+      ],
+      "source_family": "GO/ChEBI/NCBI"
+    },
+    {
+      "id": "biology:evolution",
+      "domain": "biology",
+      "preferred": "evolution",
+      "preferred_zh": "进化",
+      "aliases": [
+        "biological evolution",
+        "演化"
+      ],
+      "related_terms": [
+        "natural selection",
+        "phylogenesis",
+        "自然选择"
+      ],
+      "question_numbers": [
+        33
+      ],
+      "source_family": "GO/ChEBI/NCBI"
+    },
+    {
+      "id": "biology:de_extinction",
+      "domain": "biology",
+      "preferred": "de-extinction",
+      "preferred_zh": "物种复活",
+      "aliases": [],
+      "related_terms": [
+        "back-breeding",
+        "resurrection biology",
+        "灭绝物种复生",
+        "逆向育种"
+      ],
+      "question_numbers": [
+        34
+      ],
+      "source_family": "GO/ChEBI/NCBI"
+    },
+    {
+      "id": "biology:hybridization",
+      "domain": "biology",
+      "preferred": "hybridization",
+      "preferred_zh": "杂交",
+      "aliases": [
+        "hybridisation",
+        "interbreeding",
+        "种间杂交"
+      ],
+      "related_terms": [
+        "introgression",
+        "基因渗入"
+      ],
+      "question_numbers": [
+        35
+      ],
+      "source_family": "GO/ChEBI/NCBI"
+    },
+    {
+      "id": "biology:domestication",
+      "domain": "biology",
+      "preferred": "domestication",
+      "preferred_zh": "驯化",
+      "aliases": [
+        "家养"
+      ],
+      "related_terms": [
+        "co-evolution",
+        "human-animal bond",
+        "协同进化"
+      ],
+      "question_numbers": [
+        36
+      ],
+      "source_family": "GO/ChEBI/NCBI"
+    },
+    {
+      "id": "biology:emotion",
+      "domain": "biology",
+      "preferred": "emotion",
+      "preferred_zh": "情感",
+      "aliases": [
+        "affect",
+        "情绪"
+      ],
+      "related_terms": [
+        "emotional processing",
+        "情感处理"
+      ],
+      "question_numbers": [
+        37
+      ],
+      "source_family": "GO/ChEBI/NCBI"
+    },
+    {
+      "id": "biology:population_growth",
+      "domain": "biology",
+      "preferred": "population growth",
+      "preferred_zh": "人口增长",
+      "aliases": [],
+      "related_terms": [
+        "carrying capacity",
+        "demographic expansion",
+        "人口扩张",
+        "环境容纳量"
+      ],
+      "question_numbers": [
+        38
+      ],
+      "source_family": "GO/ChEBI/NCBI"
+    },
+    {
+      "id": "biology:somatic_growth",
+      "domain": "biology",
+      "preferred": "somatic growth",
+      "preferred_zh": "躯体生长",
+      "aliases": [],
+      "related_terms": [
+        "epiphyseal closure",
+        "growth cessation",
+        "生长停止",
+        "骨骺闭合"
+      ],
+      "question_numbers": [
+        39
+      ],
+      "source_family": "GO/ChEBI/NCBI"
+    },
+    {
+      "id": "biology:hibernation",
+      "domain": "biology",
+      "preferred": "hibernation",
+      "preferred_zh": "冬眠",
+      "aliases": [
+        "蛰伏"
+      ],
+      "related_terms": [
+        "metabolic depression",
+        "torpor",
+        "代谢抑制"
+      ],
+      "question_numbers": [
+        40
+      ],
+      "source_family": "GO/ChEBI/NCBI"
+    },
+    {
+      "id": "biology:phenotypic_evolution",
+      "domain": "biology",
+      "preferred": "phenotypic evolution",
+      "preferred_zh": "表型进化",
+      "aliases": [],
+      "related_terms": [
+        "morphological change",
+        "physical adaptation",
+        "形态变化",
+        "生理适应"
+      ],
+      "question_numbers": [
+        41
+      ],
+      "source_family": "GO/ChEBI/NCBI"
+    },
+    {
+      "id": "biology:mass_extinction",
+      "domain": "biology",
+      "preferred": "mass extinction",
+      "preferred_zh": "大规模灭绝",
+      "aliases": [
+        "mass extinction event",
+        "大灭绝"
+      ],
+      "related_terms": [
+        "extinction event",
+        "radiation",
+        "灭绝事件",
+        "物种大爆发"
+      ],
+      "question_numbers": [
+        42
+      ],
+      "source_family": "GO/ChEBI/NCBI"
+    },
+    {
+      "id": "biology:genome_editing",
+      "domain": "biology",
+      "preferred": "genome editing",
+      "preferred_zh": "基因组编辑",
+      "aliases": [
+        "gene editing",
+        "基因编辑"
+      ],
+      "related_terms": [
+        "CRISPR-Cas9",
+        "CRISPR技术"
+      ],
+      "question_numbers": [
+        43
+      ],
+      "source_family": "GO/ChEBI/NCBI"
+    },
+    {
+      "id": "biology:synthetic_cell",
+      "domain": "biology",
+      "preferred": "synthetic cell",
+      "preferred_zh": "合成细胞",
+      "aliases": [
+        "artificial cell",
+        "人工细胞"
+      ],
+      "related_terms": [
+        "protocell",
+        "原始细胞"
+      ],
+      "question_numbers": [
+        44
+      ],
+      "source_family": "GO/ChEBI/NCBI"
+    },
+    {
+      "id": "biology:subcellular_organization",
+      "domain": "biology",
+      "preferred": "subcellular organization",
+      "preferred_zh": "亚细胞组织",
+      "aliases": [],
+      "related_terms": [
+        "biomolecular condensate",
+        "organelle assembly",
+        "生物分子凝聚体",
+        "细胞器组装"
+      ],
+      "question_numbers": [
+        45
+      ],
+      "source_family": "GO/ChEBI/NCBI"
+    },
+    {
+      "id": "astronomy:spatial_dimension",
+      "domain": "astronomy",
+      "preferred": "spatial dimension",
+      "preferred_zh": "空间维度",
+      "aliases": [
+        "dimension of space",
+        "space dimension",
+        "空间维数"
+      ],
+      "related_terms": [
+        "dimensions",
+        "维度"
+      ],
+      "question_numbers": [
+        46
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:shape_of_the_universe",
+      "domain": "astronomy",
+      "preferred": "shape of the universe",
+      "preferred_zh": "宇宙形状",
+      "aliases": [
+        "global geometry of the universe",
+        "universe geometry",
+        "宇宙几何"
+      ],
+      "related_terms": [
+        "cosmic topology",
+        "宇宙拓扑"
+      ],
+      "question_numbers": [
+        47
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:big_bang",
+      "domain": "astronomy",
+      "preferred": "Big Bang",
+      "preferred_zh": "大爆炸",
+      "aliases": [
+        "Big Bang theory",
+        "大爆炸理论"
+      ],
+      "related_terms": [
+        "primordial explosion"
+      ],
+      "question_numbers": [
+        48
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:orbital_stability",
+      "domain": "astronomy",
+      "preferred": "orbital stability",
+      "preferred_zh": "轨道稳定性",
+      "aliases": [],
+      "related_terms": [
+        "orbital decay",
+        "planetary orbit stability",
+        "行星轨道",
+        "轨道衰减"
+      ],
+      "question_numbers": [
+        49
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:cosmic_expansion",
+      "domain": "astronomy",
+      "preferred": "cosmic expansion",
+      "preferred_zh": "宇宙膨胀",
+      "aliases": [
+        "expansion of the universe",
+        "Hubble expansion",
+        "metric expansion",
+        "哈勃膨胀"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        50
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:fate_of_the_universe",
+      "domain": "astronomy",
+      "preferred": "fate of the universe",
+      "preferred_zh": "宇宙命运",
+      "aliases": [
+        "ultimate fate of the universe"
+      ],
+      "related_terms": [
+        "Big Freeze",
+        "Big Rip",
+        "heat death",
+        "宇宙终结",
+        "热寂"
+      ],
+      "question_numbers": [
+        50
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:planetary_habitability",
+      "domain": "astronomy",
+      "preferred": "planetary habitability",
+      "preferred_zh": "行星宜居性",
+      "aliases": [
+        "exoplanet habitability"
+      ],
+      "related_terms": [
+        "colonization",
+        "habitability",
+        "habitable zone",
+        "宜居带"
+      ],
+      "question_numbers": [
+        51
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:black_hole",
+      "domain": "astronomy",
+      "preferred": "black hole",
+      "preferred_zh": "黑洞",
+      "aliases": [
+        "BH"
+      ],
+      "related_terms": [
+        "event horizon",
+        "stellar black hole",
+        "supermassive black hole"
+      ],
+      "question_numbers": [
+        52
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:composition_of_the_universe",
+      "domain": "astronomy",
+      "preferred": "composition of the universe",
+      "preferred_zh": "宇宙组成",
+      "aliases": [],
+      "related_terms": [
+        "baryonic matter",
+        "cosmic composition",
+        "dark energy",
+        "dark matter",
+        "matter-energy content",
+        "暗物质",
+        "暗能量",
+        "重子物质"
+      ],
+      "question_numbers": [
+        53
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:cosmic_ray",
+      "domain": "astronomy",
+      "preferred": "cosmic ray",
+      "preferred_zh": "宇宙射线",
+      "aliases": [
+        "cosmic rays",
+        "CR"
+      ],
+      "related_terms": [
+        "high-energy particle",
+        "primary cosmic ray",
+        "高能粒子"
+      ],
+      "question_numbers": [
+        54
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:extraterrestrial_life",
+      "domain": "astronomy",
+      "preferred": "extraterrestrial life",
+      "preferred_zh": "地外生命",
+      "aliases": [
+        "alien life",
+        "地外生物"
+      ],
+      "related_terms": [
+        "astrobiology",
+        "biosignature",
+        "SETI",
+        "天体生物学",
+        "生物特征"
+      ],
+      "question_numbers": [
+        55
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:origin_of_mass",
+      "domain": "astronomy",
+      "preferred": "origin of mass",
+      "preferred_zh": "质量起源",
+      "aliases": [],
+      "related_terms": [
+        "electroweak symmetry breaking",
+        "Higgs boson",
+        "Higgs mechanism",
+        "希格斯机制",
+        "希格斯玻色子"
+      ],
+      "question_numbers": [
+        56
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:milky_way",
+      "domain": "astronomy",
+      "preferred": "Milky Way",
+      "preferred_zh": "银河系",
+      "aliases": [
+        "Milky Way Galaxy",
+        "MW",
+        "银河"
+      ],
+      "related_terms": [
+        "Galaxy"
+      ],
+      "question_numbers": [
+        57
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:planck_scale",
+      "domain": "astronomy",
+      "preferred": "Planck scale",
+      "preferred_zh": "普朗克尺度",
+      "aliases": [],
+      "related_terms": [
+        "Planck length",
+        "Planck time",
+        "quantum gravity scale",
+        "smallest scale",
+        "普朗克长度",
+        "量子引力尺度"
+      ],
+      "question_numbers": [
+        58
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:general_relativity",
+      "domain": "astronomy",
+      "preferred": "general relativity",
+      "preferred_zh": "广义相对论",
+      "aliases": [
+        "Einstein's general theory of relativity",
+        "GR",
+        "爱因斯坦广义相对论"
+      ],
+      "related_terms": [
+        "geometric theory of gravitation"
+      ],
+      "question_numbers": [
+        59
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:water",
+      "domain": "astronomy",
+      "preferred": "water",
+      "preferred_zh": "水",
+      "aliases": [
+        "H2O"
+      ],
+      "related_terms": [
+        "liquid water",
+        "solvent",
+        "液态水"
+      ],
+      "question_numbers": [
+        60
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:pulsar",
+      "domain": "astronomy",
+      "preferred": "pulsar",
+      "preferred_zh": "脉冲星",
+      "aliases": [
+        "脉冲星"
+      ],
+      "related_terms": [
+        "magnetar",
+        "rotating neutron star",
+        "中子星",
+        "磁星"
+      ],
+      "question_numbers": [
+        61
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:deep_space_exploration",
+      "domain": "astronomy",
+      "preferred": "deep space exploration",
+      "preferred_zh": "深空探测",
+      "aliases": [],
+      "related_terms": [
+        "human spaceflight",
+        "interplanetary travel",
+        "space propulsion",
+        "星际旅行",
+        "载人航天"
+      ],
+      "question_numbers": [
+        62
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:deep_biosphere",
+      "domain": "astronomy",
+      "preferred": "deep biosphere",
+      "preferred_zh": "深部生物圈",
+      "aliases": [
+        "subsurface biosphere",
+        "地下生物圈"
+      ],
+      "related_terms": [
+        "endoliths",
+        "subsurface life",
+        "地下生命"
+      ],
+      "question_numbers": [
+        63
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:earth",
+      "domain": "astronomy",
+      "preferred": "Earth",
+      "preferred_zh": "地球",
+      "aliases": [
+        "planet Earth"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        64
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:space_settlement",
+      "domain": "astronomy",
+      "preferred": "space settlement",
+      "preferred_zh": "太空定居",
+      "aliases": [
+        "off-world settlement"
+      ],
+      "related_terms": [
+        "planetary evacuation",
+        "space colonization",
+        "离开地球"
+      ],
+      "question_numbers": [
+        64
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:compact_star",
+      "domain": "astronomy",
+      "preferred": "compact star",
+      "preferred_zh": "致密星",
+      "aliases": [
+        "compact stars",
+        "致密天体"
+      ],
+      "related_terms": [
+        "compact object",
+        "degenerate matter",
+        "neutron star",
+        "white dwarf",
+        "简并物质"
+      ],
+      "question_numbers": [
+        65
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:cosmic_neutrino",
+      "domain": "astronomy",
+      "preferred": "cosmic neutrino",
+      "preferred_zh": "宇宙中微子",
+      "aliases": [
+        "cosmic neutrinos"
+      ],
+      "related_terms": [
+        "astrophysical neutrino",
+        "high-energy neutrino",
+        "IceCube",
+        "高能中微子"
+      ],
+      "question_numbers": [
+        66
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:gravity",
+      "domain": "astronomy",
+      "preferred": "gravity",
+      "preferred_zh": "引力",
+      "aliases": [
+        "gravitation",
+        "引力"
+      ],
+      "related_terms": [
+        "gravitational force",
+        "spacetime curvature",
+        "时空弯曲",
+        "重力"
+      ],
+      "question_numbers": [
+        67
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "astronomy:nucleosynthesis",
+      "domain": "astronomy",
+      "preferred": "nucleosynthesis",
+      "preferred_zh": "核合成",
+      "aliases": [
+        "元素核合成"
+      ],
+      "related_terms": [
+        "heavy elements",
+        "r-process",
+        "s-process",
+        "stellar nucleosynthesis",
+        "supernova nucleosynthesis",
+        "元素合成",
+        "重元素"
+      ],
+      "question_numbers": [
+        68
+      ],
+      "source_family": "UAT"
+    },
+    {
+      "id": "physics:diffraction_limit",
+      "domain": "physics",
+      "preferred": "diffraction limit",
+      "preferred_zh": "衍射极限",
+      "aliases": [
+        "Abbe diffraction limit",
+        "阿贝衍射极限"
+      ],
+      "related_terms": [
+        "Abbe limit",
+        "Rayleigh criterion",
+        "瑞利判据",
+        "阿贝极限"
+      ],
+      "question_numbers": [
+        69
+      ],
+      "source_family": "PhySH"
+    },
+    {
+      "id": "physics:high_temperature_superconductivity",
+      "domain": "physics",
+      "preferred": "high-temperature superconductivity",
+      "preferred_zh": "高温超导",
+      "aliases": [
+        "high-Tc superconductivity",
+        "HTS",
+        "高Tc超导"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        70
+      ],
+      "source_family": "PhySH"
+    },
+    {
+      "id": "physics:heat_transfer",
+      "domain": "physics",
+      "preferred": "heat transfer",
+      "preferred_zh": "热传递",
+      "aliases": [
+        "thermal transport",
+        "热输运"
+      ],
+      "related_terms": [
+        "heat conduction",
+        "热传导"
+      ],
+      "question_numbers": [
+        71
+      ],
+      "source_family": "PhySH"
+    },
+    {
+      "id": "physics:collective_motion",
+      "domain": "physics",
+      "preferred": "collective motion",
+      "preferred_zh": "集体运动",
+      "aliases": [],
+      "related_terms": [
+        "active matter",
+        "swarming",
+        "活性物质",
+        "群集行为"
+      ],
+      "question_numbers": [
+        72
+      ],
+      "source_family": "PhySH"
+    },
+    {
+      "id": "physics:speed_of_light",
+      "domain": "physics",
+      "preferred": "speed of light",
+      "preferred_zh": "光速",
+      "aliases": [
+        "vacuum speed of light",
+        "真空光速"
+      ],
+      "related_terms": [
+        "c"
+      ],
+      "question_numbers": [
+        73,
+        79
+      ],
+      "source_family": "PhySH"
+    },
+    {
+      "id": "physics:quantum_uncertainty",
+      "domain": "physics",
+      "preferred": "quantum uncertainty",
+      "preferred_zh": "量子不确定性",
+      "aliases": [
+        "quantum mechanical uncertainty"
+      ],
+      "related_terms": [
+        "Heisenberg uncertainty principle",
+        "uncertainty principle",
+        "不确定性原理",
+        "海森堡不确定性原理"
+      ],
+      "question_numbers": [
+        74
+      ],
+      "source_family": "PhySH"
+    },
+    {
+      "id": "physics:elementary_particle",
+      "domain": "physics",
+      "preferred": "elementary particle",
+      "preferred_zh": "基本粒子",
+      "aliases": [
+        "fundamental particle"
+      ],
+      "related_terms": [
+        "Standard Model particles",
+        "标准模型粒子"
+      ],
+      "question_numbers": [
+        75
+      ],
+      "source_family": "PhySH"
+    },
+    {
+      "id": "physics:arrow_of_time",
+      "domain": "physics",
+      "preferred": "arrow of time",
+      "preferred_zh": "时间箭头",
+      "aliases": [
+        "time's arrow",
+        "时间之箭"
+      ],
+      "related_terms": [
+        "thermodynamic arrow",
+        "time asymmetry",
+        "时间不对称性",
+        "热力学时间箭头"
+      ],
+      "question_numbers": [
+        76
+      ],
+      "source_family": "PhySH"
+    },
+    {
+      "id": "physics:photon",
+      "domain": "physics",
+      "preferred": "photon",
+      "preferred_zh": "光子",
+      "aliases": [
+        "light quantum",
+        "光量子"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        77
+      ],
+      "source_family": "PhySH"
+    },
+    {
+      "id": "physics:bose_einstein_condensate",
+      "domain": "physics",
+      "preferred": "Bose-Einstein condensate",
+      "preferred_zh": "玻色-爱因斯坦凝聚",
+      "aliases": [
+        "BEC",
+        "玻色凝聚体"
+      ],
+      "related_terms": [
+        "玻色凝聚"
+      ],
+      "question_numbers": [
+        78
+      ],
+      "source_family": "PhySH"
+    },
+    {
+      "id": "physics:particle_acceleration",
+      "domain": "physics",
+      "preferred": "particle acceleration",
+      "preferred_zh": "粒子加速",
+      "aliases": [],
+      "related_terms": [
+        "accelerator physics",
+        "加速器物理"
+      ],
+      "question_numbers": [
+        79
+      ],
+      "source_family": "PhySH"
+    },
+    {
+      "id": "physics:computational_simulation",
+      "domain": "physics",
+      "preferred": "computational simulation",
+      "preferred_zh": "计算模拟",
+      "aliases": [
+        "computer simulation",
+        "计算机模拟"
+      ],
+      "related_terms": [
+        "many-body simulation",
+        "numerical simulation",
+        "多体模拟",
+        "数值模拟"
+      ],
+      "question_numbers": [
+        80
+      ],
+      "source_family": "PhySH"
+    },
+    {
+      "id": "physics:incoherent_laser",
+      "domain": "physics",
+      "preferred": "incoherent laser",
+      "preferred_zh": "非相干激光",
+      "aliases": [],
+      "related_terms": [
+        "chaotic laser",
+        "random laser",
+        "混沌激光",
+        "随机激光"
+      ],
+      "question_numbers": [
+        81
+      ],
+      "source_family": "PhySH"
+    },
+    {
+      "id": "physics:quantum_entanglement",
+      "domain": "physics",
+      "preferred": "quantum entanglement",
+      "preferred_zh": "量子纠缠",
+      "aliases": [
+        "entanglement",
+        "量子缠结"
+      ],
+      "related_terms": [
+        "EPR paradox",
+        "EPR佯谬",
+        "many-body entanglement",
+        "多体纠缠"
+      ],
+      "question_numbers": [
+        82
+      ],
+      "source_family": "PhySH"
+    },
+    {
+      "id": "physics:quantum_field_theory",
+      "domain": "physics",
+      "preferred": "quantum field theory",
+      "preferred_zh": "量子场论",
+      "aliases": [
+        "QFT"
+      ],
+      "related_terms": [
+        "field theory",
+        "场论"
+      ],
+      "question_numbers": [
+        82
+      ],
+      "source_family": "PhySH"
+    },
+    {
+      "id": "physics:invisibility_cloak",
+      "domain": "physics",
+      "preferred": "invisibility cloak",
+      "preferred_zh": "隐形斗篷",
+      "aliases": [
+        "cloaking device",
+        "隐身装置"
+      ],
+      "related_terms": [
+        "metamaterial cloaking",
+        "超材料隐身"
+      ],
+      "question_numbers": [
+        83
+      ],
+      "source_family": "PhySH"
+    },
+    {
+      "id": "physics:theory_of_everything",
+      "domain": "physics",
+      "preferred": "theory of everything",
+      "preferred_zh": "万有理论",
+      "aliases": [
+        "TOE"
+      ],
+      "related_terms": [
+        "quantum gravity",
+        "unified field theory",
+        "统一场论",
+        "量子引力"
+      ],
+      "question_numbers": [
+        84
+      ],
+      "source_family": "PhySH"
+    },
+    {
+      "id": "physics:dark_matter",
+      "domain": "physics",
+      "preferred": "dark matter",
+      "preferred_zh": "暗物质",
+      "aliases": [
+        "non-baryonic dark matter",
+        "非重子暗物质"
+      ],
+      "related_terms": [
+        "non-baryonic matter",
+        "非重子物质"
+      ],
+      "question_numbers": [
+        85
+      ],
+      "source_family": "PhySH"
+    },
+    {
+      "id": "physics:quantum_computer_hardware",
+      "domain": "physics",
+      "preferred": "quantum computer hardware",
+      "preferred_zh": "量子计算机硬件",
+      "aliases": [],
+      "related_terms": [
+        "qubit implementation",
+        "superconducting qubits",
+        "trapped ions",
+        "离子阱",
+        "超导量子比特",
+        "量子比特实现"
+      ],
+      "question_numbers": [
+        86
+      ],
+      "source_family": "PhySH"
+    },
+    {
+      "id": "engineering_materials:statistical_invariance",
+      "domain": "engineering_materials",
+      "preferred": "statistical invariance",
+      "preferred_zh": "统计不变性",
+      "aliases": [],
+      "related_terms": [
+        "statistical symmetry"
+      ],
+      "question_numbers": [
+        87
+      ],
+      "source_family": "EMMO"
+    },
+    {
+      "id": "engineering_materials:turbulence",
+      "domain": "engineering_materials",
+      "preferred": "turbulence",
+      "preferred_zh": "湍流",
+      "aliases": [
+        "紊流"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        87
+      ],
+      "source_family": "EMMO"
+    },
+    {
+      "id": "engineering_materials:manufacturing_system",
+      "domain": "engineering_materials",
+      "preferred": "manufacturing system",
+      "preferred_zh": "制造系统",
+      "aliases": [
+        "production system",
+        "生产系统"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        88
+      ],
+      "source_family": "EMMO"
+    },
+    {
+      "id": "engineering_materials:mars",
+      "domain": "engineering_materials",
+      "preferred": "Mars",
+      "preferred_zh": "火星",
+      "aliases": [],
+      "related_terms": [],
+      "question_numbers": [
+        88
+      ],
+      "source_family": "EMMO"
+    },
+    {
+      "id": "engineering_materials:energy_conversion_efficiency",
+      "domain": "engineering_materials",
+      "preferred": "energy conversion efficiency",
+      "preferred_zh": "能源转换效率",
+      "aliases": [
+        "energy-conversion efficiency",
+        "power conversion efficiency"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        89
+      ],
+      "source_family": "EMMO"
+    },
+    {
+      "id": "engineering_materials:autonomous_vehicle",
+      "domain": "engineering_materials",
+      "preferred": "autonomous vehicle",
+      "preferred_zh": "自动驾驶汽车",
+      "aliases": [
+        "AV",
+        "driverless car",
+        "self-driving car",
+        "无人驾驶汽车"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        90
+      ],
+      "source_family": "EMMO"
+    },
+    {
+      "id": "information_science:computer_processing_speed",
+      "domain": "information_science",
+      "preferred": "computer processing speed",
+      "preferred_zh": "计算机处理速度",
+      "aliases": [],
+      "related_terms": [
+        "computational speed",
+        "processing performance",
+        "处理性能",
+        "计算速度"
+      ],
+      "question_numbers": [
+        91
+      ],
+      "source_family": "CSO/ACM CCS"
+    },
+    {
+      "id": "information_science:topological_quantum_computing",
+      "domain": "information_science",
+      "preferred": "topological quantum computing",
+      "preferred_zh": "拓扑量子计算",
+      "aliases": [
+        "topological quantum computation",
+        "TQC"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        92
+      ],
+      "source_family": "CSO/ACM CCS"
+    },
+    {
+      "id": "information_science:dna_data_storage",
+      "domain": "information_science",
+      "preferred": "DNA data storage",
+      "preferred_zh": "DNA数据存储",
+      "aliases": [
+        "DNA information storage",
+        "DNA存储"
+      ],
+      "related_terms": [
+        "molecular data storage",
+        "分子数据存储"
+      ],
+      "question_numbers": [
+        93
+      ],
+      "source_family": "CSO/ACM CCS"
+    },
+    {
+      "id": "information_science:artificial_intelligence_in_healthcare",
+      "domain": "information_science",
+      "preferred": "artificial intelligence in healthcare",
+      "preferred_zh": "医疗人工智能",
+      "aliases": [
+        "AI in medicine",
+        "medical AI",
+        "医学人工智能"
+      ],
+      "related_terms": [
+        "clinical AI",
+        "临床人工智能"
+      ],
+      "question_numbers": [
+        94
+      ],
+      "source_family": "CSO/ACM CCS"
+    },
+    {
+      "id": "neuroscience:consciousness",
+      "domain": "neuroscience",
+      "preferred": "consciousness",
+      "preferred_zh": "意识",
+      "aliases": [],
+      "related_terms": [
+        "awareness",
+        "qualia",
+        "subjective experience"
+      ],
+      "question_numbers": [
+        95
+      ],
+      "source_family": "NeuroLex/NIFSTD"
+    },
+    {
+      "id": "neuroscience:action_potential",
+      "domain": "neuroscience",
+      "preferred": "action potential",
+      "preferred_zh": "动作电位",
+      "aliases": [
+        "nerve impulse",
+        "neuronal spike"
+      ],
+      "related_terms": [
+        "spike"
+      ],
+      "question_numbers": [
+        96
+      ],
+      "source_family": "NeuroLex/NIFSTD"
+    },
+    {
+      "id": "neuroscience:neural_coding",
+      "domain": "neuroscience",
+      "preferred": "neural coding",
+      "preferred_zh": "神经编码",
+      "aliases": [
+        "neuronal code",
+        "neuronal coding"
+      ],
+      "related_terms": [
+        "rate coding",
+        "spike train coding",
+        "temporal coding"
+      ],
+      "question_numbers": [
+        96
+      ],
+      "source_family": "NeuroLex/NIFSTD"
+    },
+    {
+      "id": "neuroscience:memory",
+      "domain": "neuroscience",
+      "preferred": "memory",
+      "preferred_zh": "记忆",
+      "aliases": [
+        "记忆"
+      ],
+      "related_terms": [
+        "engram",
+        "memory trace"
+      ],
+      "question_numbers": [
+        97
+      ],
+      "source_family": "NeuroLex/NIFSTD"
+    },
+    {
+      "id": "neuroscience:sleep",
+      "domain": "neuroscience",
+      "preferred": "sleep",
+      "preferred_zh": "睡眠",
+      "aliases": [
+        "slumber"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        98
+      ],
+      "source_family": "NeuroLex/NIFSTD"
+    },
+    {
+      "id": "neuroscience:addiction",
+      "domain": "neuroscience",
+      "preferred": "addiction",
+      "preferred_zh": "成瘾",
+      "aliases": [
+        "chemical dependency",
+        "drug dependence"
+      ],
+      "related_terms": [
+        "substance use disorder"
+      ],
+      "question_numbers": [
+        99
+      ],
+      "source_family": "NeuroLex/NIFSTD"
+    },
+    {
+      "id": "neuroscience:romantic_love",
+      "domain": "neuroscience",
+      "preferred": "romantic love",
+      "preferred_zh": "浪漫爱情",
+      "aliases": [],
+      "related_terms": [
+        "attachment behavior",
+        "pair bonding"
+      ],
+      "question_numbers": [
+        100
+      ],
+      "source_family": "NeuroLex/NIFSTD"
+    },
+    {
+      "id": "neuroscience:neurodegenerative_disease",
+      "domain": "neuroscience",
+      "preferred": "neurodegenerative disease",
+      "preferred_zh": "神经退行性疾病",
+      "aliases": [
+        "neurodegenerative disorder"
+      ],
+      "related_terms": [
+        "Alzheimer's disease",
+        "neurodegeneration",
+        "Parkinson's disease"
+      ],
+      "question_numbers": [
+        101
+      ],
+      "source_family": "NeuroLex/NIFSTD"
+    },
+    {
+      "id": "neuroscience:handedness",
+      "domain": "neuroscience",
+      "preferred": "handedness",
+      "preferred_zh": "利手性",
+      "aliases": [
+        "利手性"
+      ],
+      "related_terms": [
+        "cerebral lateralization",
+        "lateralization",
+        "left-handedness",
+        "right-handedness"
+      ],
+      "question_numbers": [
+        102
+      ],
+      "source_family": "NeuroLex/NIFSTD"
+    },
+    {
+      "id": "neuroscience:future_event_prediction",
+      "domain": "neuroscience",
+      "preferred": "future event prediction",
+      "preferred_zh": "未来事件预测",
+      "aliases": [
+        "prediction of future events"
+      ],
+      "related_terms": [
+        "predictive processing",
+        "prospection",
+        "预测未来"
+      ],
+      "question_numbers": [
+        103
+      ],
+      "source_family": "NeuroLex/NIFSTD"
+    },
+    {
+      "id": "neuroscience:broca_s_area",
+      "domain": "neuroscience",
+      "preferred": "Broca's area",
+      "preferred_zh": "布罗卡氏区",
+      "aliases": [
+        "Broca area",
+        "布洛卡区"
+      ],
+      "related_terms": [
+        "BA44",
+        "BA45",
+        "inferior frontal gyrus"
+      ],
+      "question_numbers": [
+        104
+      ],
+      "source_family": "NeuroLex/NIFSTD"
+    },
+    {
+      "id": "neuroscience:language_evolution",
+      "domain": "neuroscience",
+      "preferred": "language evolution",
+      "preferred_zh": "语言进化",
+      "aliases": [
+        "evolution of language"
+      ],
+      "related_terms": [
+        "phylogeny of language"
+      ],
+      "question_numbers": [
+        104
+      ],
+      "source_family": "NeuroLex/NIFSTD"
+    },
+    {
+      "id": "neuroscience:speech",
+      "domain": "neuroscience",
+      "preferred": "speech",
+      "preferred_zh": "言语",
+      "aliases": [
+        "spoken language",
+        "言语"
+      ],
+      "related_terms": [
+        "vocalization"
+      ],
+      "question_numbers": [
+        104
+      ],
+      "source_family": "NeuroLex/NIFSTD"
+    },
+    {
+      "id": "neuroscience:wernicke_s_area",
+      "domain": "neuroscience",
+      "preferred": "Wernicke's area",
+      "preferred_zh": "韦尼克氏区",
+      "aliases": [
+        "Wernicke area",
+        "韦尼克区"
+      ],
+      "related_terms": [
+        "superior temporal gyrus"
+      ],
+      "question_numbers": [
+        104
+      ],
+      "source_family": "NeuroLex/NIFSTD"
+    },
+    {
+      "id": "neuroscience:animal_cognition",
+      "domain": "neuroscience",
+      "preferred": "animal cognition",
+      "preferred_zh": "动物认知",
+      "aliases": [
+        "comparative animal cognition"
+      ],
+      "related_terms": [
+        "animal intelligence",
+        "comparative cognition"
+      ],
+      "question_numbers": [
+        105
+      ],
+      "source_family": "NeuroLex/NIFSTD"
+    },
+    {
+      "id": "neuroscience:mental_disorder",
+      "domain": "neuroscience",
+      "preferred": "mental disorder",
+      "preferred_zh": "精神障碍",
+      "aliases": [
+        "mental illness",
+        "psychiatric disorder"
+      ],
+      "related_terms": [
+        "psychopathology"
+      ],
+      "question_numbers": [
+        106
+      ],
+      "source_family": "NeuroLex/NIFSTD"
+    },
+    {
+      "id": "ecology:global_climate_change",
+      "domain": "ecology",
+      "preferred": "global climate change",
+      "preferred_zh": "全球气候变化",
+      "aliases": [
+        "global climatic change"
+      ],
+      "related_terms": [
+        "climate change",
+        "气候变化"
+      ],
+      "question_numbers": [
+        107
+      ],
+      "source_family": "ENVO"
+    },
+    {
+      "id": "ecology:carbon_dioxide",
+      "domain": "ecology",
+      "preferred": "carbon dioxide",
+      "preferred_zh": "二氧化碳",
+      "aliases": [
+        "CO2",
+        "CO₂"
+      ],
+      "related_terms": [
+        "excess carbon dioxide",
+        "过量二氧化碳"
+      ],
+      "question_numbers": [
+        108
+      ],
+      "source_family": "ENVO"
+    },
+    {
+      "id": "ecology:carbon_sequestration",
+      "domain": "ecology",
+      "preferred": "carbon sequestration",
+      "preferred_zh": "碳封存",
+      "aliases": [
+        "carbon storage",
+        "碳储存"
+      ],
+      "related_terms": [
+        "carbon capture and storage",
+        "碳捕获与封存"
+      ],
+      "question_numbers": [
+        108
+      ],
+      "source_family": "ENVO"
+    },
+    {
+      "id": "ecology:earth_s_magnetic_field",
+      "domain": "ecology",
+      "preferred": "Earth's magnetic field",
+      "preferred_zh": "地球磁场",
+      "aliases": [
+        "geomagnetic field",
+        "地磁场"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        109
+      ],
+      "source_family": "ENVO"
+    },
+    {
+      "id": "ecology:geodynamo",
+      "domain": "ecology",
+      "preferred": "geodynamo",
+      "preferred_zh": "地球发电机",
+      "aliases": [],
+      "related_terms": [
+        "dynamo theory",
+        "发电机理论"
+      ],
+      "question_numbers": [
+        109
+      ],
+      "source_family": "ENVO"
+    },
+    {
+      "id": "ecology:earthquake",
+      "domain": "ecology",
+      "preferred": "earthquake",
+      "preferred_zh": "地震",
+      "aliases": [
+        "seismic event"
+      ],
+      "related_terms": [
+        "地震事件"
+      ],
+      "question_numbers": [
+        110
+      ],
+      "source_family": "ENVO"
+    },
+    {
+      "id": "ecology:hurricane",
+      "domain": "ecology",
+      "preferred": "hurricane",
+      "preferred_zh": "飓风",
+      "aliases": [
+        "tropical cyclone"
+      ],
+      "related_terms": [
+        "typhoon",
+        "台风",
+        "热带气旋"
+      ],
+      "question_numbers": [
+        110
+      ],
+      "source_family": "ENVO"
+    },
+    {
+      "id": "ecology:tsunami",
+      "domain": "ecology",
+      "preferred": "tsunami",
+      "preferred_zh": "海啸",
+      "aliases": [
+        "tsunamis"
+      ],
+      "related_terms": [
+        "seismic sea wave",
+        "地震海浪"
+      ],
+      "question_numbers": [
+        110
+      ],
+      "source_family": "ENVO"
+    },
+    {
+      "id": "ecology:ice_sheet",
+      "domain": "ecology",
+      "preferred": "ice sheet",
+      "preferred_zh": "冰盖",
+      "aliases": [
+        "continental ice sheet"
+      ],
+      "related_terms": [
+        "continental glacier",
+        "glacial ice",
+        "冰川冰",
+        "大陆冰川"
+      ],
+      "question_numbers": [
+        111
+      ],
+      "source_family": "ENVO"
+    },
+    {
+      "id": "ecology:sea_level_rise",
+      "domain": "ecology",
+      "preferred": "sea level rise",
+      "preferred_zh": "海平面上升",
+      "aliases": [
+        "global sea level rise"
+      ],
+      "related_terms": [
+        "全球海平面上升"
+      ],
+      "question_numbers": [
+        111
+      ],
+      "source_family": "ENVO"
+    },
+    {
+      "id": "ecology:bioplastic",
+      "domain": "ecology",
+      "preferred": "bioplastic",
+      "preferred_zh": "生物塑料",
+      "aliases": [],
+      "related_terms": [
+        "biodegradable plastic",
+        "environmentally friendly plastic",
+        "可生物降解塑料",
+        "环保塑料"
+      ],
+      "question_numbers": [
+        112
+      ],
+      "source_family": "ENVO"
+    },
+    {
+      "id": "ecology:circular_economy",
+      "domain": "ecology",
+      "preferred": "circular economy",
+      "preferred_zh": "循环经济",
+      "aliases": [],
+      "related_terms": [
+        "closed-loop system",
+        "闭环系统"
+      ],
+      "question_numbers": [
+        113
+      ],
+      "source_family": "ENVO"
+    },
+    {
+      "id": "ecology:recycling",
+      "domain": "ecology",
+      "preferred": "recycling",
+      "preferred_zh": "回收利用",
+      "aliases": [
+        "material recycling"
+      ],
+      "related_terms": [
+        "material recovery",
+        "reuse",
+        "再利用",
+        "材料回收"
+      ],
+      "question_numbers": [
+        113
+      ],
+      "source_family": "ENVO"
+    },
+    {
+      "id": "ecology:maize",
+      "domain": "ecology",
+      "preferred": "maize",
+      "preferred_zh": "玉米",
+      "aliases": [
+        "corn",
+        "Zea mays",
+        "玉蜀黍"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        114
+      ],
+      "source_family": "ENVO"
+    },
+    {
+      "id": "ecology:monoculture",
+      "domain": "ecology",
+      "preferred": "monoculture",
+      "preferred_zh": "单一栽培",
+      "aliases": [
+        "monocropping",
+        "单一种植"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        114
+      ],
+      "source_family": "ENVO"
+    },
+    {
+      "id": "ecology:rice",
+      "domain": "ecology",
+      "preferred": "rice",
+      "preferred_zh": "水稻",
+      "aliases": [
+        "Oryza sativa",
+        "亚洲稻"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        114
+      ],
+      "source_family": "ENVO"
+    },
+    {
+      "id": "ecology:soybean",
+      "domain": "ecology",
+      "preferred": "soybean",
+      "preferred_zh": "大豆",
+      "aliases": [
+        "Glycine max",
+        "soy",
+        "黄豆"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        114
+      ],
+      "source_family": "ENVO"
+    },
+    {
+      "id": "ecology:wheat",
+      "domain": "ecology",
+      "preferred": "wheat",
+      "preferred_zh": "小麦",
+      "aliases": [
+        "Triticum"
+      ],
+      "related_terms": [
+        "小麦属"
+      ],
+      "question_numbers": [
+        114
+      ],
+      "source_family": "ENVO"
+    },
+    {
+      "id": "energy_science:fossil_fuel",
+      "domain": "energy_science",
+      "preferred": "fossil fuel",
+      "preferred_zh": "化石燃料",
+      "aliases": [
+        "fossil fuels",
+        "化石能源"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        115
+      ],
+      "source_family": "OEO"
+    },
+    {
+      "id": "energy_science:hydrogen_energy",
+      "domain": "energy_science",
+      "preferred": "hydrogen energy",
+      "preferred_zh": "氢能",
+      "aliases": [
+        "hydrogen power",
+        "氢能源"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        116
+      ],
+      "source_family": "OEO"
+    },
+    {
+      "id": "energy_science:cold_fusion",
+      "domain": "energy_science",
+      "preferred": "cold fusion",
+      "preferred_zh": "冷聚变",
+      "aliases": [
+        "冷核聚变"
+      ],
+      "related_terms": [
+        "LENR",
+        "low-energy nuclear reaction",
+        "低温核聚变"
+      ],
+      "question_numbers": [
+        117
+      ],
+      "source_family": "OEO"
+    },
+    {
+      "id": "artificial_intelligence:human_intelligence",
+      "domain": "artificial_intelligence",
+      "preferred": "human intelligence",
+      "preferred_zh": "人类智能",
+      "aliases": [
+        "HI"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        118
+      ],
+      "source_family": "AIO/ISO 22989"
+    },
+    {
+      "id": "artificial_intelligence:robot",
+      "domain": "artificial_intelligence",
+      "preferred": "robot",
+      "preferred_zh": "机器人",
+      "aliases": [
+        "robots"
+      ],
+      "related_terms": [
+        "autonomous robot"
+      ],
+      "question_numbers": [
+        119,
+        125
+      ],
+      "source_family": "AIO/ISO 22989"
+    },
+    {
+      "id": "artificial_intelligence:sentience",
+      "domain": "artificial_intelligence",
+      "preferred": "sentience",
+      "preferred_zh": "感知能力",
+      "aliases": [
+        "感知性"
+      ],
+      "related_terms": [
+        "consciousness",
+        "phenomenal consciousness",
+        "意识"
+      ],
+      "question_numbers": [
+        119
+      ],
+      "source_family": "AIO/ISO 22989"
+    },
+    {
+      "id": "artificial_intelligence:artificial_intelligence",
+      "domain": "artificial_intelligence",
+      "preferred": "artificial intelligence",
+      "preferred_zh": "人工智能",
+      "aliases": [
+        "AI"
+      ],
+      "related_terms": [],
+      "question_numbers": [
+        120,
+        124,
+        125
+      ],
+      "source_family": "AIO/ISO 22989"
+    },
+    {
+      "id": "artificial_intelligence:nanorobot",
+      "domain": "artificial_intelligence",
+      "preferred": "nanorobot",
+      "preferred_zh": "纳米机器人",
+      "aliases": [
+        "nanobot"
+      ],
+      "related_terms": [
+        "medical nanorobot",
+        "therapeutic nanobot"
+      ],
+      "question_numbers": [
+        121
+      ],
+      "source_family": "AIO/ISO 22989"
+    },
+    {
+      "id": "artificial_intelligence:brain_computer_interface",
+      "domain": "artificial_intelligence",
+      "preferred": "brain-computer interface",
+      "preferred_zh": "脑机接口",
+      "aliases": [
+        "BCI",
+        "BMI",
+        "brain-machine interface"
+      ],
+      "related_terms": [
+        "neural interface"
+      ],
+      "question_numbers": [
+        122
+      ],
+      "source_family": "AIO/ISO 22989"
+    },
+    {
+      "id": "artificial_intelligence:collective_intelligence",
+      "domain": "artificial_intelligence",
+      "preferred": "collective intelligence",
+      "preferred_zh": "群体智能",
+      "aliases": [
+        "群体智慧"
+      ],
+      "related_terms": [
+        "swarm intelligence",
+        "群智能"
+      ],
+      "question_numbers": [
+        123
+      ],
+      "source_family": "AIO/ISO 22989"
+    },
+    {
+      "id": "artificial_intelligence:quantum_artificial_intelligence",
+      "domain": "artificial_intelligence",
+      "preferred": "quantum artificial intelligence",
+      "preferred_zh": "量子人工智能",
+      "aliases": [
+        "QAI"
+      ],
+      "related_terms": [
+        "QML",
+        "quantum machine learning"
+      ],
+      "question_numbers": [
+        124
+      ],
+      "source_family": "AIO/ISO 22989"
+    },
+    {
+      "id": "artificial_intelligence:computational_creativity",
+      "domain": "artificial_intelligence",
+      "preferred": "computational creativity",
+      "preferred_zh": "计算创造力",
+      "aliases": [
+        "artificial creativity",
+        "machine creativity"
+      ],
+      "related_terms": [
+        "AI creativity"
+      ],
+      "question_numbers": [
+        125
+      ],
+      "source_family": "AIO/ISO 22989"
+    },
+    {
+      "id": "biomedical:akt",
+      "domain": "biomedical",
+      "preferred": "akt",
+      "preferred_zh": "",
+      "aliases": [
+        "akt1",
+        "pkb",
+        "protein kinase b",
+        "rac-alpha"
+      ],
+      "related_terms": [],
+      "question_numbers": [],
+      "source_family": "legacy-curated"
+    },
+    {
+      "id": "biomedical:ampk",
+      "domain": "biomedical",
+      "preferred": "ampk",
+      "preferred_zh": "",
+      "aliases": [
+        "amp-activated protein kinase",
+        "prkaa1",
+        "prkaa2"
+      ],
+      "related_terms": [],
+      "question_numbers": [],
+      "source_family": "legacy-curated"
+    },
+    {
+      "id": "biomedical:bcl-2",
+      "domain": "biomedical",
+      "preferred": "bcl-2",
+      "preferred_zh": "",
+      "aliases": [
+        "bcl2",
+        "b-cell lymphoma 2"
+      ],
+      "related_terms": [],
+      "question_numbers": [],
+      "source_family": "legacy-curated"
+    },
+    {
+      "id": "biomedical:caspase-3",
+      "domain": "biomedical",
+      "preferred": "caspase-3",
+      "preferred_zh": "",
+      "aliases": [
+        "casp3",
+        "caspase 3"
+      ],
+      "related_terms": [],
+      "question_numbers": [],
+      "source_family": "legacy-curated"
+    },
+    {
+      "id": "biomedical:egfr",
+      "domain": "biomedical",
+      "preferred": "egfr",
+      "preferred_zh": "",
+      "aliases": [
+        "epidermal growth factor receptor",
+        "erbb1",
+        "her1"
+      ],
+      "related_terms": [],
+      "question_numbers": [],
+      "source_family": "legacy-curated"
+    },
+    {
+      "id": "biomedical:hedgehog",
+      "domain": "biomedical",
+      "preferred": "hedgehog",
+      "preferred_zh": "",
+      "aliases": [
+        "shh",
+        "sonic hedgehog"
+      ],
+      "related_terms": [],
+      "question_numbers": [],
+      "source_family": "legacy-curated"
+    },
+    {
+      "id": "biomedical:hsp70",
+      "domain": "biomedical",
+      "preferred": "hsp70",
+      "preferred_zh": "",
+      "aliases": [
+        "hspa1a",
+        "hspa1b",
+        "hsp72",
+        "hsp70-1",
+        "heat shock protein 70"
+      ],
+      "related_terms": [],
+      "question_numbers": [],
+      "source_family": "legacy-curated"
+    },
+    {
+      "id": "biomedical:hsp90",
+      "domain": "biomedical",
+      "preferred": "hsp90",
+      "preferred_zh": "",
+      "aliases": [
+        "hsp90aa1",
+        "hsp90ab1",
+        "hspc1",
+        "heat shock protein 90"
+      ],
+      "related_terms": [],
+      "question_numbers": [],
+      "source_family": "legacy-curated"
+    },
+    {
+      "id": "biomedical:il-6",
+      "domain": "biomedical",
+      "preferred": "il-6",
+      "preferred_zh": "",
+      "aliases": [
+        "il6",
+        "interleukin-6",
+        "interleukin 6"
+      ],
+      "related_terms": [],
+      "question_numbers": [],
+      "source_family": "legacy-curated"
+    },
+    {
+      "id": "biomedical:mapk",
+      "domain": "biomedical",
+      "preferred": "mapk",
+      "preferred_zh": "",
+      "aliases": [
+        "map kinase",
+        "mitogen-activated protein kinase"
+      ],
+      "related_terms": [],
+      "question_numbers": [],
+      "source_family": "legacy-curated"
+    },
+    {
+      "id": "biomedical:mtor",
+      "domain": "biomedical",
+      "preferred": "mtor",
+      "preferred_zh": "",
+      "aliases": [
+        "frap1",
+        "mammalian target of rapamycin"
+      ],
+      "related_terms": [],
+      "question_numbers": [],
+      "source_family": "legacy-curated"
+    },
+    {
+      "id": "biomedical:nad+",
+      "domain": "biomedical",
+      "preferred": "nad+",
+      "preferred_zh": "",
+      "aliases": [
+        "nad",
+        "nicotinamide adenine dinucleotide"
+      ],
+      "related_terms": [],
+      "question_numbers": [],
+      "source_family": "legacy-curated"
+    },
+    {
+      "id": "biomedical:nf-kb",
+      "domain": "biomedical",
+      "preferred": "nf-kb",
+      "preferred_zh": "",
+      "aliases": [
+        "nfkb",
+        "nf-κb",
+        "nuclear factor kappa b",
+        "nuclear factor κb"
+      ],
+      "related_terms": [],
+      "question_numbers": [],
+      "source_family": "legacy-curated"
+    },
+    {
+      "id": "biomedical:notch",
+      "domain": "biomedical",
+      "preferred": "notch",
+      "preferred_zh": "",
+      "aliases": [
+        "notch signaling"
+      ],
+      "related_terms": [],
+      "question_numbers": [],
+      "source_family": "legacy-curated"
+    },
+    {
+      "id": "biomedical:p53",
+      "domain": "biomedical",
+      "preferred": "p53",
+      "preferred_zh": "",
+      "aliases": [
+        "tp53",
+        "tumor protein p53",
+        "tumour protein p53"
+      ],
+      "related_terms": [],
+      "question_numbers": [],
+      "source_family": "legacy-curated"
+    },
+    {
+      "id": "biomedical:pi3k",
+      "domain": "biomedical",
+      "preferred": "pi3k",
+      "preferred_zh": "",
+      "aliases": [
+        "phosphatidylinositol 3-kinase",
+        "pi3 kinase"
+      ],
+      "related_terms": [],
+      "question_numbers": [],
+      "source_family": "legacy-curated"
+    },
+    {
+      "id": "biomedical:ros",
+      "domain": "biomedical",
+      "preferred": "ros",
+      "preferred_zh": "",
+      "aliases": [
+        "reactive oxygen species"
+      ],
+      "related_terms": [],
+      "question_numbers": [],
+      "source_family": "legacy-curated"
+    },
+    {
+      "id": "biomedical:tnf-alpha",
+      "domain": "biomedical",
+      "preferred": "tnf-alpha",
+      "preferred_zh": "",
+      "aliases": [
+        "tnf-α",
+        "tnfa",
+        "tnfα",
+        "tumor necrosis factor alpha"
+      ],
+      "related_terms": [],
+      "question_numbers": [],
+      "source_family": "legacy-curated"
+    },
+    {
+      "id": "biomedical:vegf",
+      "domain": "biomedical",
+      "preferred": "vegf",
+      "preferred_zh": "",
+      "aliases": [
+        "vegf-a",
+        "vascular endothelial growth factor"
+      ],
+      "related_terms": [],
+      "question_numbers": [],
+      "source_family": "legacy-curated"
+    },
+    {
+      "id": "biomedical:wnt",
+      "domain": "biomedical",
+      "preferred": "wnt",
+      "preferred_zh": "",
+      "aliases": [
+        "wingless"
+      ],
+      "related_terms": [],
+      "question_numbers": [],
+      "source_family": "legacy-curated"
+    }
+  ]
+}
