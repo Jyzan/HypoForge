@@ -216,14 +216,16 @@ class PipelineConfig(BaseModel):
     verbose: bool = True
     log_level: str = "INFO"  # DEBUG / INFO / WARNING / ERROR
     interactive: bool = False  # solicit human guidance between iterations (the CLI enables this)
+    advanced_model_tiers: bool = False
 
     # ---- pipeline control ----
     enabled_modules: List[str] = Field(
         default_factory=lambda: ["m1", "m2", "m3", "m4", "m5", "m6"]
     )
     max_iterations: int = 3
+    max_evidence_gap_rounds: int = Field(default=1, ge=0, le=5)
     enable_iteration: bool = True
-    iteration_module_target: str = "m4"  # which module receives feedback
+    iteration_module_target: str = "m4"
 
     # ---- iteration core (feature switches — default OFF keeps the 6 baseline
     # configs behaving exactly as before) ----
@@ -258,6 +260,7 @@ class PipelineConfig(BaseModel):
 
     # ---- persistence ----
     memory_cache_dir: str = ""  # if non-empty, M3 persists knowledge graph here
+    entity_cache_dir: str = ".cache/hypoforge"  # stable entity IDs/pair decisions
 
     # ---- M3 grounding (full-text → claims → relations) ----
     grounding: GroundingConfig = Field(default_factory=GroundingConfig)
@@ -273,6 +276,12 @@ class PipelineConfig(BaseModel):
                 "grounding.enabled=true requires search.implementation='agentic' "
                 "because M3 consumes M2KnowledgeExport evidence"
             )
+        if not self.advanced_model_tiers:
+            base = self.qwen.base
+            for tier in (self.qwen.max, self.qwen.plus, self.qwen.turbo):
+                tier.model = base.model
+                tier.api_base = base.api_base
+                tier.api_key = base.api_key
         return self
 
     # ------------------------------------------------------------------
@@ -298,6 +307,10 @@ class PipelineConfig(BaseModel):
             pipeline_raw = raw.pop("pipeline")
             raw.setdefault("enabled_modules", pipeline_raw.get("enabled_modules", ["m1", "m2", "m3", "m4", "m5", "m6"]))
             raw.setdefault("max_iterations", pipeline_raw.get("max_iterations", 3))
+            raw.setdefault(
+                "max_evidence_gap_rounds",
+                pipeline_raw.get("max_evidence_gap_rounds", 1),
+            )
             raw.setdefault("enable_iteration", pipeline_raw.get("enable_iteration", True))
             raw.setdefault("iteration_module_target", pipeline_raw.get("iteration_module_target", "m4"))
             for key in (

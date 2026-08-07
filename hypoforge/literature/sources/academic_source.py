@@ -6,6 +6,7 @@ The legacy tool is called unchanged; only input/output shapes are bridged.
 
 from __future__ import annotations
 
+import math
 from typing import List, Optional
 
 from hypoforge.literature.models import FulltextStatus, PaperRecord, SearchQuery
@@ -25,6 +26,25 @@ def _dict_to_record(d: dict, source_name: str) -> PaperRecord:
     legacy_source = (d.get("source") or "").strip()
     legacy_paper_id = (d.get("paper_id") or "").strip()
     year = d.get("year") or 0
+    external_ids = {
+        str(key): str(value)
+        for key, value in (d.get("external_ids") or {}).items()
+        if value not in (None, "")
+    }
+    pmid = str(d.get("pmid") or external_ids.get("PubMed") or "").strip()
+    pmcid = str(
+        d.get("pmcid") or external_ids.get("PubMedCentral") or ""
+    ).strip()
+    oa_pdf_url = str(d.get("oa_pdf_url") or "").strip()
+    if oa_pdf_url:
+        external_ids["oa_pdf_url"] = oa_pdf_url
+    raw_native_relevance = d.get("retrieval_relevance")
+    rank_scores = {}
+    if (
+        isinstance(raw_native_relevance, (int, float))
+        and math.isfinite(float(raw_native_relevance))
+    ):
+        rank_scores["source_native_relevance"] = float(raw_native_relevance)
 
     if legacy_paper_id:
         if legacy_source == "semantic_scholar":
@@ -56,16 +76,23 @@ def _dict_to_record(d: dict, source_name: str) -> PaperRecord:
         year=year if year else None,
         journal=(d.get("journal") or "").strip(),
         doi=doi,
-        pmid="",
-        pmcid="",
-        external_ids={},
+        pmid=pmid,
+        pmcid=pmcid,
+        external_ids=external_ids,
         citation_count=d.get("citation_count", 0) or 0,
         publication_type="",
-        sources=[source_name],
+        sources=[legacy_source or source_name],
+        is_open_access=(
+            bool(d.get("is_open_access")) if d.get("is_open_access") is not None
+            else None
+        ),
         fulltext_status=(
-            FulltextStatus.ABSTRACT_ONLY if abstract
+            FulltextStatus.PDF_AVAILABLE if oa_pdf_url
+            else FulltextStatus.XML_AVAILABLE if pmcid
+            else FulltextStatus.ABSTRACT_ONLY if abstract
             else FulltextStatus.UNKNOWN
         ),
+        rank_scores=rank_scores,
     )
 
 
@@ -100,6 +127,14 @@ class AcademicSource(LiteratureSourceProtocol):
                 f"{self.backend_name} backend failed: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
+        if (
+            not raw
+            and self.backend_name == "openalex"
+            and not str(getattr(self._tool, "openalex_api_key", "") or "").strip()
+        ):
+            raise AcademicBackendError(
+                "openalex returned zero results and OPENALEX_API_KEY is not configured"
+            )
         records = []
         for row in raw:
             if not any(

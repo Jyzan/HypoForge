@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import os
 from pathlib import Path
 from typing import Any
 
@@ -131,4 +132,6 @@ def build_integrated_search_adapter(
         search_agent=agent,
         reading_workflow=reading_workflow,
         budget=resolved_budget,
+        entity_judge_client=client,
+        entity_embedding_model=os.getenv("EMBEDDING_MODEL", ""),
     )

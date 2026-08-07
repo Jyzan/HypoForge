@@ -41,6 +41,7 @@ from hypoforge.state import (
     EvidenceNodeType,
     EvidenceSufficiencyVerdict,
     FollowupRequest,
+    GraphCorrectionRequest,
     PipelineState,
     ReviewResult,
     ReviewerDimension,
@@ -177,7 +178,7 @@ def test_route_after_m6_priority3_sufficient_and_threshold_met_ends():
     )
     assert _route_after_m6(state, _revisit_config()) == "end"
 
-    # verdict None (switch off / fail-open) counts as sufficient
+    # verdict None while the revisit switch is off counts as sufficient
     state = _state_after_review(score=4.5)
     assert _route_after_m6(state, _revisit_config()) == "end"
 
@@ -187,6 +188,22 @@ def test_route_after_m6_priority4_insufficient_but_stuck_revises_m4():
     even when the score clears the threshold."""
     state = _insufficient_state(score=4.9, search_round=2)
     assert _route_after_m6(state, _revisit_config(max_search_rounds=2)) == "revise_m4"
+
+
+def test_route_after_m6_pending_graph_correction_revises_m3():
+    state = _state_after_review(
+        score=2.0,
+        graph_correction_requests=[GraphCorrectionRequest(
+            request_id="GCR_1",
+            operation="remove_edge",
+            source_node_id="N1",
+            target_node_id="N2",
+            evidence_ids=["EV1"],
+            reason="The cited evidence does not support this relation.",
+        )],
+    )
+
+    assert _route_after_m6(state, PipelineConfig(verbose=False)) == "revise_m3"
 
 
 def test_route_after_m6_low_score_revises_m4():
@@ -837,6 +854,7 @@ def test_build_followup_seed_inherits_only_whitelist_fields():
     assert state.parent_run_id == "parent-1"
     assert state.followup == FollowupRequest(text="追问？", parent_run_id="parent-1")
     assert state.max_iterations == config.max_iterations  # fresh budget
+    assert state.max_evidence_gap_rounds == config.max_evidence_gap_rounds
 
     # --- inherited (whitelist) ---
     assert state.problem_card is not None and state.problem_card.key_entities == ["Hsp70"]

@@ -79,7 +79,7 @@ async def test_reader_returns_validated_evidence_linked_knowledge() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reader_rejects_entries_with_unknown_or_mixed_evidence_ids() -> None:
+async def test_reader_repairs_mixed_ids_without_losing_valid_entries() -> None:
     response = valid_response()
     response["entries"].append(
         {
@@ -96,9 +96,12 @@ async def test_reader_rejects_entries_with_unknown_or_mixed_evidence_ids() -> No
         "question", paper(), [evidence()]
     )
 
-    assert result.knowledge_entries == []
+    assert len(result.knowledge_entries) == 1
+    assert result.knowledge_entries[0].content == "A method claim."
+    assert result.knowledge_entries[0].evidence_ids == ["e1"]
     assert [item.evidence_id for item in result.evidence] == ["e1"]
-    assert any("rejected 2" in item for item in result.errors)
+    assert any("rejected 1" in item for item in result.errors)
+    assert any("repaired" in item for item in result.errors)
 
 
 @pytest.mark.asyncio

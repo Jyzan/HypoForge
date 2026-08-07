@@ -14,7 +14,7 @@ Two prompt families:
 # ============================================================================
 
 M3_BATCH_RELATION_SYSTEM_PROMPT = """\
-You are a biomedical relation extraction engine. Your ONLY task is to \
+You are a cross-disciplinary scientific relation extraction engine. Your ONLY task is to \
 identify typed semantic relationships between the knowledge entries provided.
 
 For each pair of entries that share a meaningful connection, add one edge:
@@ -48,18 +48,18 @@ no extra text — nothing but the JSON."""
 # ============================================================================
 
 M3_RELATION_SYSTEM_PROMPT = """\
-You are a biomedical knowledge graph engineer. Given a set of structured \
+You are a cross-disciplinary scientific knowledge graph engineer. Given a set of structured \
 knowledge entries extracted from the literature, your task is to:
 
 1. **Create nodes** for every Claim, piece of Evidence, Source paper, \
-Limitation, Conflict, and biomedical Entity.
+Limitation, Conflict, and domain entity.
 
 2. **Create typed edges** between nodes:
    - *supports* — evidence supports a claim
    - *contradicts* — evidence contradicts a claim or another piece of evidence
    - *extends* — a claim builds upon / generalises another
    - *limits* — a limitation qualifies a claim
-   - *involves* — a claim or evidence involves a biological entity
+   - *involves* — a claim or evidence involves a domain entity
 
 3. **Categorise knowledge entries** into three buckets:
    - *established_facts* — entries with high-confidence, well-supported claims

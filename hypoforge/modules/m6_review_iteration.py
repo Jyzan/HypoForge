@@ -11,12 +11,14 @@ Output: ``reviews`` appended; ``iteration_count`` incremented.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
 from typing import Any, Dict, List, Optional
 
 from ..observability import emit_event
+from ..graph_context import build_graph_context
 from ..protocol import ModuleProtocol
 from ..prompts.m6_prompts import (
     M6_EVIDENCE_VERDICT_SYSTEM,
@@ -30,11 +32,13 @@ from ..registry import ModuleRegistry
 from ..state import (
     EvidenceGap,
     EvidenceSufficiencyVerdict,
+    GraphCorrectionRequest,
     PipelineState,
     ReviewResult,
     ReviewerDimension,
     make_gap_id,
 )
+from ..task_alignment import assess_task_alignment
 from ..tools.qwen_client import QwenClient
 
 logger = logging.getLogger(__name__)
@@ -45,6 +49,44 @@ class M6ReviewIteration(ModuleProtocol):
     module_name = "m6"
     module_version = "0.1.0"
     description = "Multi-reviewer assessment + iterative refinement decision"
+
+    @staticmethod
+    def _normalise_graph_corrections(
+        review: ReviewResult,
+        *,
+        valid_evidence_ids: set[str],
+        version: int,
+    ) -> List[GraphCorrectionRequest]:
+        if review.dimension.value != "evidence_consistency":
+            return []
+        output: List[GraphCorrectionRequest] = []
+        for request in review.graph_correction_requests:
+            evidence_ids = list(dict.fromkeys(
+                evidence_id for evidence_id in request.evidence_ids
+                if evidence_id in valid_evidence_ids
+            ))
+            request_id = request.request_id.strip()
+            if not request_id:
+                fingerprint = "|".join([
+                    request.operation,
+                    request.source_node_id,
+                    request.target_node_id,
+                    str(request.current_relation or ""),
+                    str(request.proposed_relation or ""),
+                    str(version),
+                ])
+                request_id = "GCR_" + hashlib.sha256(
+                    fingerprint.encode("utf-8")
+                ).hexdigest()[:12]
+            output.append(request.model_copy(update={
+                "request_id": request_id,
+                "evidence_ids": evidence_ids,
+                "requested_by": review.dimension.value,
+                "iteration": version,
+                "status": "pending",
+                "rejection_reason": "",
+            }))
+        return output
 
     # ------------------------------------------------------------------
     # Configurable
@@ -106,10 +148,50 @@ class M6ReviewIteration(ModuleProtocol):
             state.research_plans[0],
         )
         graph = state.evidence_graph
+        graph_context = build_graph_context(state)
+        rendered_graph_context = graph_context.render()
+        valid_evidence_ids = set(graph_context.available_evidence_ids)
+        hypothesis_alignment = assess_task_alignment(
+            state,
+            hypothesis.model_dump_json(exclude={"task_trace"}),
+            subject_text="\n".join([hypothesis.statement, hypothesis.mechanism]),
+            trace=hypothesis.task_trace,
+        )
+        plan_alignment = assess_task_alignment(
+            state,
+            plan.model_dump_json(exclude={"task_trace"}),
+            subject_text=plan.study_subjects,
+            trace=plan.task_trace,
+        )
+        deterministic_alignment_passed = (
+            hypothesis_alignment.passed and plan_alignment.passed
+        )
+        deterministic_alignment_rationale = " ".join(filter(None, [
+            f"Hypothesis: {hypothesis_alignment.rationale}",
+            f"Plan: {plan_alignment.rationale}",
+        ]))
 
-        # Specialist reviewers (LLM); "overall" is computed, not queried.
-        specialist_dims = [d for d in self.reviewer_dims if d != "overall"]
-        new_reviews: List[ReviewResult] = []
+        # Task alignment is a deterministic, independent hard gate. It does
+        # not consume an LLM call and cannot be overridden by a plausible but
+        # off-topic model self-assessment.
+        new_reviews: List[ReviewResult] = [ReviewResult(
+            dimension=ReviewerDimension("task_alignment"),
+            reasoning=deterministic_alignment_rationale,
+            score=5.0 if deterministic_alignment_passed else 1.0,
+            comments="Compared the task contract with the hypothesis and study subject.",
+            suggestions=(
+                "" if deterministic_alignment_passed
+                else "Restore the original research object, domain, and requested task before approval."
+            ),
+            hard_gate_passed=deterministic_alignment_passed,
+            version=version,
+        )]
+
+        # Remaining specialist reviewers use LLMs; "overall" is computed.
+        specialist_dims = [
+            dimension for dimension in self.reviewer_dims
+            if dimension not in {"overall", "task_alignment"}
+        ]
 
         for dim in specialist_dims:
             # Anchor the score (rubric) and force reason-before-score, both
@@ -130,8 +212,13 @@ class M6ReviewIteration(ModuleProtocol):
                 system_prompt=system_prompt,
                 user_prompt=M6_USER_TEMPLATE.format(
                     original_question=state.input_question,
+                    problem_card_json=(
+                        state.problem_card.model_dump_json(indent=2)
+                        if state.problem_card else "{}"
+                    ),
                     hypothesis_json=json.dumps(hypothesis.model_dump(mode="json"), ensure_ascii=False, indent=2),
                     plan_json=json.dumps(plan.model_dump(mode="json"), ensure_ascii=False, indent=2),
+                    graph_context=rendered_graph_context,
                     facts_count=len(graph.established_facts) if graph else 0,
                     conflicts_count=len(graph.conflicts) if graph else 0,
                     gaps_count=len(graph.knowledge_gaps) if graph else 0,
@@ -144,6 +231,35 @@ class M6ReviewIteration(ModuleProtocol):
             payload["dimension"] = dim
             payload["version"] = version
             review = ReviewResult.model_validate(payload)
+            cited_evidence = list(dict.fromkeys(
+                identifier
+                for identifier in review.evidence_ids
+                if identifier in valid_evidence_ids
+            ))
+            updates: Dict[str, Any] = {"evidence_ids": cited_evidence}
+            updates["graph_correction_requests"] = (
+                self._normalise_graph_corrections(
+                    review,
+                    valid_evidence_ids=valid_evidence_ids,
+                    version=version,
+                )
+            )
+            if dim == "evidence_consistency":
+                if not valid_evidence_ids:
+                    updates.update({
+                        "score": 1.0,
+                        "hard_gate_passed": False,
+                        "suggestions": "No auditable evidence IDs are available; return to M2/M3 and fill a searchable evidence gap.",
+                    })
+                elif not cited_evidence:
+                    updates.update({
+                        "score": min(review.score, 2.0),
+                        "hard_gate_passed": False,
+                        "suggestions": "Evidence sufficiency cannot pass without citing at least one canonical evidence ID. " + review.suggestions,
+                    })
+                else:
+                    updates["hard_gate_passed"] = True
+            review = review.model_copy(update=updates)
             new_reviews.append(review)
             emit_event(
                 "tool_completed",
@@ -168,12 +284,28 @@ class M6ReviewIteration(ModuleProtocol):
             )
             specialist_scores = [r.score for r in new_reviews if r.score > 0]
             avg = sum(specialist_scores) / len(specialist_scores) if specialist_scores else 3.0
+            failed_gates = [
+                review.dimension.value
+                for review in new_reviews
+                if review.hard_gate_passed is False
+            ]
+            if failed_gates:
+                avg = min(avg, 1.9 if "task_alignment" in failed_gates else 2.9)
             new_reviews.append(ReviewResult(
                 dimension=ReviewerDimension("overall"),
-                reasoning="Computed as the mean of the specialist reviews.",
+                reasoning=(
+                    "Computed from specialist reviews; hard-gate failures: "
+                    + (", ".join(failed_gates) if failed_gates else "none")
+                ),
                 score=round(avg, 1),
-                comments="Computed from specialist reviews (scientific_logic, evidence_consistency, method_feasibility).",
+                comments="Computed from specialist reviews and capped when task/evidence hard gates fail.",
                 suggestions="See individual dimension reviews for detailed suggestions.",
+                evidence_ids=list(dict.fromkeys(
+                    evidence_id
+                    for review in new_reviews
+                    for evidence_id in review.evidence_ids
+                )),
+                hard_gate_passed=not failed_gates,
                 version=version,
             ))
             emit_event(
@@ -186,12 +318,21 @@ class M6ReviewIteration(ModuleProtocol):
                 details={"version": version, "score": round(avg, 1)},
             )
 
+        correction_by_id = {
+            request.request_id: request.model_copy(deep=True)
+            for request in state.graph_correction_requests
+        }
+        for review in new_reviews:
+            for request in review.graph_correction_requests:
+                correction_by_id[request.request_id] = request
+
         patch: Dict[str, Any] = {
             "reviews": state.reviews + new_reviews,
             "iteration_count": version,
+            "graph_correction_requests": list(correction_by_id.values()),
         }
 
-        # --- iteration core: evidence-sufficiency verdict (fail-open) ---
+        # --- iteration core: evidence-sufficiency verdict (fail-closed) ---
         # Exactly ONE extra structured call, only when the switch is on.
         if self.m6_evidence_revisit:
             verdict = await self._judge_evidence_sufficiency(
@@ -225,12 +366,14 @@ class M6ReviewIteration(ModuleProtocol):
         plan: Any,
         version: int,
     ) -> EvidenceSufficiencyVerdict:
-        """One structured LLM call judging evidence sufficiency.
+        """Judge sufficiency against auditable graph evidence.
 
-        Fail-open by design: any failure / parse error / empty output yields
-        ``sufficient=True, gaps=[]`` so the main flow is never blocked.
+        Empty graphs, missing canonical citations, and judge failures are
+        fail-closed. They produce a bounded, searchable coverage gap instead
+        of silently allowing an unsupported plan to pass.
         """
         graph = state.evidence_graph
+        graph_context = build_graph_context(state)
         started_at = time.monotonic()
         emit_event(
             "tool_started",
@@ -254,6 +397,7 @@ class M6ReviewIteration(ModuleProtocol):
                     facts_count=len(graph.established_facts) if graph else 0,
                     conflicts_count=len(graph.conflicts) if graph else 0,
                     gaps_count=len(graph.knowledge_gaps) if graph else 0,
+                    graph_context=graph_context.render(),
                     hypothesis_json=json.dumps(
                         hypothesis.model_dump(mode="json"), ensure_ascii=False, indent=2
                     ),
@@ -267,18 +411,36 @@ class M6ReviewIteration(ModuleProtocol):
             if not payload:
                 raise ValueError("empty evidence-sufficiency payload")
             verdict = EvidenceSufficiencyVerdict.model_validate(dict(payload))
-        except Exception as exc:  # fail-open: never block the main flow
-            logger.warning("Evidence-sufficiency judge failed open: %s", exc)
+        except Exception as exc:
+            logger.warning("Evidence-sufficiency judge failed closed: %s", exc)
             emit_event(
                 "tool_failed",
                 module="m6",
                 tool="evidence_sufficiency_judge",
                 status="failed",
-                message=f"证据裁决失败（fail-open）：{type(exc).__name__}: {exc}",
+                message=f"证据裁决失败（fail-closed）：{type(exc).__name__}: {exc}",
                 elapsed_seconds=time.monotonic() - started_at,
                 details={"version": version},
             )
-            return EvidenceSufficiencyVerdict(sufficient=True)
+            return EvidenceSufficiencyVerdict(
+                sufficient=False,
+                gaps=[self._coverage_gap(state, version)],
+                rationale=f"Evidence judge failed: {type(exc).__name__}: {exc}",
+            )
+
+        valid_evidence_ids = set(graph_context.available_evidence_ids)
+        verdict.evidence_ids = list(dict.fromkeys(
+            evidence_id for evidence_id in verdict.evidence_ids
+            if evidence_id in valid_evidence_ids
+        ))
+        if verdict.sufficient and not verdict.evidence_ids:
+            verdict.sufficient = False
+            verdict.rationale = " ".join(filter(None, [
+                verdict.rationale,
+                "No canonical supporting evidence ID could be verified.",
+            ]))
+        if not verdict.sufficient and not verdict.gaps:
+            verdict.gaps = [self._coverage_gap(state, version)]
 
         # Normalise gaps CODE-SIDE: gap_id is always recomputed from
         # (target_sub_question, gap_type, canonical_entities) — any id the LLM
@@ -307,6 +469,34 @@ class M6ReviewIteration(ModuleProtocol):
             },
         )
         return verdict
+
+    @staticmethod
+    def _coverage_gap(state: PipelineState, version: int) -> EvidenceGap:
+        """Create a domain-neutral, searchable gap for missing provenance."""
+
+        card = state.problem_card
+        target = (
+            card.sub_questions[0]
+            if card is not None and card.sub_questions
+            else state.input_question
+        )
+        entities: List[str] = []
+        if card is not None:
+            required = [
+                entity.name for entity in card.task_contract.entities
+                if entity.required and entity.name
+            ]
+            entities = list(dict.fromkeys([*required, *card.key_entities]))[:6]
+        query = " ".join([*entities[:3], target]).strip()
+        return EvidenceGap(
+            description=f"Auditable literature evidence is missing for: {target}",
+            gap_type="coverage",
+            canonical_entities=entities,
+            target_sub_question=target,
+            suggested_queries=[query or target],
+            source_review_version=version,
+            status="open",
+        )
 
     @staticmethod
     def _merge_evidence_gaps(
@@ -419,7 +609,11 @@ class M6ReviewIteration(ModuleProtocol):
 
     @classmethod
     def get_input_fields(cls) -> List[str]:
-        return ["top_hypotheses", "research_plans", "evidence_graph", "iteration_count"]
+        return [
+            "top_hypotheses", "research_plans", "evidence_graph", "iteration_count",
+            "problem_card", "grounding_report", "literature_results",
+            "m2_knowledge_export",
+        ]
 
     @classmethod
     def get_output_fields(cls) -> List[str]:

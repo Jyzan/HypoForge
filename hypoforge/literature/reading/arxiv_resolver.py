@@ -204,6 +204,10 @@ class ArxivPDFResolver(FulltextResolverProtocol):
             content_level=ContentLevel.PDF,
             source_uri=source_uri,
             local_path=str(path.resolve()),
+            license=(
+                "Provider-declared Open Access PDF"
+                if paper.external_ids.get("oa_pdf_url") else ""
+            ),
         )
 
     def _abstract_document(self, paper: PaperRecord, error: str) -> DocumentRecord:
@@ -234,15 +238,19 @@ class ArxivPDFResolver(FulltextResolverProtocol):
         """Materialize the real abstract without another network request."""
         return self._abstract_document(
             paper,
-            "arXiv full text unavailable; used abstract",
+            "open-access PDF full text unavailable; used abstract",
         )
 
     async def resolve(self, paper: PaperRecord) -> DocumentRecord:
         arxiv_id = self._arxiv_id(paper)
-        if not arxiv_id:
-            return self._abstract_document(paper, "arXiv identifier unavailable")
-        quoted_id = urllib.parse.quote(arxiv_id, safe="/.")
-        source_uri = f"https://arxiv.org/pdf/{quoted_id}"
+        oa_pdf_url = str(paper.external_ids.get("oa_pdf_url") or "").strip()
+        if oa_pdf_url:
+            source_uri = oa_pdf_url
+        elif arxiv_id:
+            quoted_id = urllib.parse.quote(arxiv_id, safe="/.")
+            source_uri = f"https://arxiv.org/pdf/{quoted_id}"
+        else:
+            return self._abstract_document(paper, "open-access PDF identifier unavailable")
         path = self._paper_dir(paper) / "paper.pdf"
         if self._valid_cached_pdf(path):
             return self._pdf_document(paper, path, source_uri)

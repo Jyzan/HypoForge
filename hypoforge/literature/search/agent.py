@@ -11,6 +11,7 @@ from ...observability import emit_event
 from ..models import (
     CoverageReport,
     PaperRecord,
+    PaperRetentionDecision,
     ScoutNote,
     SearchBudget,
     SearchQuery,
@@ -27,7 +28,7 @@ from ..protocols import (
     ScoutReaderProtocol,
 )
 from .budget import calculate_remaining, choose_stop_reason, estimate_tokens
-from .ranking import rerank_with_scout
+from .ranking import rerank_with_scout, select_retained_papers
 
 
 class _SearchTimeBudgetExpired(TimeoutError):
@@ -43,6 +44,62 @@ class IterativeSearchAgent:
         r"(?i)\b(api[_-]?key|access[_-]?token|token|authorization|password)"
         r"\b(\s*[=:]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s&]+)"
     )
+
+    @staticmethod
+    def _deterministic_relaxations(
+        query: SearchQuery,
+        key_entities: Sequence[str],
+    ) -> list[SearchQuery]:
+        """Build a stable strict→unfielded→unquoted→keyword fallback chain."""
+
+        original = " ".join(query.text.split())
+        candidates: list[str] = []
+        unfielded = re.sub(r"\[[^\]]+\]", "", original)
+        unfielded = re.sub(
+            r"\b(?:title|abstract|author|keyword):", "", unfielded, flags=re.I
+        )
+        candidates.append(" ".join(unfielded.split()))
+        unquoted = re.sub(r'["“”]', "", unfielded)
+        candidates.append(" ".join(unquoted.split()))
+
+        anchors = [" ".join(str(value).split()) for value in key_entities if str(value).strip()]
+        anchor_words = {
+            token.casefold()
+            for anchor in anchors
+            for token in re.findall(r"[\w\-]+", anchor, flags=re.UNICODE)
+        }
+        terms = re.findall(r"[\w\-]+", unquoted, flags=re.UNICODE)
+        removable = [
+            index for index, term in enumerate(terms)
+            if term.casefold() not in anchor_words
+        ]
+        for index in reversed(removable):
+            if len(terms) <= max(3, len(anchor_words)):
+                break
+            terms = terms[:index] + terms[index + 1:]
+            anchored = list(terms)
+            for anchor in anchors:
+                if anchor.casefold() not in " ".join(anchored).casefold():
+                    anchored.append(anchor)
+            candidates.append(" ".join(anchored))
+
+        output: list[SearchQuery] = []
+        seen = {original.casefold()}
+        for index, text in enumerate(candidates, start=1):
+            key = text.casefold()
+            if not text or key in seen:
+                continue
+            seen.add(key)
+            output.append(query.model_copy(update={
+                "query_id": f"{query.query_id}:relax{index}",
+                "text": text,
+                "purpose": f"deterministic fallback: {query.purpose}",
+                "relation_to_question": (
+                    query.relation_to_question
+                    + " Deterministic relaxation with core entities preserved."
+                ),
+            }))
+        return output
 
     def __init__(
         self,
@@ -102,6 +159,7 @@ class IterativeSearchAgent:
         self.clock = clock
         self.stage_clock = stage_clock
         self.token_estimator = token_estimator
+        self._search_cache: dict[tuple[str, str, int], list[PaperRecord]] = {}
 
     async def run(
         self,
@@ -120,6 +178,13 @@ class IterativeSearchAgent:
             key_entities=set(key_entities),
             domains=set(domains),
         )
+        alignment_question = "\n".join(filter(None, [
+            sub_question,
+            "Task entities for this atomic sub-question: " + ", ".join(key_entities)
+            if key_entities else "",
+            "Task domains (context, not mandatory literal keywords): " + ", ".join(domains)
+            if domains else "",
+        ]))
         state.remaining_budget = calculate_remaining(limits, state)
         all_queries: list[SearchQuery] = []
         query_history: set[tuple[str, str]] = set()
@@ -276,6 +341,30 @@ class IterativeSearchAgent:
             except _SearchTimeBudgetExpired as exc:
                 stop_reason = mark_time_budget_expired(exc)
                 break
+            # Empty results use a deterministic relaxation chain before asking
+            # the planner for another stochastic round. Every fallback is
+            # recorded and consumes the same query budget.
+            for original_query, original_result in list(zip(queries, search_results)):
+                if isinstance(original_result, BaseException) or original_result:
+                    continue
+                for relaxed in self._deterministic_relaxations(
+                    original_query, key_entities
+                ):
+                    if state.queries_executed + len(queries) >= limits.max_queries:
+                        break
+                    key = self._query_key(relaxed)
+                    if key in query_history:
+                        continue
+                    query_history.add(key)
+                    queries.append(relaxed)
+                    try:
+                        relaxed_result = await self._search(relaxed)
+                    except BaseException as exc:
+                        search_results.append(exc)
+                        break
+                    search_results.append(relaxed_result)
+                    if relaxed_result:
+                        break
             raw_papers: list[PaperRecord] = []
             successful_queries = 0
             for query, result in zip(queries, search_results):
@@ -290,6 +379,16 @@ class IterativeSearchAgent:
                 source_result_counts[source_name] = (
                     source_result_counts.get(source_name, 0) + len(result)
                 )
+                for paper in result:
+                    providers = {
+                        provider.casefold() for provider in paper.sources
+                    }
+                    if providers and source_name.casefold() not in providers:
+                        for provider in sorted(providers):
+                            fallback_key = f"{source_name}->{provider}"
+                            source_result_counts[fallback_key] = (
+                                source_result_counts.get(fallback_key, 0) + 1
+                            )
                 raw_papers.extend(result)
 
             papers_found += len(raw_papers)
@@ -350,7 +449,7 @@ class IterativeSearchAgent:
                 ranked = await measure(
                     "paper_ranker",
                     self.ranker.rank(
-                        sub_question,
+                        alignment_question,
                         list(candidate_pool.values()),
                         limit=min(self.candidate_limit, limits.max_papers),
                     ),
@@ -381,7 +480,7 @@ class IterativeSearchAgent:
             try:
                 new_scout_notes = await measure(
                     "scout_reader",
-                    self.scout_reader.read(sub_question, papers_needing_scout),
+                    self.scout_reader.read(alignment_question, papers_needing_scout),
                 )
             except _SearchTimeBudgetExpired as exc:
                 stop_reason = mark_time_budget_expired(exc)
@@ -497,11 +596,31 @@ class IterativeSearchAgent:
             for paper in ranked
             if paper.rank_scores.get("semantic_not_applicable", 0.0) < 0.5
         ]
-        final_papers = (
-            applicable_finalists[: self.final_k]
-            if applicable_finalists
-            else ranked[: self.final_k]
+        final_papers, applicable_decisions = select_retained_papers(
+            applicable_finalists,
+            list(scout_by_paper.values()),
+            final_k=self.final_k,
         )
+        decisions_by_id = {
+            decision.paper_id: decision for decision in applicable_decisions
+        }
+        retention_decisions: list[PaperRetentionDecision] = []
+        for rank_position, paper in enumerate(ranked, start=1):
+            decision = decisions_by_id.get(paper.paper_id)
+            if decision is None:
+                decision = PaperRetentionDecision(
+                    paper_id=paper.paper_id,
+                    decision="reject",
+                    roles=[],
+                    reason="Scout marked the paper not applicable to the atomic task",
+                    rank_position=rank_position,
+                )
+            retention_decisions.append(decision)
+        if ranked and not final_papers:
+            errors.append(
+                "domain guard rejected all ranked papers as not applicable; "
+                "no unrelated fallback papers were retained"
+            )
         return SearchRunResult(
             sub_question=sub_question,
             queries=all_queries,
@@ -520,6 +639,7 @@ class IterativeSearchAgent:
             reused_paper_ids=[
                 paper.paper_id for paper in ranked if paper.paper_id in reused_ids
             ],
+            retention_decisions=retention_decisions,
             final_state=state,
         )
 
@@ -528,6 +648,22 @@ class IterativeSearchAgent:
         if source is None:
             raise LookupError(f"unknown literature source: {query.target_source}")
         started_at = self.stage_clock()
+        cache_key = (
+            query.target_source.casefold(),
+            " ".join(query.text.casefold().split()),
+            self.per_query_limit,
+        )
+        cached = self._search_cache.get(cache_key)
+        if cached is not None:
+            emit_event(
+                "tool_result",
+                module="m2",
+                tool=f"source:{query.target_source}",
+                status="completed",
+                message=f"复用 {query.target_source} 检索缓存 ({len(cached)} 篇)",
+                details={"query": query.text, "cache_hit": True},
+            )
+            return [paper.model_copy(deep=True) for paper in cached]
         tool = f"source:{query.target_source}"
         emit_event(
             "tool_started",
@@ -570,6 +706,9 @@ class IterativeSearchAgent:
                 "papers": len(result),
             },
         )
+        self._search_cache[cache_key] = [
+            paper.model_copy(deep=True) for paper in result
+        ]
         return result
 
     @staticmethod

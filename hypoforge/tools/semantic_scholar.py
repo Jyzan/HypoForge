@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import time
 import urllib.parse
@@ -127,7 +128,7 @@ def _s2_search(query: str, limit: int, api_key: str = "") -> List[dict]:
     params: Dict[str, str] = {
         "query": query,
         "limit": str(min(limit, 100)),
-        "fields": "title,year,authors,journal,externalIds,citationCount,abstract",
+        "fields": "title,year,authors,journal,externalIds,citationCount,abstract,openAccessPdf,isOpenAccess",
     }
     qs = urllib.parse.urlencode(params)
     url = f"{_S2_BASE}/paper/search?{qs}"
@@ -144,7 +145,7 @@ def _s2_search(query: str, limit: int, api_key: str = "") -> List[dict]:
 
 def _s2_fetch(paper_id: str, api_key: str = "") -> dict:
     """Fetch a single paper from Semantic Scholar by ID."""
-    fields = "title,abstract,year,authors,journal,externalIds,citationCount"
+    fields = "title,abstract,year,authors,journal,externalIds,citationCount,openAccessPdf,isOpenAccess"
     url = f"{_S2_BASE}/paper/{paper_id}?fields={fields}"
     return _s2_normalise(_http_get_json(url, s2_api_key=api_key))
 
@@ -154,6 +155,8 @@ def _s2_normalise(raw: dict) -> dict:
     authors = [a.get("name", "") for a in raw.get("authors", [])]
     journal_info = raw.get("journal") or {}
     ext_ids = raw.get("externalIds") or {}
+    oa_pdf = raw.get("openAccessPdf") or {}
+    oa_pdf_url = str(oa_pdf.get("url") or "") if isinstance(oa_pdf, dict) else ""
     return {
         "source": "semantic_scholar",
         "paper_id": raw.get("paperId", ""),
@@ -161,6 +164,15 @@ def _s2_normalise(raw: dict) -> dict:
         "abstract": raw.get("abstract") or "",
         "year": raw.get("year") or 0,
         "doi": ext_ids.get("DOI", ""),
+        "pmid": ext_ids.get("PubMed", ""),
+        "pmcid": ext_ids.get("PubMedCentral", ""),
+        "external_ids": {
+            str(key): str(value)
+            for key, value in ext_ids.items()
+            if value not in (None, "")
+        },
+        "oa_pdf_url": oa_pdf_url,
+        "is_open_access": bool(raw.get("isOpenAccess")),
         "authors": authors,
         "journal": journal_info.get("name", ""),
         "citation_count": raw.get("citationCount", 0),
@@ -252,6 +264,16 @@ def _oa_normalise(raw: dict) -> dict:
         "abstract": abstract,
         "year": raw.get("publication_year") or 0,
         "doi": doi_raw,
+        "external_ids": {
+            str(key): str(value)
+            for key, value in (raw.get("ids") or {}).items()
+            if value not in (None, "")
+        },
+        "oa_pdf_url": str(
+            ((raw.get("best_oa_location") or {}).get("pdf_url") or "")
+        ),
+        "is_open_access": bool((raw.get("open_access") or {}).get("is_oa")),
+        "retrieval_relevance": raw.get("relevance_score"),
         "authors": authors,
         "journal": journal,
         "citation_count": raw.get("cited_by_count", 0),
@@ -265,9 +287,34 @@ def _oa_normalise(raw: dict) -> dict:
 def _search(query: str, limit: int = 20) -> List[dict]:
     """Dispatch search to the active backend."""
     if _BACKEND == "semantic_scholar":
-        return _s2_search(query, limit, _S2_API_KEY)
-    else:
-        return _oa_search(query, limit, _OPENALEX_API_KEY)
+        s2_error: Exception | None = None
+        try:
+            rows = _s2_search(query, limit, _S2_API_KEY)
+            if rows:
+                return rows
+            logger.warning("Semantic Scholar returned zero results; falling back to OpenAlex")
+        except Exception as exc:
+            s2_error = exc
+            logger.warning(
+                "Semantic Scholar failed (%s); falling back to OpenAlex",
+                type(exc).__name__,
+            )
+        openalex_query = re.sub(r"\[[^\]]+\]", "", query)
+        openalex_query = re.sub(
+            r"\b(?:title|abstract|author):", "", openalex_query, flags=re.I
+        )
+        try:
+            return _oa_search(
+                " ".join(openalex_query.split()), limit, _OPENALEX_API_KEY
+            )
+        except Exception as oa_error:
+            if s2_error is not None:
+                raise RuntimeError(
+                    f"Semantic Scholar failed ({s2_error}); "
+                    f"OpenAlex fallback failed ({oa_error})"
+                ) from oa_error
+            raise RuntimeError(f"OpenAlex fallback failed: {oa_error}") from oa_error
+    return _oa_search(query, limit, _OPENALEX_API_KEY)
 
 
 def _fetch(identifier: str) -> dict:
@@ -326,7 +373,30 @@ class SemanticScholarTool(ToolProtocol):
         ):
             return _search(query, limit)
         if self._backend == "semantic_scholar":
-            return _s2_search(query, limit, self.api_key)
+            s2_error: Exception | None = None
+            try:
+                rows = _s2_search(query, limit, self.api_key)
+                if rows:
+                    return rows
+                logger.warning("Semantic Scholar returned zero results; falling back to OpenAlex")
+            except Exception as exc:
+                s2_error = exc
+                logger.warning(
+                    "Semantic Scholar failed (%s); falling back to OpenAlex",
+                    type(exc).__name__,
+                )
+            # OpenAlex search syntax is plain text: remove source-specific
+            # field tags and keep quoted phrase contents.
+            openalex_query = re.sub(r"\[[^\]]+\]", "", query)
+            openalex_query = re.sub(r"\b(?:title|abstract|author):", "", openalex_query, flags=re.I)
+            try:
+                return _oa_search(" ".join(openalex_query.split()), limit, self.openalex_api_key)
+            except Exception as oa_error:
+                if s2_error is not None:
+                    raise RuntimeError(
+                        f"Semantic Scholar failed ({s2_error}); OpenAlex fallback failed ({oa_error})"
+                    ) from oa_error
+                raise RuntimeError(f"OpenAlex fallback failed: {oa_error}") from oa_error
         return _oa_search(query, limit, self.openalex_api_key)
 
     def _fetch_instance(self, identifier: str) -> dict:

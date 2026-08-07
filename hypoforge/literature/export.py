@@ -9,10 +9,11 @@ from ..state import (
     M2EvidenceExport,
     M2KnowledgeRun,
     M2PaperExport,
+    M2PaperRetentionExport,
     M2SearchProvenance,
     M2SearchQueryExport,
 )
-from .models import PaperReadingResult, PaperRecord, SearchRunResult
+from .models import ContentLevel, FulltextStatus, PaperReadingResult, PaperRecord, SearchRunResult
 
 
 _MAX_EXPORTED_ERRORS = 20
@@ -108,6 +109,18 @@ def _paper_export(
     paper: PaperRecord,
     reading: PaperReadingResult,
 ) -> M2PaperExport:
+    if reading.content_level is ContentLevel.STRUCTURED_FULLTEXT:
+        resolved_status = FulltextStatus.DOWNLOADED.value
+    elif reading.content_level is ContentLevel.PDF:
+        resolved_status = FulltextStatus.DOWNLOADED.value
+    elif reading.content_level is ContentLevel.HTML:
+        resolved_status = FulltextStatus.HTML_AVAILABLE.value
+    elif reading.content_level is ContentLevel.ABSTRACT:
+        resolved_status = FulltextStatus.ABSTRACT_ONLY.value
+    elif reading.errors:
+        resolved_status = FulltextStatus.UNAVAILABLE.value
+    else:
+        resolved_status = _enum_value(paper.fulltext_status)
     return M2PaperExport(
         paper_id=paper.paper_id,
         title=paper.title,
@@ -123,7 +136,9 @@ def _paper_export(
         publication_type=paper.publication_type,
         sources=list(paper.sources),
         is_open_access=paper.is_open_access,
-        fulltext_status=_enum_value(paper.fulltext_status),
+        # Reading is authoritative: search-time availability is stale once
+        # resolution/parsing has completed.
+        fulltext_status=resolved_status,
         rank_scores=dict(paper.rank_scores),
         reading_summary=reading.summary,
         content_level=_enum_value(reading.content_level),
@@ -201,6 +216,10 @@ def _search_provenance(search_result: SearchRunResult) -> M2SearchProvenance:
         stage_elapsed_seconds=dict(search_result.stage_elapsed_seconds),
         papers_found=search_result.papers_found,
         papers_after_dedup=search_result.papers_after_dedup,
+        retention_decisions=[
+            M2PaperRetentionExport(**decision.model_dump(mode="python"))
+            for decision in search_result.retention_decisions
+        ],
     )
 
 

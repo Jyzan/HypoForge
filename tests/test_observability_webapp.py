@@ -429,11 +429,13 @@ def test_versions_endpoint_groups_reviews_and_snapshots(tmp_path: Path) -> None:
     assert v1["overall"] == 3.5
     assert v1["top_hypothesis_titles"] == ["v1 H1"]
     assert v1["research_plans_count"] == 1
+    assert v1["research_plans"] == [{}]
     assert v1["snapshots"] == ["snapshots/001-m4-r0-iter0.json"]
     assert v2["overall"] == 4.5
     # Final state is authoritative for the latest version.
     assert v2["top_hypothesis_titles"] == ["final H1"]
     assert v2["research_plans_count"] == 1
+    assert v2["research_plans"] == [{"hypothesis_id": "H1"}]
     assert "snapshots/002-m6-r0-iter1.json" in v2["snapshots"]
 
 

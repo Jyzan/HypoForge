@@ -8,7 +8,11 @@ from hypoforge.literature.models import (
     PaperRecord,
     ScoutNote,
 )
-from hypoforge.literature.search.ranking import PaperRanker, rerank_with_scout
+from hypoforge.literature.search.ranking import (
+    PaperRanker,
+    rerank_with_scout,
+    select_retained_papers,
+)
 
 
 def paper(paper_id: str, title: str, **kwargs: object) -> PaperRecord:
@@ -18,6 +22,50 @@ def paper(paper_id: str, title: str, **kwargs: object) -> PaperRecord:
         sources=["test"],
         **kwargs,
     )
+
+
+def test_retention_expands_final_k_for_missing_method_and_recent_roles() -> None:
+    papers = [
+        paper("core", "Core evidence", rank_scores={"post_scout_total": 0.95}),
+        paper("context", "Context", rank_scores={"post_scout_total": 0.90}),
+        paper("method", "Method", rank_scores={"post_scout_total": 0.84}),
+        paper("recent", "Recent", rank_scores={"post_scout_total": 0.82}),
+        paper("tail", "Tail", rank_scores={"post_scout_total": 0.70}),
+        paper("outside", "Outside", rank_scores={"post_scout_total": 0.69}),
+    ]
+    notes = [
+        ScoutNote(
+            paper_id="core", relevance_to_question=0.9,
+            directness_to_question=0.9, study_design="experimental",
+            supporting_evidence=["direct result"],
+            evidence_buckets={EvidenceBucket.SUPPORTING},
+        ),
+        ScoutNote(paper_id="context", relevance_to_question=0.8),
+        ScoutNote(
+            paper_id="method", relevance_to_question=0.75,
+            directness_to_question=0.6, study_design="method",
+            evidence_buckets={EvidenceBucket.METHODOLOGICAL},
+        ),
+        ScoutNote(
+            paper_id="recent", relevance_to_question=0.72,
+            directness_to_question=0.5, study_design="observational",
+            evidence_buckets={EvidenceBucket.RECENT},
+        ),
+        ScoutNote(paper_id="tail", relevance_to_question=0.7),
+        ScoutNote(paper_id="outside", relevance_to_question=0.7),
+    ]
+
+    retained, decisions = select_retained_papers(papers, notes, final_k=2)
+
+    assert [item.paper_id for item in retained] == [
+        "core", "context", "method", "recent",
+    ]
+    by_id = {decision.paper_id: decision for decision in decisions}
+    assert by_id["method"].decision == "retain"
+    assert "method_evidence" in by_id["method"].reason
+    assert by_id["recent"].decision == "retain"
+    assert by_id["outside"].decision == "reject"
+    assert "outside bounded retention window" in by_id["outside"].reason
 
 
 @pytest.mark.asyncio
@@ -60,7 +108,6 @@ async def test_ranker_populates_all_scores_without_mutating_inputs() -> None:
     assert source.model_dump() == before
     assert set(ranked[0].rank_scores) >= {
         "query_relevance",
-        "retrieval_prior",
         "citation_impact",
         "recency",
         "metadata_quality",

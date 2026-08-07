@@ -2,7 +2,7 @@
 
 Covers:
 
-* M6 structured evidence-sufficiency verdict — fail-open on error, switch-off
+* M6 structured evidence-sufficiency verdict — fail-closed on error, switch-off
   produces zero extra calls and no verdict keys (hard acceptance);
 * gap merge semantics — gap_id matching, attempts inheritance, close-on
   ``sufficient`` **or** M3 gain > 0, resolved gaps stay resolved;
@@ -123,13 +123,15 @@ async def test_m6_switch_off_never_calls_verdict() -> None:
     patch = await module(state)
 
     assert client.calls == 3
-    assert set(patch) == {"reviews", "iteration_count"}  # no verdict keys
+    assert set(patch) == {
+        "reviews", "iteration_count", "graph_correction_requests",
+    }  # no evidence-verdict keys
     assert patch["iteration_count"] == 1
-    assert len(patch["reviews"]) == 4  # 3 specialists + overall
+    assert len(patch["reviews"]) == 5  # alignment gate + 3 specialists + overall
 
 
 # ---------------------------------------------------------------------------
-# M6 verdict: happy path + gap merge + fail-open
+# M6 verdict: happy path + gap merge + fail-closed
 # ---------------------------------------------------------------------------
 
 
@@ -173,7 +175,7 @@ async def test_m6_verdict_matches_existing_gap_inherits_attempts() -> None:
 
 
 @pytest.mark.asyncio
-async def test_m6_verdict_fail_open() -> None:
+async def test_m6_verdict_fail_closed() -> None:
     client = FakeM6Client([_review_payload()] * 3 + [RuntimeError("boom")])
     module = make_m6_module(client)
     state = make_m6_state()
@@ -182,9 +184,10 @@ async def test_m6_verdict_fail_open() -> None:
 
     assert client.calls == 4  # the verdict call was attempted
     verdict = patch["evidence_verdict"]
-    assert verdict.sufficient is True
-    assert verdict.gaps == []
-    assert patch["evidence_gaps"] == []  # nothing to merge
+    assert verdict.sufficient is False
+    assert len(verdict.gaps) == 1
+    assert verdict.gaps[0].gap_type == "coverage"
+    assert patch["evidence_gaps"][0].status == "open"
 
 
 # ---------------------------------------------------------------------------

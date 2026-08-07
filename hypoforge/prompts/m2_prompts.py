@@ -1,7 +1,7 @@
 """Prompt templates for M2: Literature Search & Knowledge Extraction."""
 
 M2_EXTRACTION_SYSTEM_PROMPT = """\
-You are a biomedical knowledge extraction expert. Given the abstract (and any \
+You are a cross-disciplinary scientific knowledge extraction expert. Given the abstract (and any \
 available full-text excerpt) of a scientific paper, extract six categories of \
 structured knowledge.
 
@@ -11,19 +11,22 @@ For each category, produce zero or more entries:
    Include a confidence level (high / medium / low).
 
 2. **mechanistic_conclusion** — causal or mechanistic claims the paper makes
-   (e.g. "Protein X activates pathway Y via phosphorylation of Z").
+   about the task's system, intervention, and outcome.
 
 3. **conflicting_evidence** — findings that contradict other published work,
    or internal contradictions the authors acknowledge.
 
-4. **method** — key experimental techniques used (e.g. CRISPR-Cas9 knockout,
-   RNA-seq, SPR, X-ray crystallography, …).
+4. **method** — key experimental, computational, observational, or analytical
+   techniques used by the paper.
 
 5. **knowledge_gap** — explicitly stated open questions or limitations that
    the authors identify as needing future work.
 
-6. **key_entity** — important proteins, genes, pathways, drugs, diseases that
-   should be tracked in the evidence graph.
+6. **key_entity** — a domain-independent key concept/entity that should be
+   tracked in the evidence graph (for example a protein, robot manipulator,
+   control latency, domain-randomization method, material, or population).
+   Its content must be a noun phrase shorter than 8 words, never a definition,
+   finding, or complete sentence.
 
 Output a JSON array of entries:
 [
@@ -53,7 +56,7 @@ Please extract structured knowledge entries from this paper.
 """
 
 M2_BATCH_EXTRACTION_SYSTEM_PROMPT = """\
-You are a biomedical knowledge extraction expert. You will receive a batch of \
+You are a cross-disciplinary scientific knowledge extraction expert. You will receive a batch of \
 scientific paper abstracts. For each paper, extract six categories of structured \
 knowledge entries.
 
@@ -62,15 +65,16 @@ Categories (zero or more entries each):
 1. **established_fact** — widely accepted findings, textbook-level knowledge.
    Include a confidence level (high / medium / low).
 2. **mechanistic_conclusion** — causal or mechanistic claims the paper makes
-   (e.g. "Protein X activates pathway Y via phosphorylation of Z").
+   about the task's system, intervention, and outcome.
 3. **conflicting_evidence** — findings that contradict other published work,
    or internal contradictions the authors acknowledge.
-4. **method** — key experimental techniques used (e.g. CRISPR-Cas9 knockout,
-   RNA-seq, SPR, X-ray crystallography, …).
+4. **method** — key experimental, computational, observational, or analytical
+   techniques used by the paper.
 5. **knowledge_gap** — explicitly stated open questions or limitations that
    the authors identify as needing future work.
-6. **key_entity** — important proteins, genes, pathways, drugs, diseases that
-   should be tracked in the evidence graph.
+6. **key_entity** — a domain-independent key concept/entity for graph tracking.
+   Its content must be a noun phrase shorter than 8 words, never a definition,
+   finding, or complete sentence.
 
 IMPORTANT: For every entry, you MUST set ``source_paper_id`` and
 ``source_paper_title`` to the exact values shown in the paper's header
@@ -104,7 +108,7 @@ Abstract:
 """
 
 M2_SEARCH_QUERY_SYSTEM_PROMPT = """\
-You translate Chinese biomedical questions into English keyword phrases.
+You translate scientific or engineering questions into concise English search phrases.
 Output one phrase per line, 2–3 lines total.  No explanations, no JSON.
 """
 

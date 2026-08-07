@@ -42,6 +42,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from ..entity_normalization import EntityNormalizationService
 from ..memory.paper_store import PaperStore, normalize_query_text, paper_key
 from ..observability import emit_event
 from ..protocol import ModuleProtocol
@@ -57,6 +58,7 @@ from ..state import (
     PipelineState,
     SearchLedger,
 )
+from ..task_alignment import search_entities_for_sub_question
 from .export import build_m2_knowledge_export_run
 from .models import QueryIntent, SearchBudget, SearchQuery, StopReason
 from .protocols import QueryPlannerProtocol, ReadingExtractionWorkflowProtocol
@@ -122,11 +124,52 @@ class AgenticM2Adapter(ModuleProtocol):
         reading_workflow: ReadingExtractionWorkflowProtocol,
         budget: Optional[SearchBudget] = None,
         supplement_paper_budget: int = _DEFAULT_SUPPLEMENT_PAPER_BUDGET,
+        entity_judge_client: Any = None,
+        entity_embedding_model: str = "",
     ) -> None:
         self.search_agent = search_agent
         self.reading_workflow = reading_workflow
         self.budget = budget
         self.supplement_paper_budget = max(1, int(supplement_paper_budget))
+        self.entity_judge_client = entity_judge_client
+        self.entity_embedding_model = entity_embedding_model
+
+    async def _normalise_reading_entities(
+        self,
+        state: PipelineState,
+        reading_results: list,
+    ) -> list:
+        card = state.problem_card
+        if card is None:
+            return reading_results
+        service = EntityNormalizationService.from_task(
+            card.task_contract,
+            domains=card.domain,
+            cache_dir=state.entity_cache_dir or state.memory_cache_dir,
+            client=self.entity_judge_client,
+            embedding_model=self.entity_embedding_model,
+        )
+        names = [
+            entity
+            for reading in reading_results
+            for entry in reading.knowledge_entries
+            for entity in entry.entities
+        ]
+        resolved = await service.resolve_batch(names)
+        output = []
+        for reading in reading_results:
+            entries = [
+                entry.model_copy(update={
+                    "entities": list(dict.fromkeys(
+                        resolved[entity].canonical_name
+                        if entity in resolved else entity
+                        for entity in entry.entities
+                    )),
+                })
+                for entry in reading.knowledge_entries
+            ]
+            output.append(reading.model_copy(update={"knowledge_entries": entries}))
+        return output
 
     async def __call__(
         self,
@@ -142,18 +185,24 @@ class AgenticM2Adapter(ModuleProtocol):
 
         # ---- fresh round: full search flow (unchanged) ---------------------
         problem_card = state.problem_card
-        sub_questions = (
+        pending_gaps = [
+            gap for gap in state.evidence_gap_requests if gap.status == "pending"
+        ]
+        sub_questions = list(dict.fromkeys(
+            gap.sub_question for gap in pending_gaps
+        )) if pending_gaps else (
             problem_card.sub_questions
             if problem_card and problem_card.sub_questions
             else [state.input_question]
         )
-        key_entities = problem_card.key_entities if problem_card else []
         domains = problem_card.domain if problem_card else []
         question_type = problem_card.question_type.value if problem_card else ""
 
         literature_results: list[LiteratureResult] = []
         export_runs = []
+        executed_queries: dict[str, list[str]] = {}
         for sub_question in sub_questions:
+            key_entities = search_entities_for_sub_question(state, sub_question)
             search_result = await self.search_agent.run(
                 sub_question,
                 key_entities=key_entities,
@@ -164,11 +213,17 @@ class AgenticM2Adapter(ModuleProtocol):
             if search_result.stop_reason is StopReason.ERROR:
                 detail = "; ".join(search_result.errors) or "unrecoverable search error"
                 raise RuntimeError(f"Agentic M2 search failed: {detail}")
+            executed_queries[sub_question] = [
+                query.text for query in search_result.queries
+            ]
 
             reading_results = await self.reading_workflow.run(
                 sub_question,
                 search_result.final_papers,
                 search_context=search_result,
+            )
+            reading_results = await self._normalise_reading_entities(
+                state, list(reading_results)
             )
             export_run = build_m2_knowledge_export_run(
                 sub_question,
@@ -189,10 +244,51 @@ class AgenticM2Adapter(ModuleProtocol):
         if getattr(state, "memory_cache_dir", ""):
             self._persist_full_run(state, export_runs)
 
-        return {
-            "literature_results": literature_results,
-            "m2_knowledge_export": M2KnowledgeExport(runs=export_runs),
+        # Follow-up search rounds are additive. Replacing these fields breaks
+        # historical graph-ID resolution in M4 and causes repeated requests.
+        merged_results: list[LiteratureResult] = []
+        by_question: dict[str, LiteratureResult] = {}
+        for result in [*state.literature_results, *literature_results]:
+            existing = by_question.get(result.sub_question)
+            if existing is None:
+                copied = result.model_copy(deep=True)
+                by_question[result.sub_question] = copied
+                merged_results.append(copied)
+                continue
+            entries = {entry.id: entry for entry in existing.knowledge_entries}
+            entries.update({entry.id: entry for entry in result.knowledge_entries})
+            existing.knowledge_entries = list(entries.values())
+            existing.papers_retrieved = max(
+                existing.papers_retrieved, result.papers_retrieved
+            )
+
+        historical_runs = (
+            list(state.m2_knowledge_export.runs)
+            if state.m2_knowledge_export else []
+        )
+        result: Dict[str, Any] = {
+            "literature_results": merged_results,
+            "m2_knowledge_export": M2KnowledgeExport(
+                runs=[*historical_runs, *export_runs]
+            ),
         }
+        if pending_gaps:
+            pending_ids = {gap.gap_id for gap in pending_gaps}
+            result["evidence_gap_requests"] = [
+                gap.model_copy(update={
+                    "status": "searched",
+                    "attempts": gap.attempts + 1,
+                    "executed_queries": list(dict.fromkeys([
+                        *gap.executed_queries,
+                        *executed_queries.get(gap.sub_question, []),
+                    ])),
+                }) if gap.gap_id in pending_ids else gap.model_copy(deep=True)
+                for gap in state.evidence_gap_requests
+            ]
+            result["evidence_gap_search_rounds"] = (
+                state.evidence_gap_search_rounds + 1
+            )
+        return result
 
     @classmethod
     def get_input_fields(cls) -> list[str]:
@@ -342,6 +438,9 @@ class AgenticM2Adapter(ModuleProtocol):
                 sub_question,
                 new_papers,
                 search_context=filtered_result,
+            )
+            reading_results = await self._normalise_reading_entities(
+                state, list(reading_results)
             )
             export_run = build_m2_knowledge_export_run(
                 sub_question, filtered_result, reading_results

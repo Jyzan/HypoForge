@@ -39,7 +39,7 @@ class PipelineCancelled(Exception):
 
 def _route_after_m6(
     state: PipelineState, config: Any
-) -> Literal["end", "revise_m4", "supplement_m2"]:
+) -> Literal["end", "revise_m3", "revise_m4", "supplement_m2"]:
     """Routing decision after M6 (v2 contract — priority order is strict).
 
     1. ``iteration_count >= max_iterations`` → ``"end"`` (the ONLY hard stop;
@@ -47,10 +47,11 @@ def _route_after_m6(
     2. ``m6_evidence_revisit`` on **and** verdict present **and**
        ``sufficient == False`` **and** an ``open`` gap exists **and**
        ``search_round < max_search_rounds`` → ``"supplement_m2"``;
-    3. evidence sufficient (verdict ``None`` — switch off / fail-open — or
+    3. evidence sufficient (verdict ``None`` because the switch is off, or
        ``sufficient == True``) **and** this round's ``overall`` ≥
        ``review_score_threshold`` → ``"end"``;
-    4. everything else → ``"revise_m4"`` (the legacy single-hop feedback loop).
+    4. pending graph corrections → ``"revise_m3"``; otherwise →
+       ``"revise_m4"`` (the legacy hypothesis feedback loop).
 
     With the switch off the verdict is ``None``, rule 2 never fires and rule 3
     degenerates to the legacy threshold check, so default behaviour is exactly
@@ -59,7 +60,12 @@ def _route_after_m6(
     ``config`` may be ``None`` — feature switches are then treated as
     disabled, keeping the function usable as a pure routing oracle.
     """
-    # 1. global hard stop — wins over everything
+    # 1. fatal core errors and the global hard stop win over everything.
+    if any(
+        str(error).lstrip().startswith(("[m1]", "[m4]", "[m5]"))
+        for error in state.errors
+    ):
+        return "end"
     if state.iteration_count >= state.max_iterations:
         return "end"
 
@@ -76,18 +82,31 @@ def _route_after_m6(
         ):
             return "supplement_m2"
 
+    revision_route = (
+        "revise_m3"
+        if any(request.status == "pending" for request in state.graph_correction_requests)
+        else "revise_m4"
+    )
+
     # 3. evidence sufficient + quality threshold met → end.
     # The verdict is only meaningful while the switch is on; with it off any
     # (stale) verdict is ignored, keeping behaviour equivalent to legacy.
     verdict = state.evidence_verdict if revisit else None
     evidence_sufficient = verdict is None or verdict.sufficient
     recent = [r for r in state.reviews if r.version == state.iteration_count]
+    if any(review.hard_gate_passed is False for review in recent):
+        return revision_route
     overall = [r for r in recent if r.dimension.value == "overall"]
-    if evidence_sufficient and overall and overall[0].score >= state.review_score_threshold:
-        return "end"
+    if (
+        evidence_sufficient
+        and overall
+        and overall[0].score >= state.review_score_threshold
+        and overall[0].hard_gate_passed is not False
+    ):
+        return "end"  # quality threshold met
 
     # 4. legacy feedback loop
-    return "revise_m4"
+    return revision_route
 
 
 def _route_after_m1(
@@ -142,6 +161,7 @@ _SEED_INHERIT_FIELDS = (
     "best_hypotheses",
     "search_ledger",
     "memory_cache_dir",
+    "entity_cache_dir",
 )
 
 
@@ -176,6 +196,7 @@ def build_followup_seed(
 
     parent_run_id = str(seed_state.get("run_id", "") or "")
     memory_cache_dir = inherited.pop("memory_cache_dir", "") or config.memory_cache_dir
+    entity_cache_dir = inherited.pop("entity_cache_dir", "") or config.entity_cache_dir
 
     return PipelineState(
         input_question=followup_text,
@@ -183,8 +204,20 @@ def build_followup_seed(
         parent_run_id=parent_run_id,
         followup=FollowupRequest(text=followup_text, parent_run_id=parent_run_id),
         max_iterations=config.max_iterations,
+        max_evidence_gap_rounds=config.max_evidence_gap_rounds,
         memory_cache_dir=memory_cache_dir,
+        entity_cache_dir=entity_cache_dir,
         **inherited,
+    )
+
+
+def _route_after_m4(state: PipelineState) -> str:
+    """Search before M5 only while a bounded M4 gap is explicitly pending."""
+
+    return (
+        "search_gap"
+        if any(gap.status == "pending" for gap in state.evidence_gap_requests)
+        else "continue"
     )
 
 
@@ -207,6 +240,11 @@ class PipelineRunner:
         "m5": ["research_plan_designer"],
         "m6": ["specialist_reviewers", "overall_score_aggregator", "evidence_sufficiency_judge"],
     }
+    _CORE_REQUIRED_OUTPUTS = {
+        "m1": ("problem_card",),
+        "m4": ("candidate_hypotheses", "top_hypotheses"),
+        "m5": ("research_plans",),
+    }
 
     def __init__(
         self,
@@ -223,6 +261,7 @@ class PipelineRunner:
         self.cancelled = False
         self._graph = None
         self._skills = None
+        self._resume_last_module: str | None = None
 
     def _cancel_requested(self) -> bool:
         return self.cancel_event is not None and bool(
@@ -264,10 +303,17 @@ class PipelineRunner:
             graph = result["evidence_graph"]
             summary.update({"nodes": len(graph.nodes), "edges": len(graph.edges)})
         elif name == "m4":
+            gaps = result.get("evidence_gap_requests") or []
             summary.update(
                 {
                     "candidates": len(result.get("candidate_hypotheses") or []),
                     "top_hypotheses": len(result.get("top_hypotheses") or []),
+                    "pending_evidence_gaps": sum(
+                        gap.status == "pending" for gap in gaps
+                    ),
+                    "exhausted_evidence_gaps": sum(
+                        gap.status == "exhausted" for gap in gaps
+                    ),
                 }
             )
         elif name == "m5":
@@ -289,6 +335,37 @@ class PipelineRunner:
                 }
             )
         return summary
+
+    @classmethod
+    def _validate_core_result(
+        cls,
+        name: str,
+        declared_output_fields: set[str],
+        result: Dict[str, Any],
+    ) -> None:
+        """Fail closed when a standard core module produced no usable output.
+
+        Enforcement is conditional on the module declaring the standard fields,
+        so custom modules that reuse an M1/M4/M5 slot keep their own contracts.
+        """
+
+        required = [
+            field
+            for field in cls._CORE_REQUIRED_OUTPUTS.get(name, ())
+            if field in declared_output_fields
+        ]
+        missing = []
+        for field in required:
+            value = result.get(field)
+            if value is None or (
+                isinstance(value, (list, dict, str)) and not value
+            ):
+                missing.append(field)
+        if missing:
+            raise RuntimeError(
+                f"Core module {name} produced no usable value for: "
+                + ", ".join(missing)
+            )
 
     # ------------------------------------------------------------------
     # Graph construction
@@ -337,8 +414,15 @@ class PipelineRunner:
             self.config.followup_routing or self.config.m6_evidence_revisit
         )
         routing_targets_available = routing_enabled and {"m2", "m4"} <= set(active)
+        gap_route_enabled = (
+            all(name in enabled for name in ("m2", "m3", "m4"))
+            and enabled.index("m2") + 1 == enabled.index("m3")
+            and enabled.index("m3") + 1 == enabled.index("m4")
+        )
         for i in range(len(enabled) - 1):
             src, dst = enabled[i], enabled[i + 1]
+            if src == "m4" and gap_route_enabled:
+                continue
             if src == "m1" and dst == "m2" and routing_targets_available:
                 workflow.add_conditional_edges(
                     src,
@@ -348,6 +432,18 @@ class PipelineRunner:
             else:
                 workflow.add_edge(src, dst)
 
+        if gap_route_enabled:
+            m4_index = enabled.index("m4")
+            continuation = (
+                enabled[m4_index + 1]
+                if m4_index + 1 < len(enabled) else END
+            )
+            workflow.add_conditional_edges(
+                "m4",
+                _route_after_m4,
+                {"search_gap": "m2", "continue": continuation},
+            )
+
         # --- entry point ---
         workflow.set_entry_point(enabled[0])
 
@@ -355,10 +451,16 @@ class PipelineRunner:
         last_module = enabled[-1]
         if self.config.enable_iteration and last_module == "m6":
             if routing_targets_available:
+                iteration_target = self.config.iteration_module_target
                 workflow.add_conditional_edges(
                     last_module,
                     self._decide_after_m6,
-                    {"end": END, "revise_m4": "m4", "supplement_m2": "m2"},
+                    {
+                        "end": END,
+                        "revise_m3": "m3",
+                        "revise_m4": iteration_target,
+                        "supplement_m2": "m2",
+                    },
                 )
             else:
                 iteration_target = self.config.iteration_module_target
@@ -529,6 +631,7 @@ class PipelineRunner:
                     raise ValueError(
                         f"Module {name} returned unknown state fields: {sorted(unknown_result)}"
                     )
+                self._validate_core_result(name, output_fields, result)
 
                 # --- build post-execution state for after hooks ---
                 state_after_dict = state_for_module.model_dump(mode="python")
@@ -607,19 +710,11 @@ class PipelineRunner:
                 elapsed = time.perf_counter() - module_started_at
                 snapshot_path = None
                 if self.event_recorder is not None:
+                    from pydantic_core import to_jsonable_python
+
                     merged_snapshot = state.model_dump(mode="json")
                     for key, value in final.items():
-                        if hasattr(value, "model_dump"):
-                            merged_snapshot[key] = value.model_dump(mode="json")
-                        elif isinstance(value, list):
-                            merged_snapshot[key] = [
-                                item.model_dump(mode="json")
-                                if hasattr(item, "model_dump")
-                                else item
-                                for item in value
-                            ]
-                        else:
-                            merged_snapshot[key] = value
+                        merged_snapshot[key] = to_jsonable_python(value)
                     snapshot_path = self.event_recorder.save_snapshot(
                         f"{name}-r{state.search_round}-iter{state.iteration_count}",
                         merged_snapshot,
@@ -655,6 +750,11 @@ class PipelineRunner:
                     console.print(f"  [{COLORS['error']}][ERR] [{name.upper()}] ERROR: {exc}[/{COLORS['error']}]")
                 if isinstance(exc, (SkillHookError, SkillPatchError)):
                     raise
+                standard_core_fields = set(
+                    self._CORE_REQUIRED_OUTPUTS.get(name, ())
+                ) & output_fields
+                if standard_core_fields:
+                    raise
                 return {"errors": state.errors + [f"[{name}] {exc}\n{traceback.format_exc()}"]}
 
         return node_fn
@@ -687,6 +787,34 @@ class PipelineRunner:
           additional rounds.
         * Everything else keeps the legacy "done ⇒ skip" semantics.
         """
+        resume_cursor = self._resume_last_module
+        if resume_cursor is not None:
+            try:
+                current_index = self.config.enabled_modules.index(name)
+                cursor_index = self.config.enabled_modules.index(resume_cursor)
+            except ValueError:
+                self._resume_last_module = None
+            else:
+                if current_index <= cursor_index:
+                    if not self._is_module_done(state, output_fields):
+                        # A checkpoint cursor is only trustworthy when the
+                        # module's declared outputs survived round-trip.
+                        self._resume_last_module = None
+                        return False
+                    if name == resume_cursor:
+                        # The cursor applies only to the first traversal. Any
+                        # later M6 iteration or M4 gap loop must run normally.
+                        self._resume_last_module = None
+                    return True
+
+        if name == "m2" and any(
+            gap.status == "pending" for gap in state.evidence_gap_requests
+        ):
+            return False
+        if name == "m3" and any(
+            gap.status == "searched" for gap in state.evidence_gap_requests
+        ):
+            return False
         if not self._is_module_done(state, output_fields):
             return False
 
@@ -795,6 +923,10 @@ class PipelineRunner:
                 decided_by = "policy"
                 reason = "iteration budget exhausted or review threshold met"
                 gap_ids = []
+            elif to_module == "revise_m3":
+                decided_by = "m6"
+                reason = "validate pending evidence-graph corrections before regenerating hypotheses"
+                gap_ids = []
             else:
                 decided_by = "policy"
                 reason = "revise hypotheses via the M4 feedback loop"
@@ -859,7 +991,7 @@ class PipelineRunner:
             return
         self._record_routing_event(decision)
         patch["routing_history"] = list(state.routing_history) + [decision]
-        if name == "m6" and decision.to_module == "revise_m4":
+        if name == "m6" and decision.to_module in {"revise_m3", "revise_m4"}:
             patch["revision_count"] = state.revision_count + 1
         if name == "m1" and decision.to_module == "direct_m4":
             # The conditional edge bypasses M2/M3 entirely, so their wrappers
@@ -887,26 +1019,86 @@ class PipelineRunner:
         out_dir.mkdir(parents=True, exist_ok=True)
         return str(out_dir / f"{self._current_run_id}_checkpoint.json")
 
+    def _acquire_run_lock(self):
+        """Acquire a non-blocking, process-scoped single-writer lock per run ID."""
+
+        import os
+        from pathlib import Path
+
+        lock_path = Path(self._checkpoint_path()).with_suffix(".lock")
+        handle = open(lock_path, "a+b")
+        try:
+            if lock_path.stat().st_size == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            handle.close()
+            raise RuntimeError(
+                f"Run {self._current_run_id!r} already has an active writer"
+            ) from exc
+        return handle
+
+    @staticmethod
+    def _release_run_lock(handle) -> None:
+        import os
+
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
     def _save_checkpoint(self, module_name: str, state: PipelineState, result: Dict) -> None:
-        """Persist state after *module_name* completes."""
+        """Persist state after *module_name* completes using atomic publication."""
         import json
-        from pydantic import BaseModel
+        import os
+        import tempfile
+        from pathlib import Path
+        from pydantic_core import to_jsonable_python
 
         merged = state.model_dump(mode="json")
-        # result values may be Pydantic models — serialise them too
+        # State patches can contain models nested inside mappings/lists (for
+        # example ``research_plan_history[int] -> list[ResearchPlan]``).
         for key, value in result.items():
-            if isinstance(value, BaseModel):
-                merged[key] = value.model_dump(mode="json")
-            elif isinstance(value, list) and value and isinstance(value[0], BaseModel):
-                merged[key] = [v.model_dump(mode="json") for v in value]
-            else:
-                merged[key] = value
+            merged[key] = to_jsonable_python(value)
         merged["_last_module"] = module_name
+        target = Path(self._checkpoint_path())
+        temporary: Path | None = None
         try:
-            with open(self._checkpoint_path(), "w", encoding="utf-8") as fh:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=target.parent,
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as fh:
+                temporary = Path(fh.name)
                 json.dump(merged, fh, ensure_ascii=False, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(temporary, target)
+            temporary = None
         except OSError:
             pass  # non-critical
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _load_checkpoint(self) -> dict | None:
         """Load a checkpoint dict if one exists, or None."""
@@ -975,76 +1167,84 @@ class PipelineRunner:
             },
         )
 
-        graph = self._build_graph()
+        run_lock = self._acquire_run_lock()
+        try:
+            graph = self._build_graph()
 
-        # ---- initial state: followup run > checkpoint resume > fresh ----
-        checkpoint = self._load_checkpoint() if resume else None
-        if seed_state is not None:
-            initial_state = build_followup_seed(
-                seed_state=seed_state,
-                followup_text=followup_text or question,
-                run_id=run_id,
-                config=self.config,
-            )
-            question = initial_state.input_question
+            # ---- initial state: followup run > checkpoint resume > fresh ----
+            checkpoint = self._load_checkpoint() if resume else None
+            if seed_state is not None:
+                self._resume_last_module = None
+                initial_state = build_followup_seed(
+                    seed_state=seed_state,
+                    followup_text=followup_text or question,
+                    run_id=run_id,
+                    config=self.config,
+                )
+                question = initial_state.input_question
+                if self.config.verbose:
+                    from .display import console, COLORS
+                    console.print()
+                    console.print(
+                        f"  [{COLORS['success']}][FOLLOWUP] Built on parent run "
+                        f"[bold]{initial_state.parent_run_id}[/bold] — M2/M3 knowledge "
+                        f"artifacts inherited, M4-M6 will re-run"
+                        f"[/{COLORS['success']}]"
+                    )
+            elif checkpoint:
+                last_module = checkpoint.pop("_last_module", "?")
+                self._resume_last_module = (
+                    last_module
+                    if last_module in self.config.enabled_modules else None
+                )
+                initial_state = PipelineState(**checkpoint)
+                if self.config.verbose:
+                    from .display import console, COLORS
+                    console.print()
+                    console.print(
+                        f"  [{COLORS['success']}][RESUME] Loaded checkpoint from "
+                        f"[bold]{last_module}[/bold] — {len(checkpoint)} state fields restored"
+                        f"[/{COLORS['success']}]"
+                    )
+            else:
+                self._resume_last_module = None
+                initial_state = PipelineState(
+                    input_question=question,
+                    run_id=run_id,
+                    max_iterations=self.config.max_iterations,
+                    max_evidence_gap_rounds=self.config.max_evidence_gap_rounds,
+                    memory_cache_dir=self.config.memory_cache_dir,
+                    entity_cache_dir=self.config.entity_cache_dir,
+                )
+
+            initial_state.review_score_threshold = self.config.scoring.review_threshold
+
             if self.config.verbose:
                 from .display import console, COLORS
+                from rich.panel import Panel
                 console.print()
-                console.print(
-                    f"  [{COLORS['success']}][FOLLOWUP] Built on parent run "
-                    f"[bold]{initial_state.parent_run_id}[/bold] — M2/M3 knowledge "
-                    f"artifacts inherited, M4-M6 will re-run"
-                    f"[/{COLORS['success']}]"
-                )
-        elif checkpoint:
-            last_module = checkpoint.pop("_last_module", "?")
-            initial_state = PipelineState(**checkpoint)
-            if self.config.verbose:
-                from .display import console, COLORS
-                console.print()
-                console.print(
-                    f"  [{COLORS['success']}][RESUME] Loaded checkpoint from "
-                    f"[bold]{last_module}[/bold] — {len(checkpoint)} state fields restored"
-                    f"[/{COLORS['success']}]"
-                )
-        else:
-            initial_state = PipelineState(
-                input_question=question,
-                run_id=run_id,
-                max_iterations=self.config.max_iterations,
-                memory_cache_dir=self.config.memory_cache_dir,
-            )
+                console.print(Panel(
+                    f"[bold]{question}[/bold]",
+                    title=f"[bold {COLORS['primary']}]HypoForge Pipeline — {run_id}",
+                    border_style=COLORS["primary"],
+                ))
 
-        # Iteration stop-threshold comes from config (single source of truth),
-        # applied on both fresh and resumed runs.
-        initial_state.review_score_threshold = self.config.scoring.review_threshold
-
-        if self.config.verbose:
-            from .display import console, COLORS
-            from rich.panel import Panel
-            console.print()
-            console.print(Panel(
-                f"[bold]{question}[/bold]",
-                title=f"[bold {COLORS['primary']}]HypoForge Pipeline — {run_id}",
-                border_style=COLORS["primary"],
-            ))
-
-        # Stream through the graph.  A pending cancellation stops the run
-        # cooperatively: the module currently executing finishes, the next
-        # node wrapper raises PipelineCancelled, and the state accumulated
-        # up to here becomes the run's final (persisted) state.
-        final_state_dict = None
-        with bind_recorder(self.event_recorder):
-            try:
-                async for chunk in graph.astream(
-                    initial_state,
-                    stream_mode="values",
-                    config={"recursion_limit": 100},
-                ):
-                    final_state_dict = chunk
-            except PipelineCancelled as exc:
-                self.cancelled = True
-                self._cancelled_before_module = getattr(exc, "module", "")
+            # The run lock covers every checkpoint mutation. Cancellation is
+            # cooperative: a running module finishes and the next one stops.
+            final_state_dict = None
+            with bind_recorder(self.event_recorder):
+                try:
+                    async for chunk in graph.astream(
+                        initial_state,
+                        stream_mode="values",
+                        config={"recursion_limit": 100},
+                    ):
+                        final_state_dict = chunk
+                except PipelineCancelled as exc:
+                    self.cancelled = True
+                    self._cancelled_before_module = getattr(exc, "module", "")
+        finally:
+            self._release_run_lock(run_lock)
 
         if final_state_dict is None:
             if self.cancelled:
@@ -1158,16 +1358,43 @@ class PipelineRunner:
     # ------------------------------------------------------------------
 
     def _save_output(self, state: PipelineState) -> None:
-        """Persist the final state as JSON in the output directory."""
+        """Persist the final state as JSON using atomic publication."""
         import json
+        import os
+        import tempfile
         from pathlib import Path
 
         out_dir = Path(self.config.output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
         out_path = out_dir / f"{state.run_id}.json"
-        with open(out_path, "w", encoding="utf-8") as fh:
-            json.dump(state.model_dump(mode="json"), fh, ensure_ascii=False, indent=2)
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=out_dir,
+                prefix=f".{out_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as fh:
+                temporary = Path(fh.name)
+                json.dump(
+                    state.model_dump(mode="json"),
+                    fh,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(temporary, out_path)
+            temporary = None
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
         if self.config.verbose:
             from .display import console, COLORS

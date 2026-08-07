@@ -5,6 +5,16 @@
 # ---------------------------------------------------------------------------
 
 M6_REVIEWER_PROMPTS = {
+    "task_alignment": """\
+You are an independent **task alignment** gatekeeper. Compare the original
+question and M1 ProblemCard with the hypothesis and research plan. Check the
+research object, domain, requested goal, and key entities. A scientifically
+plausible plan for a different object must fail. Set `hard_gate_passed` to true
+only when the object and goal align; otherwise score at most 2/5. Treat the
+task trace as auditable pointers, not proof: verify each quoted excerpt and reject
+an unexpected study object or scope substitution even if the original object is
+mentioned incidentally.""",
+
     "scientific_logic": """\
 You are a reviewer focused on **scientific logic**.  For the given hypothesis \
 and research plan, evaluate:
@@ -25,7 +35,13 @@ and research plan, evaluate:
 3. Are citations sufficient and appropriate?
 4. Are there important gaps in the literature that the hypothesis overlooks?
 
-Score 1–5 (5 = perfect alignment with evidence base).""",
+For every evidence claim, cite canonical IDs in `evidence_ids`. If no concrete
+ID can be verified, set `hard_gate_passed=false` and do not claim the evidence
+is sufficient. If a concrete graph edge is wrong or missing, add a
+`graph_correction_requests` item using exact existing node IDs, the operation,
+current/proposed relation, reason, and supporting canonical evidence IDs.
+These are requests for M3 validation, not direct mutations. Score 1–5
+(5 = perfect alignment with evidence base).""",
 
     "method_feasibility": """\
 You are a reviewer focused on **method feasibility**.  For the given research \
@@ -55,6 +71,7 @@ most important improvement the authors should make.
 M6_REASON_FIRST = (
     "First write your `reasoning`: cite the specific parts of the hypothesis, the "
     "research plan, and the evidence-graph summary that justify your assessment. "
+    "Cite exact canonical IDs in `evidence_ids` whenever making an evidence claim. "
     "ONLY AFTER that, assign the 1–5 score, and put concrete fixes in `suggestions`."
 )
 
@@ -62,14 +79,20 @@ M6_REASON_FIRST = (
 M6_USER_TEMPLATE = """\
 Original question: {original_question}
 
+M1 ProblemCard (binding task contract):
+{problem_card_json}
+
 Hypothesis:
 {hypothesis_json}
 
 Research plan:
 {plan_json}
 
-Evidence graph summary (facts / conflicts / gaps):
+Evidence graph counts (facts / conflicts / gaps):
 {facts_count} established facts, {conflicts_count} conflicts, {gaps_count} knowledge gaps
+
+Provenance-rich evidence graph context:
+{graph_context}
 
 Please provide your structured review.
 """
@@ -109,14 +132,15 @@ Should we accept this version or iterate again?
 # ---------------------------------------------------------------------------
 
 M6_EVIDENCE_VERDICT_SYSTEM = """\
-You are an evidence-sufficiency judge for a biomedical research pipeline. \
-Given the evidence-graph statistics and the current top hypothesis + research \
-plan, decide whether the collected literature evidence is SUFFICIENT to \
-support the hypothesis generation and research plan as they stand.
+You are an evidence-sufficiency judge for a domain-neutral research pipeline. \
+Given the provenance-rich evidence graph and the current top hypothesis + \
+research plan, decide whether the collected literature evidence is SUFFICIENT \
+to support the hypothesis generation and research plan as they stand.
 
 Rules:
-1. `sufficient=true` when the established facts cover the hypothesis's key \
-mechanistic claims and no critical literature gap blocks the plan.
+1. `sufficient=true` only when established facts cover the hypothesis's key \
+claims, no critical literature gap blocks the plan, and `evidence_ids` cites at \
+least one exact canonical ID present in the supplied graph context.
 2. `sufficient=false` ONLY when concrete, searchable evidence gaps exist. For \
 each gap provide: a precise `description`; `gap_type` (one of mechanism / \
 population / dosage / conflict / coverage / other); the sub-question it \
@@ -125,7 +149,9 @@ weakens (`target_sub_question`); the canonical entities involved \
 concrete literature search queries (`suggested_queries`) that could fill it.
 3. Do NOT invent gaps that additional searching could not possibly address \
 (e.g. purely experimental unknowns).
-4. Leave `gap_id` empty; it is assigned automatically from \
+4. Never invent an evidence ID. If no supplied evidence can be verified, set \
+`sufficient=false` and return a searchable coverage gap.
+5. Leave `gap_id` empty; it is assigned automatically from \
 (target_sub_question, gap_type, canonical_entities).
 
 Output valid JSON matching the provided schema.
@@ -136,6 +162,9 @@ Original question: {original_question}
 
 Evidence graph summary (facts / conflicts / gaps):
 {facts_count} established facts, {conflicts_count} conflicts, {gaps_count} knowledge gaps
+
+Provenance-rich evidence graph context:
+{graph_context}
 
 Top hypothesis:
 {hypothesis_json}

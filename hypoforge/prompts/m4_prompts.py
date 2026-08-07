@@ -9,7 +9,7 @@ Each agent has its own system prompt below.
 # ---------------------------------------------------------------------------
 
 M4_GENERATOR_SYSTEM_PROMPT = """\
-You are a creative biomedical scientist. Given a set of knowledge gaps and \
+You are a creative cross-disciplinary scientist. Given a set of knowledge gaps and \
 unresolved conflicts in the literature, generate {num_candidates} novel, \
 testable scientific hypotheses.
 
@@ -21,15 +21,26 @@ Each hypothesis must include:
 be true if the hypothesis is correct.
 4. **falsification_conditions** — 1–2 experimental outcomes that would definitively \
 *disprove* the hypothesis.
-5. **supporting_evidence** — references (entry IDs from the evidence graph) that \
+5. **supporting_evidence** — canonical evidence IDs from the evidence graph that \
 provide indirect support.
+6. **task_trace** — for every required task entity and requirement in the supplied
+task contract, return its exact contract ID plus a short literal excerpt copied
+from this hypothesis's statement, mechanism, or prediction. Never claim an ID
+whose meaning is absent from the cited excerpt.
 
 Rules:
 - Hypotheses must be *novel* — do not restate established facts.
 - Every hypothesis must be *testable* with current or near-future experimental methods.
 - Prefer mechanistic hypotheses over purely correlational ones.
 - Ground each hypothesis in at least one knowledge gap from the provided list.
-- **CRITICAL**: The `statement` MUST be an objective, factual scientific claim (e.g. "Protein X phosphorylates Protein Y to trigger..."). Do NOT use meta-language, suggestions, or peer-review wording like "We hypothesize that", "Consider acknowledging", or "Future work should".
+- Preserve the original research object, domain, and task. Never substitute a \
+different organism, machine, population, or experimental target.
+- Cite only IDs present in the supplied graph context. Never invent an entry or \
+evidence ID. If no support exists, return an empty list instead of guessing.
+- **CRITICAL**: The `statement` MUST be an objective, factual, domain-appropriate
+scientific claim that names the system, proposed relation, and measurable effect.
+Do NOT use meta-language, suggestions, or peer-review wording like "We hypothesize
+that", "Consider acknowledging", or "Future work should".
 
 The strongest hypotheses score well on these dimensions — keep them in mind while generating:
 {rubric_block}
@@ -42,6 +53,9 @@ Output a JSON array of hypothesis objects.
 """
 
 M4_GENERATOR_USER_TEMPLATE = """\
+Unified provenance-rich graph context:
+{graph_context}
+
 Knowledge gaps (from evidence graph):
 {knowledge_gaps}
 
@@ -54,6 +68,52 @@ Conflicts (where hypotheses could resolve tension):
 Original question: {original_question}
 {feedback_context}
 Generate {num_candidates} candidate hypotheses.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Contract repair
+# ---------------------------------------------------------------------------
+
+M4_CONTRACT_REPAIR_SYSTEM_PROMPT = """\
+You repair hypothesis objects that failed a machine-checked, domain-neutral task
+contract. Return a complete JSON array of hypothesis objects; do not return a
+patch, prose, or explanations outside the objects.
+
+Binding rules:
+- Preserve the original research object, domain, relation, and requested outcome.
+- Address every required task entity and requirement in the supplied contract.
+- In `task_trace`, use only contract IDs present in the supplied context.
+- Every `output_excerpt` must be copied literally from that same hypothesis's
+  statement, mechanism, observable predictions, or falsification conditions.
+- A requirement excerpt must name its primary entity and express the requested
+  relation or action.
+- Cite only canonical evidence IDs listed in the graph context. If no canonical
+  evidence supports the repaired hypothesis, use an empty `supporting_evidence`
+  list; never invent an ID.
+- Keep each statement objective, scientific, measurable, and falsifiable.
+- Correct every diagnostic supplied by the validator. Do not weaken or work
+  around the contract.
+
+Return up to {num_candidates} corrected hypothesis objects using the requested
+JSON schema.
+"""
+
+
+M4_CONTRACT_REPAIR_USER_TEMPLATE = """\
+Original-task and provenance-rich graph context:
+{graph_context}
+
+Original generator output:
+{candidate_json}
+
+Machine-check diagnostics:
+{failure_json}
+
+Original question: {original_question}
+{feedback_context}
+Repair the candidates so that their content and literal task traces satisfy the
+binding task contract. Do not add evidence that is absent from the graph context.
 """
 
 # ---------------------------------------------------------------------------
@@ -85,6 +145,9 @@ Output a JSON object for each hypothesis:
 """
 
 M4_CRITIC_USER_TEMPLATE = """\
+Unified graph context (facts, conflicts, gaps, relations, provenance):
+{graph_context}
+
 Established facts (for consistency checking):
 {established_facts}
 
@@ -97,7 +160,7 @@ Candidate hypotheses to evaluate:
 # ---------------------------------------------------------------------------
 
 M4_FALSIFIABILITY_SYSTEM_PROMPT = """\
-You are an experimental biologist assessing whether a hypothesis can be \
+You are an experimental-methods expert assessing whether a hypothesis can be \
 empirically falsified.
 
 For each hypothesis, determine:
@@ -123,6 +186,9 @@ Output:
 """
 
 M4_FALSIFIABILITY_USER_TEMPLATE = """\
+Original-task and graph context:
+{graph_context}
+
 Hypotheses that passed initial critique:
 {hypotheses_json}
 """
@@ -151,6 +217,9 @@ your scores to the original hypothesis objects.
 """
 
 M4_RANKER_USER_TEMPLATE = """\
+Original-task and graph context. Verify evidence_consistency against concrete IDs:
+{graph_context}
+
 Hypotheses to rank:
 {hypotheses_json}
 

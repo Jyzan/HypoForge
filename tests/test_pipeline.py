@@ -25,6 +25,8 @@ from pydantic import ValidationError
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hypoforge.config import PipelineConfig
+from hypoforge.pipeline import PipelineRunner, _should_continue_iterating
+from hypoforge.protocol import ModuleProtocol
 from hypoforge.state import (
     HypothesisCard,
     PipelineState,
@@ -277,6 +279,148 @@ def test_review_result_reason_before_score():
     fields = list(ReviewResult.model_fields.keys())
     assert "reasoning" in fields
     assert fields.index("reasoning") < fields.index("score")
+
+
+class _EmptyStandardM4(ModuleProtocol):
+    module_name = "m4"
+    module_version = "test"
+    description = "empty standard M4"
+
+    async def __call__(self, state, config=None):
+        return {"candidate_hypotheses": [], "top_hypotheses": []}
+
+    @classmethod
+    def get_input_fields(cls):
+        return []
+
+    @classmethod
+    def get_output_fields(cls):
+        return ["candidate_hypotheses", "top_hypotheses"]
+
+
+class _FailingStandardM5(ModuleProtocol):
+    module_name = "m5"
+    module_version = "test"
+    description = "failing standard M5"
+
+    async def __call__(self, state, config=None):
+        raise ValueError("plan generation failed")
+
+    @classmethod
+    def get_input_fields(cls):
+        return []
+
+    @classmethod
+    def get_output_fields(cls):
+        return ["research_plans"]
+
+
+@pytest.mark.asyncio
+async def test_standard_core_module_empty_output_fails_closed(tmp_path) -> None:
+    runner = PipelineRunner(PipelineConfig(verbose=False, output_dir=str(tmp_path)))
+    runner._skills = []
+    runner._current_run_id = "core-empty"
+
+    with pytest.raises(RuntimeError, match="top_hypotheses"):
+        await runner._make_node_wrapper("m4", _EmptyStandardM4())(
+            PipelineState(input_question="q")
+        )
+
+
+@pytest.mark.asyncio
+async def test_standard_core_module_exception_is_not_converted_to_soft_error(
+    tmp_path,
+) -> None:
+    runner = PipelineRunner(PipelineConfig(verbose=False, output_dir=str(tmp_path)))
+    runner._skills = []
+    runner._current_run_id = "core-error"
+
+    with pytest.raises(ValueError, match="plan generation failed"):
+        await runner._make_node_wrapper("m5", _FailingStandardM5())(
+            PipelineState(input_question="q")
+        )
+
+
+def test_legacy_core_error_cannot_trigger_another_iteration() -> None:
+    state = PipelineState(
+        input_question="q",
+        iteration_count=1,
+        max_iterations=3,
+        errors=["[m4] contract validation failed"],
+    )
+
+    assert _should_continue_iterating(state) == "end"
+
+
+def test_checkpoint_is_atomically_published_without_temp_residue(tmp_path) -> None:
+    import json
+
+    runner = PipelineRunner(PipelineConfig(verbose=False, output_dir=str(tmp_path)))
+    runner._current_run_id = "atomic-checkpoint"
+    state = PipelineState(input_question="q")
+
+    nested_plan = ResearchPlan(
+        hypothesis_id="H1",
+        study_subjects="A recursively serialized subject",
+    )
+    runner._save_checkpoint("m5", state, {
+        "metrics": {"complete": True},
+        "research_plan_history": {1: [nested_plan]},
+    })
+
+    checkpoint = tmp_path / "atomic-checkpoint_checkpoint.json"
+    payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert payload["_last_module"] == "m5"
+    assert payload["metrics"] == {"complete": True}
+    assert payload["research_plan_history"]["1"][0]["hypothesis_id"] == "H1"
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_run_lock_rejects_a_second_writer_for_the_same_run(tmp_path) -> None:
+    runner = PipelineRunner(PipelineConfig(verbose=False, output_dir=str(tmp_path)))
+    runner._current_run_id = "single-writer"
+    first = runner._acquire_run_lock()
+    try:
+        with pytest.raises(RuntimeError, match="active writer"):
+            runner._acquire_run_lock()
+    finally:
+        runner._release_run_lock(first)
+
+    second = runner._acquire_run_lock()
+    runner._release_run_lock(second)
+
+
+def test_resume_cursor_skips_last_completed_module_once() -> None:
+    card = HypothesisCard(
+        hypothesis_id="H1",
+        statement="A testable system-level hypothesis.",
+    )
+    state = PipelineState(
+        input_question="q",
+        candidate_hypotheses=[card],
+        top_hypotheses=[card],
+        iteration_count=0,
+        max_iterations=2,
+    )
+    runner = PipelineRunner(PipelineConfig(verbose=False))
+    runner._resume_last_module = "m4"
+    fields = {"candidate_hypotheses", "top_hypotheses"}
+
+    assert runner._should_skip_module("m4", fields, state) is True
+    assert runner._resume_last_module is None
+    assert runner._should_skip_module("m4", fields, state) is False
+
+
+def test_resume_cursor_cannot_skip_incomplete_declared_output() -> None:
+    runner = PipelineRunner(PipelineConfig(verbose=False))
+    runner._resume_last_module = "m4"
+
+    assert runner._should_skip_module(
+        "m4",
+        {"candidate_hypotheses", "top_hypotheses"},
+        PipelineState(input_question="q"),
+    ) is False
+    assert runner._resume_last_module is None
 
 
 if __name__ == "__main__":

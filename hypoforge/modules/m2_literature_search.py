@@ -32,6 +32,7 @@ from ..paper_sources import (
     resolve_gap_sub_question,
 )
 from ..protocol import ModuleProtocol
+from ..entity_normalization import EntityNormalizationService
 from ..prompts.m2_prompts import (
     M2_BATCH_EXTRACTION_SYSTEM_PROMPT,
     M2_BATCH_EXTRACTION_USER_TEMPLATE,
@@ -51,6 +52,7 @@ from ..state import (
     PipelineState,
     SearchLedger,
 )
+from ..task_alignment import search_entities_for_sub_question
 from ..tools.qwen_client import QwenClient, _salvage_string_arrays
 
 logger = logging.getLogger(__name__)
@@ -240,6 +242,7 @@ class M2LiteratureSearch(ModuleProtocol):
         _qcfg = query_llm_config if query_llm_config is not None else llm_config
         self.query_llm_config = _qcfg
         self.query_client = QwenClient.from_config(_qcfg) if _qcfg else None
+        self._last_queries_by_question: Dict[str, List[str]] = {}
 
     # ------------------------------------------------------------------
     # ModuleProtocol implementation
@@ -265,15 +268,24 @@ class M2LiteratureSearch(ModuleProtocol):
             raise RuntimeError(
                 "M2 requires an LLM client — pass llm_config / set OPENAI_API_KEY."
             )
-        sub_questions = (
+        pending_gaps = [
+            gap for gap in state.evidence_gap_requests if gap.status == "pending"
+        ]
+        sub_questions = list(dict.fromkeys(
+            gap.sub_question for gap in pending_gaps
+        )) if pending_gaps else (
             state.problem_card.sub_questions
             if state.problem_card
             else [state.input_question]
         )
-        key_entities = (
-            state.problem_card.key_entities if state.problem_card else []
+        entities_by_question = {
+            sub_question: search_entities_for_sub_question(state, sub_question)
+            for sub_question in sub_questions
+        }
+        results, collected = await self._run_real(
+            sub_questions,
+            entities_by_question=entities_by_question,
         )
-        results, collected = await self._run_real(sub_questions, key_entities)
         # Junction (P2): seed the persistent paper cache so later supplement
         # rounds can hit it.  Best-effort side effect only — the returned
         # patch is unchanged.
@@ -288,7 +300,68 @@ class M2LiteratureSearch(ModuleProtocol):
                     round=state.search_round,
                     source="legacy_m2",
                 )
-        return {"literature_results": results}
+        if state.problem_card:
+            normalizer = EntityNormalizationService.from_task(
+                state.problem_card.task_contract,
+                domains=state.problem_card.domain,
+                cache_dir=state.entity_cache_dir or state.memory_cache_dir,
+                client=self.client,
+            )
+            entity_names = [
+                entity
+                for result_item in results
+                for entry in result_item.knowledge_entries
+                for entity in entry.entities
+            ]
+            resolved = await normalizer.resolve_batch(entity_names)
+            results = [
+                result_item.model_copy(update={
+                    "knowledge_entries": [
+                        entry.model_copy(update={
+                            "entities": list(dict.fromkeys(
+                                resolved[entity].canonical_name
+                                if entity in resolved else entity
+                                for entity in entry.entities
+                            )),
+                        })
+                        for entry in result_item.knowledge_entries
+                    ],
+                })
+                for result_item in results
+            ]
+        merged: Dict[str, LiteratureResult] = {
+            item.sub_question: item.model_copy(deep=True)
+            for item in state.literature_results
+        }
+        for item in results:
+            current = merged.get(item.sub_question)
+            if current is None:
+                merged[item.sub_question] = item
+                continue
+            entries = {entry.id: entry for entry in current.knowledge_entries}
+            entries.update({entry.id: entry for entry in item.knowledge_entries})
+            current.knowledge_entries = list(entries.values())
+            current.papers_retrieved = max(
+                current.papers_retrieved, item.papers_retrieved
+            )
+        result: Dict[str, Any] = {"literature_results": list(merged.values())}
+        if pending_gaps:
+            pending_ids = {gap.gap_id for gap in pending_gaps}
+            result["evidence_gap_requests"] = [
+                gap.model_copy(update={
+                    "status": "searched",
+                    "attempts": gap.attempts + 1,
+                    "executed_queries": list(dict.fromkeys([
+                        *gap.executed_queries,
+                        *self._last_queries_by_question.get(gap.sub_question, []),
+                    ])),
+                }) if gap.gap_id in pending_ids else gap.model_copy(deep=True)
+                for gap in state.evidence_gap_requests
+            ]
+            result["evidence_gap_search_rounds"] = (
+                state.evidence_gap_search_rounds + 1
+            )
+        return result
 
     # ------------------------------------------------------------------
     # Supplement round (cache-first incremental search, legacy path)
@@ -494,6 +567,7 @@ class M2LiteratureSearch(ModuleProtocol):
         self,
         sub_questions: List[str],
         key_entities: Optional[List[str]] = None,
+        entities_by_question: Optional[Dict[str, List[str]]] = None,
     ) -> tuple[List[LiteratureResult], List[tuple]]:
         """Execute real search + LLM extraction for each sub_question.
 
@@ -511,14 +585,20 @@ class M2LiteratureSearch(ModuleProtocol):
 
         results: List[LiteratureResult] = []
         collected: List[tuple] = []
+        self._last_queries_by_question = {}
         for sq in sub_questions:
             logger.info("M2: searching for sub_question=%r", sq[:80])
+            scoped_entities = (
+                (entities_by_question or {}).get(sq, key_entities)
+                or []
+            )
 
             # --- Step 0: synthesise English search queries ---
             # PubMed / OpenAlex return ~0 results for Chinese-language queries,
             # so we translate the (possibly Chinese) sub-question into focused
             # English queries before searching.
-            queries = await self._generate_search_queries(sq, key_entities)
+            queries = await self._generate_search_queries(sq, scoped_entities)
+            self._last_queries_by_question[sq] = list(queries)
             logger.info("M2: %d search queries: %s", len(queries), [q[:60] for q in queries])
 
             # --- Step 1: search every query across both backends ---

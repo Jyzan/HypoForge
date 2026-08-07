@@ -174,7 +174,7 @@ async def test_format_followup_without_artifacts_falls_back_to_llm(monkeypatch):
     state = _parent_state("请你给我中文方案", plans=False, best=False)
     patch = await mod(state)
 
-    assert len(client.calls) == 1  # no shortcut → LLM triage ran
+    assert len(client.calls) == 2  # triage + TaskContract repair retry
     assert patch["followup"].skip_search is True
 
 
@@ -191,7 +191,7 @@ async def test_semantic_followup_never_shortcircuits(monkeypatch, followup_text)
     mod = _module(client)
     patch = await mod(_parent_state(followup_text, plans=True))
 
-    assert len(client.calls) == 1  # LLM triage, not the shortcut
+    assert len(client.calls) == 2  # triage + TaskContract repair, not shortcut
     assert patch["followup"].skip_search is False
 
 

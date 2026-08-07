@@ -1001,6 +1001,50 @@ function scoreRowsHtml(scores){
     return `<div class="score-row" style="margin:6px 0"><div class="score-chip"><div class="v">${number.toFixed(2)}</div><div class="k">${esc(key)}</div></div></div>`;
   }).join("");
 }
+function planDetailsHtml(p, index){
+  const evidence = (p.supporting_evidence_ids || []).join(", ") || "待验证";
+  const papers = (p.source_paper_ids || []).join(", ") || "待验证";
+  const design = pretty({
+    independent_variables:p.independent_variables,
+    dependent_variables:p.dependent_variables,
+    control_groups:p.control_groups,
+    procedures:p.procedures,
+    measurement_metrics:p.measurement_metrics,
+    analysis_methods:p.analysis_methods,
+    risks_and_alternatives:p.risks_and_alternatives,
+    evidence_links:p.evidence_links,
+    task_trace:p.task_trace,
+  });
+  return `<div style="margin-bottom:12px"><p><b>方案 ${index+1} · ${esc(p.hypothesis_id || "")}</b><br>` +
+    `研究对象：${esc(p.study_subjects || "")} · 时间线：${esc(p.timeline || "")}</p>` +
+    `<p><b>Evidence IDs：</b>${esc(evidence)}<br><b>Paper IDs：</b>${esc(papers)}</p>` +
+    `<details><summary>完整实验设计与引用映射</summary><pre>${design}</pre></details></div>`;
+}
+function provenanceHtml(r){
+  if(!r) return "";
+  const sections = [];
+  const m2Runs = r.m2_knowledge_export?.runs || [];
+  if(m2Runs.length) sections.push(`<div class="plan-sec"><h4>M2 来源、降级与保留裁决</h4>${m2Runs.map(run =>
+    `<details><summary>${esc(run.sub_question || "子问题")} · ${(run.papers || []).length} 篇</summary>` +
+    `<pre>${pretty({ source_hits:run.search_provenance?.source_result_counts || {}, failed_sources:run.search_provenance?.failed_sources || [], stop_reason:run.search_provenance?.stop_reason, retention_decisions:run.search_provenance?.retention_decisions || [], queries:run.search_provenance?.queries || [], errors:run.search_provenance?.errors || [] })}</pre></details>`
+  ).join("")}</div>`);
+  if(r.evidence_gap_requests?.length) sections.push(`<div class="plan-sec"><h4>M4 补搜生命周期</h4><pre>${pretty(r.evidence_gap_requests)}</pre></div>`);
+  const audit = r.evidence_graph?.audit_log || [];
+  if(audit.length || r.graph_correction_requests?.length) sections.push(`<div class="plan-sec"><h4>M3 图谱修正审计</h4><pre>${pretty({ graph_version:r.evidence_graph?.version || 1, correction_requests:r.graph_correction_requests || [], audit_log:audit })}</pre></div>`);
+  return sections.join("");
+}
+function moduleSnapshotHtml(moduleId, r){
+  if(!r) return "";
+  const data = {
+    m1:{ problem_card:r.problem_card },
+    m2:{ literature_results:r.literature_results, m2_knowledge_export:r.m2_knowledge_export },
+    m3:{ evidence_graph:r.evidence_graph, grounding_report:r.grounding_report, graph_correction_requests:r.graph_correction_requests },
+    m4:{ candidate_hypotheses:r.candidate_hypotheses, top_hypotheses:r.top_hypotheses, evidence_gap_requests:r.evidence_gap_requests },
+    m5:{ research_plans:r.research_plans, research_plan_history:r.research_plan_history },
+    m6:{ reviews:r.reviews, evidence_gaps:r.evidence_gaps, routing_history:r.routing_history },
+  }[moduleId];
+  return data ? `<div class="d-sec-title">最终只读快照</div><div class="output-box"><details><summary>查看完整字段与证据 ID</summary><pre>${pretty(data)}</pre></details></div>` : "";
+}
 function renderPlanBody(v, label){
   const body = $("planBody");
   const isFinal = resultData && versionsData.length > 0 && v === versionsData[versionsData.length - 1];
@@ -1015,10 +1059,9 @@ function renderPlanBody(v, label){
   } else if(v && v.top_hypothesis_titles?.length){
     sections.push(`<div class="plan-sec"><h4>本轮 Top 假设（${v.top_hypotheses_count} 条）</h4><ul>${v.top_hypothesis_titles.map(t => `<li>${esc(t)}</li>`).join("")}</ul></div>`);
   }
-  if(isFinal && resultData.research_plans?.length){
-    sections.push(`<div class="plan-sec"><h4>研究计划（${resultData.research_plans.length} 份）</h4>` + resultData.research_plans.map((p, i) =>
-      `<p style="margin-bottom:8px"><b>方案 ${i+1} · ${esc(p.hypothesis_id || "")}</b><br>研究对象：${esc(p.study_subjects || "")} · 时间线：${esc(p.timeline || "")}</p>` +
-      `<details><summary>实验步骤与分析方法</summary><pre>${pretty({ procedures:p.procedures, analysis_methods:p.analysis_methods, risks_and_alternatives:p.risks_and_alternatives })}</pre></details>`).join("") + `</div>`);
+  const plans = v?.research_plans?.length ? v.research_plans : (isFinal ? resultData?.research_plans || [] : []);
+  if(plans.length){
+    sections.push(`<div class="plan-sec"><h4>研究计划（${plans.length} 份）</h4>` + plans.map(planDetailsHtml).join("") + `</div>`);
   } else if(v){
     sections.push(`<div class="plan-sec"><h4>研究计划</h4><p>本轮共 ${v.research_plans_count} 份研究计划${isFinal ? "" : "（详情见该轮快照文件）"}。</p></div>`);
   }
@@ -1035,6 +1078,7 @@ function renderPlanBody(v, label){
   if(isFinal && resultData.scores){
     sections.push(`<div class="plan-sec"><h4>独立评分摘要</h4>${scoreRowsHtml(resultData.scores.aggregate)}<details><summary>查看完整评分 JSON</summary><pre>${pretty(resultData.scores)}</pre></details></div>`);
   }
+  if(isFinal) sections.push(provenanceHtml(resultData));
   if(isFinal && resultData.errors?.length){
     sections.push(`<div class="plan-sec"><h4>告警（${resultData.errors.length}）</h4>${resultData.errors.map(x => `<div class="error-banner" style="margin-bottom:8px">${esc(x)}</div>`).join("")}</div>`);
   }
@@ -1129,10 +1173,9 @@ function renderOverallBody(){
     } else if(v.top_hypothesis_titles?.length){
       sections.push(`<div class="plan-sec"><h4>本轮 Top 假设（${v.top_hypotheses_count} 条）</h4><ul>${v.top_hypothesis_titles.map(t => `<li>${esc(t)}</li>`).join("")}</ul></div>`);
     }
-    if(isChainFinal && result && result.research_plans?.length){
-      sections.push(`<div class="plan-sec"><h4>研究计划（${result.research_plans.length} 份）</h4>` + result.research_plans.map((p, i) =>
-        `<p style="margin-bottom:8px"><b>方案 ${i+1} · ${esc(p.hypothesis_id || "")}</b><br>研究对象：${esc(p.study_subjects || "")} · 时间线：${esc(p.timeline || "")}</p>` +
-        `<details><summary>实验步骤与分析方法</summary><pre>${pretty({ procedures:p.procedures, analysis_methods:p.analysis_methods, risks_and_alternatives:p.risks_and_alternatives })}</pre></details>`).join("") + `</div>`);
+    const plans = v.research_plans?.length ? v.research_plans : (isChainFinal && result ? result.research_plans || [] : []);
+    if(plans.length){
+      sections.push(`<div class="plan-sec"><h4>研究计划（${plans.length} 份）</h4>` + plans.map(planDetailsHtml).join("") + `</div>`);
     } else {
       sections.push(`<div class="plan-sec"><h4>研究计划</h4><p>本轮共 ${v.research_plans_count} 份研究计划${isChainFinal ? "" : "（详情见该轮快照文件）"}。</p></div>`);
     }
@@ -1150,6 +1193,7 @@ function renderOverallBody(){
   if(isChainFinal && result && result.scores){
     sections.push(`<div class="plan-sec"><h4>独立评分摘要</h4>${scoreRowsHtml(result.scores.aggregate)}<details><summary>查看完整评分 JSON</summary><pre>${pretty(result.scores)}</pre></details></div>`);
   }
+  if(isChainFinal && result) sections.push(provenanceHtml(result));
   body.innerHTML = sections.join("") || `<div class="empty">该版本暂无可展示内容</div>`;
 }
 function renderOverall(){
@@ -1283,7 +1327,8 @@ function renderDrawer(){
     <div class="d-sec-title">实时日志（${logs.length} 条）</div>
     <div class="log-box" id="drawerLogs">${logsHtml}</div>
     <div class="d-sec-title">历史输出</div>
-    ${outputHtml}`;
+    ${outputHtml}
+    ${moduleSnapshotHtml(drawerModule, resultData)}`;
   const lb = $("drawerLogs");
   if(lb) lb.scrollTop = lb.scrollHeight;
 }

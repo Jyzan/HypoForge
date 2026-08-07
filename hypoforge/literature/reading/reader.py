@@ -16,12 +16,18 @@ from ..models import (
 )
 from ..protocols import PaperReaderProtocol
 
-_SYSTEM_PROMPT = """You are a biomedical evidence extraction engine.
+_SYSTEM_PROMPT = """You are a cross-disciplinary scientific evidence extraction engine.
 Use only the supplied evidence passages. Extract zero or more concise knowledge
 entries in the allowed categories. Every summary and entry must cite one or more
 CITABLE evidence IDs. Context-only passages may clarify adjacent text but must
 never be cited. Do not infer facts that are not stated in the passages, do not
-invent citations, and do not output chain-of-thought."""
+invent citations, and do not output chain-of-thought.
+
+For key_entity entries, content must be a domain-relevant noun phrase shorter
+than 8 words, never a definition or complete sentence. Put findings and claims
+in established_fact or mechanistic_conclusion. The content of every non-entity
+entry must be a one-sentence, question-relevant normalized claim, not a copied
+chunk opening or an unsupported inference."""
 
 _OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -63,6 +69,15 @@ def _clean(value: object, limit: int) -> str:
 
 def _error(exc: BaseException) -> str:
     return " ".join(f"{type(exc).__name__}: {exc}".split())[:500]
+
+
+def _valid_entity(value: str) -> bool:
+    text = _clean(value, 200)
+    if not text or len(text.split()) > 8 or len(text) > 100:
+        return False
+    if text.count("(") != text.count(")") or text.count("（") != text.count("）"):
+        return False
+    return not text.endswith((".", "。", "!", "！", "?", "？", ":", "："))
 
 
 class QwenPaperReader(PaperReaderProtocol):
@@ -152,11 +167,14 @@ class QwenPaperReader(PaperReaderProtocol):
         summary_ids = raw.get("summary_evidence_ids")
         if not isinstance(summary_ids, list):
             summary_ids = []
-        normalized_summary_ids = [str(item) for item in summary_ids]
-        if summary and normalized_summary_ids and all(
-            item in citable_by_id for item in normalized_summary_ids
-        ):
-            used_ids.update(normalized_summary_ids)
+        normalized_summary_ids = list(dict.fromkeys(str(item) for item in summary_ids))
+        valid_summary_ids = [
+            item for item in normalized_summary_ids if item in citable_by_id
+        ]
+        if summary and valid_summary_ids:
+            used_ids.update(valid_summary_ids)
+            if len(valid_summary_ids) != len(normalized_summary_ids):
+                errors.append("summary repaired: removed invalid evidence IDs")
         else:
             if summary:
                 errors.append("summary rejected: invalid evidence IDs")
@@ -190,14 +208,14 @@ class QwenPaperReader(PaperReaderProtocol):
             except ValueError:
                 rejected += 1
                 continue
-            if (
-                not content
-                or not normalized_ids
-                or not all(value in citable_by_id for value in normalized_ids)
-            ):
+            unique_ids = list(dict.fromkeys(
+                value for value in normalized_ids if value in citable_by_id
+            ))
+            if not content or not unique_ids:
                 rejected += 1
                 continue
-            unique_ids = list(dict.fromkeys(normalized_ids))
+            if len(unique_ids) != len(list(dict.fromkeys(normalized_ids))):
+                errors.append("paper_reader repaired an entry by removing invalid evidence IDs")
             key = (
                 entry_type.value,
                 content.casefold(),
@@ -217,12 +235,17 @@ class QwenPaperReader(PaperReaderProtocol):
                     dict.fromkeys(
                         _clean(value, 200)
                         for value in entities_raw
-                        if _clean(value, 200)
+                        if _valid_entity(_clean(value, 200))
                     )
                 )
                 if isinstance(entities_raw, list)
                 else []
             )
+            if entry_type is KnowledgeEntryType.KEY_ENTITY:
+                if not entities:
+                    rejected += 1
+                    continue
+                content = entities[0]
             entries.append(
                 EvidenceLinkedKnowledge(
                     entry_id=f"reading-{digest}",
@@ -237,10 +260,18 @@ class QwenPaperReader(PaperReaderProtocol):
 
         if rejected:
             errors.append(f"paper_reader rejected {rejected} invalid entries")
-        accepted_evidence = [
-            item for item in candidates
-            if item.citable and item.evidence_id in used_ids
-        ]
+        claims_by_evidence: dict[str, list[str]] = {}
+        for entry in entries:
+            for evidence_id in entry.evidence_ids:
+                claims_by_evidence.setdefault(evidence_id, []).append(entry.content)
+        accepted_evidence = []
+        for item in candidates:
+            if not item.citable or item.evidence_id not in used_ids:
+                continue
+            claims = claims_by_evidence.get(item.evidence_id, [])
+            accepted_evidence.append(item.model_copy(update={
+                "normalized_claim": claims[0] if claims else summary,
+            }))
         return PaperReadingResult(
             paper_id=paper.paper_id,
             summary=summary,

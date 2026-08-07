@@ -382,6 +382,19 @@ class QueryPlanner(QueryPlannerProtocol):
             text = _sanitize_query(raw.get("text", "").strip(), backend)
             if not text:
                 continue
+            # M1's first key entity is the canonical task object. The planner
+            # may simplify modifiers, but it must never silently drop this
+            # hard anchor from an LLM-generated query.
+            if entities:
+                core_entity = " ".join(str(entities[0]).split())
+                normalized_query = re.sub(r'[^\w\u3400-\u9fff]+', ' ', text.casefold())
+                normalized_entity = re.sub(
+                    r'[^\w\u3400-\u9fff]+', ' ', core_entity.casefold()
+                ).strip()
+                if normalized_entity and normalized_entity not in normalized_query:
+                    text = _sanitize_query(
+                        f'{text} "{core_entity}"', backend
+                    )
 
             purpose = raw.get("purpose", "").strip()
             intent = _purpose_to_intent(purpose)

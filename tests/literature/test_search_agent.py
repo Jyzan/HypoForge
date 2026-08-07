@@ -49,6 +49,65 @@ def paper(paper_id: str, source: str) -> PaperRecord:
 
 
 @pytest.mark.asyncio
+async def test_agent_uses_deterministic_four_to_three_term_fallback() -> None:
+    planner = FakePlanner([[query("q-strict", "alpha beta gamma delta", "pubmed")]])
+    source = FakeSource("pubmed", {
+        "alpha beta gamma delta": [],
+        "alpha beta gamma": [paper("three-term-hit", "pubmed")],
+    })
+    agent = IterativeSearchAgent(
+        query_planner=planner,
+        sources=[source],
+        deduplicator=FakeDeduplicator(),
+        ranker=FakeRanker(),
+        scout_reader=FakeScoutReader(),
+        coverage_evaluator=FakeCoverageEvaluator([
+            CoverageReport(sufficient=True, rationale="hit")
+        ]),
+        final_k=1,
+    )
+
+    result = await agent.run(
+        "alpha relationship",
+        key_entities=["alpha"],
+        budget=SearchBudget(max_queries=4),
+    )
+
+    assert [call.text for call in source.calls] == [
+        "alpha beta gamma delta",
+        "alpha beta gamma",
+    ]
+    assert [item.paper_id for item in result.final_papers] == ["three-term-hit"]
+    assert result.queries[-1].purpose.startswith("deterministic fallback")
+
+
+@pytest.mark.asyncio
+async def test_agent_reuses_normalized_search_cache_across_runs() -> None:
+    planner = FakePlanner([[query("q-cache", "Alpha   Beta", "pubmed")]])
+    source = FakeSource("pubmed", {
+        "Alpha   Beta": [paper("cached-paper", "pubmed")],
+    })
+    agent = IterativeSearchAgent(
+        query_planner=planner,
+        sources=[source],
+        deduplicator=FakeDeduplicator(),
+        ranker=FakeRanker(),
+        scout_reader=FakeScoutReader(),
+        coverage_evaluator=FakeCoverageEvaluator([
+            CoverageReport(sufficient=True, rationale="done")
+        ]),
+        final_k=1,
+    )
+
+    first = await agent.run("Alpha Beta")
+    second = await agent.run("Alpha Beta")
+
+    assert len(source.calls) == 1
+    assert first.final_papers[0].paper_id == "cached-paper"
+    assert second.final_papers[0].paper_id == "cached-paper"
+
+
+@pytest.mark.asyncio
 async def test_agent_returns_complete_result_when_first_round_is_sufficient() -> None:
     planner = FakePlanner(
         [[query("q-1", "query one", "pubmed"), query("q-2", "query two", "openalex")]]

@@ -557,6 +557,33 @@ async def test_workflow_bounds_fetch_concurrency() -> None:
 
 
 @pytest.mark.asyncio
+async def test_workflow_reuses_reading_result_for_same_question_and_paper() -> None:
+    class CountingResolver(FakeResolver):
+        def __init__(self) -> None:
+            super().__init__({"p1": ContentLevel.STRUCTURED_FULLTEXT})
+            self.calls = 0
+
+        async def resolve(self, item: PaperRecord) -> DocumentRecord:
+            self.calls += 1
+            return await super().resolve(item)
+
+    resolver = CountingResolver()
+    workflow = FullTextReadingWorkflow(
+        resolver=resolver,
+        parser=FakeParser(),
+        retriever=FakeRetriever(),
+        reader=FakeReader(),
+        store=InMemoryChunkStore(),
+    )
+
+    first = await workflow.run("same question", [paper("p1")])
+    second = await workflow.run("same   question", [paper("p1")])
+
+    assert resolver.calls == 1
+    assert first == second
+
+
+@pytest.mark.asyncio
 async def test_workflow_propagates_global_timeout_and_cancellation() -> None:
     timeout = FullTextReadingWorkflow(
         resolver=FakeResolver({"p1": ContentLevel.STRUCTURED_FULLTEXT}, delay=0.1),

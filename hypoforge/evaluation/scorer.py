@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 from ..state import KnowledgeEntry, PipelineState, ResearchPlan
+from ..graph_context import build_graph_context
+from ..task_alignment import assess_task_alignment
 from .metrics import MetricRegistry
 from .rubric import (
     HYPOTHESIS_RUBRIC,
@@ -189,6 +191,103 @@ def _aggregate(
     }
 
 
+def _quality_gates(state: PipelineState) -> Dict[str, Any]:
+    """Independent object/evidence/coverage/source gates (O-09)."""
+
+    context = build_graph_context(state)
+    valid_evidence = set(context.available_evidence_ids)
+    alignment_rows = []
+    for hypothesis in state.top_hypotheses:
+        plan = next(
+            (item for item in state.research_plans if item.hypothesis_id == hypothesis.hypothesis_id),
+            None,
+        )
+        hypothesis_assessment = assess_task_alignment(
+            state,
+            hypothesis.model_dump_json(exclude={"task_trace"}),
+            subject_text="\n".join([hypothesis.statement, hypothesis.mechanism]),
+            trace=hypothesis.task_trace,
+        )
+        plan_assessment = (
+            assess_task_alignment(
+                state,
+                plan.model_dump_json(exclude={"task_trace"}),
+                subject_text=plan.study_subjects,
+                trace=plan.task_trace,
+            ) if plan else None
+        )
+        passed = hypothesis_assessment.passed and bool(
+            plan_assessment and plan_assessment.passed
+        )
+        score = min(
+            hypothesis_assessment.score,
+            plan_assessment.score if plan_assessment else 0.0,
+        )
+        alignment_rows.append({
+            "hypothesis_id": hypothesis.hypothesis_id,
+            "passed": passed,
+            "score": score,
+            "matched_anchors": list(hypothesis_assessment.matched_anchors),
+            "conflicts": list(hypothesis_assessment.conflicts)
+            + (list(plan_assessment.conflicts) if plan_assessment else []),
+            "rationale": " ".join(filter(None, [
+                f"Hypothesis: {hypothesis_assessment.rationale}",
+                f"Plan: {plan_assessment.rationale}" if plan_assessment else "Plan: missing",
+            ])),
+        })
+
+    claim_units = 0
+    supported_units = 0
+    for hypothesis in state.top_hypotheses:
+        claim_units += 1
+        if any(item in valid_evidence for item in hypothesis.supporting_evidence):
+            supported_units += 1
+    for plan in state.research_plans:
+        claim_units += 1
+        cited = set(plan.supporting_evidence_ids)
+        cited.update(
+            evidence_id
+            for link in plan.evidence_links
+            for evidence_id in link.supporting_evidence_ids
+            if link.support_status == "supported"
+        )
+        if cited & valid_evidence:
+            supported_units += 1
+    evidence_coverage = supported_units / claim_units if claim_units else 0.0
+
+    plan_completeness = [score_plan_completeness(plan) for plan in state.research_plans]
+    anchor_coverage = [row["score"] for row in alignment_rows]
+    answer_completeness = (
+        0.5 * (sum(plan_completeness) / len(plan_completeness))
+        + 0.5 * (sum(anchor_coverage) / len(anchor_coverage))
+        if plan_completeness and anchor_coverage else 0.0
+    )
+
+    paper_quality: list[float] = []
+    if state.m2_knowledge_export:
+        for run in state.m2_knowledge_export.runs:
+            for paper in run.papers:
+                semantic = paper.rank_scores.get("scout_relevance")
+                if isinstance(semantic, (int, float)):
+                    paper_quality.append(float(semantic))
+                else:
+                    paper_quality.append(
+                        1.0 if paper.content_level in {"structured_fulltext", "pdf", "html"}
+                        else 0.6 if paper.content_level == "abstract" else 0.0
+                    )
+    source_quality = sum(paper_quality) / len(paper_quality) if paper_quality else 0.0
+
+    return {
+        "task_alignment": {
+            "passed": bool(alignment_rows) and all(row["passed"] for row in alignment_rows),
+            "items": alignment_rows,
+        },
+        "evidence_coverage": round(evidence_coverage, 4),
+        "answer_completeness": round(answer_completeness, 4),
+        "source_quality": round(source_quality, 4),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Full pipeline scoring
 # ---------------------------------------------------------------------------
@@ -218,13 +317,22 @@ async def score_pipeline_state_async(
         for p in state.research_plans
     ]
 
+    quality_gates = _quality_gates(state)
+    aggregate = _aggregate(state, hypothesis_scores, plan_scores)
+    aggregate.update({
+        "task_alignment_passed": quality_gates["task_alignment"]["passed"],
+        "evidence_coverage": quality_gates["evidence_coverage"],
+        "answer_completeness": quality_gates["answer_completeness"],
+        "source_quality": quality_gates["source_quality"],
+    })
     return {
         "run_id": state.run_id,
         "question": state.input_question,
         "iterations": state.iteration_count,
         "hypothesis_scores": hypothesis_scores,
         "plan_scores": plan_scores,
-        "aggregate": _aggregate(state, hypothesis_scores, plan_scores),
+        "aggregate": aggregate,
+        "quality_gates": quality_gates,
         "rubric": {
             "weights": normalise_weights(weights),
             "dimensions": HYPOTHESIS_RUBRIC,

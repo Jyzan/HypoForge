@@ -18,7 +18,11 @@ class RoutingFulltextResolver(FulltextResolverProtocol):
         self.arxiv_resolver = arxiv_resolver
 
     def _resolver_for(self, paper: PaperRecord) -> FulltextResolverProtocol:
-        if "arxiv" in paper.sources or paper.external_ids.get("arxiv"):
+        if (
+            "arxiv" in paper.sources
+            or paper.external_ids.get("arxiv")
+            or paper.external_ids.get("oa_pdf_url")
+        ):
             return self.arxiv_resolver
         return self.pmc_resolver
 

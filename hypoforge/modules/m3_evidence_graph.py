@@ -32,10 +32,14 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from ..memory.hypoforge_types import GapGain, stable_entry_id
 from ..protocol import ModuleProtocol
+from ..entity_normalization import (
+    EntityNormalizationService,
+    clean_entity_surface,
+)
 from ..observability import emit_event
 from ..prompts.m3_prompts import (
     M3_BATCH_RELATION_SYSTEM_PROMPT,
@@ -48,6 +52,8 @@ from ..state import (
     EvidenceEdge,
     EvidenceEdgeRelation,
     EvidenceGraph,
+    GraphAuditRecord,
+    GraphCorrectionRequest,
     EvidenceNode,
     EvidenceNodeType,
     GroundingReport,
@@ -233,6 +239,7 @@ class M3EvidenceGraph(ModuleProtocol):
         relation_max_tokens: int = 16384,
         enable_cross_batch: bool = True,
         bridge_batch_size: int = 10,
+        entity_embedding_model: str = "",
         # ---- grounding settings ----
         grounding_enabled: bool = False,
         grounding_mode: str = "rule",
@@ -268,6 +275,9 @@ class M3EvidenceGraph(ModuleProtocol):
         self.enable_cross_batch = enable_cross_batch
         self.bridge_batch_size = max(1, bridge_batch_size)
         self.client = QwenClient.from_config(llm_config) if llm_config else None
+        self.entity_embedding_model = (
+            entity_embedding_model or grounding_embedding_model
+        )
 
         # Gap confirmation: how many no-improvement rounds before a
         # pending_grounding gap is declared unimprovable.
@@ -303,8 +313,9 @@ class M3EvidenceGraph(ModuleProtocol):
                 relation_judge_retries=grounding_relation_judge_retries,
             )
 
-        # NOTE: incremental dedup is rebuilt on the fly from the existing
-        # graph's node ids / metadata each run — no instance-level id sets.
+        # Incremental dedup is rebuilt from graph metadata each run. Only the
+        # task-local canonical surface map is instance state.
+        self._task_entity_index: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # ModuleProtocol implementation
@@ -315,54 +326,83 @@ class M3EvidenceGraph(ModuleProtocol):
         state: PipelineState,
         config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        indexed_gap_requests = [
+            gap.model_copy(update={"status": "indexed"})
+            if gap.status == "searched" else gap.model_copy(deep=True)
+            for gap in state.evidence_gap_requests
+        ]
         # --- collect all knowledge entries ---
         all_entries = []
         for lr in state.literature_results:
             all_entries.extend(lr.knowledge_entries)
 
+        # One public normalizer owns task aliases, optional embedding recall,
+        # conservative LLM identity judgments, and persistent pair decisions.
+        namespace = "|".join(sorted(
+            state.problem_card.domain if state.problem_card else []
+        )) or "global"
+        normalizer = EntityNormalizationService(
+            cache_dir=state.entity_cache_dir or state.memory_cache_dir,
+            namespace=namespace,
+            client=self.client,
+            embedding_model=self.entity_embedding_model,
+        )
+        # Compatibility vocabularies are explicit inputs to the public service;
+        # the current task contract is registered last and is authoritative.
+        for canonical, aliases in ENTITY_SYNONYMS.items():
+            normalizer.register_alias_group(canonical, aliases)
+        if state.problem_card:
+            normalizer.register_task_contract(state.problem_card.task_contract)
+        resolved_entities = await normalizer.resolve_batch(
+            entity
+            for entry in all_entries
+            for entity in entry.entities
+        )
+        self._task_entity_index = {
+            clean_entity_surface(original): resolved.canonical_name
+            for original, resolved in resolved_entities.items()
+            if clean_entity_surface(original)
+        }
+
         existing_graph = state.evidence_graph
+        if existing_graph is None and state.memory_cache_dir:
+            existing_graph = self._load_persistent_graph(
+                state.memory_cache_dir,
+                " ".join(filter(None, [
+                    state.input_question,
+                    " ".join(state.problem_card.domain)
+                    if state.problem_card else "",
+                    " ".join(state.problem_card.key_entities)
+                    if state.problem_card else "",
+                ])),
+            )
 
         if not all_entries:
-            # No knowledge entries at all: never wipe an existing graph.
-            # Only return a genuinely empty graph when there is nothing.
-            if existing_graph is not None and existing_graph.nodes:
+            if not (existing_graph and existing_graph.nodes):
+                existing_graph = self._load_persisted_graph(state)
+            graph = existing_graph or EvidenceGraph()
+            if graph.nodes:
                 logger.info(
                     "M3: no knowledge entries; reusing existing graph "
                     "(%d nodes, %d edges)",
-                    len(existing_graph.nodes), len(existing_graph.edges),
+                    len(graph.nodes), len(graph.edges),
                 )
-                emit_event(
-                    "module_notice",
-                    module="m3",
-                    status="completed",
-                    message=(
-                        "无知识条目，保留既有证据图（"
-                        f"{len(existing_graph.nodes)} 节点 / "
-                        f"{len(existing_graph.edges)} 边），不清空重建"
-                    ),
+            correction_updates = [
+                request.model_copy(deep=True)
+                for request in state.graph_correction_requests
+            ]
+            if any(request.status == "pending" for request in correction_updates):
+                graph, correction_updates = self._apply_graph_corrections(
+                    graph,
+                    correction_updates,
+                    iteration=state.iteration_count,
                 )
-                return {"evidence_graph": existing_graph}
-            # State carries no graph — fall back to the persisted one
-            # (lossless round snapshot first, then the JSONL memory store).
-            persisted = self._load_persisted_graph(state)
-            if persisted is not None and persisted.nodes:
-                logger.info(
-                    "M3: no knowledge entries; reusing persisted graph "
-                    "(%d nodes, %d edges)",
-                    len(persisted.nodes), len(persisted.edges),
-                )
-                emit_event(
-                    "module_notice",
-                    module="m3",
-                    status="completed",
-                    message=(
-                        "无知识条目，从持久化记忆恢复证据图（"
-                        f"{len(persisted.nodes)} 节点 / "
-                        f"{len(persisted.edges)} 边）"
-                    ),
-                )
-                return {"evidence_graph": persisted}
-            return {"evidence_graph": EvidenceGraph()}
+            result: Dict[str, Any] = {"evidence_graph": graph}
+            if indexed_gap_requests != state.evidence_gap_requests:
+                result["evidence_gap_requests"] = indexed_gap_requests
+            if correction_updates != state.graph_correction_requests:
+                result["graph_correction_requests"] = correction_updates
+            return result
 
         # --- Step 1: rule-based graph construction (with incremental update) ---
         rule_started_at = time.monotonic()
@@ -459,23 +499,23 @@ class M3EvidenceGraph(ModuleProtocol):
                     elapsed_seconds=time.monotonic() - llm_started_at,
                 )
 
-        # --- Step 3: Iterative refinement from M6 reviews ---
-        if (
-            state.iteration_count > 0
-            and state.reviews
-            and self.client
-            and self.mode in {"llm", "direct", "api"}
-        ):
-            try:
-                graph = await self._refine_with_reviews(graph, state)
-            except Exception as exc:
-                logger.warning(
-                    "M3 iterative refinement failed; keeping unrefined graph: %s", exc
-                )
+        # --- Step 3: validated, audited corrections requested by M6 ---
+        correction_updates = [
+            request.model_copy(deep=True)
+            for request in state.graph_correction_requests
+        ]
+        if any(request.status == "pending" for request in correction_updates):
+            graph, correction_updates = self._apply_graph_corrections(
+                graph,
+                correction_updates,
+                iteration=state.iteration_count,
+            )
 
         # --- Step 4: M3 grounding (optional — consumes M2KnowledgeExport) ---
         result: Dict[str, Any] = {"evidence_graph": graph}
-        if self.grounding_enabled and self._grounder is not None:
+        if correction_updates != state.graph_correction_requests:
+            result["graph_correction_requests"] = correction_updates
+        if new_entries and self.grounding_enabled and self._grounder is not None:
             if state.m2_knowledge_export is None:
                 logger.warning(
                     "M3 grounding is enabled but m2_knowledge_export is None. "
@@ -495,6 +535,7 @@ class M3EvidenceGraph(ModuleProtocol):
                         grounded.get("claims", []),
                         grounded.get("relations", []),
                         grounded.get("report"),
+                        entity_normalizer=self._normalise_task_entity,
                     )
                     result["evidence_graph"] = graph
                 except Exception as exc:
@@ -527,6 +568,9 @@ class M3EvidenceGraph(ModuleProtocol):
         snapshot_dir = self.output_dir or getattr(state, "memory_cache_dir", "")
         if snapshot_dir:
             self._write_round_snapshot(graph, snapshot_dir, state)
+
+        if indexed_gap_requests != state.evidence_gap_requests:
+            result["evidence_gap_requests"] = indexed_gap_requests
 
         return result
 
@@ -590,6 +634,13 @@ class M3EvidenceGraph(ModuleProtocol):
     # Step 1 — rule-based graph construction
     # ------------------------------------------------------------------
 
+    def _normalise_task_entity(self, name: str) -> str:
+        surface = clean_entity_surface(name)
+        if surface in self._task_entity_index:
+            return self._task_entity_index[surface]
+        cleaned = normalize_entity(name)
+        return self._task_entity_index.get(cleaned, cleaned)
+
     def _build_rule_graph(self, all_entries: list) -> EvidenceGraph:
         """Build nodes and ``INVOLVES`` edges from entry metadata.
 
@@ -634,17 +685,32 @@ class M3EvidenceGraph(ModuleProtocol):
 
             # Normalise entities in metadata
             normalised_entities = [
-                normalize_entity(name) for name in e.entities
+                normalized
+                for name in e.entities
+                if (normalized := self._normalise_task_entity(name))
             ]
+            node_label = e.content[:120]
+            if e.type is KnowledgeEntryType.KEY_ENTITY:
+                canonical = (
+                    normalised_entities[0]
+                    if normalised_entities else self._normalise_task_entity(e.content)
+                )
+                if canonical:
+                    node_label = canonical
 
             nodes.append(EvidenceNode(
                 id=nid,
                 type=node_type,
-                label=e.content[:120],
+                label=node_label,
                 metadata={
+                    "entry_id": e.id,
                     "entry_type": e.type.value,
                     "confidence": e.confidence.value if e.confidence else None,
                     "entities": normalised_entities,
+                    "evidence_ids": list(e.evidence_ids),
+                    "source_paper_id": e.source_paper_id,
+                    "source_paper_title": e.source_paper_title,
+                    "full_text": e.content[:2000],
                 },
             ))
 
@@ -665,7 +731,13 @@ class M3EvidenceGraph(ModuleProtocol):
                         id=eid,
                         type=EvidenceNodeType.ENTITY,
                         label=name,
-                        metadata={"normalised_from": e.entities},
+                        metadata={
+                            "normalised_from": [
+                                original
+                                for original in e.entities
+                                if self._normalise_task_entity(original) == name
+                            ],
+                        },
                     ))
                 entity_nid = seen_entities[name]
                 # Avoid duplicate entity→entry edges
@@ -789,7 +861,7 @@ class M3EvidenceGraph(ModuleProtocol):
                 "entry_id": entry.id,
                 "type": entry.type.value,
                 "content": entry.content[:600],
-                "entities": [normalize_entity(name) for name in entry.entities],
+                "entities": [self._normalise_task_entity(name) for name in entry.entities],
                 "source": entry.source_paper_id,
             }
             for entry in entries
@@ -919,7 +991,7 @@ class M3EvidenceGraph(ModuleProtocol):
                 "entry_id": e.id,
                 "type": e.type.value,
                 "content": e.content[:600],
-                "entities": [normalize_entity(name) for name in e.entities],
+                "entities": [self._normalise_task_entity(name) for name in e.entities],
                 "source": e.source_paper_id,
             })
 
@@ -1057,214 +1129,123 @@ class M3EvidenceGraph(ModuleProtocol):
     # Step 3 — iterative refinement from M6 reviews
     # ------------------------------------------------------------------
 
-    async def _refine_with_reviews(
-        self,
+    @staticmethod
+    def _apply_graph_corrections(
         graph: EvidenceGraph,
-        state: PipelineState,
-    ) -> EvidenceGraph:
-        """Use M6 review feedback to correct or augment the evidence graph.
+        requests: List[GraphCorrectionRequest],
+        *,
+        iteration: int,
+    ) -> tuple[EvidenceGraph, List[GraphCorrectionRequest]]:
+        """Validate correction requests and append a before/after audit record."""
 
-        Only runs when ``iteration_count > 0`` (i.e., M6 has already
-        produced reviews in a previous iteration).  The LLM receives the
-        current graph summary + reviewer critiques and returns a list of
-        edge additions, removals, or re-classifications.
-        """
-        assert self.client is not None
-
-        # Summarise the current graph
-        node_summary = []
-        for n in graph.nodes[:80]:
-            node_summary.append(
-                f"  {n.id} [{n.type.value}] {n.label[:100]}"
-            )
-        edge_summary = []
-        for e in graph.edges[:120]:
-            conf_str = f" c={e.confidence:.2f}" if e.confidence is not None else ""
-            rat_str = f" ({e.rationale[:60]})" if e.rationale else ""
-            edge_summary.append(
-                f"  {e.source} --[{e.relation.value}{conf_str}]--> {e.target}{rat_str}"
-            )
-
-        review_text = "\n".join(
-            f"[{r.dimension.value}] score={r.score:.1f} "
-            f"comments={r.comments[:200]} suggestions={r.suggestions[:200]}"
-            for r in state.reviews[-4:]  # last 4 reviews
-        )
-
-        schema = {
-            "type": "object",
-            "properties": {
-                "add_edges": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "source": {"type": "string"},
-                            "target": {"type": "string"},
-                            "relation": {
-                                "type": "string",
-                                "enum": [
-                                    "supports", "contradicts",
-                                    "extends", "limits",
-                                ],
-                            },
-                            "confidence": {
-                                "type": "number", "minimum": 0, "maximum": 1,
-                            },
-                            "rationale": {"type": "string"},
-                        },
-                        "required": ["source", "target", "relation"],
-                    },
-                },
-                "remove_edges": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "source": {"type": "string"},
-                            "target": {"type": "string"},
-                            "reason": {"type": "string"},
-                        },
-                        "required": ["source", "target"],
-                    },
-                },
-                "reclassify_edges": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "source": {"type": "string"},
-                            "target": {"type": "string"},
-                            "new_relation": {
-                                "type": "string",
-                                "enum": [
-                                    "supports", "contradicts",
-                                    "extends", "limits",
-                                ],
-                            },
-                            "rationale": {"type": "string"},
-                        },
-                        "required": ["source", "target", "new_relation"],
-                    },
-                },
-                "refinement_summary": {"type": "string"},
-            },
+        node_ids = {node.id for node in graph.nodes}
+        valid_evidence_ids = {
+            str(evidence_id)
+            for node in graph.nodes
+            for evidence_id in (node.metadata or {}).get("evidence_ids", [])
         }
-
-        prompt = (
-            "You are reviewing an evidence graph that was used to generate "
-            "scientific hypotheses.  Reviewer feedback suggests improvements. "
-            "Your task: suggest concrete edge corrections to improve the graph.\n\n"
-            f"## Review Feedback\n{review_text}\n\n"
-            f"## Current Graph Nodes ({len(graph.nodes)} total, showing first 80)\n"
-            + "\n".join(node_summary)
-            + f"\n\n## Current Graph Edges ({len(graph.edges)} total, showing first 120)\n"
-            + "\n".join(edge_summary)
-            + "\n\nSuggest edge additions, removals, and reclassifications "
-            "based on the reviewer feedback.  Be conservative — only suggest "
-            "changes directly motivated by reviewer comments."
+        valid_evidence_ids.update(
+            evidence_id for edge in graph.edges for evidence_id in edge.evidence_ids
         )
+        updated: List[GraphCorrectionRequest] = []
 
-        try:
-            result = await self.client.structured_chat(
-                system_prompt=(
-                    "You are a biomedical knowledge graph curator. "
-                    "Given reviewer feedback, suggest targeted corrections "
-                    "to an evidence graph. Be precise: use exact node IDs. "
-                    "Only suggest changes with clear scientific justification."
-                ),
-                user_prompt=prompt,
-                output_schema=schema,
-                max_tokens=8192,
-                temperature=0.1,
-                disable_thinking=True,
-            )
-        except Exception:
-            logger.exception("M3 refinement LLM call failed")
-            return graph
-
-        if not isinstance(result, dict) or result.get("_parse_error"):
-            return graph
-
-        # Apply removals
-        remove_keys = {
-            (r.get("source", ""), r.get("target", ""))
-            for r in (result.get("remove_edges") or [])
-            if isinstance(r, dict)
-        }
-        if remove_keys:
-            before = len(graph.edges)
-            graph.edges = [
-                e for e in graph.edges
-                if (e.source, e.target) not in remove_keys
+        for request in requests:
+            if request.status != "pending":
+                updated.append(request)
+                continue
+            before_version = graph.version
+            before: Dict[str, Any] = {}
+            after: Dict[str, Any] = {}
+            rejection = ""
+            matching = [
+                edge for edge in graph.edges
+                if edge.source == request.source_node_id
+                and edge.target == request.target_node_id
+                and (
+                    request.current_relation is None
+                    or edge.relation == request.current_relation
+                )
             ]
-            logger.info(
-                "M3 refinement: removed %d edges", before - len(graph.edges)
-            )
 
-        # Apply reclassifications
-        reclassify = [
-            r for r in (result.get("reclassify_edges") or [])
-            if isinstance(r, dict)
-        ]
-        for rc in reclassify:
-            src = rc.get("source", "")
-            tgt = rc.get("target", "")
-            new_rel_str = rc.get("new_relation", "")
-            try:
-                new_rel = EvidenceEdgeRelation(new_rel_str)
-            except ValueError:
-                continue
-            rationale = str(rc.get("rationale", "") or "")[:500]
-            for edge in graph.edges:
-                if edge.source == src and edge.target == tgt:
-                    edge.relation = new_rel
-                    if rationale:
-                        edge.rationale = rationale
-                    break
-        if reclassify:
-            logger.info("M3 refinement: reclassified %d edges", len(reclassify))
-
-        # Apply additions
-        add_edges = [
-            a for a in (result.get("add_edges") or [])
-            if isinstance(a, dict)
-        ]
-        added = 0
-        for ae in add_edges:
-            src = ae.get("source", "")
-            tgt = ae.get("target", "")
-            rel_str = ae.get("relation", "")
-            try:
-                rel = EvidenceEdgeRelation(rel_str)
-            except ValueError:
-                continue
-            if any(
-                e.source == src and e.target == tgt and e.relation == rel
-                for e in graph.edges
+            if request.source_node_id not in node_ids or request.target_node_id not in node_ids:
+                rejection = "request references an unknown graph node"
+            elif not request.reason.strip():
+                rejection = "request has no correction reason"
+            elif not request.evidence_ids:
+                rejection = "request has no canonical supporting evidence ID"
+            elif any(
+                evidence_id not in valid_evidence_ids
+                for evidence_id in request.evidence_ids
             ):
-                continue
-            confidence: Optional[float] = None
-            raw_conf = ae.get("confidence")
-            if isinstance(raw_conf, (int, float)) and 0 <= raw_conf <= 1:
-                confidence = float(raw_conf)
-            rationale = str(ae.get("rationale", "") or "")[:500] or None
-            graph.edges.append(EvidenceEdge(
-                source=src,
-                target=tgt,
-                relation=rel,
-                confidence=confidence,
-                rationale=rationale,
+                rejection = "request references evidence not present in the graph"
+            elif request.operation in {"remove_edge", "reclassify_edge"} and len(matching) != 1:
+                rejection = "request does not identify exactly one existing edge"
+            elif request.operation in {"add_edge", "reclassify_edge"} and request.proposed_relation is None:
+                rejection = "request has no proposed relation"
+
+            if not rejection:
+                if request.operation == "add_edge":
+                    duplicate = any(
+                        edge.source == request.source_node_id
+                        and edge.target == request.target_node_id
+                        and edge.relation == request.proposed_relation
+                        for edge in graph.edges
+                    )
+                    if duplicate:
+                        rejection = "the proposed edge already exists"
+                    else:
+                        edge = EvidenceEdge(
+                            source=request.source_node_id,
+                            target=request.target_node_id,
+                            relation=request.proposed_relation,
+                            rationale=request.reason[:500],
+                            evidence_ids=list(request.evidence_ids),
+                        )
+                        graph.edges.append(edge)
+                        after = edge.model_dump(mode="json")
+                elif request.operation == "remove_edge":
+                    edge = matching[0]
+                    before = edge.model_dump(mode="json")
+                    graph.edges.remove(edge)
+                else:
+                    edge = matching[0]
+                    before = edge.model_dump(mode="json")
+                    edge.relation = request.proposed_relation
+                    edge.rationale = request.reason[:500]
+                    edge.evidence_ids = list(dict.fromkeys([
+                        *edge.evidence_ids, *request.evidence_ids,
+                    ]))
+                    after = edge.model_dump(mode="json")
+
+            if rejection:
+                resolved = request.model_copy(update={
+                    "status": "rejected",
+                    "rejection_reason": rejection,
+                })
+                status = "rejected"
+            else:
+                graph.version += 1
+                resolved = request.model_copy(update={
+                    "status": "applied",
+                    "rejection_reason": "",
+                })
+                status = "applied"
+            graph.audit_log.append(GraphAuditRecord(
+                sequence=len(graph.audit_log) + 1,
+                graph_version_before=before_version,
+                graph_version_after=graph.version,
+                request_id=request.request_id,
+                operation=request.operation,
+                status=status,
+                before=before,
+                after=after,
+                reason=rejection or request.reason,
+                evidence_ids=list(request.evidence_ids),
+                iteration=iteration,
             ))
-            added += 1
-        if added:
-            logger.info("M3 refinement: added %d edges", added)
+            updated.append(resolved)
 
-        summary = str(result.get("refinement_summary", "") or "")
-        if summary:
-            logger.info("M3 refinement summary: %s", summary[:200])
-
-        return graph
+        return graph, updated
 
     # ------------------------------------------------------------------
     # Step 4 — merge grounding results into the evidence graph
@@ -1277,6 +1258,7 @@ class M3EvidenceGraph(ModuleProtocol):
         claims: List[AtomicClaim],
         relations: List[EvidenceRelation],
         report: Any,
+        entity_normalizer: Optional[Callable[[str], str]] = None,
     ) -> EvidenceGraph:
         """Merge grounding workflow output into the existing evidence graph.
 
@@ -1285,6 +1267,7 @@ class M3EvidenceGraph(ModuleProtocol):
         The ``evidence_ids`` on both claims and relations point back to
         ``M2EvidenceExport.evidence_id``, which is recorded in node metadata.
         """
+        normalise = entity_normalizer or normalize_entity
         record_map = {record.evidence_id: record for record in records}
         claim_map: Dict[str, str] = {}
 
@@ -1307,7 +1290,7 @@ class M3EvidenceGraph(ModuleProtocol):
                     "evidence_ids": claim.evidence_ids,
                     "paper_ids": list(dict.fromkeys(evidence_paper_ids)),
                     "entities": [
-                        normalize_entity(name)
+                        normalise(name)
                         for name in claim.entities
                     ],
                     "provenance_level": "m2_fulltext_grounded",
@@ -1543,6 +1526,51 @@ class M3EvidenceGraph(ModuleProtocol):
         return None
 
     @staticmethod
+    def _load_persistent_graph(cache_dir: str, query: str) -> Optional[EvidenceGraph]:
+        """Retrieve a task-relevant historical subgraph through the BM25 cache."""
+
+        from pathlib import Path
+        from ..memory.graph_manager import KnowledgeGraphManager
+        from ..memory.schema import knowledge_graph_to_evidence_graph
+
+        try:
+            manager = KnowledgeGraphManager(cache_dir=Path(cache_dir))
+            if query.strip():
+                knowledge_graph = manager.search_nodes(
+                    query, context="evidence_graph", top_k=30
+                )
+                graph = knowledge_graph_to_evidence_graph(knowledge_graph)
+            else:
+                graph = manager.load_to_evidence_graph()
+            if graph is None or not graph.nodes:
+                return None
+            # A retrieved subgraph may not include the persistent _buckets meta
+            # entity. Reconstruct buckets from canonical node metadata.
+            for node in graph.nodes:
+                metadata = node.metadata or {}
+                entry_id = str(metadata.get("entry_id") or "")
+                entry_type = str(metadata.get("entry_type") or "")
+                if not entry_id:
+                    continue
+                if entry_type == KnowledgeEntryType.ESTABLISHED_FACT.value:
+                    graph.established_facts.append(entry_id)
+                elif entry_type == KnowledgeEntryType.CONFLICTING_EVIDENCE.value:
+                    graph.conflicts.append(entry_id)
+                elif entry_type == KnowledgeEntryType.KNOWLEDGE_GAP.value:
+                    graph.knowledge_gaps.append(entry_id)
+            graph.established_facts = list(dict.fromkeys(graph.established_facts))
+            graph.conflicts = list(dict.fromkeys(graph.conflicts))
+            graph.knowledge_gaps = list(dict.fromkeys(graph.knowledge_gaps))
+            logger.info(
+                "M3 loaded %d task-relevant nodes from persistent memory",
+                len(graph.nodes),
+            )
+            return graph
+        except Exception as exc:
+            logger.warning("M3 persistent graph retrieval failed: %s", exc)
+            return None
+
+    @staticmethod
     def _persist_graph(graph: EvidenceGraph, cache_dir: str) -> None:
         """Merge the evidence graph into the JSONL-backed persistent store.
 
@@ -1589,7 +1617,10 @@ class M3EvidenceGraph(ModuleProtocol):
 
     @classmethod
     def get_input_fields(cls) -> List[str]:
-        return ["literature_results", "evidence_graph", "reviews", "iteration_count"]
+        return [
+            "literature_results", "m2_knowledge_export", "evidence_graph",
+            "reviews", "iteration_count", "memory_cache_dir", "problem_card",
+        ]
 
     @classmethod
     def get_output_fields(cls) -> List[str]:

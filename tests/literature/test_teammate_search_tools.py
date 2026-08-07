@@ -155,13 +155,21 @@ async def test_semantic_scholar_constructor_key_selects_instance_backend(
         calls.append((query, limit, api_key))
         return []
 
+    fallback_calls = []
+
+    def openalex_search(query: str, limit: int, api_key: str):
+        fallback_calls.append((query, limit, api_key))
+        return []
+
     monkeypatch.setattr(semantic_scholar, "_s2_search", search)
+    monkeypatch.setattr(semantic_scholar, "_oa_search", openalex_search)
     tool = SemanticScholarTool(api_key="instance-key")
 
     await tool.search_strict("Hippo", limit=3)
 
     assert tool.backend_name == "semantic_scholar"
     assert calls == [("Hippo", 3, "instance-key")]
+    assert fallback_calls == [("Hippo", 3, "")]
 
 
 @pytest.mark.asyncio
@@ -361,6 +369,39 @@ async def test_academic_source_maps_stable_identity_and_abstract_status() -> Non
     assert [paper.fulltext_status for paper in papers] == [
         FulltextStatus.ABSTRACT_ONLY, FulltextStatus.UNKNOWN
     ]
+
+
+@pytest.mark.asyncio
+async def test_academic_source_preserves_s2_pubmed_and_oa_pdf_metadata() -> None:
+    source = AcademicSource(tool=FakeLegacyTool([{
+        "source": "semantic_scholar",
+        "paper_id": "legacy-oa",
+        "title": "Open manipulator study",
+        "abstract": "Direct manipulation evidence.",
+        "pmid": "12345",
+        "pmcid": "PMC12345",
+        "external_ids": {
+            "PubMed": "12345",
+            "PubMedCentral": "PMC12345",
+        },
+        "oa_pdf_url": "https://example.test/open.pdf",
+        "is_open_access": True,
+    }]))
+    query = SearchQuery(
+        query_id="q-oa",
+        text="robot manipulation sim-to-real",
+        target_source="semantic_scholar",
+        purpose="method",
+        relation_to_question="direct",
+    )
+
+    paper = (await source.search(query))[0]
+
+    assert paper.pmid == "12345"
+    assert paper.pmcid == "PMC12345"
+    assert paper.external_ids["oa_pdf_url"] == "https://example.test/open.pdf"
+    assert paper.is_open_access is True
+    assert paper.fulltext_status is FulltextStatus.PDF_AVAILABLE
 
 
 @pytest.mark.asyncio

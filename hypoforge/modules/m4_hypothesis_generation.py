@@ -11,6 +11,7 @@ Output: ``candidate_hypotheses`` + ``top_hypotheses`` in state.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -19,8 +20,11 @@ import time
 from typing import Any, Dict, List, Optional
 
 from ..observability import emit_event
+from ..graph_context import GraphContext, build_graph_context
 from ..protocol import ModuleProtocol
 from ..prompts.m4_prompts import (
+    M4_CONTRACT_REPAIR_SYSTEM_PROMPT,
+    M4_CONTRACT_REPAIR_USER_TEMPLATE,
     M4_CRITIC_SYSTEM_PROMPT,
     M4_CRITIC_USER_TEMPLATE,
     M4_FALSIFIABILITY_SYSTEM_PROMPT,
@@ -38,7 +42,8 @@ from ..evaluation.rubric import (
     weights_summary,
 )
 from ..registry import ModuleRegistry
-from ..state import HypothesisCard, PipelineState
+from ..state import EvidenceGapRequest, HypothesisCard, PipelineState
+from ..task_alignment import assess_task_alignment
 from ..tools.qwen_client import QwenClient
 
 logger = logging.getLogger(__name__)
@@ -159,13 +164,6 @@ class M4HypothesisGeneration(ModuleProtocol):
         )
         return result
 
-    def _entry_lookup(self, state: PipelineState) -> Dict[str, str]:
-        entries: Dict[str, str] = {}
-        for lr in state.literature_results:
-            for entry in lr.knowledge_entries:
-                entries[entry.id] = entry.content
-        return entries
-
     @staticmethod
     def _is_scientific_statement(statement: str) -> bool:
         """Return whether *statement* has the form of a scientific claim.
@@ -180,11 +178,139 @@ class M4HypothesisGeneration(ModuleProtocol):
         return _EDITORIAL_STATEMENT_RE.match(text) is None
 
     def _graph_bucket_text(self, state: PipelineState, bucket: str) -> str:
-        graph = state.evidence_graph
-        entry_text = self._entry_lookup(state)
-        ids = getattr(graph, bucket, []) if graph else []
-        lines = [f"- {entry_id}: {entry_text.get(entry_id, entry_id)}" for entry_id in ids]
+        context = build_graph_context(state)
+        items = getattr(context, bucket, [])
+        lines = [
+            f"- {item.entry_id}: {item.text}"
+            + (f" [evidence: {', '.join(item.evidence_ids)}]" if item.evidence_ids else "")
+            for item in items
+        ]
         return "\n".join(lines) if lines else "- None available"
+
+    @staticmethod
+    def _check_context_contract(
+        state: PipelineState,
+        context: GraphContext,
+        cards: List[HypothesisCard],
+    ) -> tuple[List[HypothesisCard], List[Dict[str, Any]]]:
+        """Return accepted cards and machine-readable contract diagnostics."""
+
+        valid_references = set(context.available_evidence_ids)
+        accepted: List[HypothesisCard] = []
+        failures: List[Dict[str, Any]] = []
+        for card in cards:
+            candidate_text = "\n".join([
+                card.statement,
+                card.mechanism,
+                *card.observable_predictions,
+                *card.falsification_conditions,
+            ])
+            alignment = assess_task_alignment(
+                state,
+                candidate_text,
+                subject_text="\n".join([card.statement, card.mechanism]),
+                trace=card.task_trace,
+            )
+            if not alignment.passed:
+                failures.append({
+                    "hypothesis_id": card.hypothesis_id,
+                    "rationale": alignment.rationale,
+                    "missing_task_entities": list(alignment.missing_anchors),
+                    "missing_requirement_ids": list(
+                        alignment.missing_requirement_ids
+                    ),
+                    "invalid_task_trace_references": list(
+                        alignment.invalid_trace_references
+                    ),
+                })
+                logger.warning(
+                    "M4 discarded task-misaligned hypothesis %s: %s",
+                    card.hypothesis_id,
+                    alignment.rationale,
+                )
+                continue
+            references = list(dict.fromkeys(
+                reference
+                for reference in card.supporting_evidence
+                if reference in valid_references
+            ))
+            if len(references) != len(card.supporting_evidence):
+                logger.warning(
+                    "M4 removed unresolved evidence references from %s",
+                    card.hypothesis_id,
+                )
+            accepted.append(card.model_copy(update={"supporting_evidence": references}))
+        return accepted, failures
+
+    @staticmethod
+    def _enforce_context_contract(
+        state: PipelineState,
+        context: GraphContext,
+        cards: List[HypothesisCard],
+    ) -> List[HypothesisCard]:
+        """Compatibility wrapper returning only contract-compliant cards."""
+
+        accepted, _ = M4HypothesisGeneration._check_context_contract(
+            state, context, cards
+        )
+        return accepted
+
+    async def _repair_context_contract(
+        self,
+        *,
+        state: PipelineState,
+        context: GraphContext,
+        candidates: List[HypothesisCard],
+        failures: List[Dict[str, Any]],
+        feedback_context: str,
+    ) -> tuple[List[HypothesisCard], List[Dict[str, Any]]]:
+        """Make one deterministic repair attempt without relaxing hard gates."""
+
+        assert self.client is not None
+        question = (
+            state.problem_card.original_question
+            if state.problem_card else state.input_question
+        )
+        repaired = await self._observe_tool(
+            "hypothesis_contract_repair",
+            self.client.structured_chat(
+                system_prompt=M4_CONTRACT_REPAIR_SYSTEM_PROMPT.format(
+                    num_candidates=self.num_candidates,
+                ),
+                user_prompt=M4_CONTRACT_REPAIR_USER_TEMPLATE.format(
+                    graph_context=context.render(),
+                    candidate_json=json.dumps(
+                        [card.model_dump(mode="json") for card in candidates],
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    failure_json=json.dumps(
+                        failures or [{
+                            "rationale": (
+                                "No schema-valid scientific hypothesis was returned."
+                            ),
+                        }],
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    original_question=question,
+                    feedback_context=feedback_context,
+                ),
+                output_schema={
+                    "type": "array",
+                    "items": HypothesisCard.model_json_schema(),
+                },
+                max_tokens=16384,
+                temperature=0.0,
+            ),
+            details={
+                "candidate_count": len(candidates),
+                "failure_count": len(failures),
+                "iteration": state.iteration_count + 1,
+            },
+        )
+        repaired_candidates = self._normalise_hypotheses(repaired)
+        return self._check_context_contract(state, context, repaired_candidates)
 
     def _normalise_hypotheses(self, payload: Any) -> List[HypothesisCard]:
         if isinstance(payload, dict):
@@ -226,6 +352,7 @@ class M4HypothesisGeneration(ModuleProtocol):
         self,
         candidates: List[HypothesisCard],
         payload: Any,
+        context: GraphContext | None = None,
     ) -> List[HypothesisCard]:
         """Attach ranker-only output to the original candidate objects.
 
@@ -257,6 +384,14 @@ class M4HypothesisGeneration(ModuleProtocol):
                 continue
             if not all(0.0 <= value <= 1.0 for value in scores.values()):
                 continue
+            if context is not None and not by_id[hypothesis_id].supporting_evidence:
+                # A self-assigned high evidence score cannot survive without a
+                # concrete canonical citation. This is intentionally separate
+                # from novelty/soundness/testability.
+                scores["evidence_consistency"] = min(
+                    scores["evidence_consistency"],
+                    0.0 if not context.available_evidence_ids else 0.2,
+                )
             scores["composite"] = composite_score(scores, self.weights)
             ranked_cards.append(by_id[hypothesis_id].model_copy(update={
                 "ranking_rationale": str(item.get("ranking_rationale") or "").strip(),
@@ -360,10 +495,103 @@ class M4HypothesisGeneration(ModuleProtocol):
                 dedup[key] = card
         return self._rank_top(list(dedup.values()))
 
+    @staticmethod
+    def _update_evidence_gaps(
+        state: PipelineState,
+        hypotheses: List[HypothesisCard],
+        context: GraphContext,
+    ) -> List[EvidenceGapRequest]:
+        """Create/deduplicate bounded search requests before M5 is allowed to run."""
+
+        existing = {
+            gap.gap_id: gap.model_copy(deep=True)
+            for gap in state.evidence_gap_requests
+        }
+        card = state.problem_card
+        requirements = {
+            item.requirement_id: item
+            for item in (card.task_contract.requirements if card else [])
+            if item.required
+        }
+        valid_evidence = set(context.available_evidence_ids)
+
+        for hypothesis in hypotheses:
+            cited = list(dict.fromkeys(
+                evidence_id for evidence_id in hypothesis.supporting_evidence
+                if evidence_id in valid_evidence
+            ))
+            traced_requirement_ids = [
+                reference.contract_id
+                for reference in hypothesis.task_trace.requirement_mentions
+                if reference.contract_id in requirements
+            ]
+            if not traced_requirement_ids:
+                traced_requirement_ids = list(requirements)
+
+            targets = traced_requirement_ids or [""]
+            for requirement_id in targets:
+                requirement = requirements.get(requirement_id)
+                sub_question = (
+                    requirement.sub_question if requirement
+                    else (card.original_question if card else state.input_question)
+                )
+                relation = requirement.relation if requirement else hypothesis.mechanism
+                entity_ids = list(dict.fromkeys(filter(None, [
+                    requirement.primary_entity_id if requirement else "",
+                    *(requirement.related_entity_ids if requirement else []),
+                ])))
+                fingerprint = "|".join([
+                    requirement_id or sub_question.casefold(),
+                    "supporting_evidence",
+                ])
+                gap_id = "GAP_" + hashlib.sha256(
+                    fingerprint.encode("utf-8")
+                ).hexdigest()[:12]
+                previous = existing.get(gap_id)
+                if cited:
+                    if previous is not None:
+                        existing[gap_id] = previous.model_copy(update={
+                            "status": "resolved",
+                            "resolution_evidence_ids": cited,
+                            "hypothesis_id": hypothesis.hypothesis_id,
+                        })
+                    continue
+
+                attempts = previous.attempts if previous else 0
+                status = (
+                    "exhausted"
+                    if attempts >= state.max_evidence_gap_rounds
+                    else "pending"
+                )
+                existing[gap_id] = EvidenceGapRequest(
+                    gap_id=gap_id,
+                    hypothesis_id=hypothesis.hypothesis_id,
+                    requirement_id=requirement_id,
+                    sub_question=sub_question,
+                    task_entity_ids=entity_ids,
+                    relation=relation,
+                    suggested_queries=[sub_question],
+                    executed_queries=(previous.executed_queries if previous else []),
+                    status=status,
+                    attempts=attempts,
+                    created_iteration=(
+                        previous.created_iteration
+                        if previous else state.iteration_count
+                    ),
+                    rationale=(
+                        "No canonical supporting evidence ID was attached to a "
+                        "hypothesis that addresses this task requirement."
+                    ),
+                )
+
+        return list(existing.values())
+
     async def _run_llm(self, state: PipelineState, feedback_context: str = "") -> Dict[str, Any]:
         assert self.client is not None
         question = state.problem_card.original_question if state.problem_card else state.input_question
         rubric_block = hypothesis_rubric_block()
+        graph_context = build_graph_context(state)
+        rendered_graph_context = graph_context.render()
 
         # ── Step 1: Generator ──────────────────────────────────────────
         generator_schema = {
@@ -378,6 +606,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                     rubric_block=rubric_block,
                 ),
                 user_prompt=M4_GENERATOR_USER_TEMPLATE.format(
+                    graph_context=rendered_graph_context,
                     knowledge_gaps=self._graph_bucket_text(state, "knowledge_gaps"),
                     established_facts=self._graph_bucket_text(state, "established_facts"),
                     conflicts=self._graph_bucket_text(state, "conflicts"),
@@ -395,8 +624,26 @@ class M4HypothesisGeneration(ModuleProtocol):
             },
         )
         candidates = self._normalise_hypotheses(generated)
+        candidates, contract_failures = self._check_context_contract(
+            state, graph_context, candidates
+        )
         if not candidates:
-            raise ValueError("M4 generator returned no valid hypotheses")
+            candidates, contract_failures = await self._repair_context_contract(
+                state=state,
+                context=graph_context,
+                candidates=self._normalise_hypotheses(generated),
+                failures=contract_failures,
+                feedback_context=feedback_context,
+            )
+        if not candidates:
+            diagnostics = "; ".join(
+                str(item.get("rationale") or "contract validation failed")
+                for item in contract_failures[:3]
+            )
+            raise ValueError(
+                "M4 generator and one deterministic repair attempt returned no "
+                f"task-contract-compliant hypotheses: {diagnostics}"
+            )
 
         if self.mode != "multi_agent":
             top = self._rank_top(candidates)
@@ -439,6 +686,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                     rubric_block=hypothesis_rubric_block(),
                 ),
                 user_prompt=M4_RANKER_USER_TEMPLATE.format(
+                    graph_context=rendered_graph_context,
                     hypotheses_json=json.dumps(
                         [h.model_dump(mode="json") for h in candidates],
                         ensure_ascii=False,
@@ -452,7 +700,7 @@ class M4HypothesisGeneration(ModuleProtocol):
             ),
             details={"candidates": len(candidates), "top_k": self.top_k},
         )
-        top = self._attach_rankings(candidates, ranked)
+        top = self._attach_rankings(candidates, ranked, graph_context)
         if not top:
             logger.warning("M4 ranker returned incomplete scores; ranking generated candidates instead")
             top = self._rank_top(candidates)
@@ -495,6 +743,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                 self.client.structured_chat(
                     system_prompt=M4_CRITIC_SYSTEM_PROMPT,
                     user_prompt=M4_CRITIC_USER_TEMPLATE.format(
+                        graph_context=build_graph_context(state).render(),
                         established_facts=self._graph_bucket_text(state, "established_facts"),
                         hypotheses_json=json.dumps(
                             [h.model_dump(mode="json") for h in candidates],
@@ -562,6 +811,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                 self.client.structured_chat(
                     system_prompt=M4_FALSIFIABILITY_SYSTEM_PROMPT,
                     user_prompt=M4_FALSIFIABILITY_USER_TEMPLATE.format(
+                        graph_context=build_graph_context(state).render(),
                         hypotheses_json=json.dumps(
                             [h.model_dump(mode="json") for h in candidates],
                             ensure_ascii=False,
@@ -624,11 +874,35 @@ class M4HypothesisGeneration(ModuleProtocol):
         result = await self._run_llm(state, feedback_context)
         result["user_guidance"] = guidance
         result["best_hypotheses"] = self._update_best(state, result.get("top_hypotheses", []))
+        graph_context = build_graph_context(state)
+        gaps = self._update_evidence_gaps(
+            state,
+            result.get("top_hypotheses", []),
+            graph_context,
+        )
+        result["evidence_gap_requests"] = gaps
+        pending = [gap for gap in gaps if gap.status == "pending"]
+        if pending:
+            emit_event(
+                "routing_decision",
+                module="m4",
+                tool="evidence_gap_detector",
+                status="pending",
+                message=f"M4 detected {len(pending)} searchable evidence gap(s)",
+                details={
+                    "route": "m4->m2->m3->m4",
+                    "gap_ids": [gap.gap_id for gap in pending],
+                    "sub_questions": [gap.sub_question for gap in pending],
+                },
+            )
         return result
 
     @classmethod
     def get_input_fields(cls) -> List[str]:
-        return ["evidence_graph", "problem_card", "literature_results"]
+        return [
+            "evidence_graph", "problem_card", "literature_results",
+            "m2_knowledge_export", "grounding_report",
+        ]
 
     @classmethod
     def get_output_fields(cls) -> List[str]:

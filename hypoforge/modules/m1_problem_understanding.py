@@ -96,6 +96,57 @@ class M1ProblemUnderstanding(ModuleProtocol):
     module_version = "0.2.0"
     description = "Problem decomposition: sub-questions, domain tagging, entity extraction"
 
+    @staticmethod
+    def _sub_question_violations(sub_questions: List[str]) -> List[str]:
+        violations: List[str] = []
+        for index, value in enumerate(sub_questions, start=1):
+            text = " ".join(str(value or "").split())
+            reasons: List[str] = []
+            if len(text) > 240:
+                reasons.append("longer than 240 characters")
+            if text.count("?") + text.count("？") > 1:
+                reasons.append("contains multiple question marks")
+            if re.search(r"[;；]", text):
+                reasons.append("contains a semicolon/parallel clause")
+            if re.search(r"[（(][^）)]*[,，、;/；][^）)]*[）)]", text):
+                reasons.append("contains a parenthesized enumeration")
+            if reasons:
+                violations.append(f"sub_question[{index}]: {', '.join(reasons)}")
+        return violations
+
+    @staticmethod
+    def _contract_violations(card: ProblemCard) -> List[str]:
+        """Validate structure/coverage without encoding any scientific domain."""
+
+        contract = card.task_contract
+        violations: List[str] = []
+        if contract.source != "m1":
+            violations.append("task_contract was omitted and only a legacy contract was derived")
+        required_primary = [
+            entity for entity in contract.entities
+            if entity.role == "primary_object" and entity.required
+        ]
+        if not required_primary:
+            violations.append("task_contract has no required primary_object")
+        requirements_by_question: Dict[str, int] = {}
+        for requirement in contract.requirements:
+            key = " ".join(requirement.sub_question.split()).casefold()
+            requirements_by_question[key] = requirements_by_question.get(key, 0) + 1
+            if not requirement.primary_entity_id:
+                violations.append(
+                    f"{requirement.requirement_id}: primary_entity_id is empty"
+                )
+            if not requirement.relation:
+                violations.append(f"{requirement.requirement_id}: relation is empty")
+        for index, question in enumerate(card.sub_questions, start=1):
+            key = " ".join(question.split()).casefold()
+            count = requirements_by_question.get(key, 0)
+            if count != 1:
+                violations.append(
+                    f"sub_question[{index}] must map to exactly one requirement; found {count}"
+                )
+        return violations
+
     # ------------------------------------------------------------------
     # ModuleProtocol implementation
     # ------------------------------------------------------------------
@@ -179,10 +230,44 @@ class M1ProblemUnderstanding(ModuleProtocol):
             )
             raise
         card = ProblemCard.model_validate(payload)
+        violations = [
+            *self._sub_question_violations(card.sub_questions),
+            *self._contract_violations(card),
+        ]
+        if violations:
+            retry_prompt = "\n".join([
+                M1_USER_TEMPLATE.format(question=question),
+                "The previous decomposition violated the atomic-sub-question contract:",
+                *[f"- {violation}" for violation in violations],
+                "Return a corrected ProblemCard. Split parallel tasks into separate atomic questions.",
+            ])
+            retry_payload = await self.client.structured_chat(
+                system_prompt=M1_SYSTEM_PROMPT,
+                user_prompt=retry_prompt,
+                output_schema=ProblemCard.model_json_schema(),
+                max_tokens=8192,
+                temperature=0.0,
+            )
+            retried = ProblemCard.model_validate(retry_payload)
+            retry_violations = [
+                *self._sub_question_violations(retried.sub_questions),
+                *self._contract_violations(retried),
+            ]
+            if retry_violations:
+                logger.warning(
+                    "ProblemCard still violates the atomic task contract: %s",
+                    "; ".join(retry_violations),
+                )
+            card = retried
         if not card.original_question:
             card.original_question = question
         if self.max_sub_questions and self.max_sub_questions > 0:
             card.sub_questions = card.sub_questions[: self.max_sub_questions]
+            retained = {" ".join(item.split()).casefold() for item in card.sub_questions}
+            card.task_contract.requirements = [
+                requirement for requirement in card.task_contract.requirements
+                if " ".join(requirement.sub_question.split()).casefold() in retained
+            ]
         emit_event(
             "tool_completed",
             module="m1",
@@ -194,6 +279,8 @@ class M1ProblemUnderstanding(ModuleProtocol):
                 "sub_questions": list(card.sub_questions),
                 "domains": list(card.domain),
                 "key_entities": list(card.key_entities),
+                "task_entities": len(card.task_contract.entities),
+                "task_requirements": len(card.task_contract.requirements),
             },
         )
         return card
@@ -272,6 +359,41 @@ class M1ProblemUnderstanding(ModuleProtocol):
             raise
 
         card = decision.problem_card
+        violations = [
+            *self._sub_question_violations(card.sub_questions),
+            *self._contract_violations(card),
+        ]
+        if violations:
+            retry_prompt = "\n".join([
+                M1_FOLLOWUP_USER_TEMPLATE.format(
+                    problem_card_json=problem_card_json,
+                    followup_text=followup.text,
+                    graph_overview=graph_overview,
+                    parent_artifacts_summary=parent_artifacts_summary,
+                ),
+                "The proposed follow-up decomposition violated the atomic task contract:",
+                *[f"- {violation}" for violation in violations],
+                "Return a corrected follow-up decision with one atomic requirement per sub-question.",
+            ])
+            retry_payload = await self.client.structured_chat(
+                system_prompt=M1_FOLLOWUP_SYSTEM_PROMPT,
+                user_prompt=retry_prompt,
+                output_schema=_FollowupUnderstanding.model_json_schema(),
+                max_tokens=8192,
+                temperature=0.0,
+            )
+            retried = _FollowupUnderstanding.model_validate(retry_payload)
+            retry_violations = [
+                *self._sub_question_violations(retried.problem_card.sub_questions),
+                *self._contract_violations(retried.problem_card),
+            ]
+            if retry_violations:
+                logger.warning(
+                    "Follow-up ProblemCard still violates the atomic task contract: %s",
+                    "; ".join(retry_violations),
+                )
+            decision = retried
+            card = decision.problem_card
         if not card.original_question:
             card.original_question = (
                 state.problem_card.original_question
@@ -280,6 +402,11 @@ class M1ProblemUnderstanding(ModuleProtocol):
             )
         if self.max_sub_questions and self.max_sub_questions > 0:
             card.sub_questions = card.sub_questions[: self.max_sub_questions]
+            retained = {" ".join(item.split()).casefold() for item in card.sub_questions}
+            card.task_contract.requirements = [
+                requirement for requirement in card.task_contract.requirements
+                if " ".join(requirement.sub_question.split()).casefold() in retained
+            ]
 
         skip_search = bool(decision.skip_search)
         emit_event(

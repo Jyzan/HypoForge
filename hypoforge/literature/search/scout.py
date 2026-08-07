@@ -58,7 +58,22 @@ Use exactly one relation:
 
 Every supports/contradicts judgment must cite the corresponding supplied
 sentence IDs. Never invent or rewrite sentence IDs. Return one result per
-paper, preserve paper_id exactly, and do not claim to have read full text."""
+paper, preserve paper_id exactly, and do not claim to have read full text.
+
+Score anchors:
+- relevance 0.0-0.2: different object/domain or only shares generic vocabulary;
+  0.5: same broad topic but does not answer the requested relationship;
+  0.8-1.0: directly studies the required object and relationship.
+- directness 0.0-0.2: background mention only; 0.5: relevant proxy/partial
+  result; 0.8-1.0: a method, experiment, or conclusion sentence directly
+  answers the sub-question. Directness above 0.7 requires at least one valid
+  supporting or contradicting sentence ID. A paper that evaluates only one
+  component (for example environmental noise) cannot be scored as a complete
+  method for a broader task (for example sim-to-real transfer).
+
+Any "Required task entities/domains" in the sub-question are hard constraints.
+A paper about a different object is not_applicable even if it shares generic
+terms such as adaptation, transfer, stress, or simulation."""
 
 
 def _clean_text(value: Any) -> str:
@@ -450,7 +465,6 @@ class ScoutReader(ScoutReaderProtocol):
                     paper,
                     raw.get("contradicting_evidence"),
                 )
-
             if relation == "supports" and not supporting:
                 relation = "insufficient"
             elif relation == "contradicts" and not contradicting:
@@ -479,6 +493,8 @@ class ScoutReader(ScoutReaderProtocol):
                 raw.get("directness", raw.get("directness_to_question")),
                 fallback.directness_to_question or 0.0,
             )
+            if directness > 0.7 and not (supporting or contradicting):
+                directness = 0.7
             if relation == "not_applicable":
                 relevance = min(relevance, 0.20)
                 directness = min(directness, 0.20)

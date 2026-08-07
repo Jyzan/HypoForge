@@ -67,12 +67,112 @@ class ReviewerDimension(str, Enum):
     SCIENTIFIC_LOGIC = "scientific_logic"
     EVIDENCE_CONSISTENCY = "evidence_consistency"
     METHOD_FEASIBILITY = "method_feasibility"
+    TASK_ALIGNMENT = "task_alignment"
     OVERALL = "overall"
 
 
 # ============================================================================
 # M1 产出 — ProblemCard
 # ============================================================================
+
+class TaskEntity(BaseModel):
+    """One task-scoped entity with aliases supplied by M1, not source code."""
+
+    entity_id: str
+    name: str
+    aliases: List[str] = Field(default_factory=list)
+    role: Literal[
+        "primary_object", "intervention", "outcome", "method",
+        "context", "constraint", "other",
+    ] = "other"
+    required: bool = False
+
+    @field_validator("entity_id", "name", mode="before")
+    @classmethod
+    def normalize_scalar(cls, value: Any) -> str:
+        return re.sub(r"\s+", " ", str(value or "")).strip()
+
+    @field_validator("aliases", mode="before")
+    @classmethod
+    def normalize_aliases(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        return list(dict.fromkeys(
+            re.sub(r"\s+", " ", str(item or "")).strip()
+            for item in value
+            if str(item or "").strip()
+        ))
+
+
+class TaskRequirement(BaseModel):
+    """An atomic user requirement mapped to one M1 sub-question."""
+
+    requirement_id: str
+    sub_question: str
+    primary_entity_id: str = ""
+    related_entity_ids: List[str] = Field(default_factory=list)
+    relation: str
+    required: bool = True
+
+    @field_validator(
+        "requirement_id", "sub_question", "primary_entity_id", "relation",
+        mode="before",
+    )
+    @classmethod
+    def normalize_scalar(cls, value: Any) -> str:
+        return re.sub(r"\s+", " ", str(value or "")).strip()
+
+    @field_validator("related_entity_ids", mode="before")
+    @classmethod
+    def normalize_entity_ids(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        return list(dict.fromkeys(str(item or "").strip() for item in value if str(item or "").strip()))
+
+
+class TaskContract(BaseModel):
+    """Domain-neutral task identity propagated from M1 through M6."""
+
+    source: Literal["m1", "derived"] = "m1"
+    entities: List[TaskEntity] = Field(default_factory=list)
+    requirements: List[TaskRequirement] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_references(self) -> "TaskContract":
+        entity_ids = [entity.entity_id for entity in self.entities]
+        requirement_ids = [item.requirement_id for item in self.requirements]
+        if len(entity_ids) != len(set(entity_ids)):
+            raise ValueError("task contract contains duplicate entity IDs")
+        if len(requirement_ids) != len(set(requirement_ids)):
+            raise ValueError("task contract contains duplicate requirement IDs")
+        known = set(entity_ids)
+        for requirement in self.requirements:
+            referenced = [
+                requirement.primary_entity_id,
+                *requirement.related_entity_ids,
+            ]
+            unknown = [item for item in referenced if item and item not in known]
+            if unknown:
+                raise ValueError(
+                    f"requirement {requirement.requirement_id!r} references "
+                    f"unknown task entities: {unknown}"
+                )
+        return self
+
+
+class TaskTraceReference(BaseModel):
+    """A contract ID plus a literal excerpt from the generated output."""
+
+    contract_id: str
+    output_excerpt: str
+
+
+class TaskTrace(BaseModel):
+    """Auditable claim that an output addresses task entities/requirements."""
+
+    entity_mentions: List[TaskTraceReference] = Field(default_factory=list)
+    requirement_mentions: List[TaskTraceReference] = Field(default_factory=list)
+
 
 class ProblemCard(BaseModel):
     """Structured decomposition of a scientific question (M1 output)."""
@@ -82,6 +182,7 @@ class ProblemCard(BaseModel):
     sub_questions: List[str] = Field(default_factory=list)
     key_entities: List[str] = Field(default_factory=list)
     question_type: QuestionType = QuestionType.MECHANISM
+    task_contract: TaskContract = Field(default_factory=TaskContract)
 
     @field_validator("original_question", mode="before")
     @classmethod
@@ -96,6 +197,40 @@ class ProblemCard(BaseModel):
         if value is None:
             return []
         return [re.sub(r"\s+", " ", str(item or "")).strip() for item in value]
+
+    @model_validator(mode="after")
+    def provide_backward_compatible_contract(self) -> "ProblemCard":
+        """Derive a conservative contract for snapshots created before v2."""
+
+        if self.task_contract.entities or self.task_contract.requirements:
+            return self
+        entities = [
+            TaskEntity(
+                entity_id=f"E{index}",
+                name=name,
+                role="primary_object" if index == 1 else "other",
+                required=index == 1,
+            )
+            for index, name in enumerate(self.key_entities, start=1)
+            if name
+        ]
+        primary_id = entities[0].entity_id if entities else ""
+        requirements = [
+            TaskRequirement(
+                requirement_id=f"R{index}",
+                sub_question=question,
+                primary_entity_id=primary_id,
+                relation="address the atomic sub-question",
+            )
+            for index, question in enumerate(self.sub_questions, start=1)
+            if question
+        ]
+        self.task_contract = TaskContract(
+            source="derived",
+            entities=entities,
+            requirements=requirements,
+        )
+        return self
 
 
 # ============================================================================
@@ -154,6 +289,39 @@ class EvidenceEdge(BaseModel):
     evidence_ids: List[str] = Field(default_factory=list)
 
 
+class GraphCorrectionRequest(BaseModel):
+    """A reviewer-proposed, not-yet-trusted graph mutation."""
+
+    request_id: str = ""
+    operation: Literal["add_edge", "remove_edge", "reclassify_edge"]
+    source_node_id: str
+    target_node_id: str
+    current_relation: Optional[EvidenceEdgeRelation] = None
+    proposed_relation: Optional[EvidenceEdgeRelation] = None
+    evidence_ids: List[str] = Field(default_factory=list)
+    reason: str
+    requested_by: str = "evidence_consistency"
+    iteration: int = Field(default=0, ge=0)
+    status: Literal["pending", "applied", "rejected"] = "pending"
+    rejection_reason: str = ""
+
+
+class GraphAuditRecord(BaseModel):
+    """Append-only before/after record for one graph correction request."""
+
+    sequence: int = Field(ge=1)
+    graph_version_before: int = Field(ge=1)
+    graph_version_after: int = Field(ge=1)
+    request_id: str
+    operation: str
+    status: Literal["applied", "rejected"]
+    before: Dict[str, Any] = Field(default_factory=dict)
+    after: Dict[str, Any] = Field(default_factory=dict)
+    reason: str = ""
+    evidence_ids: List[str] = Field(default_factory=list)
+    iteration: int = Field(default=0, ge=0)
+
+
 class EvidenceGraph(BaseModel):
     """Full evidence graph (M3 output)."""
 
@@ -164,6 +332,8 @@ class EvidenceGraph(BaseModel):
     established_facts: List[str] = Field(default_factory=list)
     conflicts: List[str] = Field(default_factory=list)
     knowledge_gaps: List[str] = Field(default_factory=list)
+    version: int = Field(default=1, ge=1)
+    audit_log: List[GraphAuditRecord] = Field(default_factory=list)
 
 
 # ============================================================================
@@ -179,6 +349,7 @@ class HypothesisCard(BaseModel):
     observable_predictions: List[str] = Field(default_factory=list)
     falsification_conditions: List[str] = Field(default_factory=list)
     supporting_evidence: List[str] = Field(default_factory=list)
+    task_trace: TaskTrace = Field(default_factory=TaskTrace)
 
     # Reasoning written by the Ranker *before* the numeric scores (reason-before-score).
     ranking_rationale: str = ""
@@ -187,9 +358,45 @@ class HypothesisCard(BaseModel):
     scores: Dict[str, float] = Field(default_factory=dict)
 
 
+class EvidenceGapRequest(BaseModel):
+    """A searchable M4 evidence gap with an auditable bounded lifecycle."""
+
+    gap_id: str
+    hypothesis_id: str = ""
+    requirement_id: str = ""
+    sub_question: str
+    task_entity_ids: List[str] = Field(default_factory=list)
+    relation: str = ""
+    missing_evidence_type: Literal[
+        "supporting_evidence", "contradicting_evidence", "method_evidence",
+        "recent_evidence", "source_quality",
+    ] = "supporting_evidence"
+    suggested_queries: List[str] = Field(default_factory=list)
+    executed_queries: List[str] = Field(default_factory=list)
+    status: Literal[
+        "pending", "searched", "indexed", "resolved", "exhausted",
+    ] = "pending"
+    attempts: int = Field(default=0, ge=0)
+    created_iteration: int = Field(default=0, ge=0)
+    resolution_evidence_ids: List[str] = Field(default_factory=list)
+    rationale: str = ""
+
+
 # ============================================================================
 # M5 产出 — Research Plan
 # ============================================================================
+
+class ResearchPlanEvidenceLink(BaseModel):
+    """Trace one plan claim/step to evidence, or mark it as unverified."""
+
+    plan_element: str
+    claim: str = ""
+    supporting_evidence_ids: List[str] = Field(default_factory=list)
+    source_paper_ids: List[str] = Field(default_factory=list)
+    support_status: Literal[
+        "supported", "hypothesis_to_validate", "unsupported"
+    ] = "hypothesis_to_validate"
+
 
 class ResearchPlan(BaseModel):
     """A detailed research plan for one hypothesis (M5 output)."""
@@ -206,6 +413,10 @@ class ResearchPlan(BaseModel):
     expected_results_if_refuted: str = ""
     timeline: str = ""
     risks_and_alternatives: str = ""
+    supporting_evidence_ids: List[str] = Field(default_factory=list)
+    source_paper_ids: List[str] = Field(default_factory=list)
+    evidence_links: List[ResearchPlanEvidenceLink] = Field(default_factory=list)
+    task_trace: TaskTrace = Field(default_factory=TaskTrace)
 
 
 # ============================================================================
@@ -217,9 +428,12 @@ class ReviewResult(BaseModel):
 
     dimension: ReviewerDimension
     reasoning: str = ""  # written *before* the score (reason-before-score)
-    score: float  # 1.0 – 5.0
+    score: float = Field(ge=1.0, le=5.0)
     comments: str = ""
     suggestions: str = ""
+    evidence_ids: List[str] = Field(default_factory=list)
+    hard_gate_passed: Optional[bool] = None
+    graph_correction_requests: List[GraphCorrectionRequest] = Field(default_factory=list)
     version: int = 1
 
 
@@ -251,6 +465,14 @@ class M2CoverageExport(BaseModel):
     rationale: str = ""
 
 
+class M2PaperRetentionExport(BaseModel):
+    paper_id: str
+    decision: Literal["retain", "reject"]
+    roles: List[str] = Field(default_factory=list)
+    reason: str
+    rank_position: int
+
+
 class M2SearchProvenance(BaseModel):
     """Full provenance trail for a single sub-question search run."""
 
@@ -264,6 +486,7 @@ class M2SearchProvenance(BaseModel):
     stage_elapsed_seconds: Dict[str, float] = Field(default_factory=dict)
     papers_found: int = 0
     papers_after_dedup: int = 0
+    retention_decisions: List[M2PaperRetentionExport] = Field(default_factory=list)
 
 
 class M2PaperExport(BaseModel):
@@ -529,6 +752,7 @@ class EvidenceSufficiencyVerdict(BaseModel):
 
     sufficient: bool
     gaps: List[EvidenceGap] = Field(default_factory=list)
+    evidence_ids: List[str] = Field(default_factory=list)
     rationale: str = ""
 
 
@@ -589,9 +813,14 @@ class PipelineState(BaseModel):
     candidate_hypotheses: List[HypothesisCard] = Field(default_factory=list)
     top_hypotheses: List[HypothesisCard] = Field(default_factory=list)
     best_hypotheses: List[HypothesisCard] = Field(default_factory=list)  # keep-best across iterations
+    evidence_gap_requests: List[EvidenceGapRequest] = Field(default_factory=list)
+    evidence_gap_search_rounds: int = 0
+    max_evidence_gap_rounds: int = 1
+    graph_correction_requests: List[GraphCorrectionRequest] = Field(default_factory=list)
 
     # ---- M5 ----
     research_plans: List[ResearchPlan] = Field(default_factory=list)
+    research_plan_history: Dict[int, List[ResearchPlan]] = Field(default_factory=dict)
 
     # ---- M6 + iteration ----
     reviews: List[ReviewResult] = Field(default_factory=list)
@@ -619,6 +848,7 @@ class PipelineState(BaseModel):
 
     # ---- persistence ----
     memory_cache_dir: str = ""  # non-empty enables persistent knowledge graph
+    entity_cache_dir: str = ""  # non-empty enables cross-run entity decisions
 
     # ---- metadata ----
     run_id: str = ""

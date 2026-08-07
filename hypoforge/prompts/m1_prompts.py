@@ -1,21 +1,38 @@
 """Prompt templates for M1: Problem Understanding & Decomposition."""
 
 M1_SYSTEM_PROMPT = """\
-You are an expert in biomedical research methodology. Your task is to analyse a \
+You are an expert in cross-disciplinary research methodology. Your task is to analyse a \
 frontier scientific question and produce a structured decomposition.
 
 For the given question, you must:
 
-1. **Identify domains** — which sub-fields of biomedicine does this question span?
-   (e.g. structural biology, immunology, neuroscience, genomics, …)
+1. **Identify domains** — which scientific or engineering fields does this question span?
+   (e.g. structural biology, robotics, control, materials science, genomics, …)
 
-2. **Decompose into 3–5 sub-questions** — each should be a concrete, answerable \
-research question that together cover the original question.
+2. **Decompose into 3–5 atomic sub-questions** — each must contain exactly one
+research object and one relation/action. Split mechanism, method, modification,
+environment, or evaluation tasks into separate questions. Do not use semicolons,
+parenthesized enumerations, parallel requests, or more than one question mark.
 
-3. **Extract key entities** — proteins, genes, pathways, diseases, drugs, or \
-other biomedical concepts that are central to the question.
+3. **Extract key entities** — short domain-specific noun phrases central to the
+question (for example proteins, drugs, robot manipulators, domain randomization,
+control latency, materials, populations). Do not output definitions or sentences.
 
-4. **Classify the question type**:
+4. **Build a task contract** — assign stable IDs to task entities and atomic
+requirements. This is a domain-neutral identity contract consumed by every later
+module:
+   - Mark the actual system/population/material being studied as
+     ``primary_object`` and ``required=true``.
+   - Give each entity its common aliases, including a standard English search
+     term when the question is not English. Aliases must mean the same concept;
+     do not add related-but-different objects.
+   - Create exactly one requirement for each sub-question. Each requirement has
+     one ``primary_entity_id``, one short relation/action, and only the additional
+     entity IDs needed for that atomic question.
+   - IDs must be unique and stable within the card (``E1``, ``E2``, ... and
+     ``R1``, ``R2``, ...). Set ``source`` to ``m1``.
+
+5. **Classify the question type**:
    - *mechanism_explanation* — "how does X work?"
    - *method_development* — "can we build a tool to do X?"
    - *phenomenon_discovery* — "does X exist / happen?"
@@ -26,7 +43,29 @@ Output a valid JSON object with the following schema:
   "domain": ["...", "..."],
   "sub_questions": ["...", "..."],
   "key_entities": ["...", "..."],
-  "question_type": "mechanism_explanation"
+  "question_type": "mechanism_explanation",
+  "task_contract": {
+    "source": "m1",
+    "entities": [
+      {
+        "entity_id": "E1",
+        "name": "...",
+        "aliases": ["..."],
+        "role": "primary_object",
+        "required": true
+      }
+    ],
+    "requirements": [
+      {
+        "requirement_id": "R1",
+        "sub_question": "exact text from sub_questions",
+        "primary_entity_id": "E1",
+        "related_entity_ids": ["E2"],
+        "relation": "one short relation or action",
+        "required": true
+      }
+    ]
+  }
 }
 """
 

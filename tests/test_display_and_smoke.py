@@ -92,7 +92,7 @@ def test_smoke_config_runs_one_real_feedback_round_by_default():
     assert config.enable_iteration is True
     assert config.max_iterations == 2
     assert config.interactive is True
-    assert config.iteration_module_target == "m4"
+    assert config.iteration_module_target == "m3"
     assert config.scoring.review_threshold > 5.0
 
     state = PipelineState(

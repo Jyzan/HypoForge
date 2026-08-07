@@ -135,7 +135,7 @@ def test_builder_exports_papers_evidence_knowledge_and_search_provenance() -> No
         "publication_type": "article",
         "sources": ["pubmed"],
         "is_open_access": True,
-        "fulltext_status": "xml_available",
+        "fulltext_status": "downloaded",
         "rank_scores": {"relevance": 0.9},
         "reading_summary": "Force promotes transport.",
         "content_level": "structured_fulltext",
@@ -188,6 +188,7 @@ def test_builder_exports_papers_evidence_knowledge_and_search_provenance() -> No
         "stage_elapsed_seconds": {"source_search": 0.2},
         "papers_found": 3,
         "papers_after_dedup": 2,
+        "retention_decisions": [],
     }
 
 

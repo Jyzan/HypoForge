@@ -129,7 +129,7 @@ class AddToEvidenceGraph(BaseTool if _BASETOOL_AVAILABLE else object):  # type: 
     if _BASETOOL_AVAILABLE:
         name: str = "add_to_evidence_graph"
         description: str = (
-            "Add biomedical entities, relations, and observations to the "
+            "Add scientific or engineering entities, relations, and observations to the "
             "persistent evidence knowledge graph.  Call this after extracting "
             "a new finding from the literature.  Entities are deduplicated by "
             "name; relations auto-create missing entities."

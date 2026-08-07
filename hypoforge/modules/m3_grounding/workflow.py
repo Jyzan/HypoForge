@@ -288,9 +288,14 @@ class GroundingWorkflow:
             ]
             entities = " ".join(state.problem_card.key_entities[:12])
             if entities:
+                relations = " ".join(
+                    requirement.relation
+                    for requirement in state.problem_card.task_contract.requirements
+                    if requirement.relation
+                )
                 queries.extend([
-                    f"{entities} molecular mechanism causal pathway",
-                    f"{entities} experimental method population outcome",
+                    f"{entities} {relations}".strip(),
+                    f"{entities} methods evaluation metrics",
                     f"{entities} contradictory evidence limitations boundary conditions",
                 ])
 

@@ -263,10 +263,14 @@ def test_m5_user_prompt_carries_followup_text() -> None:
         followup=FollowupRequest(text="请用中文输出方案", parent_run_id="p1"),
     )
     prompt = M5_USER_TEMPLATE.format(
+        original_question=state.input_question,
+        problem_card_json="{}",
+        graph_context="(no evidence)",
         statement="PBK activation sustains persister survival.",
         mechanism="PBK -> bypass signaling",
         predictions="p1",
         falsification_conditions="f1",
+        hypothesis_evidence="[]",
         feedback_context=M5ResearchPlan._build_feedback_context(state),
     )
     assert "请用中文输出方案" in prompt

@@ -7,18 +7,23 @@ from collections import Counter
 from collections.abc import Sequence
 from datetime import datetime, timezone
 
-from ..models import EvidenceBucket, FulltextStatus, PaperRecord, ScoutNote
+from ..models import (
+    EvidenceBucket,
+    FulltextStatus,
+    PaperRecord,
+    PaperRetentionDecision,
+    ScoutNote,
+)
 from ..protocols import PaperRankerProtocol
 from ._text import lexical_relevance
 
 
 _WEIGHTS = {
-    "query_relevance": 0.45,
-    "retrieval_prior": 0.20,
-    "citation_impact": 0.15,
+    "query_relevance": 0.55,
+    "citation_impact": 0.20,
     "recency": 0.10,
-    "metadata_quality": 0.05,
-    "access_quality": 0.05,
+    "metadata_quality": 0.075,
+    "access_quality": 0.075,
 }
 _ACCESS_SCORE = {
     FulltextStatus.UNKNOWN: 0.10,
@@ -189,6 +194,115 @@ def _evidence_roles(paper: PaperRecord, note: ScoutNote | None) -> set[str]:
     if _is_direct_primary(paper, note):
         roles.add("direct_primary")
     return roles
+
+
+def paper_retention_roles(
+    paper: PaperRecord,
+    note: ScoutNote | None,
+) -> set[str]:
+    """Map Scout judgments to domain-neutral portfolio roles."""
+
+    roles: set[str] = set()
+    evidence_roles = _evidence_roles(paper, note)
+    if "direct_primary" in evidence_roles or evidence_roles.intersection({
+        EvidenceBucket.SUPPORTING.value,
+        EvidenceBucket.CONTRADICTING.value,
+    }):
+        roles.add("core_evidence")
+    if (
+        EvidenceBucket.METHODOLOGICAL.value in evidence_roles
+        or (note and note.study_design.casefold() in {"method", "protocol", "computational"})
+    ):
+        roles.add("method_evidence")
+    if EvidenceBucket.RECENT.value in evidence_roles:
+        roles.add("recent_evidence")
+    if EvidenceBucket.CONTRADICTING.value in evidence_roles:
+        roles.add("contradicting_evidence")
+    if _is_review(paper, note):
+        roles.add("review_context")
+    return roles
+
+
+def select_retained_papers(
+    papers: Sequence[PaperRecord],
+    notes: Sequence[ScoutNote],
+    *,
+    final_k: int,
+) -> tuple[list[PaperRecord], list[PaperRetentionDecision]]:
+    """Retain the ranked core plus credible missing evidence roles.
+
+    The expansion is bounded by ``max(final_k*2, final_k+3)``. It is not a
+    relevance bypass: only papers inside that ranked window and above the Scout
+    credibility threshold may be added to cover a missing role.
+    """
+
+    if final_k <= 0:
+        raise ValueError("final_k must be positive")
+    ranked = list(papers)
+    if not ranked:
+        return [], []
+    note_by_id = {note.paper_id: note for note in notes}
+    window_size = min(len(ranked), max(final_k * 2, final_k + 3))
+    window = ranked[:window_size]
+    retained = list(window[:final_k])
+    retained_ids = {paper.paper_id for paper in retained}
+    covered = set().union(*(
+        paper_retention_roles(paper, note_by_id.get(paper.paper_id))
+        for paper in retained
+    )) if retained else set()
+
+    desired_roles = ("core_evidence", "method_evidence", "recent_evidence")
+    role_reason: dict[str, str] = {}
+    for role in desired_roles:
+        if role in covered:
+            continue
+        eligible = [
+            paper for paper in window
+            if paper.paper_id not in retained_ids
+            and role in paper_retention_roles(paper, note_by_id.get(paper.paper_id))
+            and _is_credible_for_early_selection(
+                paper, note_by_id.get(paper.paper_id)
+            )
+        ]
+        if not eligible:
+            continue
+        chosen = max(
+            eligible,
+            key=lambda paper: (
+                _safe_score(paper.rank_scores.get("post_scout_total"), 0.0),
+                -ranked.index(paper),
+            ),
+        )
+        retained.append(chosen)
+        retained_ids.add(chosen.paper_id)
+        chosen_roles = paper_retention_roles(chosen, note_by_id.get(chosen.paper_id))
+        covered.update(chosen_roles)
+        role_reason[chosen.paper_id] = role
+
+    decisions: list[PaperRetentionDecision] = []
+    for index, paper in enumerate(ranked, start=1):
+        roles = sorted(paper_retention_roles(paper, note_by_id.get(paper.paper_id)))
+        if paper.paper_id in retained_ids:
+            reason = (
+                f"retained to cover missing portfolio role: {role_reason[paper.paper_id]}"
+                if paper.paper_id in role_reason
+                else "retained in the primary relevance-ranked Final-K set"
+            )
+            decision = "retain"
+        elif index > window_size:
+            decision = "reject"
+            reason = f"outside bounded retention window of {window_size} candidates"
+        else:
+            decision = "reject"
+            reason = "did not add a credible evidence role missing from the retained set"
+        decisions.append(PaperRetentionDecision(
+            paper_id=paper.paper_id,
+            decision=decision,
+            roles=roles,
+            reason=reason,
+            rank_position=index,
+        ))
+    return retained, decisions
 
 
 def _selection_kind(paper: PaperRecord, note: ScoutNote | None) -> str:
@@ -429,16 +543,6 @@ class PaperRanker(PaperRankerProtocol):
         ranked: list[tuple[float, int, str, PaperRecord]] = []
         for index, paper in enumerate(papers):
             relevance = lexical_relevance(sub_question, paper.title, paper.abstract)
-            supplied_prior = paper.rank_scores.get("source_relevance")
-            has_retrieval_prior = (
-                supplied_prior is not None
-                and isinstance(supplied_prior, (int, float))
-                and math.isfinite(float(supplied_prior))
-            )
-            if has_retrieval_prior:
-                retrieval_prior = _clamp(float(supplied_prior))
-            else:
-                retrieval_prior = 0.0
             citation_impact = (
                 citation_raw[index] / max_citation if max_citation > 0 else 0.0
             )
@@ -451,7 +555,6 @@ class PaperRanker(PaperRankerProtocol):
 
             scores = {
                 "query_relevance": relevance,
-                "retrieval_prior": retrieval_prior,
                 "citation_impact": citation_impact,
                 "recency": recency,
                 "metadata_quality": metadata_quality,
@@ -462,7 +565,6 @@ class PaperRanker(PaperRankerProtocol):
                 for name, weight in _WEIGHTS.items()
                 if (
                     (name != "citation_impact" or paper.citation_count is not None)
-                    and (name != "retrieval_prior" or has_retrieval_prior)
                 )
             }
             weight_sum = sum(active_weights.values())

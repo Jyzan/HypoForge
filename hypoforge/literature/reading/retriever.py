@@ -40,11 +40,6 @@ def _jaccard(left: set[str], right: set[str]) -> float:
     return len(left & right) / len(union) if union else 0.0
 
 
-def _first_sentence(text: str) -> str:
-    match = re.search(r"[.!?。！？](?:\s|$)", text)
-    return text[: match.end()].strip()[:300] if match else text.strip()[:300]
-
-
 class HybridEvidenceRetriever(EvidenceRetrieverProtocol):
     def __init__(
         self,
@@ -102,7 +97,9 @@ class HybridEvidenceRetriever(EvidenceRetrieverProtocol):
             section=chunk.section,
             page=chunk.page,
             quote=chunk.text,
-            normalized_claim=_first_sentence(chunk.text),
+            # Retrieval selects source context; semantic claim normalization is
+            # performed by QwenPaperReader and merged back by the workflow.
+            normalized_claim="",
             relevance_score=max(0.0, min(relevance, 1.0)),
             citable=citable,
         )

@@ -7,7 +7,7 @@ documents live in an external document store and are addressed by stable IDs.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Annotated, Dict, List, Optional, Set
+from typing import Annotated, Dict, List, Literal, Optional, Set
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
@@ -140,6 +140,16 @@ class ScoutNote(LiteratureModel):
     evidence_summary: str = ""
 
 
+class PaperRetentionDecision(LiteratureModel):
+    """Auditable Final-K/diversity decision derived from Scout semantics."""
+
+    paper_id: NonEmptyStr
+    decision: Literal["retain", "reject"]
+    roles: List[str] = Field(default_factory=list)
+    reason: NonEmptyStr
+    rank_position: int = Field(ge=1)
+
+
 class CoverageReport(LiteratureModel):
     covered_buckets: Set[EvidenceBucket] = Field(default_factory=set)
     missing_buckets: Set[EvidenceBucket] = Field(default_factory=set)
@@ -204,6 +214,7 @@ class SearchRunResult(LiteratureModel):
     stage_elapsed_seconds: Dict[str, float] = Field(default_factory=dict)
     scout_notes: List[ScoutNote] = Field(default_factory=list)
     reused_paper_ids: List[str] = Field(default_factory=list)
+    retention_decisions: List[PaperRetentionDecision] = Field(default_factory=list)
     final_state: Optional[SearchState] = None
 
 
@@ -235,7 +246,9 @@ class EvidenceChunk(LiteratureModel):
     section: str = ""
     page: Optional[int] = Field(default=None, ge=1)
     quote: NonEmptyStr
-    normalized_claim: NonEmptyStr
+    # Empty until the semantic reader produces a question-relevant claim.
+    # Retrieval itself must not manufacture one from a chunk boundary.
+    normalized_claim: str = ""
     relevance_score: float = Field(ge=0.0, le=1.0)
     citable: bool = True
 

@@ -265,6 +265,11 @@ class RunManager:
                     "turbo": config.qwen.turbo.model,
                 },
                 "enabled_modules": list(config.enabled_modules),
+                "credential_status": {
+                    "llm_configured": bool(config.qwen.base.api_key),
+                    "semantic_scholar_configured": bool(semantic_scholar_api_key),
+                    "openalex_configured": bool(os.environ.get("OPENALEX_API_KEY")),
+                },
                 "output_dir": str(run_dir),
             }
             if followup_info:
@@ -493,10 +498,16 @@ class RunManager:
             "question": state.get("input_question", ""),
             "problem_card": state.get("problem_card"),
             "literature_results": state.get("literature_results", []),
+            "m2_knowledge_export": state.get("m2_knowledge_export"),
             "evidence_graph": state.get("evidence_graph"),
+            "grounding_report": state.get("grounding_report"),
+            "candidate_hypotheses": state.get("candidate_hypotheses", []),
             "top_hypotheses": state.get("top_hypotheses", []),
             "best_hypotheses": state.get("best_hypotheses", []),
+            "evidence_gap_requests": state.get("evidence_gap_requests", []),
+            "graph_correction_requests": state.get("graph_correction_requests", []),
             "research_plans": state.get("research_plans", []),
+            "research_plan_history": state.get("research_plan_history", {}),
             "reviews": state.get("reviews", []),
             "iteration_count": state.get("iteration_count", 0),
             "routing_history": state.get("routing_history", []),
@@ -562,6 +573,7 @@ class RunManager:
                 "top_hypothesis_titles": [],
                 "top_hypotheses_count": 0,
                 "research_plans_count": 0,
+                "research_plans": [],
                 "snapshots": [],
             }
 
@@ -581,8 +593,10 @@ class RunManager:
                     "score": review.get("score"),
                     "reasoning": review.get("reasoning", ""),
                     "comments": review.get("comments", ""),
-                    "suggestions": review.get("suggestions", ""),
-                    "version": version,
+                        "suggestions": review.get("suggestions", ""),
+                        "evidence_ids": review.get("evidence_ids", []),
+                        "hard_gate_passed": review.get("hard_gate_passed"),
+                        "version": version,
                 }
             )
             if review.get("dimension") == "overall":
@@ -638,6 +652,7 @@ class RunManager:
                 plans = snapshot.get("research_plans")
                 if isinstance(plans, list) and plans:
                     entry["research_plans_count"] = len(plans)
+                    entry["research_plans"] = plans
 
         # Final state is authoritative for the latest version.
         if state:
@@ -658,6 +673,7 @@ class RunManager:
                 if isinstance(item, dict)
             ][:10]
             entry["research_plans_count"] = len(state.get("research_plans") or [])
+            entry["research_plans"] = state.get("research_plans") or []
 
         return [entries[version] for version in sorted(entries)]
 

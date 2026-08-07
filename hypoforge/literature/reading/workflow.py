@@ -104,6 +104,7 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
         self.workflow_timeout_seconds = workflow_timeout_seconds
         self.top_k = top_k
         self._detached_resolver_tasks: set[asyncio.Task[DocumentRecord]] = set()
+        self._reading_cache: dict[tuple[str, str], PaperReadingResult] = {}
 
     def _detach_resolver_task(
         self,
@@ -408,13 +409,22 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
                 stage_elapsed_seconds=timings,
                 errors=[*document_errors, "paper_reader returned a mismatched paper_id"],
             )
+        reader_evidence = {item.evidence_id: item for item in reading.evidence}
+        merged_evidence = [
+            item.model_copy(update={
+                "normalized_claim": reader_evidence[item.evidence_id].normalized_claim
+            })
+            if item.evidence_id in reader_evidence
+            else item
+            for item in evidence
+        ]
         return reading.model_copy(
             update={
                 "content_level": document.content_level,
                 **self._document_result_fields(document),
                 "chunks_parsed": len(chunks),
                 "chunks_retrieved": len(evidence),
-                "evidence": list(evidence),
+                "evidence": merged_evidence,
                 "degraded_to_abstract": (
                     reading.degraded_to_abstract
                     or document.content_level is ContentLevel.ABSTRACT
@@ -444,20 +454,22 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
         read_semaphore = asyncio.Semaphore(self.read_concurrency)
 
         async def run_all() -> list[PaperReadingResult]:
-            return list(
-                await asyncio.gather(
-                    *(
-                        self._read_one(
-                            sub_question,
-                            query,
-                            paper,
-                            fetch_semaphore,
-                            read_semaphore,
-                        )
-                        for paper in papers
-                    )
+            async def cached_read(paper: PaperRecord) -> PaperReadingResult:
+                key = (" ".join(sub_question.casefold().split()), paper.paper_id)
+                cached = self._reading_cache.get(key)
+                if cached is not None:
+                    return cached.model_copy(deep=True)
+                result = await self._read_one(
+                    sub_question,
+                    query,
+                    paper,
+                    fetch_semaphore,
+                    read_semaphore,
                 )
-            )
+                self._reading_cache[key] = result.model_copy(deep=True)
+                return result
+
+            return list(await asyncio.gather(*(cached_read(paper) for paper in papers)))
 
         try:
             results = await asyncio.wait_for(
