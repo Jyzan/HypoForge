@@ -24,6 +24,22 @@ from ..tools.qwen_client import QwenClient
 logger = logging.getLogger(__name__)
 
 
+def _followup_requirement_block(state: PipelineState) -> str:
+    """Format ``state.followup.text`` as a priority requirement block.
+
+    Returns ``""`` on non-followup runs, so prompt construction stays
+    byte-for-byte identical to the legacy behaviour when no followup exists.
+    """
+    followup = getattr(state, "followup", None)
+    text = (followup.text or "").strip() if followup is not None else ""
+    if not text:
+        return ""
+    return (
+        "\n--- 用户追问要求 (user follow-up instruction, highest priority, must be honoured) ---\n"
+        f"{text}\n"
+    )
+
+
 @ModuleRegistry.register
 class M5ResearchPlan(ModuleProtocol):
     module_name = "m5"
@@ -46,9 +62,14 @@ class M5ResearchPlan(ModuleProtocol):
 
     @staticmethod
     def _build_feedback_context(state: PipelineState) -> str:
-        """Route the latest method-feasibility review to plan revision."""
+        """Route the latest method-feasibility review to plan revision.
+
+        Followup runs additionally inject ``state.followup.text`` so user
+        instructions (e.g. "输出中文方案") shape plan generation; on
+        non-followup runs the output is unchanged."""
+        followup_block = _followup_requirement_block(state)
         if state.iteration_count <= 0 or not state.reviews:
-            return ""
+            return followup_block
         latest = max(review.version for review in state.reviews)
         feedback = [
             review.suggestions or review.comments or ""
@@ -58,14 +79,14 @@ class M5ResearchPlan(ModuleProtocol):
         ]
         feedback = [item.strip() for item in feedback if item.strip()]
         if not feedback:
-            return ""
+            return followup_block
         lines = [
             "",
             "Research-plan revision guidance from the latest method-feasibility review:",
             *[f"- {item}" for item in feedback],
             "Apply only suggestions relevant to this hypothesis and keep them in the research plan, not the hypothesis statement.",
         ]
-        return "\n".join(lines)
+        return followup_block + "\n".join(lines)
 
     async def __call__(
         self,

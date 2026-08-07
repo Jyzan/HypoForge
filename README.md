@@ -137,6 +137,25 @@ M3 职责：
   M3 不联网下载论文
 ```
 
+### 迭代轮次与三计数器（iteration core）
+
+迭代架构由两个开关控制（**默认全部关闭**，关闭时图拓扑与执行行为和旧版完全一致）：
+
+| 开关 | 默认 | 作用 |
+|------|------|------|
+| `followup_routing` | `false` | 追问运行时 M1 判定是否免检索（skip_search），免检索则 M1→M4 直达 |
+| `m6_evidence_revisit` | `false` | M6 输出证据充分性裁决，证据不足且有 open 缺口时回跳 M2 补搜 |
+
+三个计数器语义（单一事实源在 `config.py` 注释）：
+
+| 计数器 | 语义 | 上限 |
+|--------|------|------|
+| `iteration_count` | M6 评审总次数，每次 M6 运行 +1 | 全局硬停止条件 `iteration_count >= max_iterations`（**不与 `max_search_rounds` 相加**；补搜轮有意消耗 1 次评审预算，即总成本封顶） |
+| `search_round` | M2 执行次数（首轮 + 补搜） | `max_search_rounds`（默认 2），仅约束补搜回跳 |
+| `revision_count` | M6→M4 修订回跳次数 | 无，仅审计与前端展示，不参与任何停止判定 |
+
+即 `max_iterations=3` 的典型路径为"全跑 + 至多 2 次回跳（补搜或修订混合）"。追问运行（followup）通过白名单继承父运行的知识产物（problem_card / literature_results / m2_knowledge_export / evidence_graph / grounding_report / best_hypotheses / search_ledger / memory_cache_dir），其余字段全部重置并获得全新预算。运行中提交追问会被拒绝（HTTP 409），需等当前运行结束。
+
 ## M2 搜索模式
 
 | 模式 | 实现 | 说明 |

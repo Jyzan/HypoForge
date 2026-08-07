@@ -14,11 +14,23 @@ Output: ``literature_results`` (list of ``LiteratureResult``) in state.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
 from typing import Any, Dict, List, Optional
 
+from ..memory.paper_store import normalize_query_text
+from ..observability import emit_event
+from ..paper_sources import (
+    dedupe_papers_by_key,
+    dedupe_queries,
+    gap_candidate_queries,
+    merge_literature_increment,
+    open_paper_store,
+    persist_search_results,
+    resolve_gap_sub_question,
+)
 from ..protocol import ModuleProtocol
 from ..prompts.m2_prompts import (
     M2_BATCH_EXTRACTION_SYSTEM_PROMPT,
@@ -32,20 +44,36 @@ from ..prompts.m2_prompts import (
 from ..registry import ModuleRegistry
 from ..state import (
     ConfidenceLevel,
+    EvidenceGap,
     KnowledgeEntry,
     KnowledgeEntryType,
     LiteratureResult,
     PipelineState,
+    SearchLedger,
 )
 from ..tools.qwen_client import QwenClient, _salvage_string_arrays
 
 logger = logging.getLogger(__name__)
+
+# 给每个知识打上id
+def _stable_entry_id(content: str, source_paper_id: str) -> str:
+    """Stable KnowledgeEntry id: ``KE_{sha1(normalised content + paper)[:12]}``.
+
+    Content-based (not list-index-based), so re-extracting the same paper in
+    a later round yields the same ids and M3 incremental dedup works.
+    """
+    normalised = " ".join(str(content or "").split()).casefold()
+    digest = hashlib.sha1(
+        (normalised + "\u0000" + str(source_paper_id or "")).encode("utf-8")
+    ).hexdigest()[:12]
+    return f"KE_{digest}"
 
 
 # ---------------------------------------------------------------------------
 # Query-extraction helper (called by _generate_search_queries)
 # ---------------------------------------------------------------------------
 
+# 从模型的输出中提取查询
 def _extract_queries_from_text(raw_text: str) -> List[str]:
     """Pull search-query strings out of a free-text LLM response.
 
@@ -96,6 +124,7 @@ def _extract_queries_from_text(raw_text: str) -> List[str]:
 # Helpers — paper merge / dedup
 # ---------------------------------------------------------------------------
 
+# 用论文独有的doi去重论文
 def _doi_key(paper: dict) -> str:
     """Normalise a DOI for dedup."""
     doi = (paper.get("doi") or "").strip().lower()
@@ -105,7 +134,7 @@ def _doi_key(paper: dict) -> str:
             doi = doi[len(prefix):]
     return doi
 
-
+# 合并并去重论文
 def _merge_deduplicate(pubmed: List[dict], academic: List[dict]) -> List[dict]:
     """Merge PubMed + OpenAlex/S2 results, deduplicate by DOI, then by title prefix."""
     seen_doi: set[str] = set()
@@ -167,7 +196,7 @@ class M2LiteratureSearch(ModuleProtocol):
     """
 
     module_name = "m2"
-    module_version = "0.2.0"
+    module_version = "2026.08.06"
     description = "Literature retrieval + six-category structured knowledge extraction"
 
     # ------------------------------------------------------------------
@@ -186,6 +215,7 @@ class M2LiteratureSearch(ModuleProtocol):
         query_max_tokens: int = 2048,
         query_disable_thinking: bool = True,
         query_max_attempts: int = 2,
+        supplement_paper_budget: int = 6,
         **kwargs,
     ):
         self.search_tools = search_tools or ["semantic_scholar", "pubmed"]
@@ -199,6 +229,10 @@ class M2LiteratureSearch(ModuleProtocol):
         self.query_max_tokens = max(128, query_max_tokens)
         self.query_disable_thinking = query_disable_thinking
         self.query_max_attempts = max(1, query_max_attempts)
+        # Per-round paper budget for cache-first supplement searches
+        # (mirrors config.supplement_paper_budget; the agentic adapter is the
+        # primary supplement path, legacy keeps the same cap for parity).
+        self.supplement_paper_budget = max(1, int(supplement_paper_budget))
         self.client = QwenClient.from_config(llm_config) if llm_config else None
         # Query generation uses a separate (more reliable) model tier because
         # the turbo model often returns empty output for translation tasks on
@@ -216,6 +250,17 @@ class M2LiteratureSearch(ModuleProtocol):
         state: PipelineState,
         config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        # Supplement-round guards (mirror the agentic adapter trigger):
+        # * re-entry with NO open gaps → keep existing results untouched
+        #   (avoids a destructive full re-search overwrite);
+        # * re-entry WITH open gaps → cache-first incremental supplement
+        #   (never clears ``literature_results``).
+        open_gaps = [gap for gap in state.evidence_gaps if gap.status == "open"]
+        if state.search_round > 0 and state.literature_results and not open_gaps:
+            return {"literature_results": list(state.literature_results)}
+        if state.search_round > 0 and open_gaps:
+            return await self._run_supplement(state, open_gaps)
+
         if self.client is None:
             raise RuntimeError(
                 "M2 requires an LLM client — pass llm_config / set OPENAI_API_KEY."
@@ -228,8 +273,218 @@ class M2LiteratureSearch(ModuleProtocol):
         key_entities = (
             state.problem_card.key_entities if state.problem_card else []
         )
-        results = await self._run_real(sub_questions, key_entities)
+        results, collected = await self._run_real(sub_questions, key_entities)
+        # Junction (P2): seed the persistent paper cache so later supplement
+        # rounds can hit it.  Best-effort side effect only — the returned
+        # patch is unchanged.
+        if getattr(state, "memory_cache_dir", ""):
+            store = open_paper_store(state.memory_cache_dir)
+            for _sq, queries, papers in collected:
+                persist_search_results(
+                    store,
+                    papers,
+                    queries,
+                    run_id=state.run_id,
+                    round=state.search_round,
+                    source="legacy_m2",
+                )
         return {"literature_results": results}
+
+    # ------------------------------------------------------------------
+    # Supplement round (cache-first incremental search, legacy path)
+    # ------------------------------------------------------------------
+
+    async def _run_supplement(
+        self,
+        state: PipelineState,
+        open_gaps: List[EvidenceGap],
+    ) -> Dict[str, Any]:
+        """Cache-first incremental supplement (mirrors the agentic adapter).
+
+        1. Probe the persistent ``PaperStore`` with each open gap's queries;
+           a hit becomes a paper-count increment (no fabricated knowledge
+           entries), the gap moves to ``pending_grounding`` and a
+           ``memory_hit`` event fires.
+        2. Misses issue live searches for the gap's ``suggested_queries``
+           (deduplicated against ``state.search_ledger``), bounded by
+           ``supplement_paper_budget``.
+        3. ``literature_results`` is merged per sub-question — existing
+           entries are never cleared; ``evidence_gaps`` / ``search_ledger``
+           are returned in full (LangGraph list fields have no reducer).
+        """
+        from ..tools.pubmed_search import PubMedTool
+        from ..tools.semantic_scholar import SemanticScholarTool
+
+        store = open_paper_store(getattr(state, "memory_cache_dir", ""))
+
+        merged_results = [
+            result.model_copy(deep=True) for result in state.literature_results
+        ]
+        existing_sub_questions = [result.sub_question for result in merged_results]
+        known_keys = set(state.search_ledger.paper_keys)
+        issued_norms = {
+            normalize_query_text(query)
+            for query in state.search_ledger.queries_issued
+        }
+
+        pubmed: Optional[Any] = None  # lazy — cache-hit paths never build one
+        academic: Optional[Any] = None
+        new_query_texts: List[str] = []
+        new_paper_keys: List[str] = []
+        attempted_gap_ids: set = set()
+        remaining_budget = self.supplement_paper_budget
+
+        for gap in open_gaps:
+            sub_question = resolve_gap_sub_question(gap, existing_sub_questions)
+            candidates = gap_candidate_queries(gap)
+
+            # -- Step 1: cache hit first ----------------------------------
+            if store is not None:
+                hit_keys: List[str] = []
+                seen: set = set()
+                for query in candidates:
+                    for key in store.lookup_by_query(query):
+                        if key not in seen and key not in known_keys:
+                            seen.add(key)
+                            hit_keys.append(key)
+                if hit_keys:
+                    cached_papers = store.lookup_by_keys(hit_keys)
+                    merge_literature_increment(
+                        merged_results, sub_question, len(cached_papers), []
+                    )
+                    known_keys.update(hit_keys)
+                    new_paper_keys.extend(hit_keys)
+                    attempted_gap_ids.add(gap.gap_id)
+                    emit_event(
+                        "memory_hit",
+                        module="m2",
+                        status="completed",
+                        message=(
+                            f"证据缺口 {gap.gap_id} 命中论文缓存 "
+                            f"{len(cached_papers)} 篇"
+                        ),
+                        details={
+                            "gap_id": gap.gap_id,
+                            "hits": len(cached_papers),
+                            "sub_question": sub_question,
+                            "source": "paper_store",
+                        },
+                    )
+                    for query in candidates:
+                        store.record_query(
+                            query,
+                            hit_keys,
+                            run_id=state.run_id,
+                            round=state.search_round,
+                        )
+                    continue
+
+            # -- Step 2: live gap search ----------------------------------
+            attempted_gap_ids.add(gap.gap_id)
+            fresh_queries = dedupe_queries(candidates, issued_norms)
+            if not fresh_queries or remaining_budget <= 0:
+                continue
+            if self.client is None:
+                raise RuntimeError(
+                    "M2 requires an LLM client — pass llm_config / set OPENAI_API_KEY."
+                )
+            if pubmed is None:
+                pubmed = PubMedTool()
+                academic = SemanticScholarTool()
+
+            search_calls = []
+            for query in fresh_queries:
+                search_calls.append(
+                    ("pubmed", pubmed.search(query, limit=remaining_budget))
+                )
+                search_calls.append(
+                    ("academic", academic.search(query, limit=remaining_budget))
+                )
+            raw_results = await asyncio.gather(
+                *(call for _, call in search_calls),
+                return_exceptions=True,
+            )
+            pubmed_papers: List[dict] = []
+            acad_papers: List[dict] = []
+            for (backend, _), res in zip(search_calls, raw_results):
+                if isinstance(res, Exception):
+                    logger.warning("%s supplement search failed: %s", backend, res)
+                    continue
+                (pubmed_papers if backend == "pubmed" else acad_papers).extend(res)
+
+            all_papers = _merge_deduplicate(pubmed_papers, acad_papers)
+            new_papers, fresh_keys = dedupe_papers_by_key(all_papers, known_keys)
+            new_papers = new_papers[:remaining_budget]
+            fresh_keys = fresh_keys[:remaining_budget]
+            new_query_texts.extend(fresh_queries)
+
+            if store is not None:
+                for query in fresh_queries:
+                    store.record_query(
+                        query,
+                        fresh_keys,
+                        run_id=state.run_id,
+                        round=state.search_round,
+                    )
+                if new_papers:
+                    store.upsert_papers(
+                        new_papers,
+                        run_id=state.run_id,
+                        round=state.search_round,
+                        source="legacy_m2",
+                    )
+            if not new_papers:
+                continue
+
+            # Batch-extract knowledge entries from the genuinely new papers.
+            entries: List[KnowledgeEntry] = []
+            batches = [
+                new_papers[i:i + self.batch_size]
+                for i in range(0, len(new_papers), self.batch_size)
+            ]
+            sem = asyncio.Semaphore(3)
+
+            async def _bounded_batch(batch):
+                async with sem:
+                    return await self._extract_batch(batch)
+
+            entry_lists = await asyncio.gather(
+                *[_bounded_batch(batch) for batch in batches],
+                return_exceptions=True,
+            )
+            for batch_entries in entry_lists:
+                if isinstance(batch_entries, Exception):
+                    logger.warning(
+                        "M2 supplement batch extraction failed: %s", batch_entries
+                    )
+                    continue
+                entries.extend(batch_entries)
+
+            merge_literature_increment(
+                merged_results, sub_question, len(new_papers), entries
+            )
+            new_paper_keys.extend(fresh_keys)
+            remaining_budget -= len(new_papers)
+
+        # -- Step 3: gap status + ledger (full-list return) ---------------
+        updated_gaps: List[EvidenceGap] = []
+        for gap in state.evidence_gaps:
+            if gap.gap_id in attempted_gap_ids and gap.status == "open":
+                updated_gaps.append(
+                    gap.model_copy(update={"status": "pending_grounding"})
+                )
+            else:
+                updated_gaps.append(gap.model_copy(deep=True))
+
+        ledger = SearchLedger(
+            queries_issued=[*state.search_ledger.queries_issued, *new_query_texts],
+            paper_keys=[*state.search_ledger.paper_keys, *new_paper_keys],
+        )
+        return {
+            "literature_results": merged_results,
+            "evidence_gaps": updated_gaps,
+            "search_ledger": ledger,
+        }
 
     # ------------------------------------------------------------------
     # Real pipeline
@@ -239,8 +494,13 @@ class M2LiteratureSearch(ModuleProtocol):
         self,
         sub_questions: List[str],
         key_entities: Optional[List[str]] = None,
-    ) -> List[LiteratureResult]:
-        """Execute real search + LLM extraction for each sub_question."""
+    ) -> tuple[List[LiteratureResult], List[tuple]]:
+        """Execute real search + LLM extraction for each sub_question.
+
+        Returns ``(results, collected)`` where *collected* is a list of
+        ``(sub_question, queries, top_papers)`` tuples used only by the
+        paper-cache junction (never part of the state patch).
+        """
         from ..tools.pubmed_search import PubMedTool
         from ..tools.semantic_scholar import SemanticScholarTool
 
@@ -250,6 +510,7 @@ class M2LiteratureSearch(ModuleProtocol):
         key_entities = key_entities or []
 
         results: List[LiteratureResult] = []
+        collected: List[tuple] = []
         for sq in sub_questions:
             logger.info("M2: searching for sub_question=%r", sq[:80])
 
@@ -320,8 +581,9 @@ class M2LiteratureSearch(ModuleProtocol):
                 papers_retrieved=len(top_papers),
                 knowledge_entries=all_entries,
             ))
+            collected.append((sq, queries, top_papers))
 
-        return results
+        return results, collected
 
     # ------------------------------------------------------------------
     # Search-query generation (English, from any-language sub-question)
@@ -489,7 +751,7 @@ class M2LiteratureSearch(ModuleProtocol):
                     source_title = paper_map[source_id].get("title", "")
 
                 entries.append(KnowledgeEntry(
-                    id=f"KE_{source_id.replace(':', '_')}_{i}",
+                    id=_stable_entry_id(raw.get("content", ""), source_id),
                     type=KnowledgeEntryType(raw.get("type", "established_fact")),
                     content=raw.get("content", ""),
                     confidence=(
@@ -583,7 +845,7 @@ class M2LiteratureSearch(ModuleProtocol):
                 continue
             try:
                 entries.append(KnowledgeEntry(
-                    id=f"KE_{source_id.replace(':', '_')}_{i}",
+                    id=_stable_entry_id(raw.get("content", ""), source_id),
                     type=KnowledgeEntryType(raw.get("type", "established_fact")),
                     content=raw.get("content", ""),
                     confidence=(

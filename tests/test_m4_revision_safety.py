@@ -6,7 +6,9 @@ import pytest
 
 from hypoforge.modules.m4_hypothesis_generation import M4HypothesisGeneration
 from hypoforge.modules.m5_research_plan import M5ResearchPlan
+from hypoforge.prompts.m5_prompts import M5_USER_TEMPLATE
 from hypoforge.state import (
+    FollowupRequest,
     HypothesisCard,
     PipelineState,
     ReviewResult,
@@ -217,3 +219,67 @@ def test_method_feedback_is_routed_to_m5_not_m4() -> None:
     assert "power analysis" not in m4_context
     assert "power analysis" in m5_context
     assert "causal mechanism" not in m5_context
+
+
+# ---------------------------------------------------------------------------
+# Followup text injection into M4/M5 prompts (task #16 fix 2)
+# ---------------------------------------------------------------------------
+
+def test_followup_text_is_injected_into_m4_and_m5_context() -> None:
+    state = PipelineState(
+        input_question="q",
+        followup=FollowupRequest(text="请用中文输出方案", parent_run_id="p1"),
+    )
+    m4_context = M4HypothesisGeneration()._build_feedback_context(state, [])
+    m5_context = M5ResearchPlan._build_feedback_context(state)
+
+    for context in (m4_context, m5_context):
+        assert "请用中文输出方案" in context
+        assert "用户追问要求" in context
+
+
+def test_followup_block_coexists_with_m4_revision_context() -> None:
+    state = PipelineState(
+        input_question="q",
+        iteration_count=1,
+        followup=FollowupRequest(text="输出中文方案", parent_run_id="p1"),
+        reviews=[
+            ReviewResult(
+                dimension=ReviewerDimension("scientific_logic"),
+                score=3.0,
+                suggestions="clarify the causal mechanism",
+                version=1,
+            ),
+        ],
+    )
+    context = M4HypothesisGeneration()._build_feedback_context(state, [])
+    assert "输出中文方案" in context
+    assert "causal mechanism" in context  # revision feedback still present
+
+
+def test_m5_user_prompt_carries_followup_text() -> None:
+    state = PipelineState(
+        input_question="q",
+        followup=FollowupRequest(text="请用中文输出方案", parent_run_id="p1"),
+    )
+    prompt = M5_USER_TEMPLATE.format(
+        statement="PBK activation sustains persister survival.",
+        mechanism="PBK -> bypass signaling",
+        predictions="p1",
+        falsification_conditions="f1",
+        feedback_context=M5ResearchPlan._build_feedback_context(state),
+    )
+    assert "请用中文输出方案" in prompt
+
+
+def test_no_followup_keeps_prompt_context_unchanged() -> None:
+    """Incremental injection: without a followup the context is exactly the
+    legacy empty string (first round) in both modules."""
+    plain = PipelineState(input_question="q")
+    assert M4HypothesisGeneration()._build_feedback_context(plain, []) == ""
+    assert M5ResearchPlan._build_feedback_context(plain) == ""
+
+    # empty followup text is treated the same as no followup
+    blank = PipelineState(input_question="q", followup=FollowupRequest(text="  "))
+    assert M4HypothesisGeneration()._build_feedback_context(blank, []) == ""
+    assert M5ResearchPlan._build_feedback_context(blank) == ""

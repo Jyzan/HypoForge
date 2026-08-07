@@ -131,7 +131,7 @@ class QwenClient:
         api_base: str = "",
     ):
         self.model = model
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
+        self.api_key = api_key or os.environ.get("QWEN_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
         self.api_base = (
             api_base
             or os.environ.get("OPENAI_BASE_URL")

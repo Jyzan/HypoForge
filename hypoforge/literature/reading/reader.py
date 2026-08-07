@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 from typing import Any
 
 from ...state import ConfidenceLevel, KnowledgeEntryType
@@ -207,9 +206,11 @@ class QwenPaperReader(PaperReaderProtocol):
             if key in seen:
                 continue
             seen.add(key)
-            digest = hashlib.sha256(
-                json.dumps(key, ensure_ascii=False).encode("utf-8")
-            ).hexdigest()[:16]
+            # Stable entry id: sha1(normalised content + source paper)[:12],
+            # so re-reading the same paper yields identical entry ids.
+            digest = hashlib.sha1(
+                (content.casefold() + "\u0000" + paper.paper_id).encode("utf-8")
+            ).hexdigest()[:12]
             entities_raw = item.get("entities", [])
             entities = (
                 list(

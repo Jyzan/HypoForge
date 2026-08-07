@@ -102,3 +102,46 @@ Iteration {iteration}/{max_iterations}.
 
 Should we accept this version or iterate again?
 """
+
+
+# ---------------------------------------------------------------------------
+# Evidence-sufficiency verdict (iteration core; only when m6_evidence_revisit)
+# ---------------------------------------------------------------------------
+
+M6_EVIDENCE_VERDICT_SYSTEM = """\
+You are an evidence-sufficiency judge for a biomedical research pipeline. \
+Given the evidence-graph statistics and the current top hypothesis + research \
+plan, decide whether the collected literature evidence is SUFFICIENT to \
+support the hypothesis generation and research plan as they stand.
+
+Rules:
+1. `sufficient=true` when the established facts cover the hypothesis's key \
+mechanistic claims and no critical literature gap blocks the plan.
+2. `sufficient=false` ONLY when concrete, searchable evidence gaps exist. For \
+each gap provide: a precise `description`; `gap_type` (one of mechanism / \
+population / dosage / conflict / coverage / other); the sub-question it \
+weakens (`target_sub_question`); the canonical entities involved \
+(`canonical_entities`, e.g. gene/protein/drug/population names); and 1–3 \
+concrete literature search queries (`suggested_queries`) that could fill it.
+3. Do NOT invent gaps that additional searching could not possibly address \
+(e.g. purely experimental unknowns).
+4. Leave `gap_id` empty; it is assigned automatically from \
+(target_sub_question, gap_type, canonical_entities).
+
+Output valid JSON matching the provided schema.
+"""
+
+M6_EVIDENCE_VERDICT_TEMPLATE = """\
+Original question: {original_question}
+
+Evidence graph summary (facts / conflicts / gaps):
+{facts_count} established facts, {conflicts_count} conflicts, {gaps_count} knowledge gaps
+
+Top hypothesis:
+{hypothesis_json}
+
+Research plan summary:
+{plan_summary}
+
+Judgement (review version {version}): is the evidence base sufficient?
+"""

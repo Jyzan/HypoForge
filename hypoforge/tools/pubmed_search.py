@@ -320,6 +320,64 @@ def _esearch(
     return id_list
 
 
+def _esearch_count_sync(query: str, deadline: float | None = None) -> int:
+    """Count-only ``esearch`` probe (``retmode=json``, no idlist/efetch).
+
+    Used by the zero-result relaxation ladder to cheaply check whether a
+    relaxed query would hit anything before spending an ``efetch`` call.
+    """
+    url = _build_url("esearch.fcgi", {
+        "db": "pubmed",
+        "term": query,
+        "retmax": "0",
+        "retmode": "json",
+    })
+    logger.debug("esearch count probe: %s", url[:200])
+    data = (
+        _http_get_json(url)
+        if deadline is None
+        else _http_get_json(url, deadline=deadline)
+    )
+    if not isinstance(data, dict):
+        raise PubMedProtocolError("esearch count response must be a JSON object")
+    for key in ("ERROR", "errorlist", "error"):
+        if key in data and _has_error_data(data[key]):
+            raise PubMedProtocolError(f"esearch returned {key}: {data[key]}")
+    result = data.get("esearchresult")
+    if not isinstance(result, dict):
+        raise PubMedProtocolError("esearchresult is missing or malformed")
+    for key in ("ERROR", "errorlist", "error"):
+        if key in result and _has_error_data(result[key]):
+            raise PubMedProtocolError(f"esearch returned {key}: {result[key]}")
+    count_value = result.get("count")
+    if isinstance(count_value, bool) or not (
+        isinstance(count_value, int)
+        or isinstance(count_value, str) and count_value.isdigit()
+    ):
+        raise PubMedProtocolError("esearchresult count is malformed")
+    count = int(count_value)
+    logger.info("esearch count: query=%r → total=%d", query, count)
+    return count
+
+
+async def pubmed_count(query: str, timeout_seconds: float | None = None) -> int:
+    """Lightweight async esearch count probe (no efetch).
+
+    Returns the total hit count for *query*. Raises on protocol/network
+    failures so callers can skip the relaxation level.
+    """
+    deadline = None
+    if timeout_seconds is not None:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("timeout_seconds must be a positive finite number")
+        deadline = time.monotonic() + timeout_seconds
+    return await asyncio.to_thread(_esearch_count_sync, query, deadline)
+
+
 def _efetch_batch(
     pmids: List[str],
     *,

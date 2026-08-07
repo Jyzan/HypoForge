@@ -102,6 +102,10 @@ class PaperRecord(LiteratureModel):
     is_open_access: Optional[bool] = None
     fulltext_status: FulltextStatus = FulltextStatus.UNKNOWN
     rank_scores: Dict[str, float] = Field(default_factory=dict)
+    # Original query text when this record was recalled by the PubMed
+    # zero-result relaxation ladder; empty means an exact-query hit. M3
+    # grounding uses it to avoid treating relaxed recalls as strong evidence.
+    relaxed_from: str = ""
 
     @field_validator("doi", mode="before")
     @classmethod

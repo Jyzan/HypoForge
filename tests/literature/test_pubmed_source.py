@@ -95,11 +95,14 @@ async def test_real_pubmed_backend_receives_source_timeout(monkeypatch) -> None:
         calls.append((text, limit, timeout_seconds))
         return []
 
+    async def zero_probe(text: str, timeout_seconds: float | None = None) -> int:
+        return 0
+
     monkeypatch.setattr(pubmed_source, "search_pubmed_strict", backend)
 
-    result = await PubMedLiteratureSource(timeout_seconds=0.75).search(
-        query(), limit=4
-    )
+    result = await PubMedLiteratureSource(
+        timeout_seconds=0.75, count_probe=zero_probe
+    ).search(query(), limit=4)
 
     assert result == []
     assert calls == [("Hippo AND YAP AND TAZ", 4, 0.75)]
@@ -114,7 +117,7 @@ async def test_injected_backend_keeps_two_argument_contract() -> None:
         return []
 
     result = await PubMedLiteratureSource(
-        backend=backend, timeout_seconds=0.01
+        backend=backend, timeout_seconds=0.01, enable_relaxation=False
     ).search(query(), limit=3)
 
     assert result == []

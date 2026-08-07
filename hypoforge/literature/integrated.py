@@ -40,6 +40,7 @@ def build_integrated_search_adapter(
     per_query_limit: int | None = None,
     enabled_sources: Sequence[str] | None = None,
     semantic_scholar_api_key: str = "",
+    zero_result_relaxation: bool = True,
     source_timeout_seconds: float = 30.0,
     budget: SearchBudget | Mapping[str, Any] | None = None,
     reading_cache_dir: str | Path = ".cache/hypoforge/literature/documents",
@@ -65,6 +66,7 @@ def build_integrated_search_adapter(
     tool = search_tool or LiteratureSearchTool(
         enabled_sources=enabled_sources,
         semantic_scholar_api_key=semantic_scholar_api_key,
+        zero_result_relaxation=zero_result_relaxation,
     )
     if isinstance(budget, Mapping):
         resolved_budget = SearchBudget.model_validate(dict(budget))

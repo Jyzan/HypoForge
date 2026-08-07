@@ -72,26 +72,43 @@ class Relation:
     """A directed, typed edge in the persistent knowledge graph.
 
     Serialisation uses ``from`` / ``to`` / ``relationType`` keys for
-    BioDSA compatibility.
+    BioDSA compatibility.  The optional ``confidence`` / ``rationale``
+    fields (added for merge-based knowledge retention) are extra keys
+    that older readers can safely ignore.
     """
 
     from_entity: str
     to_entity: str
     relation_type: str
+    confidence: float | None = None
+    rationale: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        data: Dict[str, Any] = {
             "from": self.from_entity,
             "to": self.to_entity,
             "relationType": self.relation_type,
         }
+        if self.confidence is not None:
+            data["confidence"] = self.confidence
+        if self.rationale:
+            data["rationale"] = self.rationale
+        return data
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Relation":
+        raw_conf = data.get("confidence")
+        confidence = (
+            float(raw_conf)
+            if isinstance(raw_conf, (int, float))
+            else None
+        )
         return cls(
             from_entity=data["from"],
             to_entity=data["to"],
             relation_type=data["relationType"],
+            confidence=confidence,
+            rationale=str(data.get("rationale", "") or ""),
         )
 
 
@@ -168,6 +185,8 @@ def evidence_graph_to_knowledge_graph(eg: "EvidenceGraph") -> KnowledgeGraph:
                 from_entity=edge.source,
                 to_entity=edge.target,
                 relation_type=edge.relation.value,
+                confidence=edge.confidence,
+                rationale=edge.rationale or "",
             )
         )
 
@@ -266,6 +285,8 @@ def knowledge_graph_to_evidence_graph(kg: KnowledgeGraph) -> "EvidenceGraph":
                 source=rel.from_entity,
                 target=rel.to_entity,
                 relation=edge_rel,
+                confidence=rel.confidence,
+                rationale=rel.rationale or None,
             )
         )
 

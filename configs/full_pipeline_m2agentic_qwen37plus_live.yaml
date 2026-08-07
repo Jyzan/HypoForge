@@ -10,6 +10,11 @@ pipeline:
   max_iterations: 2
   enable_iteration: true
   iteration_module_target: "m4"
+  followup_routing: true
+  m6_evidence_revisit: true
+  max_search_rounds: 2
+  supplement_paper_budget: 6
+  gap_no_improvement_limit: 3
 
 qwen:
   base:
@@ -81,3 +86,6 @@ module_overrides:
         - overall
 
 enabled_skills: []
+
+# Persistent paper/query cache used by M2 supplement rounds and M3 memory.
+memory_cache_dir: "./knowledge_graph"

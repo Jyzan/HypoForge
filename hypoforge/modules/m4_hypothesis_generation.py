@@ -62,6 +62,22 @@ _EDITORIAL_STATEMENT_RE = re.compile(
 )
 
 
+def _followup_requirement_block(state: PipelineState) -> str:
+    """Format ``state.followup.text`` as a priority requirement block.
+
+    Returns ``""`` on non-followup runs, so prompt construction stays
+    byte-for-byte identical to the legacy behaviour when no followup exists.
+    """
+    followup = getattr(state, "followup", None)
+    text = (followup.text or "").strip() if followup is not None else ""
+    if not text:
+        return ""
+    return (
+        "\n--- 用户追问要求 (user follow-up instruction, highest priority, must be honoured) ---\n"
+        f"{text}\n"
+    )
+
+
 @ModuleRegistry.register
 class M4HypothesisGeneration(ModuleProtocol):
     module_name = "m4"
@@ -291,9 +307,12 @@ class M4HypothesisGeneration(ModuleProtocol):
 
     def _build_feedback_context(self, state: PipelineState, guidance: List[str]) -> str:
         """Assemble reviewer feedback + prior hypotheses + human guidance into a
-        revision block for the generator (empty string on the first round)."""
+        revision block for the generator (empty string on the first round,
+        except in followup runs where the follow-up instruction is always
+        injected)."""
+        followup_block = _followup_requirement_block(state)
         if state.iteration_count <= 0:
-            return ""
+            return followup_block
 
         parts: List[str] = [f"\n--- Revision guidance (iteration {state.iteration_count}) ---"]
 
@@ -323,7 +342,7 @@ class M4HypothesisGeneration(ModuleProtocol):
             parts.extend(f"- {g}" for g in guidance)
 
         parts.append("")
-        return "\n".join(parts)
+        return followup_block + "\n".join(parts)
 
     def _update_best(self, state: PipelineState, top: List[HypothesisCard]) -> List[HypothesisCard]:
         """Keep the best hypotheses seen across all iterations, so a weaker

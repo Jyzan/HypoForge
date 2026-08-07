@@ -11,9 +11,10 @@ competition specification (§三).
 
 from __future__ import annotations
 
+import hashlib
 import re
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -453,6 +454,111 @@ class GroundingResult(BaseModel):
 
 
 # ============================================================================
+# Iteration core — evidence sufficiency, routing & followup contracts
+# ============================================================================
+
+def _normalise_gap_part(text: str) -> str:
+    """Lowercase / collapse-whitespace normalisation shared by all gap-id parts."""
+    return re.sub(r"\s+", " ", str(text or "").lower()).strip()
+
+
+def make_gap_id(
+    target_sub_question: str, gap_type: str, canonical_entities: Sequence[str]
+) -> str:
+    """Stable composite id for an evidence gap (v2 contract).
+
+    ``sha1(target_sub_question | gap_type | ",".join(sorted(entities)))[:12]``
+    with every part lowercased / whitespace-normalised and the canonical
+    entities **comma-joined** after sorting, so the *same* gap — even
+    described with different wording but bound to the same sub-question,
+    type and canonical entities — always maps to the same id across review
+    rounds.  Entity order does not matter (sorted before hashing).
+    """
+    sub_q = _normalise_gap_part(target_sub_question)
+    gtype = _normalise_gap_part(gap_type)
+    entities = ",".join(
+        sorted(_normalise_gap_part(e) for e in canonical_entities if str(e or "").strip())
+    )
+    raw = f"{sub_q}|{gtype}|{entities}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+GapType = Literal[
+    "mechanism", "population", "dosage", "conflict", "coverage", "other"
+]
+
+
+class EvidenceGap(BaseModel):
+    """One identified gap in the evidence base (M6 verdict output).
+
+    ``gap_id`` is derived **code-side** from
+    ``(target_sub_question, gap_type, canonical_entities)`` — never from the
+    free-text description alone, and never trusted from LLM output.  When
+    ``target_sub_question`` is missing the description is used as the hash
+    anchor instead, so id derivation never crashes.
+
+    ``status`` values:
+
+    * ``open`` — freshly identified, awaiting a supplement search;
+    * ``pending_grounding`` — M2 tried to mitigate it, waiting for M3
+      grounding to confirm the new evidence actually closes the gap;
+    * ``closed`` — resolved (confirmed or disappeared while sufficient);
+    * ``unimprovable`` — cannot be addressed by more searching.
+    """
+
+    gap_id: str = ""
+    description: str
+    gap_type: GapType = "other"
+    canonical_entities: List[str] = Field(default_factory=list)
+    suggested_queries: List[str] = Field(default_factory=list)
+    target_sub_question: str = ""
+    source_review_version: int = 0
+    status: Literal["open", "pending_grounding", "closed", "unimprovable"] = "open"
+    attempts: int = 0
+
+    @model_validator(mode="after")
+    def _ensure_gap_id(self) -> "EvidenceGap":
+        if not self.gap_id:
+            anchor = self.target_sub_question or self.description
+            self.gap_id = make_gap_id(anchor, self.gap_type, self.canonical_entities)
+        return self
+
+
+class EvidenceSufficiencyVerdict(BaseModel):
+    """M6 structured verdict: is the current evidence base sufficient?"""
+
+    sufficient: bool
+    gaps: List[EvidenceGap] = Field(default_factory=list)
+    rationale: str = ""
+
+
+class RoutingDecision(BaseModel):
+    """One auditable routing decision recorded in ``routing_history``."""
+
+    round: int
+    from_module: str
+    to_module: str
+    decided_by: Literal["m6", "m1", "policy"]
+    reason: str = ""
+    gap_ids: List[str] = Field(default_factory=list)
+
+
+class FollowupRequest(BaseModel):
+    """A follow-up question issued on top of a completed parent run."""
+
+    text: str
+    parent_run_id: str = ""
+    skip_search: Optional[bool] = None  # decided by M1 (None = not yet decided)
+
+
+class SearchLedger(BaseModel):
+    """Cross-round ledger of M2 search activity."""
+
+    queries_issued: List[str] = Field(default_factory=list)
+    paper_keys: List[str] = Field(default_factory=list)
+
+
+# ============================================================================
 # Global Pipeline State
 # ============================================================================
 
@@ -489,10 +595,27 @@ class PipelineState(BaseModel):
 
     # ---- M6 + iteration ----
     reviews: List[ReviewResult] = Field(default_factory=list)
+    # iteration_count = number of M6 review rounds; doubles as the GLOBAL hard
+    # stop (supplement rounds also consume this budget: global cap = max_iterations).
     iteration_count: int = 0
     max_iterations: int = 3
     review_score_threshold: float = 4.0  # M6 overall (1–5) at/above which iteration stops
     user_guidance: List[str] = Field(default_factory=list)  # human guidance injected between iterations
+
+    # ---- iteration core (evidence sufficiency / routing / followup) ----
+    # All fields have defaults so old checkpoints (without them) still load.
+    evidence_verdict: Optional[EvidenceSufficiencyVerdict] = None
+    evidence_gaps: List[EvidenceGap] = Field(default_factory=list)
+    followup: Optional[FollowupRequest] = None
+    parent_run_id: str = ""
+    # search_round = number of M2 executions (fresh + supplements), capped by
+    # config.max_search_rounds; independent of iteration_count.
+    search_round: int = 0
+    # revision_count = number of M4 revision rounds (audit/display only —
+    # never gates routing).
+    revision_count: int = 0
+    search_ledger: SearchLedger = Field(default_factory=SearchLedger)
+    routing_history: List[RoutingDecision] = Field(default_factory=list)
 
     # ---- persistence ----
     memory_cache_dir: str = ""  # non-empty enables persistent knowledge graph

@@ -28,12 +28,19 @@ Quick start::
 
 from .bm25_index import BM25SearchIndex, HAS_BM25, HAS_TIKTOKEN
 from .graph_manager import KnowledgeGraphManager
+from .hypoforge_types import GapGain, normalize_entry_content, stable_entry_id
+from .paper_store import PaperStore, normalize_query_text, paper_key, query_hash
 from .schema import (
     Entity,
     KnowledgeGraph,
     Relation,
     evidence_graph_to_knowledge_graph,
     knowledge_graph_to_evidence_graph,
+)
+from .snapshots import (
+    graph_round_snapshot_path,
+    load_latest_graph_round,
+    save_graph_round_snapshot,
 )
 
 # Tools are optional (depend on langchain_core)
@@ -50,6 +57,15 @@ __all__ = [
     "Relation",
     # Persistence
     "KnowledgeGraphManager",
+    # Shared type helpers (stable entry ids / gap-gain contract)
+    "GapGain",
+    "normalize_entry_content",
+    "stable_entry_id",
+    # Paper-level search cache (M2 supplement rounds)
+    "PaperStore",
+    "normalize_query_text",
+    "paper_key",
+    "query_hash",
     # Search
     "BM25SearchIndex",
     "HAS_BM25",
@@ -60,4 +76,8 @@ __all__ = [
     # Conversion
     "evidence_graph_to_knowledge_graph",
     "knowledge_graph_to_evidence_graph",
+    # Round snapshots (lossless)
+    "graph_round_snapshot_path",
+    "load_latest_graph_round",
+    "save_graph_round_snapshot",
 ]

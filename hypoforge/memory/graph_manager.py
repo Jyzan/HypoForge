@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
@@ -131,6 +132,46 @@ class KnowledgeGraphManager:
             self._cache_dir, context, len(kg.entities), len(kg.relations),
         )
         return kg
+
+    def merge_from_evidence_graph(
+        self,
+        evidence_graph,
+        context: str = "evidence_graph",
+    ) -> KnowledgeGraph:
+        """Merge an ``EvidenceGraph`` into the persisted ``KnowledgeGraph``.
+
+        Unlike :meth:`save_from_evidence_graph` (which **overwrites**),
+        this loads the existing graph for *context*, merges the incoming
+        evidence-converted graph into it, and writes the union back.
+
+        Merge rules:
+
+        * Entities are merged by canonical name (lowercase, stripped,
+          whitespace-collapsed).  Observations are unioned (deduplicated,
+          order preserved).
+        * Relations are merged by ``(from_entity, relation_type,
+          to_entity)`` triple.  Duplicates keep the higher ``confidence``
+          and concatenate distinct rationales.
+
+        Note: the EvidenceGraph → KnowledgeGraph conversion is lossy by
+        design; this index layer is not the source of truth (the pipeline
+        state / round snapshots are).
+
+        Returns the merged ``KnowledgeGraph`` that was written to disk.
+        """
+        incoming = evidence_graph_to_knowledge_graph(evidence_graph)
+        existing = self._load_graph(context)
+        merged = self._merge_knowledge_graphs(existing, incoming)
+        self._save_graph(merged, context)
+
+        # Build / update BM25 index so the merged graph is searchable.
+        self._ensure_index_built(context)
+
+        logger.info(
+            "Merged evidence graph into %s (context=%s): %d entities, %d relations",
+            self._cache_dir, context, len(merged.entities), len(merged.relations),
+        )
+        return merged
 
     def load_to_evidence_graph(self, context: str = "evidence_graph"):
         """Load a persisted ``KnowledgeGraph`` and convert back to ``EvidenceGraph``.
@@ -417,6 +458,99 @@ class KnowledgeGraphManager:
             self._save_graph(graph, context)
 
         return results
+
+    # ==================================================================
+    # Internal — graph merging
+    # ==================================================================
+
+    @staticmethod
+    def _normalize_entity_name(name: str) -> str:
+        """Canonical entity key: lowercase, stripped, whitespace-collapsed."""
+        return re.sub(r"\s+", " ", str(name or "").strip()).lower()
+
+    @classmethod
+    def _merge_knowledge_graphs(
+        cls,
+        base: KnowledgeGraph,
+        incoming: KnowledgeGraph,
+    ) -> KnowledgeGraph:
+        """Return a new graph = *base* ∪ *incoming* (see merge rules above)."""
+        # ---- entities by canonical name ----
+        entities: List[Entity] = []
+        by_key: Dict[str, Entity] = {}
+        # display-name canonicalisation map (any variant → first-seen name)
+        name_map: Dict[str, str] = {}
+
+        def add_entity(entity: Entity) -> None:
+            key = cls._normalize_entity_name(entity.name)
+            if not key:
+                return
+            display = name_map.setdefault(key, entity.name.strip())
+            existing = by_key.get(key)
+            if existing is None:
+                merged_entity = Entity(
+                    name=display,
+                    entity_type=entity.entity_type,
+                    observations=list(entity.observations),
+                )
+                by_key[key] = merged_entity
+                entities.append(merged_entity)
+            else:
+                if not existing.entity_type and entity.entity_type:
+                    existing.entity_type = entity.entity_type
+                for obs in entity.observations:
+                    if obs and obs not in existing.observations:
+                        existing.observations.append(obs)
+
+        for entity in base.entities:
+            add_entity(entity)
+        for entity in incoming.entities:
+            add_entity(entity)
+
+        # ---- relations by (from, relation_type, to) triple ----
+        relations: List[Relation] = []
+        rel_by_key: Dict[Tuple[str, str, str], Relation] = {}
+
+        def relation_name(name: str) -> str:
+            key = cls._normalize_entity_name(name)
+            return name_map.get(key, name)
+
+        def add_relation(rel: Relation) -> None:
+            from_name = relation_name(rel.from_entity)
+            to_name = relation_name(rel.to_entity)
+            rkey = (from_name, rel.relation_type, to_name)
+            existing = rel_by_key.get(rkey)
+            if existing is None:
+                merged_rel = Relation(
+                    from_entity=from_name,
+                    to_entity=to_name,
+                    relation_type=rel.relation_type,
+                    confidence=rel.confidence,
+                    rationale=rel.rationale,
+                )
+                rel_by_key[rkey] = merged_rel
+                relations.append(merged_rel)
+                return
+            # Duplicate triple: keep the higher confidence (None loses).
+            if (
+                rel.confidence is not None
+                and (existing.confidence is None or rel.confidence > existing.confidence)
+            ):
+                existing.confidence = rel.confidence
+            # Merge rationales (deduplicated, order preserved).
+            if rel.rationale and rel.rationale not in existing.rationale:
+                existing.rationale = (
+                    f"{existing.rationale} | {rel.rationale}".strip(" |")
+                    if existing.rationale
+                    else rel.rationale
+                )
+
+        for rel in base.relations:
+            add_relation(rel)
+        for rel in incoming.relations:
+            add_relation(rel)
+
+        return KnowledgeGraph(entities=entities, relations=relations)
 
     # ==================================================================
     # Internal — file I/O

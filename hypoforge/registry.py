@@ -163,6 +163,13 @@ class ModuleRegistry:
                     kwargs.setdefault(
                         "max_papers_per_query", config.search.papers_per_sub_question
                     )
+                else:
+                    # Agentic M2: per-round paper budget for gap-driven
+                    # supplement searches (cache-first incremental flow).
+                    kwargs.setdefault(
+                        "supplement_paper_budget",
+                        getattr(config, "supplement_paper_budget", 6),
+                    )
 
             # ---- M3 grounding config injection ----
             # The top-level `grounding:` block (GroundingConfig) is the single
@@ -181,6 +188,30 @@ class ModuleRegistry:
                         kwargs["grounding_relation_selection_mode"] = (
                             "evidence_gams" if grounding.enable_gams else "direct"
                         )
+
+            # ---- iteration-core feature switches ----
+            # M1 needs the followup-routing switch to decide search-free
+            # followups; M6 needs the evidence-revisit switch to run the
+            # evidence-sufficiency verdict.  Both default to False.
+            if name == "m1":
+                kwargs.setdefault(
+                    "followup_routing", getattr(config, "followup_routing", False)
+                )
+            if name == "m3":
+                # Gap confirmation limit + run output dir (for lossless
+                # graph-round snapshots) come from the pipeline config.
+                kwargs.setdefault(
+                    "gap_no_improvement_limit",
+                    getattr(config, "gap_no_improvement_limit", 1),
+                )
+                kwargs.setdefault(
+                    "output_dir", getattr(config, "output_dir", "")
+                )
+            if name == "m6":
+                kwargs.setdefault(
+                    "m6_evidence_revisit",
+                    getattr(config, "m6_evidence_revisit", False),
+                )
 
             # Inject scoring weights into M4 so the composite formula has a
             # single source of truth (PipelineConfig.scoring → rubric defaults).

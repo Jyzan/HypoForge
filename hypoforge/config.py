@@ -75,11 +75,16 @@ class LLMConfig(BaseModel):
     def _resolve_env(self) -> "LLMConfig":
         # ---- api_key ----
         if not self.api_key:
-            self.api_key = os.environ.get("OPENAI_API_KEY") or ""
+            self.api_key = (
+                os.environ.get("QWEN_API_KEY")
+                or os.environ.get("OPENAI_API_KEY")
+                or ""
+            )
         # ---- api_base ----
         if not self.api_base:
             self.api_base = (
-                os.environ.get("OPENAI_BASE_URL")
+                os.environ.get("QWEN_BASE_URL")
+                or os.environ.get("OPENAI_BASE_URL")
                 or "https://dashscope.aliyuncs.com/compatible-mode/v1"
             )
         return self
@@ -117,6 +122,9 @@ class SearchConfig(BaseModel):
     max_queries: int = Field(default=12, ge=1)
     max_tokens: int = Field(default=100_000, ge=1)
     max_seconds: int = Field(default=900, ge=1)
+    # Zero-result relaxation ladder inside the PubMed sources (L1 strip
+    # field tags → L2 drop AND clauses → L3 unquote core concepts).
+    zero_result_relaxation: bool = True
 
     @model_validator(mode="after")
     def _validate_agentic_budget(self) -> "SearchConfig":
@@ -217,6 +225,24 @@ class PipelineConfig(BaseModel):
     enable_iteration: bool = True
     iteration_module_target: str = "m4"  # which module receives feedback
 
+    # ---- iteration core (feature switches — default OFF keeps the 6 baseline
+    # configs behaving exactly as before) ----
+    # Three-counter semantics (single source of truth, mirrored in README):
+    #   iteration_count = total number of M6 reviews; +1 per M6 execution and
+    #     the GLOBAL hard stop is ``iteration_count >= max_iterations`` — it is
+    #     NOT added to max_search_rounds; supplement search rounds deliberately
+    #     consume one M6 review of this budget (total-cost cap);
+    #   search_round    = number of M2 executions (fresh + supplements), capped
+    #     by ``max_search_rounds``; only constrains the supplement re-hop;
+    #   revision_count  = M6→M4 revision hops, audit/display only — it never
+    #     participates in any stop condition.
+    followup_routing: bool = False      # M1 may skip M2/M3 for search-free followups
+    m6_evidence_revisit: bool = False   # M6 evidence-sufficiency verdict may re-route to M2
+    max_search_rounds: int = 2          # max M2 executions (fresh + supplement rounds)
+    supplement_paper_budget: int = 6    # paper budget per supplement search round
+    gap_no_improvement_limit: int = 3   # mark a gap unimprovable after N rounds without improvement
+    gap_no_gain_limit: int = 3          # stop supplementing a gap after N rounds with zero evidence gain
+
     # ---- LLM assignment ----
     qwen: QwenModelsConfig = Field(default_factory=QwenModelsConfig)
 
@@ -274,6 +300,16 @@ class PipelineConfig(BaseModel):
             raw.setdefault("max_iterations", pipeline_raw.get("max_iterations", 3))
             raw.setdefault("enable_iteration", pipeline_raw.get("enable_iteration", True))
             raw.setdefault("iteration_module_target", pipeline_raw.get("iteration_module_target", "m4"))
+            for key in (
+                "followup_routing",
+                "m6_evidence_revisit",
+                "max_search_rounds",
+                "supplement_paper_budget",
+                "gap_no_improvement_limit",
+                "gap_no_gain_limit",
+            ):
+                if key in pipeline_raw:
+                    raw.setdefault(key, pipeline_raw[key])
 
         # Resolve env vars for well-known keys
         return cls(**raw)
@@ -324,6 +360,10 @@ class PipelineConfig(BaseModel):
                         self.search.papers_per_sub_question,
                     )
                     kwargs.setdefault("enabled_sources", list(self.search.tools))
+                    kwargs.setdefault(
+                        "zero_result_relaxation",
+                        self.search.zero_result_relaxation,
+                    )
         return kwargs
 
 

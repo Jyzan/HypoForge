@@ -32,9 +32,9 @@ import json
 import logging
 import re
 import time
-import uuid
 from typing import Any, Dict, List, Optional, Set
 
+from ..memory.hypoforge_types import GapGain, stable_entry_id
 from ..protocol import ModuleProtocol
 from ..observability import emit_event
 from ..prompts.m3_prompts import (
@@ -254,6 +254,9 @@ class M3EvidenceGraph(ModuleProtocol):
         grounding_gams_seed: int = 42,
         grounding_llm_call_timeout: float = 120.0,
         grounding_relation_judge_retries: int = 2,
+        # ---- knowledge-retention settings ----
+        gap_no_improvement_limit: int = 1,
+        output_dir: str = "",
         **kwargs,
     ):
         self.mode = mode
@@ -265,6 +268,13 @@ class M3EvidenceGraph(ModuleProtocol):
         self.enable_cross_batch = enable_cross_batch
         self.bridge_batch_size = max(1, bridge_batch_size)
         self.client = QwenClient.from_config(llm_config) if llm_config else None
+
+        # Gap confirmation: how many no-improvement rounds before a
+        # pending_grounding gap is declared unimprovable.
+        self.gap_no_improvement_limit = max(1, int(gap_no_improvement_limit))
+        # Run output dir for lossless graph-round snapshots (falls back to
+        # state.memory_cache_dir when unset).
+        self.output_dir = output_dir
 
         # Grounding workflow (lazy — only built when enabled)
         self.grounding_enabled = grounding_enabled
@@ -293,9 +303,8 @@ class M3EvidenceGraph(ModuleProtocol):
                 relation_judge_retries=grounding_relation_judge_retries,
             )
 
-        # Track existing node/edge IDs for incremental updates
-        self._existing_node_ids: Set[str] = set()
-        self._existing_entry_ids: Set[str] = set()
+        # NOTE: incremental dedup is rebuilt on the fly from the existing
+        # graph's node ids / metadata each run — no instance-level id sets.
 
     # ------------------------------------------------------------------
     # ModuleProtocol implementation
@@ -311,9 +320,49 @@ class M3EvidenceGraph(ModuleProtocol):
         for lr in state.literature_results:
             all_entries.extend(lr.knowledge_entries)
 
-        if not all_entries:
-            return {"evidence_graph": EvidenceGraph()}
+        existing_graph = state.evidence_graph
 
+        if not all_entries:
+            # No knowledge entries at all: never wipe an existing graph.
+            # Only return a genuinely empty graph when there is nothing.
+            if existing_graph is not None and existing_graph.nodes:
+                logger.info(
+                    "M3: no knowledge entries; reusing existing graph "
+                    "(%d nodes, %d edges)",
+                    len(existing_graph.nodes), len(existing_graph.edges),
+                )
+                emit_event(
+                    "module_notice",
+                    module="m3",
+                    status="completed",
+                    message=(
+                        "无知识条目，保留既有证据图（"
+                        f"{len(existing_graph.nodes)} 节点 / "
+                        f"{len(existing_graph.edges)} 边），不清空重建"
+                    ),
+                )
+                return {"evidence_graph": existing_graph}
+            # State carries no graph — fall back to the persisted one
+            # (lossless round snapshot first, then the JSONL memory store).
+            persisted = self._load_persisted_graph(state)
+            if persisted is not None and persisted.nodes:
+                logger.info(
+                    "M3: no knowledge entries; reusing persisted graph "
+                    "(%d nodes, %d edges)",
+                    len(persisted.nodes), len(persisted.edges),
+                )
+                emit_event(
+                    "module_notice",
+                    module="m3",
+                    status="completed",
+                    message=(
+                        "无知识条目，从持久化记忆恢复证据图（"
+                        f"{len(persisted.nodes)} 节点 / "
+                        f"{len(persisted.edges)} 边）"
+                    ),
+                )
+                return {"evidence_graph": persisted}
+            return {"evidence_graph": EvidenceGraph()}
 
         # --- Step 1: rule-based graph construction (with incremental update) ---
         rule_started_at = time.monotonic()
@@ -325,45 +374,59 @@ class M3EvidenceGraph(ModuleProtocol):
             message=f"开始将 {len(all_entries)} 条知识构造成基础证据图",
         )
 
-        existing_graph = state.evidence_graph
+        new_entries: list = []
         if existing_graph is not None and existing_graph.nodes:
             new_entries = self._find_new_entries(all_entries, existing_graph)
             if not new_entries:
+                # No new entries: skip rule construction and LLM enhancement
+                # below, but still run grounding merge / gap confirmation /
+                # persistence so the round completes consistently.
                 logger.info(
                     "M3 incremental: no new entries; reusing existing graph "
                     "(%d nodes, %d edges)",
                     len(existing_graph.nodes), len(existing_graph.edges),
                 )
+                graph = existing_graph
                 emit_event(
                     "tool_completed",
                     module="m3",
                     tool="rule_graph_builder",
                     status="completed",
-                    message=f"增量更新：无新条目，复用现有图 ({len(existing_graph.nodes)} 节点 / {len(existing_graph.edges)} 边)",
+                    message=f"增量更新：无新条目，复用现有图 ({len(graph.nodes)} 节点 / {len(graph.edges)} 边)",
                     elapsed_seconds=time.monotonic() - rule_started_at,
                 )
-                return {"evidence_graph": existing_graph}
-            logger.info(
-                "M3 incremental: %d new entries; appending to existing graph "
-                "(%d nodes, %d edges)",
-                len(new_entries), len(existing_graph.nodes), len(existing_graph.edges),
-            )
-            graph = self._build_rule_graph(new_entries)
-            graph = self._merge_graphs(existing_graph, graph)
+            else:
+                logger.info(
+                    "M3 incremental: %d new entries; appending to existing graph "
+                    "(%d nodes, %d edges)",
+                    len(new_entries), len(existing_graph.nodes), len(existing_graph.edges),
+                )
+                graph = self._build_rule_graph(new_entries)
+                graph = self._merge_graphs(existing_graph, graph)
+                emit_event(
+                    "tool_completed",
+                    module="m3",
+                    tool="rule_graph_builder",
+                    status="completed",
+                    message=f"基础证据图完成：{len(graph.nodes)} 节点 / {len(graph.edges)} 边",
+                    elapsed_seconds=time.monotonic() - rule_started_at,
+                )
         else:
+            new_entries = list(all_entries)
             graph = self._build_rule_graph(all_entries)
-
-        emit_event(
-            "tool_completed",
-            module="m3",
-            tool="rule_graph_builder",
-            status="completed",
-            message=f"基础证据图完成：{len(graph.nodes)} 节点 / {len(graph.edges)} 边",
-            elapsed_seconds=time.monotonic() - rule_started_at,
-        )
+            emit_event(
+                "tool_completed",
+                module="m3",
+                tool="rule_graph_builder",
+                status="completed",
+                message=f"基础证据图完成：{len(graph.nodes)} 节点 / {len(graph.edges)} 边",
+                elapsed_seconds=time.monotonic() - rule_started_at,
+            )
 
         # --- Step 2: LLM-enhanced relation extraction (optional) ---
-        if self.mode in {"llm", "direct", "api"} and self.client:
+        # Only runs when this round contributed new entries, and then only
+        # over the new entries — old entries never get re-extracted.
+        if new_entries and self.mode in {"llm", "direct", "api"} and self.client:
             llm_started_at = time.monotonic()
             emit_event(
                 "tool_started",
@@ -373,7 +436,7 @@ class M3EvidenceGraph(ModuleProtocol):
                 message="开始抽取跨知识条目的语义关系",
             )
             try:
-                graph = await self._enhance_with_llm_batched(graph, all_entries)
+                graph = await self._enhance_with_llm_batched(graph, new_entries)
             except Exception as exc:
                 logger.warning(
                     "M3 LLM enhancement failed; using rule-only graph: %s", exc
@@ -441,14 +504,29 @@ class M3EvidenceGraph(ModuleProtocol):
                     )
 
         # Track existing IDs for next incremental run
-        self._existing_node_ids = {n.id for n in graph.nodes}
-        self._existing_entry_ids = {
-            n.id[2:] for n in graph.nodes if n.id.startswith("N_")
-        }
+        # (rebuilt on the fly from the graph itself — no instance state).
 
-        # --- persist to disk (if enabled) ---
+        # --- Step 5: pending_grounding gap confirmation ---
+        new_entry_ids = {e.id for e in new_entries if e.id}
+        gap_gain = self._compute_gap_gain(state, new_entry_ids)
+        gap_updates = self._evaluate_pending_gaps(state, gap_gain)
+        if gap_updates is not None:
+            result["evidence_gaps"] = gap_updates
+
+        # CONTRACT (P2): per-gap new-effective-evidence counts
+        # (dict[gap_id, int]).  PipelineState has no dedicated ``gap_gain``
+        # field and pipeline.py rejects unknown patch keys, so the counts
+        # travel inside the existing ``metrics`` dict under ``m3_gap_gain``.
+        # P2 consumers read ``state.metrics["m3_gap_gain"]``.
+        if state.evidence_gaps:
+            result["metrics"] = {**state.metrics, "m3_gap_gain": gap_gain}
+
+        # --- persist to disk (merge semantics) + lossless round snapshot ---
         if getattr(state, "memory_cache_dir", ""):
             self._persist_graph(graph, state.memory_cache_dir)
+        snapshot_dir = self.output_dir or getattr(state, "memory_cache_dir", "")
+        if snapshot_dir:
+            self._write_round_snapshot(graph, snapshot_dir, state)
 
         return result
 
@@ -461,7 +539,12 @@ class M3EvidenceGraph(ModuleProtocol):
         all_entries: list,
         existing_graph: EvidenceGraph,
     ) -> list:
-        """Return entries whose IDs are not already represented in the graph."""
+        """Return entries whose IDs are not already represented in the graph.
+
+        The id set is rebuilt locally from the graph every call (no
+        module-level mutable state), so a fresh module instance — or a
+        resumed run — deduplicates exactly as well as a warm one.
+        """
         existing_entry_ids: Set[str] = set()
         for node in existing_graph.nodes:
             # Rule-built nodes have id "N_{entry_id}"
@@ -534,7 +617,11 @@ class M3EvidenceGraph(ModuleProtocol):
 
         # Claim / Evidence / … nodes (one per entry)
         for e in all_entries:
-            nid = f"N_{e.id}" if e.id else f"N_{uuid.uuid4().hex[:6]}"
+            # Stable node id: entries arriving without an id get the
+            # canonical content-based id (same algorithm M2 uses) instead
+            # of a random uuid, so re-runs stay dedup-compatible.
+            entry_id = e.id or stable_entry_id(e.content, e.source_paper_id)
+            nid = f"N_{entry_id}"
 
             node_type = {
                 KnowledgeEntryType.ESTABLISHED_FACT: EvidenceNodeType.EVIDENCE,
@@ -599,12 +686,13 @@ class M3EvidenceGraph(ModuleProtocol):
         conflicts = []
         gaps = []
         for e in all_entries:
+            entry_id = e.id or stable_entry_id(e.content, e.source_paper_id)
             if e.type == KnowledgeEntryType.ESTABLISHED_FACT:
-                established.append(e.id)
+                established.append(entry_id)
             elif e.type == KnowledgeEntryType.CONFLICTING_EVIDENCE:
-                conflicts.append(e.id)
+                conflicts.append(entry_id)
             elif e.type == KnowledgeEntryType.KNOWLEDGE_GAP:
-                gaps.append(e.id)
+                gaps.append(entry_id)
 
         return EvidenceGraph(
             nodes=nodes,
@@ -1301,12 +1389,167 @@ class M3EvidenceGraph(ModuleProtocol):
         return graph
 
     # ------------------------------------------------------------------
-    # Persistence helper
+    # Step 5 — pending_grounding gap confirmation
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _sub_question_matches(sub_question: str, target: str) -> bool:
+        """Tolerant match between a literature sub-question and a gap target."""
+        a = " ".join(str(sub_question or "").split()).casefold()
+        b = " ".join(str(target or "").split()).casefold()
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        return a in b or b in a
+
+    def _compute_gap_gain(
+        self,
+        state: PipelineState,
+        new_entry_ids: Set[str],
+    ) -> GapGain:
+        """Per-gap count of this round's new effective evidence entries.
+
+        Gain for a gap = number of entries in ``new_entry_ids`` that belong
+        to literature results whose sub-question matches the gap's
+        ``target_sub_question``.  Every gap in state gets an entry (0 when
+        nothing matched) so consumers can rely on total coverage.
+        """
+        gain: GapGain = {}
+        for gap in state.evidence_gaps:
+            gain[gap.gap_id] = sum(
+                1
+                for lr in state.literature_results
+                if self._sub_question_matches(
+                    lr.sub_question, gap.target_sub_question
+                )
+                for entry in lr.knowledge_entries
+                if entry.id in new_entry_ids
+            )
+        return gain
+
+    def _evaluate_pending_gaps(
+        self,
+        state: PipelineState,
+        gap_gain: GapGain,
+    ) -> Optional[List[Any]]:
+        """Confirm ``pending_grounding`` gaps after this M3 round.
+
+        Uses the pre-computed *gap_gain* map (see :meth:`_compute_gap_gain`):
+
+        * gain > 0 → gap closed;
+        * gain == 0 → ``attempts += 1``; once ``attempts`` reaches
+          ``gap_no_improvement_limit`` the gap becomes ``unimprovable``.
+
+        Returns the full updated ``evidence_gaps`` list (a modified copy),
+        or ``None`` when there is nothing pending.
+        """
+        if not any(
+            g.status == "pending_grounding" for g in state.evidence_gaps
+        ):
+            return None
+
+        updated = [gap.model_copy(deep=True) for gap in state.evidence_gaps]
+        limit = self.gap_no_improvement_limit
+
+        for gap in updated:
+            if gap.status != "pending_grounding":
+                continue
+            gain = gap_gain.get(gap.gap_id, 0)
+            if gain > 0:
+                gap.status = "closed"
+                emit_event(
+                    "evidence_gap_closed",
+                    module="m3",
+                    status="completed",
+                    message=f"证据缺口已闭合：新增 {gain} 条有效证据",
+                    details={
+                        "gap_id": gap.gap_id,
+                        "gain": gain,
+                        "status": "closed",
+                    },
+                )
+            else:
+                gap.attempts += 1
+                if gap.attempts >= limit:
+                    gap.status = "unimprovable"
+                emit_event(
+                    "evidence_gap_status_changed",
+                    module="m3",
+                    status="completed",
+                    message=(
+                        f"证据缺口无新增证据（attempts={gap.attempts}，"
+                        f"status={gap.status}）"
+                    ),
+                    details={
+                        "gap_id": gap.gap_id,
+                        "gain": 0,
+                        "attempts": gap.attempts,
+                        "status": gap.status,
+                    },
+                )
+        return updated
+
+    # ------------------------------------------------------------------
+    # Persistence helpers
+    # ------------------------------------------------------------------
+
+    def _load_persisted_graph(
+        self,
+        state: PipelineState,
+    ) -> Optional[EvidenceGraph]:
+        """Load the most recent persisted graph (empty-entry fallback).
+
+        Preference order:
+
+        1. Lossless ``graph-round-{N}.json`` snapshot (authoritative,
+           no conversion loss);
+        2. ``KnowledgeGraphManager`` JSONL store via
+           ``load_to_evidence_graph`` (lossy KnowledgeGraph round-trip).
+
+        Returns ``None`` when neither source has a non-empty graph.
+        """
+        from pathlib import Path
+
+        from ..memory.graph_manager import KnowledgeGraphManager
+        from ..memory.snapshots import load_latest_graph_round
+
+        snapshot_dir = self.output_dir or getattr(state, "memory_cache_dir", "")
+        if snapshot_dir:
+            payload = load_latest_graph_round(snapshot_dir)
+            if payload:
+                try:
+                    graph = EvidenceGraph(**payload)
+                    if graph.nodes:
+                        return graph
+                except Exception as exc:
+                    logger.warning(
+                        "M3: failed to parse round snapshot in %s: %s",
+                        snapshot_dir, exc,
+                    )
+
+        cache_dir = getattr(state, "memory_cache_dir", "")
+        if cache_dir:
+            try:
+                mgr = KnowledgeGraphManager(cache_dir=Path(cache_dir))
+                loaded = mgr.load_to_evidence_graph()
+                if loaded is not None and loaded.nodes:
+                    return loaded
+            except Exception as exc:
+                logger.warning(
+                    "M3: failed to load persisted evidence graph from %s: %s",
+                    cache_dir, exc,
+                )
+        return None
+
+    @staticmethod
     def _persist_graph(graph: EvidenceGraph, cache_dir: str) -> None:
-        """Save the evidence graph to a JSONL-backed persistent store."""
+        """Merge the evidence graph into the JSONL-backed persistent store.
+
+        Uses ``merge_from_evidence_graph`` (union semantics) instead of the
+        overwriting ``save_from_evidence_graph`` so knowledge accumulated
+        across rounds / supplement searches is retained in the index layer.
+        """
         from pathlib import Path
 
         from ..memory.graph_manager import KnowledgeGraphManager
@@ -1314,13 +1557,35 @@ class M3EvidenceGraph(ModuleProtocol):
         _logger = logging.getLogger(__name__)
         try:
             mgr = KnowledgeGraphManager(cache_dir=Path(cache_dir))
-            mgr.save_from_evidence_graph(graph)
+            mgr.merge_from_evidence_graph(graph)
             _logger.info(
-                "M3: persisted evidence graph (%d nodes, %d edges) to %s",
+                "M3: merged evidence graph (%d nodes, %d edges) into %s",
                 len(graph.nodes), len(graph.edges), cache_dir,
             )
         except Exception as exc:
             _logger.warning("M3: failed to persist evidence graph: %s", exc)
+
+    def _write_round_snapshot(
+        self,
+        graph: EvidenceGraph,
+        snapshot_dir: str,
+        state: PipelineState,
+        round_no: Optional[int] = None,
+    ) -> None:
+        """Losslessly snapshot this round's graph as ``graph-round-{N}.json``.
+
+        *round_no* may be passed explicitly (e.g. by a caller that tracks
+        its own round counter).  Otherwise ``search_round`` is used when
+        it is positive (supplement rounds), falling back to
+        ``iteration_count`` for plain review iterations.
+        """
+        from ..memory.snapshots import save_graph_round_snapshot
+
+        if round_no is None:
+            round_no = int(getattr(state, "search_round", 0) or 0)
+            if round_no <= 0:
+                round_no = max(0, int(getattr(state, "iteration_count", 0) or 0))
+        save_graph_round_snapshot(graph, snapshot_dir, max(0, int(round_no)))
 
     @classmethod
     def get_input_fields(cls) -> List[str]:

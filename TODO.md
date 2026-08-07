@@ -2,7 +2,7 @@
 
 > 挑战杯 2026 · 赛题A：科学假设生成与研究计划设计
 > 当前状态：**Track A/B/C + Web UI 已合并** · 具备完整的 agentic 搜索、全文 grounding、评估和仪表盘
-> 最后更新：2026-07-30
+> 最后更新：2026-08-06
 
 ---
 
@@ -1150,6 +1150,250 @@ python hypoforge/app.py
 | 持久化 KG 增量更新/读取接入 | Track B.9 → `hypoforge/modules/m3_evidence_graph.py`（当前只写不读，见 Gate 2b） |
 | M3 实体归一化 / 迭代图修正 | Track B.10-B.11 → `hypoforge/modules/m3_evidence_graph.py` |
 | M2 检索优化（query expansion/缓存/路由/引用排序） | Track I → `hypoforge/modules/m2_literature_search.py`（legacy 路径，见 Gate 4b） |
+
+---
+
+## 十二、模型使用约定（比赛部署备忘）
+
+> 本节为**将来改动时的注意事项**，当前代码仍是 base/max/plus/turbo 分档配置，
+> 尚未统一。改代码时优先考虑以下约定：
+
+### 1. 模型选择：统一用最高档 max，不做分档细调
+
+- 当前代码把模型分成 base / max / plus / turbo 四档，各模块各配各的（如 M2 检索词生成用 plus、知识提取用 base 等）。
+- **改动方向**：直接统一使用最高档 `qwen3.7-max` 即可，不必分档细调。分档容易引入 bug（例如某档位模型对特定任务返回空输出），统一用一个模型最稳。
+
+### 2. 运行凭证：以网页界面里的模型为准，全流程统一
+
+- 网页最开始（首页/启动界面）有「运行凭证」配置区，里面列出了千问模型名称，是**让使用者自己选择模型**的。
+- **改动方向**：全流程（M1-M6、检索词生成、知识提取、评审）统一使用运行凭证里选定的那一个模型，不要各模块各自偷偷换模型。
+
+### 3. 默认推荐
+
+- 一般默认选 `qwen3.7-max`，或者 `qwen3.7-plus` 都可以。
+- 比赛演示建议直接用 max，配置最省心。
+
+---
+
+## 十三、M4 提前触发补搜改造（待办）
+
+> 本节记录**将来要改**的方向（2026-08-06 讨论确认），当前代码尚未改动。
+> 现状缺陷：证据缺口（EvidenceGap）**只由 M6 产生**（`state.py` 的 `EvidenceGap` docstring 明确写着 "M6 verdict output"），M6 评审发现证据不足才回跳 M2 补搜，此时 M5 的研究计划已写完 → 补搜后回跳 M4 重新生成假设，**M5 的方案白写一轮**。
+
+### 1. 目标设计
+
+把缺口发现从 M6 前移到 M4：**M4 生成假设时就检查"验证假设所需的证据是否已在图谱中"，缺了就当场生成缺口直接回跳 M2 补搜**，补完再回到 M4 重新生成，最后才进 M5 写方案。
+
+```
+现在：M2 → M3 → M4 → M5 → M6(发现缺口) → M2补搜 → M3 → M4 → M5(重写，浪费一轮)
+目标：M2 → M3 → M4(发现缺口) → M2补搜 → M3 → M4(重生成) → M5 → M6(仅评审兜底)
+```
+
+### 2. 好消息：M2 补搜无需改动
+
+- `literature/adapter.py` 的补搜分流只看 `state.evidence_gaps` 有 open 缺口 + `state.search_round > 0`，**不关心缺口是谁产生的**。
+- `search_round` 在 `pipeline.py:563-564` 每次实际执行 M2 就 +1，与触发来源无关。
+- 所以 M4 产生的缺口天然能被现有补搜消费，**adapter.py 一行都不用动**。
+
+### 3. 改动清单
+
+**① M4 新增"证据缺口检测"步骤** — `hypoforge/modules/m4_hypothesis_generation.py`
+
+- 在 Generator → Critic 之后、输出 top_hypotheses 之前，对每个候选假设检查其依赖的关键实体/关系是否在图谱 `evidence_graph.established_facts` 中。
+- 缺失的 → 生成 `EvidenceGap`（gap_type 建议新增 `"hypothesis_evidence"`；带上 `canonical_entities`、`suggested_queries`、`target_sub_question`），写入 `state.evidence_gaps`。
+- **成本控制**：检测规则优先（图谱实体匹配），LLM 结构化输出兜底，避免每轮迭代都调 LLM。
+
+**② 新增 M4 后路由** — `hypoforge/pipeline.py`
+
+- 仿照 `_route_after_m6`（40 行）新增 `_route_after_m4`：存在 open 缺口且 `search_round < max_search_rounds` → `"supplement_m2"`；否则 → `"m5"`。
+- `_build_graph`（297 行）给 m4 加条件边。
+- 补搜轮识别（720-753 行，`_should_skip` 里靠 `routing_history` 最新一条 `from_module == "m6"` 判断）**扩展为同时识别 m4 来源**，否则 M4 触发的补搜轮 m2/m3 会被跳过逻辑误跳过。
+- `_routing_decision`（781 行）扩展处理 m4 的决策记录（decided_by 等）。
+
+**③ M6 关系（讨论项）**
+
+- 建议**保留 M6 评审兜底**：M6 的 evidence_consistency 是"方案与证据一致性"评审，与 M4 的"假设所需证据存在性"检查互补，两者不是一回事。
+- 可选：M6 补搜触发降级为只处理 M4 漏掉的缺口（兜底），避免与 M4 触发重复。
+
+### 4. 注意事项
+
+- **防死循环**：M4 触发补搜同样受 `max_search_rounds` 上限约束；缺口 `attempts` 计数与 `gap_no_gain_limit`（M3 验收，连续无增益标 unimprovable）复用现有机制，无需新造。
+- **配置开关**：建议新增 `m4_gap_detection: bool = False` 默认关闭，跑通后再开，保持与项目"新功能默认关闭"的惯例一致，不影响现有 baseline 配置。
+- **职责边界**：M4 现在是"生成器 + Critic"，新增缺口检测是额外职责，注意保持检测逻辑独立可测，不要混进 Generator 的 prompt。
+- **测试**：现有测试可能依赖"M6 触发补搜"路径，改造后需回归；新增 fixture 测试：M4 产出缺口 → 断言路由进 supplement_m2 → M2 补搜 → M3 → 回 M4。
+
+---
+
+## 十四、检索查询确定性降级与概念评分机制（待办）
+
+> 本节记录**将来要改**的方向（2026-08-06 讨论确认），当前代码尚未改动。
+> 现状缺陷（agentic 路径）：子问题 → 检索词完全靠 LLM 随机拆解（`query_planner.py`），
+> 核心实体无硬约束、空结果时没有确定性减词机制——
+> 没搜到新论文时只靠 LLM 下一轮"重新想一组查询"，
+> LLM 减不减词、减哪个是随机的，两轮无增益就停（`low_gain_round_limit`），不可复现、不可调试。
+
+### 1. 目标设计（概念评分 + 贪心组合 + 确定性降级）
+
+**① 概念拆分并评分** — `hypoforge/literature/search/query_planner.py`
+
+- LLM 把子问题拆成概念短语（保留现有短概念规则），**额外输出每个短语的重要程度评分**（如 0-10，或高/中/低），`structured_chat` 的 JSON schema 增加 `importance` 字段。
+- **核心实体硬锚定**：`key_entities`（M1 输出的主语/核心名词）强制进入每个查询，不允许 LLM 丢弃。
+- 长文本子问题拆出的短语可能多达 5-6 个，禁止全塞进一条查询。
+
+**② 贪心组合而非穷举** — 同一文件或 agent 层
+
+- 全组合枚举 C(5,2)+C(5,3)≈35 种在预算内（max_rounds=3 / max_queries=12）不可行，改为**按重要性排序贪心**：
+  - 高分短语优先入查询，低分短语只作为边缘修饰词；
+  - **两个低分短语不组合在一起**；
+  - 每轮只尝试少量（2-3 条）组合，而非全部。
+
+**③ 确定性降级链（query relaxation）** — `hypoforge/literature/search/agent.py`
+
+- 空结果/极少结果时，不再依赖 LLM 随机重规划，改为确定性行为：
+  - 保持核心实体不动，**按重要性从低到高依次丢词**（如 4 个词 → 3 个 → 2 个）重搜；
+  - 每丢一次重试，直到能搜出文章或预算用尽；
+  - 有结果即停，再交给覆盖度评估。
+- 与现有停止条件（`no_result_round_limit` / `low_gain_round_limit` / `choose_stop_reason`）衔接：降级链优先于"放弃"。
+
+**④ 去重保持现状**：deduplicator + 历史论文传入已存在，不做改动。
+
+### 2. 改动位置
+
+- `hypoforge/literature/search/query_planner.py` — 概念拆分 + importance 评分 + 核心实体锚定
+- `hypoforge/literature/search/agent.py` — 空结果触发降级重试链
+- `hypoforge/literature/search/budget.py` — 降级重试计入预算/轮数，避免失控
+- `hypoforge/prompts/`（如有对应 planner prompt 文件）— 评分指令
+
+### 3. 注意事项
+
+- **配置开关**：建议新增 `query_relaxation: bool = False` 默认关闭，跑通后再开，不影响现有 baseline。
+- **失败兜底保留**：`_fallback_queries`（LLM 失败时用子问题原文直接搜）不动。
+- **降级顺序要有依据**：丢词顺序按评分从低到高，而不是顺序/随机。
+- **测试**：新增 fixture——构造"4 词查询返回空、3 词有结果"的 mock source，断言降级链按预期丢词重试并停；回归确认无降级时行为不变。
+
+---
+
+## 十五、M1 子问题拆解约束强化（待办）
+
+> 本节记录**将来要改**的方向（2026-08-06 讨论确认），当前代码尚未改动。
+> 现状缺陷：M1 的拆解指令只有一句话（`m1_prompts.py:12-13`）——
+> "Decompose into 3–5 sub-questions — each should be a concrete, answerable research question that together cover the original question"，
+> 没有原子化约束，导致简单问题被拆成**含多个问句的复杂子问题**。
+> 实例："蛋白质错误折叠如何导致神经退行性疾病？" 被拆成
+> "蛋白质错误折叠的分子机制是什么？哪些因素（如基因突变、翻译后异常、环境应激）促使正常蛋白质变为错误折叠构象？"。
+
+### 1. 为什么严重
+
+- `adapter.py:148-149`：M1 输出的 `sub_questions` **原样直接喂给 M2 搜索**（`search_agent.run(sub_question, ...)`）；
+- 复杂子问题 → M2 拆词质量差（见十四节）+ 每个子问题都要跑完整迭代搜索/全文阅读，**质量与成本双输**；
+- 根源在 prompt 的"together cover the original question"鼓励打包，且无句数/长度/括号列举限制。
+
+### 2. 修复方案
+
+**① 强化 prompt（治本）** — `hypoforge/prompts/m1_prompts.py`
+
+- **单问句约束**：每个子问题必须只含一个问句，禁止 `？` 和 `；` 并列两个问题；
+- **原子化**：一个研究对象 + 一个关系/动作；禁止括号列举（`（如基因突变、...）`这类要拆成独立子问题）；
+- **长度上限**：如 ≤ 15 个英文词 / 80 字符；
+- **明示用途**：写明"这些子问题将直接作为文献检索输入，必须短小精炼、单一主题"；
+- **few-shot 正反例**：给一个示例（原问题 → ✅ 好子问题 / ❌ 坏子问题），把用户遇到的实例作为反面教材写进去。
+
+**② 确定性校验（治标兜底）** — `hypoforge/modules/m1_problem_understanding.py`
+
+- 在 `_understand_question`（154 行）`ProblemCard.model_validate(payload)` 之后校验：
+  - 子问题含多个问号/分号 → 按问句切分重写，或触发一次带修正指令的重试；
+  - 超长 → 截断或重试；
+  - 校验失败且重试仍失败 → 保留原样但记 warning，不阻塞流程。
+
+### 3. 注意事项
+
+- 与 followup 路径（`_understand_followup`）同样适用，两处 prompt/校验保持一致；
+- `max_sub_questions` 已有参数可配合（如限制 2-3 个子问题，控制 M2 成本）；
+- **测试**：用用户实例做 fixture——断言含双问号的输出被校验拦下/重写；正常单问句输出不被误伤（回归）。
+
+---
+
+## 十六、Web 界面模块详情可视化（待办）
+
+> 本节记录**将来要改**的方向（2026-08-06 讨论确认），当前代码尚未改动。
+> 需求来源：比赛演示时评委/自己点开 M1-M6 小方块，只能看到数量统计（几个子问题、搜到几篇论文），
+> 看不到具体内容；下方"实施过程"有 100+ 条事件可以一个个翻找，但不直观。
+
+### 1. 当前问题
+
+- 点开 M1-M6 方框：只有统计数字（如子问题数、论文数），**无具体内容**；
+- "实施过程"列表：事件多（100+），能找到但太麻烦、不够直观；
+- 数据其实都在：每个模块快照已持久化（pipeline.py 的 `save_snapshot`），事件流里 `tool_result` 也带 details。
+
+### 2. 修改需求
+
+点开具体的 M1-M6 方框，**直接展示该模块的具体产出**：
+
+| 模块 | 详情面板要展示的内容 |
+|------|---------------------|
+| M1 | 拆解出的子问题列表（原文）、domain、key_entities |
+| M2 | 搜到的论文列表（标题/作者/年份/DOI/来源）、检索词、知识条目 |
+| M3 | 知识图谱可视化（节点/边、established_facts/conflicts/knowledge_gaps） |
+| M4 | 候选假设列表（含评分） |
+| M5 | 研究计划各要素 |
+| M6 | 评审维度分数、结论（sufficient / gaps） |
+
+### 3. 改动位置
+
+- `hypoforge/web/index.html` — 前端主体（单文件 HTML+JS，MODULES 配置在 ~626 行）：
+  - 每个模块详情面板/弹窗的内容渲染逻辑；
+  - 数据来源优先消费事件流里已有的 `tool_result` 事件 details（如 sub_questions、papers 列表、评分），
+    或从后端新增的详情接口拿模块最终输出（problem_card / literature_results / m2_knowledge_export / evidence_graph / top_hypotheses / research_plans / reviews）。
+- `hypoforge/webapp.py` — 后端服务：
+  - 如需"模块最终输出"快照，在事件接口旁新增轻量详情接口（读持久化快照，不重算）。
+- 可视化参考：已有 `evidence_graph_to_mermaid`（display/demo_utils.py），M3 面板可直接复用。
+
+### 4. 注意事项
+
+- 优先前端改动 + 只读接口，**不要改动 M1-M6 模块逻辑与状态契约**；
+- 数据量大时（如 M2 论文几十篇）做分页/折叠，避免面板卡顿；
+- 保持与现有主题风格一致（.codex_tmp/qa-* 里有历史截图可对照）；
+- 比赛演示优先级：M1 子问题、M2 论文列表、M3 图谱可视化三个面板最加分，可先做。
+
+---
+
+## 十七、研究计划生成与展示问题（待办）
+
+> 本节记录**将来要改**的方向（2026-08-06 讨论确认），当前代码尚未改动。
+> 两个独立问题：① 研究计划生成的文字量比 M6 评审还少（主次颠倒）；② 历史版本（如 B3、BB1）
+> 的研究计划只显示"本轮共 X 份研究计划，详情见该轮快照文件"，看不到详情。
+
+### 问题 1：研究计划文本过短（M5 prompt 压缩过度）
+
+- **现状**：`hypoforge/prompts/m5_prompts.py:43-49` 的 Conciseness requirements 硬性压缩：
+  - 每条 measurement metric ≤ 18 词、每条 analysis method ≤ 22 词、每条 procedure ≤ 25 词；
+  - 省略设备品牌/试剂目录号/单位等细节；最多 8 指标 + 8 方法；
+  - `ResearchPlan`（state.py:194）11 个字段中 6 个是 List[str] 短句，整体被压成提纲。
+- **对比**：`ReviewResult`（state.py:215）有 reasoning/comments/suggestions 三个无字数限制的长文本字段，
+  M6 prompt 无压缩要求 → 评审文字 > 计划文字，主次颠倒。
+- **改动方向**：去掉或大幅放宽 Conciseness requirements（至少删掉每条 ≤18/22/25 词上限，
+  允许写详细步骤/技术细节），让研究计划回归"详细"定位；max_tokens=16384 已有余量。
+- **测试**：构造 fixture 跑 M5，断言计划各字段长度显著增长且 schema 不变。
+
+### 问题 2：历史版本看不到研究计划详情（后端只摘计数）
+
+- **现状**：
+  - `hypoforge/webapp.py` 的 `versions()`（538 行）读快照时只取 `research_plans_count = len(plans)`（638-640 行），
+    plans 内容没放进版本 entry（top_hypotheses 好歹还取了标题，plans 连标题都没取）；
+  - `hypoforge/web/index.html` 1022-1023 行：只有最新版本（isFinal）用 `resultData.research_plans` 渲染完整计划（1018-1021 行），
+    历史版本只有计数 → 显示"详情见该轮快照文件"。
+- **数据其实完整**：每轮快照 `snapshots/*.json` 里就有完整 `research_plans`，只是没被取出。
+- **改动方向**：
+  - 后端 `versions()` 把快照里的 `research_plans` 完整内容放进版本 entry（注意保持契约向后兼容，加字段不删字段）；
+  - 前端把"研究计划"分支改为对**所有版本**渲染完整计划（研究对象/时间线/步骤/分析方法/风险替代），
+    不再区分 isFinal，仅最新版额外补充独立评分摘要。
+- **测试**：构造含多版本快照的 run 目录，断言 versions 接口返回 plans 详情、前端渲染不降级。
+
+### 注意事项
+
+- 两个问题相互独立，可分开改；
+- 问题 1 只改 prompt（M5），不影响其他模块；问题 2 只改 webapp.py + index.html，不动 M1-M6 逻辑与状态契约；
+- 比赛演示优先级：问题 2（历史版本显示详情）更影响观感，可先做。
 
 ---
 

@@ -42,16 +42,29 @@ current year is 2026.
 ## Query Construction Rules
 
 ### For PubMed queries (biomedical / life sciences ONLY):
-- Prefer field tags for precision: `[tiab]` for title+abstract, `[MeSH Terms]` for MeSH.
+- Prefer `[tiab]` (title/abstract) or bare keywords, which let PubMed's \
+  automatic term mapping resolve terminology safely.
+- **NEVER invent MeSH headings from memory.** Use `[MeSH Terms]` ONLY when \
+  you are certain the exact MeSH descriptor exists — MeSH is exact-form \
+  sensitive (e.g. `"protein misfolding"[MeSH Terms]` and \
+  `"amyloid fibril"[MeSH Terms]` match NOTHING; the real heading is \
+  `Amyloid Fibrils`). When unsure, drop the tag and use `[tiab]` or a bare \
+  phrase instead.
 - Break the sub-question into **short key concepts** (1-3 words each), then combine \
   them with AND/OR as needed. Don't put long phrases inside operators.
+- Combining 3+ concepts with pure AND frequently yields an empty \
+  intersection. For every PubMed sub-question you MUST include at least ONE \
+  broad-recall safety-net query built from only the **2 most central \
+  concepts** (e.g. `Hsp70[tiab] AND aging`).
 - **Good examples (short concepts, clear structure):**
   - `Hsp70[tiab] AND ATPase[tiab] AND protein folding[MeSH Terms]`
   - `"heat shock protein"[tiab] AND (aging OR senescence) AND proteostasis`
   - `NAD[tiab] AND chaperone[tiab] AND (aged OR aging)`
+  - `Hsp70[tiab] AND aging` ← required 2-concept broad-recall safety net
 - **Bad examples:**
   - `the role of heat shock protein 70 in ATP-dependent protein folding` ← too long, no tags
   - `Hsp70 mechanism` ← single vague term
+  - `"protein misfolding"[MeSH Terms]` ← fabricated MeSH heading, 0 hits
 
 ### For Semantic Scholar/OpenAlex queries (cross-disciplinary discovery):
 - Use phrase quotes for multi-word terms: `"protein folding"`.
@@ -395,6 +408,7 @@ class QueryPlanner(QueryPlannerProtocol):
                 sub_question,
                 queries,
                 unavailable_sources,
+                domains,
             )
 
         logger.debug("Planned %d queries (round %d)", len(queries), round_num)
@@ -405,6 +419,7 @@ class QueryPlanner(QueryPlannerProtocol):
         sub_question: str,
         queries: Sequence[SearchQuery],
         unavailable_sources: Sequence[str],
+        domains: Sequence[str] = (),
     ) -> List[SearchQuery]:
         """Add one deterministic query for every omitted available backend."""
         primary: list[SearchQuery] = []
@@ -440,7 +455,16 @@ class QueryPlanner(QueryPlannerProtocol):
             )
         # Put one query per source first so the agent's query-budget slicing
         # cannot discard coverage while retaining repeated same-source work.
-        return [*primary, *coverage, *repeated]
+        ordered = [*primary, *coverage, *repeated]
+        if _is_biomedical(domains):
+            # Biomedical questions live or die on PubMed recall; move every
+            # PubMed query to the front so max_queries budget slicing cannot
+            # squeeze PubMed out.
+            ordered = [
+                *[q for q in ordered if q.target_source == "pubmed"],
+                *[q for q in ordered if q.target_source != "pubmed"],
+            ]
+        return ordered
 
     def _fallback_queries(
         self,
@@ -467,6 +491,32 @@ class QueryPlanner(QueryPlannerProtocol):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+_BIOMEDICAL_DOMAIN_KEYWORDS = (
+    "bio",          # biology, biomedical, biochemistry, bioinformatics
+    "medic",        # medicine, medical
+    "clinical",
+    "neuro",        # neuroscience, neurology, neurobiology
+    "health",
+    "physiol",
+    "pharma",
+    "genet",
+    "immun",
+    "oncolog",
+    "cancer",
+    "molecular",
+    "patholog",
+    "epidemiol",
+    "psychiat",
+    "life science",
+)
+
+
+def _is_biomedical(domains: Sequence[str]) -> bool:
+    """Return whether *domains* describe a biomedical research area."""
+    joined = " ".join(str(domain) for domain in domains).casefold()
+    return any(keyword in joined for keyword in _BIOMEDICAL_DOMAIN_KEYWORDS)
+
 
 def _purpose_to_intent(purpose: str) -> QueryIntent:
     """Map a free-text purpose string to a QueryIntent enum."""

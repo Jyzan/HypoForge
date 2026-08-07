@@ -29,7 +29,7 @@ def main() -> None:
     parser.add_argument(
         "--env-file",
         default="",
-        help="Optional env file; FENJIN_VISION_* names are mapped automatically",
+        help="Optional env file; QWEN_* names are mapped automatically",
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7860)

@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import shutil
 import threading
 import traceback
 import uuid
@@ -23,21 +25,25 @@ from .pipeline import PipelineRunner
 
 
 def load_runtime_environment(env_file: str | Path | None = None) -> None:
-    """Load a local env file and map the team's FENJIN names to OpenAI names."""
+    """Load local Qwen credentials and map them to the OpenAI-compatible client.
+
+    ``FENJIN_VISION_*`` remains a compatibility fallback for older team env
+    files, while ``QWEN_*`` is the formal project-facing naming.
+    """
 
     if env_file:
         values = dotenv_values(Path(env_file))
         for key, value in values.items():
             if value is not None:
                 os.environ[str(key)] = str(value)
-    if not os.environ.get("OPENAI_API_KEY") and os.environ.get(
-        "FENJIN_VISION_API_KEY"
-    ):
-        os.environ["OPENAI_API_KEY"] = os.environ["FENJIN_VISION_API_KEY"]
-    if not os.environ.get("OPENAI_BASE_URL") and os.environ.get(
-        "FENJIN_VISION_BASE_URL"
-    ):
-        os.environ["OPENAI_BASE_URL"] = os.environ["FENJIN_VISION_BASE_URL"]
+    if not os.environ.get("QWEN_API_KEY") and os.environ.get("FENJIN_VISION_API_KEY"):
+        os.environ["QWEN_API_KEY"] = os.environ["FENJIN_VISION_API_KEY"]
+    if not os.environ.get("QWEN_BASE_URL") and os.environ.get("FENJIN_VISION_BASE_URL"):
+        os.environ["QWEN_BASE_URL"] = os.environ["FENJIN_VISION_BASE_URL"]
+    if not os.environ.get("OPENAI_API_KEY") and os.environ.get("QWEN_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = os.environ["QWEN_API_KEY"]
+    if not os.environ.get("OPENAI_BASE_URL") and os.environ.get("QWEN_BASE_URL"):
+        os.environ["OPENAI_BASE_URL"] = os.environ["QWEN_BASE_URL"]
 
 
 class RunManager:
@@ -55,6 +61,10 @@ class RunManager:
         self._lock = threading.RLock()
         self._runs: dict[str, dict[str, Any]] = {}
         self._run_credentials: dict[str, dict[str, str]] = {}
+        self._run_followups: dict[str, dict[str, Any]] = {}
+        # One cooperative cancellation flag per live run: set by
+        # ``request_cancel``, polled by the pipeline between modules.
+        self._cancel_events: dict[str, threading.Event] = {}
 
     def start(
         self,
@@ -63,11 +73,15 @@ class RunManager:
         model_name: str = "",
         qwen_api_key: str = "",
         semantic_scholar_api_key: str = "",
+        parent_run_id: str = "",
+        followup: str = "",
     ) -> dict[str, Any]:
         question = " ".join(str(question or "").split())
         model_name = " ".join(str(model_name or "").split())
         qwen_api_key = str(qwen_api_key or "").strip()
         semantic_scholar_api_key = str(semantic_scholar_api_key or "").strip()
+        parent_run_id = " ".join(str(parent_run_id or "").split())
+        followup = " ".join(str(followup or "").split())
         if not question:
             raise ValueError("问题不能为空")
         if len(question) > 4000:
@@ -76,9 +90,16 @@ class RunManager:
             raise ValueError("模型名称过长")
         if len(qwen_api_key) > 4096 or len(semantic_scholar_api_key) > 4096:
             raise ValueError("API Key 长度异常")
+        if len(followup) > 4000:
+            raise ValueError("追问内容过长，请控制在 4000 字以内")
+        seed_state: dict[str, Any] | None = None
+        if parent_run_id or followup:
+            if not parent_run_id or not followup:
+                raise ValueError("追问运行需要同时提供 parent_run_id 与 followup")
+            seed_state = self._load_parent_state(parent_run_id)
         with self._lock:
             if any(item.get("status") == "running" for item in self._runs.values()):
-                raise RuntimeError("已有一条流程正在运行，请等待完成后再提交")
+                raise RuntimeError("已有一条流程正在运行，当前运行结束后才能提交")
             run_id = (
                 "ui-"
                 + datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -94,8 +115,12 @@ class RunManager:
                 "completed_at": None,
                 "run_dir": str(run_dir),
                 "error": "",
+                "cancel_requested": False,
             }
+            if parent_run_id:
+                record["parent_run_id"] = parent_run_id
             self._runs[run_id] = record
+            self._cancel_events[run_id] = threading.Event()
             # Credentials are intentionally kept outside the public run record.
             # They are consumed once by the worker and never persisted.
             self._run_credentials[run_id] = {
@@ -103,6 +128,13 @@ class RunManager:
                 "qwen_api_key": qwen_api_key,
                 "semantic_scholar_api_key": semantic_scholar_api_key,
             }
+            if seed_state is not None:
+                # Memory-only, consumed once by the worker (like credentials).
+                self._run_followups[run_id] = {
+                    "parent_run_id": parent_run_id,
+                    "followup": followup,
+                    "seed_state": seed_state,
+                }
         thread = threading.Thread(
             target=self._run_pipeline,
             args=(run_id, question),
@@ -112,11 +144,87 @@ class RunManager:
         thread.start()
         return dict(record)
 
+    def request_cancel(self, run_id: str) -> dict[str, Any]:
+        """Request a cooperative stop for a running run.
+
+        Sets the run's cancellation flag; the pipeline checks it between
+        modules, finishes the module currently executing, then persists the
+        accumulated state and ends.  Raises ``ValueError`` for malformed
+        ids, ``LookupError`` for unknown runs, and ``RuntimeError`` when the
+        run has already finished (cancel is idempotent while cancelling).
+        """
+
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", run_id):
+            raise ValueError("run_id 含非法字符")
+        with self._lock:
+            record = self._runs.get(run_id)
+            if record is not None and record.get("status") != "running":
+                raise RuntimeError(
+                    f"运行 {run_id} 已结束（状态：{record.get('status')}），"
+                    "无法停止"
+                )
+            if record is None:
+                # Not live in this process — check the persisted manifest so
+                # already-finished runs report "已结束" instead of 404.
+                manifest = self.get(run_id)
+                if manifest is not None:
+                    raise RuntimeError(
+                        f"运行 {run_id} 已结束"
+                        f"（状态：{manifest.get('status', '')}），无法停止"
+                    )
+                raise LookupError(f"运行 {run_id} 不存在")
+            already = bool(record.get("cancel_requested"))
+            record["cancel_requested"] = True
+            cancel_event = self._cancel_events.get(run_id)
+        if cancel_event is not None:
+            cancel_event.set()
+        if not already:
+            RunEventRecorder(self.output_root / run_id, run_id).emit(
+                "cancel_requested",
+                status="cancelling",
+                message=(
+                    "收到停止请求：当前模块执行完成后流程将停止，"
+                    "已完成模块的成果将保留"
+                ),
+            )
+        return {"run_id": run_id, "status": "cancelling"}
+
+    def _load_parent_state(self, parent_run_id: str) -> dict[str, Any]:
+        """Load and validate a parent run's final state for a follow-up run."""
+
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", parent_run_id):
+            raise ValueError("parent_run_id 含非法字符")
+        state_path = self.output_root / parent_run_id / f"{parent_run_id}.json"
+        if not state_path.exists():
+            raise ValueError(
+                f"父运行 {parent_run_id} 的最终 state 不存在，无法发起追问"
+            )
+        try:
+            data = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"父运行 {parent_run_id} 的 state 文件损坏，无法发起追问：{exc}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise ValueError(f"父运行 {parent_run_id} 的 state 格式无效")
+        return data
+
+    def _read_final_state(self, run_id: str) -> dict[str, Any] | None:
+        state_path = self.output_root / run_id / f"{run_id}.json"
+        if not state_path.exists():
+            return None
+        try:
+            data = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
     def _run_pipeline(self, run_id: str, question: str) -> None:
         run_dir = self.output_root / run_id
         recorder = RunEventRecorder(run_dir, run_id)
         with self._lock:
             credentials = self._run_credentials.pop(run_id, {})
+            followup_info = self._run_followups.pop(run_id, {})
         try:
             config = PipelineConfig.from_yaml(self.config_path)
             config.output_dir = str(run_dir)
@@ -159,14 +267,33 @@ class RunManager:
                 "enabled_modules": list(config.enabled_modules),
                 "output_dir": str(run_dir),
             }
+            if followup_info:
+                manifest["parent_run_id"] = followup_info.get("parent_run_id", "")
+                manifest["followup"] = followup_info.get("followup", "")
             recorder.write_manifest(manifest)
+            run_kwargs: dict[str, Any] = {}
+            if followup_info:
+                run_kwargs = {
+                    "followup_text": followup_info.get("followup", ""),
+                    "seed_state": followup_info.get("seed_state"),
+                }
+            runner = PipelineRunner(config, event_recorder=recorder)
+            # Cooperative cancellation flag (set by request_cancel).
+            runner.cancel_event = self._cancel_events.get(run_id)
             state = asyncio.run(
-                PipelineRunner(config, event_recorder=recorder).run(
+                runner.run(
                     question=question,
                     run_id=run_id,
+                    **run_kwargs,
                 )
             )
-            status = "completed" if not state.errors else "completed_with_errors"
+            cancelled = bool(getattr(runner, "cancelled", False))
+            if cancelled:
+                status = "cancelled"
+            else:
+                status = (
+                    "completed" if not state.errors else "completed_with_errors"
+                )
             completed_at = datetime.now(timezone.utc).isoformat()
             with self._lock:
                 self._runs[run_id].update(
@@ -181,6 +308,11 @@ class RunManager:
                     "scores": str(run_dir / f"{run_id}_scores.json"),
                 }
             )
+            if cancelled:
+                manifest["cancel_message"] = (
+                    "用户手动停止：已完成模块的成果已保留，"
+                    "可作为后续追问的父运行"
+                )
             recorder.write_manifest(manifest)
         except BaseException as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -199,18 +331,21 @@ class RunManager:
                         "error": error,
                     }
                 )
-            recorder.write_manifest(
-                {
-                    "run_id": run_id,
-                    "question": question,
-                    "status": "failed",
-                    "started_at": self._runs[run_id]["started_at"],
-                    "completed_at": completed_at,
-                    "error": error,
-                    "config_path": str(self.config_path),
-                    "output_dir": str(run_dir),
-                }
-            )
+            failed_manifest = {
+                "run_id": run_id,
+                "question": question,
+                "status": "failed",
+                "started_at": self._runs[run_id]["started_at"],
+                "completed_at": completed_at,
+                "error": error,
+                "config_path": str(self.config_path),
+                "output_dir": str(run_dir),
+            }
+            if followup_info:
+                failed_manifest["parent_run_id"] = followup_info.get(
+                    "parent_run_id", ""
+                )
+            recorder.write_manifest(failed_manifest)
 
     def get(self, run_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -240,6 +375,86 @@ class RunManager:
             key=lambda item: str(item.get("started_at", "")),
             reverse=True,
         )
+
+    def delete(self, run_id: str) -> list[str]:
+        """Delete a run directory together with its whole followup chain.
+
+        Raises ``ValueError`` for malformed ids, ``LookupError`` when the run
+        directory does not exist, and ``RuntimeError`` while any run in the
+        affected chain is still executing.  Removal is confined to
+        ``output_root``: every resolved path is verified to live inside it
+        before ``shutil.rmtree`` is called.
+        """
+
+        if not re.fullmatch(r"ui-[A-Za-z0-9._-]+", run_id):
+            raise ValueError("run_id 非法，仅允许 ui- 开头的运行目录名")
+        run_dir = (self.output_root / run_id).resolve()
+        try:
+            run_dir.relative_to(self.output_root)
+        except ValueError as exc:
+            raise ValueError("run_id 指向的路径不在运行目录内") from exc
+        if not run_dir.is_dir():
+            raise LookupError(f"运行 {run_id} 不存在")
+
+        # parent → children map built from persisted manifests plus the
+        # in-memory records of live runs.
+        children: dict[str, set[str]] = {}
+        for manifest_path in self.output_root.glob("*/manifest.json"):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            rid = str(manifest.get("run_id") or "")
+            parent = str(manifest.get("parent_run_id") or "")
+            if rid and parent:
+                children.setdefault(parent, set()).add(rid)
+        with self._lock:
+            running = {
+                rid
+                for rid, item in self._runs.items()
+                if item.get("status") == "running"
+            }
+            for rid, item in self._runs.items():
+                parent = str(item.get("parent_run_id") or "")
+                if parent:
+                    children.setdefault(parent, set()).add(str(rid))
+
+        # Cascade: collect the full descendant chain (cycle-safe BFS).
+        targets: list[str] = [run_id]
+        seen = {run_id}
+        stack = [run_id]
+        while stack:
+            current = stack.pop()
+            for child in children.get(current, ()):
+                if child not in seen:
+                    seen.add(child)
+                    targets.append(child)
+                    stack.append(child)
+
+        busy = running & seen
+        if busy:
+            raise RuntimeError(
+                f"运行 {'、'.join(sorted(busy))} 正在执行中，"
+                "请等待其结束后再删除"
+            )
+
+        deleted: list[str] = []
+        for rid in targets:
+            target = (self.output_root / rid).resolve()
+            try:
+                target.relative_to(self.output_root)
+            except ValueError:
+                continue
+            if target.is_dir():
+                shutil.rmtree(target)
+            deleted.append(rid)
+        with self._lock:
+            for rid in deleted:
+                self._runs.pop(rid, None)
+                self._run_credentials.pop(rid, None)
+                self._run_followups.pop(rid, None)
+                self._cancel_events.pop(rid, None)
+        return deleted
 
     def events(self, run_id: str, after: int = 0) -> list[dict[str, Any]]:
         run_dir = self.output_root / run_id
@@ -284,6 +499,11 @@ class RunManager:
             "research_plans": state.get("research_plans", []),
             "reviews": state.get("reviews", []),
             "iteration_count": state.get("iteration_count", 0),
+            "routing_history": state.get("routing_history", []),
+            "evidence_gaps": state.get("evidence_gaps", []),
+            "search_round": state.get("search_round", 0),
+            "revision_count": state.get("revision_count", 0),
+            "parent_run_id": state.get("parent_run_id", ""),
             "errors": state.get("errors", []),
             "metrics": state.get("metrics", {}),
             "token_usage": {
@@ -292,6 +512,154 @@ class RunManager:
             },
             "scores": scores,
         }
+
+    def rounds(self, run_id: str) -> dict[str, Any]:
+        """Round timeline with a stable contract shape (read from state.json):
+
+        ``{"routing_history": [...], "search_round": n}``
+
+        ``routing_history`` is the auditable list of RoutingDecision records
+        written by the M1/M6 node wrappers; ``search_round`` is the number of
+        M2 executions.  Missing/corrupt runs yield the empty default shape.
+        """
+
+        state = self._read_final_state(run_id) or {}
+        routing_history = state.get("routing_history")
+        if not isinstance(routing_history, list):
+            routing_history = []
+        search_round = state.get("search_round", 0)
+        if not isinstance(search_round, int):
+            try:
+                search_round = int(search_round)
+            except (TypeError, ValueError):
+                search_round = 0
+        return {"routing_history": routing_history, "search_round": search_round}
+
+    def versions(self, run_id: str) -> list[dict[str, Any]]:
+        """Summarise each review version (vN) — stable contract shape:
+
+        ``[{"version", "overall", "timestamp", ...}, ...]``
+
+        ``timestamp`` is the event-stream time at which the M6 module of that
+        review version completed (``None`` when the event log is missing).
+        Per-round hypothesis/plan counts come from the snapshots
+        (``snapshots/*-{module}-r{R}-iter{N}.json``); snapshot label
+        ``iter{N}`` records the pre-execution iteration count, and M6 stamps
+        reviews with ``iteration_count + 1``, so a snapshot belongs to version
+        ``N + 1``.
+        """
+
+        run_dir = self.output_root / run_id
+        if not run_dir.is_dir():
+            return []
+
+        def new_entry(version: int) -> dict[str, Any]:
+            return {
+                "version": version,
+                "overall": None,
+                "timestamp": None,
+                "reviews": [],
+                "top_hypothesis_titles": [],
+                "top_hypotheses_count": 0,
+                "research_plans_count": 0,
+                "snapshots": [],
+            }
+
+        entries: dict[int, dict[str, Any]] = {}
+        state = self._read_final_state(run_id)
+        for review in (state or {}).get("reviews") or []:
+            if not isinstance(review, dict):
+                continue
+            try:
+                version = int(review.get("version") or 1)
+            except (TypeError, ValueError):
+                continue
+            entry = entries.setdefault(version, new_entry(version))
+            entry["reviews"].append(
+                {
+                    "dimension": review.get("dimension"),
+                    "score": review.get("score"),
+                    "reasoning": review.get("reasoning", ""),
+                    "comments": review.get("comments", ""),
+                    "suggestions": review.get("suggestions", ""),
+                    "version": version,
+                }
+            )
+            if review.get("dimension") == "overall":
+                entry["overall"] = review.get("score")
+
+        # Per-version completion timestamps from the event stream (best
+        # effort): the M6 ``module_completed`` event carries the review
+        # version as ``iteration_count`` in its details.
+        timestamp_by_version: dict[Any, str] = {}
+        for event in self.events(run_id):
+            if (
+                event.get("event_type") == "module_completed"
+                and event.get("module") == "m6"
+            ):
+                version = (event.get("details") or {}).get("iteration_count")
+                if version is not None and event.get("timestamp"):
+                    timestamp_by_version[version] = event["timestamp"]
+        for version, entry in entries.items():
+            entry["timestamp"] = timestamp_by_version.get(version)
+
+        # Per-round hypothesis/plan counts from snapshots (best effort).
+        snapshot_pattern = re.compile(r"-m\d-r(\d+)-iter(\d+)\.json$")
+        snapshots_dir = run_dir / "snapshots"
+        if snapshots_dir.is_dir():
+            for path in sorted(snapshots_dir.glob("*.json")):
+                match = snapshot_pattern.search(path.name)
+                if not match:
+                    continue
+                version = int(match.group(2)) + 1
+                entry = entries.setdefault(version, new_entry(version))
+                entry["snapshots"].append(
+                    str(path.relative_to(run_dir)).replace(os.sep, "/")
+                )
+                try:
+                    snapshot = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(snapshot, dict):
+                    continue
+                hypotheses = snapshot.get("top_hypotheses")
+                if isinstance(hypotheses, list) and hypotheses:
+                    entry["top_hypotheses_count"] = len(hypotheses)
+                    entry["top_hypothesis_titles"] = [
+                        str(
+                            item.get("statement")
+                            or item.get("title")
+                            or item.get("hypothesis_id")
+                            or ""
+                        )
+                        for item in hypotheses
+                        if isinstance(item, dict)
+                    ][:10]
+                plans = snapshot.get("research_plans")
+                if isinstance(plans, list) and plans:
+                    entry["research_plans_count"] = len(plans)
+
+        # Final state is authoritative for the latest version.
+        if state:
+            version = max(entries) if entries else 1
+            entry = entries.setdefault(version, new_entry(version))
+            hypotheses = state.get("top_hypotheses") or state.get(
+                "best_hypotheses"
+            ) or []
+            entry["top_hypotheses_count"] = len(hypotheses)
+            entry["top_hypothesis_titles"] = [
+                str(
+                    item.get("statement")
+                    or item.get("title")
+                    or item.get("hypothesis_id")
+                    or ""
+                )
+                for item in hypotheses
+                if isinstance(item, dict)
+            ][:10]
+            entry["research_plans_count"] = len(state.get("research_plans") or [])
+
+        return [entries[version] for version in sorted(entries)]
 
 
 class HypoForgeHTTPServer(ThreadingHTTPServer):
@@ -373,6 +741,13 @@ class HypoForgeRequestHandler(BaseHTTPRequestHandler):
             if action == "artifacts":
                 self._json({"artifacts": self.server.manager.artifacts(run_id)})
                 return
+            if action == "rounds":
+                # Contract shape: {"routing_history": [...], "search_round": n}
+                self._json(self.server.manager.rounds(run_id))
+                return
+            if action == "versions":
+                self._json({"versions": self.server.manager.versions(run_id)})
+                return
             if not action:
                 run = self.server.manager.get(run_id)
                 self._json(
@@ -382,8 +757,42 @@ class HypoForgeRequestHandler(BaseHTTPRequestHandler):
                 return
         self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
+    def do_DELETE(self) -> None:
+        route = self._run_route(urlparse(self.path).path)
+        if not route or route[1]:
+            self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            return
+        try:
+            deleted = self.server.manager.delete(route[0])
+        except ValueError as exc:
+            self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        except LookupError as exc:
+            self._json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+            return
+        except RuntimeError as exc:
+            self._json({"error": str(exc)}, HTTPStatus.CONFLICT)
+            return
+        self._json({"deleted": deleted})
+
     def do_POST(self) -> None:
-        if urlparse(self.path).path != "/api/runs":
+        parsed = urlparse(self.path)
+        route = self._run_route(parsed.path)
+        if route is not None and route[1] == "cancel":
+            try:
+                info = self.server.manager.request_cancel(route[0])
+            except ValueError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            except LookupError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+                return
+            except RuntimeError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.CONFLICT)
+                return
+            self._json(info, HTTPStatus.ACCEPTED)
+            return
+        if parsed.path != "/api/runs":
             self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             return
         try:
@@ -398,6 +807,8 @@ class HypoForgeRequestHandler(BaseHTTPRequestHandler):
                 semantic_scholar_api_key=payload.get(
                     "semantic_scholar_api_key", ""
                 ),
+                parent_run_id=payload.get("parent_run_id", ""),
+                followup=payload.get("followup", ""),
             )
         except ValueError as exc:
             self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)

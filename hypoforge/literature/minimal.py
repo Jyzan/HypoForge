@@ -206,11 +206,19 @@ class AbstractReadingWorkflow(ReadingExtractionWorkflowProtocol):
                 normalized_claim=sentence,
                 relevance_score=0.7,
             )
-            digest = hashlib.sha256(evidence_id.encode("utf-8")).hexdigest()[:12]
+            entry_content = f"PubMed abstract reports: {sentence}"
+            # Stable entry id: sha1(normalised content + source paper)[:12].
+            digest = hashlib.sha1(
+                (
+                    " ".join(entry_content.split()).casefold()
+                    + "\u0000"
+                    + paper.paper_id
+                ).encode("utf-8")
+            ).hexdigest()[:12]
             entry = EvidenceLinkedKnowledge(
                 entry_id=f"pubmed-{digest}",
                 entry_type=KnowledgeEntryType.ESTABLISHED_FACT,
-                content=f"PubMed abstract reports: {sentence}",
+                content=entry_content,
                 confidence=ConfidenceLevel.MEDIUM,
                 entities=_latin_terms(f"{sub_question} {paper.title}", limit=6),
                 evidence_ids=[evidence_id],
@@ -230,12 +238,14 @@ def build_minimal_pubmed_adapter(
     backend: PubMedBackend | None = None,
     final_k: int = 5,
     source_timeout_seconds: float = 30.0,
+    zero_result_relaxation: bool = True,
 ) -> AgenticM2Adapter:
     if final_k <= 0:
         raise ValueError("final_k must be positive")
     source = PubMedLiteratureSource(
         backend=backend,
         timeout_seconds=source_timeout_seconds,
+        enable_relaxation=zero_result_relaxation,
     )
     agent = IterativeSearchAgent(
         query_planner=RuleBasedQueryPlanner(),

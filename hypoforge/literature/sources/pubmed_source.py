@@ -12,6 +12,13 @@ from hypoforge.literature.models import FulltextStatus, PaperRecord, SearchQuery
 from hypoforge.literature.protocols import LiteratureSourceProtocol
 from hypoforge.tools.pubmed_search import PubMedTool
 
+from .pubmed import (
+    MAX_RELAXATION_PROBES,
+    PubMedCountProbe,
+    _default_count_probe,
+    run_zero_result_relaxation,
+)
+
 
 def _dict_to_record(d: dict, source_name: str) -> PaperRecord:
     """Convert a legacy PubMed dict to a ``PaperRecord``."""
@@ -63,9 +70,29 @@ class PubMedSource(LiteratureSourceProtocol):
 
     source_name = "pubmed"
 
-    def __init__(self, tool: Optional[PubMedTool] = None) -> None:
+    def __init__(
+        self,
+        tool: Optional[PubMedTool] = None,
+        *,
+        enable_relaxation: bool = True,
+        count_probe: PubMedCountProbe | None = None,
+        max_relaxation_probes: int = MAX_RELAXATION_PROBES,
+    ) -> None:
         """Optionally inject a stub tool for testing."""
+        if max_relaxation_probes <= 0:
+            raise ValueError("max_relaxation_probes must be positive")
+        self._uses_default_tool = tool is None
         self._tool = tool if tool is not None else PubMedTool()
+        self.enable_relaxation = enable_relaxation
+        self.count_probe = count_probe
+        self.max_relaxation_probes = max_relaxation_probes
+
+    def _resolve_count_probe(self) -> PubMedCountProbe | None:
+        if self.count_probe is not None:
+            return self.count_probe
+        # Only probe NCBI for real when the real tool is in use; injected
+        # test tools fall back to probe-free (blind) relaxation.
+        return _default_count_probe if self._uses_default_tool else None
 
     async def search(
         self,
@@ -74,7 +101,19 @@ class PubMedSource(LiteratureSourceProtocol):
     ) -> List[PaperRecord]:
         strict_search = getattr(self._tool, "search_strict", None)
         search = strict_search if callable(strict_search) else self._tool.search
-        raw = await search(query.text, limit=limit)
+
+        async def fetch(text: str):
+            return await search(text, limit=limit)
+
+        raw = list(await fetch(query.text))
+        relaxed_from = ""
+        if not raw and self.enable_relaxation:
+            raw, relaxed_from = await run_zero_result_relaxation(
+                query.text,
+                fetch,
+                count_probe=self._resolve_count_probe(),
+                max_probes=self.max_relaxation_probes,
+            )
         records = []
         for row in raw:
             if not any(
@@ -82,5 +121,8 @@ class PubMedSource(LiteratureSourceProtocol):
                 for key in ("pmid", "doi", "title")
             ):
                 continue
-            records.append(_dict_to_record(row, self.source_name))
+            record = _dict_to_record(row, self.source_name)
+            if relaxed_from:
+                record.relaxed_from = relaxed_from
+            records.append(record)
         return records

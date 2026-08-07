@@ -75,6 +75,16 @@ def main():
         action="store_true",
         help="Do not pause for human guidance between iterations.",
     )
+    parser.add_argument(
+        "--followup-run-id",
+        type=str,
+        default="",
+        help=(
+            "Build a follow-up run on top of a previous run: loads that run's "
+            "final state JSON ({run_id}.json in --output-dir) and treats -q as "
+            "the follow-up question."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -112,6 +122,23 @@ def main():
     else:
         config.interactive = not args.no_interactive
 
+    # ---- follow-up run: load parent state ----
+    import json as _json
+
+    seed_state = None
+    followup_text = ""
+    if args.followup_run_id:
+        parent_path = Path(config.output_dir) / f"{args.followup_run_id}.json"
+        if not parent_path.exists():
+            print(f"Error: followup parent state not found: {parent_path}")
+            sys.exit(1)
+        try:
+            seed_state = _json.loads(parent_path.read_text(encoding="utf-8"))
+        except _json.JSONDecodeError as exc:
+            print(f"Error reading followup parent state: {exc}")
+            sys.exit(1)
+        followup_text = args.question
+
     # ---- run ----
     from hypoforge.pipeline import PipelineRunner
 
@@ -122,6 +149,8 @@ def main():
             question=args.question,
             run_id=args.run_id,
             resume=args.resume,
+            followup_text=followup_text,
+            seed_state=seed_state,
         ))
     except KeyboardInterrupt:
         print("\nInterrupted by user.")

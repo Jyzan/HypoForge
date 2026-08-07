@@ -82,6 +82,7 @@ class LiteratureSearchTool:
         arxiv_source: Optional[ArxivSource] = None,
         enabled_sources: Sequence[str] | None = None,
         semantic_scholar_api_key: str = "",
+        zero_result_relaxation: bool = True,
     ):
         requested = {
             str(name).strip().casefold()
@@ -93,7 +94,11 @@ class LiteratureSearchTool:
         if not requested:
             raise ValueError("At least one literature source must be enabled")
         self._enabled_sources = requested
-        self._pubmed_source = pubmed if pubmed is not None else PubMedSource()
+        self._pubmed_source = (
+            pubmed
+            if pubmed is not None
+            else PubMedSource(enable_relaxation=zero_result_relaxation)
+        )
         self._academic_source = (
             academic
             if academic is not None
