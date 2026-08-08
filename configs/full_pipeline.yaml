@@ -35,6 +35,8 @@ search:
   papers_per_sub_question: 20
   max_papers_total: 100
 
+entity_embedding_model: "text-embedding-v3"
+
 module_overrides:
   m1:
     kwargs:

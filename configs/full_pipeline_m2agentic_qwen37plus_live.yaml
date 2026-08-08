@@ -46,6 +46,8 @@ search:
   max_tokens: 30000
   max_seconds: 600
 
+entity_embedding_model: "text-embedding-v3"
+
 module_overrides:
   m1:
     kwargs:

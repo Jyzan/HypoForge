@@ -358,19 +358,42 @@ class GroundingWorkflow:
         if not self.embedding_model:
             return None
         try:
-            from langchain_openai import OpenAIEmbeddings
-            kwargs: Dict[str, Any] = {"model": self.embedding_model}
+            import httpx
+            import os as _os
+
+            api_key = ""
+            base_url = ""
             if self.client:
-                kwargs.update({
-                    "api_key": self.client.api_key,
-                    "base_url": self.client.api_base,
-                })
-            return await OpenAIEmbeddings(**kwargs).aembed_documents(texts)
+                api_key = getattr(self.client, "api_key", "")
+                base_url = getattr(self.client, "api_base", "")
+            api_key = api_key or _os.getenv("ENTITY_EMBEDDING_API_KEY", "") or _os.getenv("OPENAI_API_KEY", "")
+            base_url = base_url or _os.getenv("ENTITY_EMBEDDING_BASE_URL", "") or _os.getenv("OPENAI_BASE_URL", "")
+            endpoint = base_url.rstrip("/") + "/embeddings"
+            # MaaS limit: 10 inputs per request.
+            all_embeddings: list[list[float]] = []
+            batch_size = 10
+            async with httpx.AsyncClient(timeout=30.0) as cli:
+                for i in range(0, len(texts), batch_size):
+                    batch = texts[i : i + batch_size]
+                    resp = await cli.post(
+                        endpoint,
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        json={"model": self.embedding_model, "input": batch},
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    all_embeddings.extend(
+                        item["embedding"] for item in data["data"]
+                    )
+                return all_embeddings
         except Exception as exc:
-            logger.warning(
-                "Embedding unavailable; continuing with sparse retrieval: %s", exc
-            )
-            return None
+            raise RuntimeError(
+                f"Grounding embedding failed for model "
+                f"{self.embedding_model!r}.  Dense retrieval is explicitly "
+                f"enabled (grounding_embedding_model is set); a silent "
+                f"BM25-only fallback would violate the evidence contract. "
+                f"Original error: {exc}"
+            ) from exc
 
     async def _retrieve_evidence(self, gs: GroundingState) -> Dict[str, Any]:
         """BM25 (optionally + embedding) retrieval over M2EvidenceExport items."""

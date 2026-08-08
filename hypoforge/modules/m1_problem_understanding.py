@@ -254,9 +254,10 @@ class M1ProblemUnderstanding(ModuleProtocol):
                 *self._contract_violations(retried),
             ]
             if retry_violations:
-                logger.warning(
-                    "ProblemCard still violates the atomic task contract: %s",
-                    "; ".join(retry_violations),
+                raise ValueError(
+                    "ProblemCard still violates the atomic task contract "
+                    "after deterministic repair: "
+                    + "; ".join(retry_violations)
                 )
             card = retried
         if not card.original_question:
@@ -389,7 +390,8 @@ class M1ProblemUnderstanding(ModuleProtocol):
             ]
             if retry_violations:
                 logger.warning(
-                    "Follow-up ProblemCard still violates the atomic task contract: %s",
+                    "Follow-up ProblemCard still violates the atomic task "
+                    "contract after deterministic repair: %s",
                     "; ".join(retry_violations),
                 )
             decision = retried

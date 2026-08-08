@@ -157,11 +157,18 @@ class ScoringConfig(BaseModel):
 
 
 class EmbeddingConfig(BaseModel):
-    """Embedding endpoint used by evidence-consistency evaluation."""
+    """Embedding endpoint used by evidence-consistency evaluation and entity normalization.
+
+    ``base_url`` should point to the embedding endpoint.  When unset, the
+    code falls back to ``ENTITY_EMBEDDING_BASE_URL`` → ``OPENAI_BASE_URL``
+    environment variables.  ``api_key_env_var`` names the env-var that holds
+    the credential (defaults to ``ENTITY_EMBEDDING_API_KEY``, then
+    ``OPENAI_API_KEY``).
+    """
 
     model_name: str = "text-embedding-v3"
-    api_key_env_var: str = "OPENAI_API_KEY"
-    base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    api_key_env_var: str = "ENTITY_EMBEDDING_API_KEY"
+    base_url: str = ""  # empty → read from ENTITY_EMBEDDING_BASE_URL / OPENAI_BASE_URL
 
 
 class ConsistencyConfig(BaseModel):
@@ -217,6 +224,14 @@ class PipelineConfig(BaseModel):
     log_level: str = "INFO"  # DEBUG / INFO / WARNING / ERROR
     interactive: bool = False  # solicit human guidance between iterations (the CLI enables this)
     advanced_model_tiers: bool = False
+
+    # ---- model tier assignment (used when advanced_model_tiers=False or as
+    #      explicit overrides; "base" uses the primary model for everything) ----
+    evaluation_model_tier: str = "base"   # post-hoc scorer LLM tier
+    secondary_model_tier: str = "base"    # query_llm / ranker_llm / auxiliary LLMs
+
+    # ---- entity normalization ----
+    entity_embedding_model: str = ""  # empty = lexical-only; set to model name to enable embedding
 
     # ---- pipeline control ----
     enabled_modules: List[str] = Field(

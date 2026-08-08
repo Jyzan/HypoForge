@@ -36,6 +36,10 @@ search:
   papers_per_sub_question: 15
   max_papers_total: 80
 
+# Entity normalization embedding (set model name to enable; empty = lexical-only).
+# Endpoint read from ENTITY_EMBEDDING_BASE_URL / ENTITY_EMBEDDING_API_KEY env vars.
+entity_embedding_model: "text-embedding-v3"
+
 module_overrides:
   m1:
     kwargs:

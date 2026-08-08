@@ -1,8 +1,8 @@
 evaluation:
   embedding:
     model_name: "text-embedding-v3"
-    api_key_env_var: "OPENAI_API_KEY"
-    base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    api_key_env_var: "ENTITY_EMBEDDING_API_KEY"
+    base_url: ""  # empty: falls back to ENTITY_EMBEDDING_BASE_URL → OPENAI_BASE_URL
   consistency:
     similarity_threshold: 0.5
 

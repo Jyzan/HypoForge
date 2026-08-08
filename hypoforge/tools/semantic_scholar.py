@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import threading
 import time
@@ -57,12 +58,37 @@ def _resolve_config() -> tuple[str, str]:
 _S2_API_KEY, _BACKEND = _resolve_config()
 _OPENALEX_API_KEY = os.environ.get("OPENALEX_API_KEY", "")
 
-# This project's approved S2 key is limited to one request per second,
-# cumulative across endpoints. Keep a safety margin above one second;
-# operators may increase it locally, but cannot configure an unsafe value.
+# Module-level 429 circuit-breaker.  When S2 repeatedly rate-limits us,
+# subsequent calls in the same process skip S2 entirely and go directly
+# to OpenAlex.  The breaker auto-resets after a quiet period so that a
+# later supplement round can try S2 again.
+_s2_circuit_open_until: float = 0.0
+_CIRCUIT_COOLDOWN_SECONDS = 120.0  # keep S2 off for 2 min after a 429 storm
+
+
+def _s2_circuit_open() -> bool:
+    """Return True when S2 should be skipped (breaker is tripped)."""
+    return time.monotonic() < _s2_circuit_open_until
+
+
+def _s2_circuit_break() -> None:
+    """Trip the S2 circuit breaker for the cooldown period."""
+    global _s2_circuit_open_until
+    _s2_circuit_open_until = time.monotonic() + _CIRCUIT_COOLDOWN_SECONDS
+
+
+def _s2_circuit_reset() -> None:
+    """Reset the S2 circuit breaker (e.g. after a successful call)."""
+    global _s2_circuit_open_until
+    _s2_circuit_open_until = 0.0
+
+# Free S2 keys are limited to ~1 request per second, but some trial /
+# academic keys have even stricter quotas.  The default is deliberately
+# conservative; set SEMANTIC_SCHOLAR_MIN_INTERVAL_SECONDS in .env to
+# adjust for your specific key tier.
 _S2_RATE_LIMIT = max(
     1.0,
-    float(os.environ.get("SEMANTIC_SCHOLAR_MIN_INTERVAL_SECONDS", "1.1")),
+    float(os.environ.get("SEMANTIC_SCHOLAR_MIN_INTERVAL_SECONDS", "5.0")),
 )
 _OPENALEX_RATE_LIMIT = 0.12
 _last_request_time: float = 0.0
@@ -99,16 +125,25 @@ def _http_get_json(url: str, *, s2_api_key: str = "") -> dict:
         except urllib.error.HTTPError as e:
             last_exc = e
             if e.code == 429 and attempt < 3:
-                wait = 2 ** attempt
-                logger.debug("429 rate-limited, retry in %ds", wait)
+                retry_after = e.headers.get("Retry-After", "")
+                if retry_after:
+                    try:
+                        wait = float(retry_after)
+                    except (ValueError, TypeError):
+                        wait = 2.0
+                else:
+                    base = 2 ** attempt
+                    wait = base + random.uniform(0, base * 0.25)
+                logger.debug("429 rate-limited, retry in %.1fs", wait)
                 time.sleep(wait)
             else:
                 raise
         except (urllib.error.URLError, OSError) as e:
             last_exc = e
             if attempt < 3:
-                wait = 2 ** attempt
-                logger.debug("Network error (%s), retry in %ds: %s", type(e).__name__, wait, e)
+                base = 2 ** attempt
+                wait = base + random.uniform(0, base * 0.25)
+                logger.debug("Network error (%s), retry in %.1fs: %s", type(e).__name__, wait, e)
                 time.sleep(wait)
             else:
                 raise
@@ -280,16 +315,22 @@ def _oa_normalise(raw: dict) -> dict:
     }
 
 
-# ============================================================================
-# Dispatcher
-# ============================================================================
+def _s2_with_oa_fallback(
+    query: str,
+    limit: int,
+    s2_api_key: str,
+    oa_api_key: str,
+    s2_error: "Exception | None" = None,
+) -> List[dict]:
+    """Try Semantic Scholar (unless *s2_error* is already set), then OpenAlex.
 
-def _search(query: str, limit: int = 20) -> List[dict]:
-    """Dispatch search to the active backend."""
-    if _BACKEND == "semantic_scholar":
-        s2_error: Exception | None = None
+    ``s2_error`` pre-populates the error from an earlier S2 attempt (e.g. from
+    a circuit-breaker path that already failed).  When ``None`` a fresh S2
+    attempt is made first.
+    """
+    if s2_error is None:
         try:
-            rows = _s2_search(query, limit, _S2_API_KEY)
+            rows = _s2_search(query, limit, s2_api_key)
             if rows:
                 return rows
             logger.warning("Semantic Scholar returned zero results; falling back to OpenAlex")
@@ -299,21 +340,66 @@ def _search(query: str, limit: int = 20) -> List[dict]:
                 "Semantic Scholar failed (%s); falling back to OpenAlex",
                 type(exc).__name__,
             )
-        openalex_query = re.sub(r"\[[^\]]+\]", "", query)
-        openalex_query = re.sub(
-            r"\b(?:title|abstract|author):", "", openalex_query, flags=re.I
+    oa_query = re.sub(r"\[[^\]]+\]", "", query)
+    oa_query = re.sub(r"\b(?:title|abstract|author):", "", oa_query, flags=re.I)
+    try:
+        return _oa_search(" ".join(oa_query.split()), limit, oa_api_key)
+    except Exception as oa_error:
+        if s2_error is not None:
+            raise RuntimeError(
+                f"Semantic Scholar failed ({s2_error}); "
+                f"OpenAlex fallback failed ({oa_error})"
+            ) from oa_error
+        raise RuntimeError(f"OpenAlex fallback failed: {oa_error}") from oa_error
+
+
+# ============================================================================
+# Dispatcher
+# ============================================================================
+
+def _search(query: str, limit: int = 20) -> List[dict]:
+    """Dispatch search to the active backend.
+
+    When Semantic Scholar is the primary backend but is persistently
+    rate-limiting us (HTTP 429), a circuit-breaker opens and subsequent
+    calls skip straight to OpenAlex for a cooldown period.  This avoids
+    wasting 20+ seconds on doomed retries for every query in a batch.
+    """
+    if _BACKEND == "semantic_scholar":
+        s2_error: Exception | None = None
+        if _s2_circuit_open():
+            logger.info("S2 circuit is open (rate-limited); using OpenAlex directly")
+            s2_error = RuntimeError("S2 circuit open")
+        else:
+            try:
+                rows = _s2_search(query, limit, _S2_API_KEY)
+                if rows:
+                    return rows
+                logger.warning(
+                    "Semantic Scholar returned zero results; falling back to OpenAlex"
+                )
+            except urllib.error.HTTPError as exc:
+                s2_error = exc
+                if exc.code == 429:
+                    _s2_circuit_break()
+                    logger.warning(
+                        "Semantic Scholar rate-limited (429); "
+                        "circuit-breaker open, falling back to OpenAlex"
+                    )
+                else:
+                    logger.warning(
+                        "Semantic Scholar failed (%s); falling back to OpenAlex",
+                        type(exc).__name__,
+                    )
+            except Exception as exc:
+                s2_error = exc
+                logger.warning(
+                    "Semantic Scholar failed (%s); falling back to OpenAlex",
+                    type(exc).__name__,
+                )
+        return _s2_with_oa_fallback(
+            query, limit, _S2_API_KEY, _OPENALEX_API_KEY, s2_error=s2_error
         )
-        try:
-            return _oa_search(
-                " ".join(openalex_query.split()), limit, _OPENALEX_API_KEY
-            )
-        except Exception as oa_error:
-            if s2_error is not None:
-                raise RuntimeError(
-                    f"Semantic Scholar failed ({s2_error}); "
-                    f"OpenAlex fallback failed ({oa_error})"
-                ) from oa_error
-            raise RuntimeError(f"OpenAlex fallback failed: {oa_error}") from oa_error
     return _oa_search(query, limit, _OPENALEX_API_KEY)
 
 
@@ -373,30 +459,9 @@ class SemanticScholarTool(ToolProtocol):
         ):
             return _search(query, limit)
         if self._backend == "semantic_scholar":
-            s2_error: Exception | None = None
-            try:
-                rows = _s2_search(query, limit, self.api_key)
-                if rows:
-                    return rows
-                logger.warning("Semantic Scholar returned zero results; falling back to OpenAlex")
-            except Exception as exc:
-                s2_error = exc
-                logger.warning(
-                    "Semantic Scholar failed (%s); falling back to OpenAlex",
-                    type(exc).__name__,
-                )
-            # OpenAlex search syntax is plain text: remove source-specific
-            # field tags and keep quoted phrase contents.
-            openalex_query = re.sub(r"\[[^\]]+\]", "", query)
-            openalex_query = re.sub(r"\b(?:title|abstract|author):", "", openalex_query, flags=re.I)
-            try:
-                return _oa_search(" ".join(openalex_query.split()), limit, self.openalex_api_key)
-            except Exception as oa_error:
-                if s2_error is not None:
-                    raise RuntimeError(
-                        f"Semantic Scholar failed ({s2_error}); OpenAlex fallback failed ({oa_error})"
-                    ) from oa_error
-                raise RuntimeError(f"OpenAlex fallback failed: {oa_error}") from oa_error
+            return _s2_with_oa_fallback(
+                query, limit, self.api_key, self.openalex_api_key
+            )
         return _oa_search(query, limit, self.openalex_api_key)
 
     def _fetch_instance(self, identifier: str) -> dict:
