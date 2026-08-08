@@ -171,6 +171,51 @@ class AgenticM2Adapter(ModuleProtocol):
             output.append(reading.model_copy(update={"knowledge_entries": entries}))
         return output
 
+    @staticmethod
+    def _validate_reading_contract(
+        sub_question: str,
+        search_result: Any,
+        reading_results: list,
+    ) -> None:
+        """Ensure the reading workflow produced at least one usable evidence item.
+
+        Partial failures (some papers fail, others succeed) are acceptable.
+        Total failure (all papers produce no citable evidence, no knowledge
+        entries, or zero papers were retained) means the evidence contract
+        for this sub-question is broken.
+        """
+        retained_count = len(search_result.final_papers)
+        if retained_count == 0:
+            raise RuntimeError(
+                f"M2 retained zero papers for sub-question {sub_question!r}.  "
+                f"The search completed but no papers met the retention criteria."
+            )
+        citable_count = sum(
+            1 for r in reading_results
+            if getattr(r, "evidence", None)
+            and any(
+                getattr(e, "citable", True)
+                for e in r.evidence
+            )
+        )
+        knowledge_count = sum(
+            1 for r in reading_results
+            if getattr(r, "knowledge_entries", None)
+            and len(r.knowledge_entries) > 0
+        )
+        if retained_count > 0 and citable_count == 0:
+            raise RuntimeError(
+                f"M2 reading produced no citable evidence for sub-question "
+                f"{sub_question!r} ({retained_count} retained paper(s), "
+                f"0 with citable evidence)"
+            )
+        if retained_count > 0 and knowledge_count == 0:
+            raise RuntimeError(
+                f"M2 reading produced no knowledge entries for sub-question "
+                f"{sub_question!r} ({retained_count} retained paper(s), "
+                f"0 with knowledge entries)"
+            )
+
     async def __call__(
         self,
         state: PipelineState,
@@ -224,6 +269,9 @@ class AgenticM2Adapter(ModuleProtocol):
             )
             reading_results = await self._normalise_reading_entities(
                 state, list(reading_results)
+            )
+            self._validate_reading_contract(
+                sub_question, search_result, list(reading_results),
             )
             export_run = build_m2_knowledge_export_run(
                 sub_question,
@@ -347,7 +395,8 @@ class AgenticM2Adapter(ModuleProtocol):
         new_runs: List[M2KnowledgeRun] = []
         new_query_texts: List[str] = []
         new_paper_keys: List[str] = []
-        attempted_gap_ids: set = set()
+        attempted_gap_ids: set[str] = set()
+        grounded_gap_ids: set[str] = set()  # gaps with actual evidence from live search
         remaining_budget = self.supplement_paper_budget
 
         for gap in open_gaps:
@@ -442,10 +491,14 @@ class AgenticM2Adapter(ModuleProtocol):
             reading_results = await self._normalise_reading_entities(
                 state, list(reading_results)
             )
+            self._validate_reading_contract(
+                sub_question, filtered_result, list(reading_results),
+            )
             export_run = build_m2_knowledge_export_run(
                 sub_question, filtered_result, reading_results
             )
             new_runs.append(export_run)
+            grounded_gap_ids.add(gap.gap_id)
             self._merge_increment(
                 merged_results,
                 sub_question,
@@ -462,7 +515,7 @@ class AgenticM2Adapter(ModuleProtocol):
         # -- Step 3: incremental merge & full-list return -------------------
         updated_gaps: List[EvidenceGap] = []
         for gap in state.evidence_gaps:
-            if gap.gap_id in attempted_gap_ids and gap.status == "open":
+            if gap.gap_id in grounded_gap_ids and gap.status == "open":
                 updated_gaps.append(
                     gap.model_copy(update={"status": "pending_grounding"})
                 )
@@ -653,6 +706,7 @@ class AgenticM2Adapter(ModuleProtocol):
                 candidate_limit=base.candidate_limit,
                 per_query_limit=base.per_query_limit,
                 source_timeout_seconds=base.source_timeout_seconds,
+                retention_judge_client=base.retention_judge_client,
             )
         else:
             agent = base  # DI fakes: degrade to a plain run() call

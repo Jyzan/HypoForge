@@ -198,12 +198,15 @@ class M3EvidenceGraph(ModuleProtocol):
     """Build typed evidence graph from structured knowledge entries.
 
     Two modes (plus optional grounding):
-      - ``"rule"`` — fast, deterministic, no LLM calls (current behaviour).
+      - ``"rule"`` — fast, deterministic, no LLM calls.
       - ``"llm"`` — adds Qwen-powered cross-entry relation extraction on top
-        of the rule-based graph.  Falls back to rule-only on failure.
+        of the rule-based graph.  When a client is explicitly configured and
+        mode is ``"llm"``, LLM failure raises ``RuntimeError`` (no silent
+        fallback to rule-only).
       - ``grounding_enabled=True`` — runs the M3 grounding workflow
-        (consuming ``M2KnowledgeExport``) and merges grounded claims +
-        relations into the evidence graph.
+        (consuming ``M2KnowledgeExport``) whenever there is grounding
+        evidence to process, regardless of whether this round contributed
+        new entries.  Grounding failure raises ``RuntimeError``.
 
     .. versionchanged:: 0.4.0
         - Incremental graph update: existing ``evidence_graph`` in state
@@ -380,12 +383,19 @@ class M3EvidenceGraph(ModuleProtocol):
         if not all_entries:
             if not (existing_graph and existing_graph.nodes):
                 existing_graph = self._load_persisted_graph(state)
-            graph = existing_graph or EvidenceGraph()
-            if graph.nodes:
+            if existing_graph is not None and existing_graph.nodes:
+                graph = existing_graph
                 logger.info(
                     "M3: no knowledge entries; reusing existing graph "
                     "(%d nodes, %d edges)",
                     len(graph.nodes), len(graph.edges),
+                )
+            else:
+                raise RuntimeError(
+                    "M3 cannot build an evidence graph because no usable "
+                    "knowledge entries or task-relevant historical graph "
+                    "are available.  M2 must produce at least one "
+                    "knowledge entry before M3 can proceed."
                 )
             correction_updates = [
                 request.model_copy(deep=True)
@@ -478,6 +488,12 @@ class M3EvidenceGraph(ModuleProtocol):
             try:
                 graph = await self._enhance_with_llm_batched(graph, new_entries)
             except Exception as exc:
+                if self.mode in {"llm", "direct", "api"} and self.client:
+                    raise RuntimeError(
+                        f"M3 LLM enhancement failed in mode={self.mode!r}.  "
+                        f"LLM-based relation extraction was explicitly "
+                        f"requested and cannot be silently skipped."
+                    ) from exc
                 logger.warning(
                     "M3 LLM enhancement failed; using rule-only graph: %s", exc
                 )
@@ -512,37 +528,48 @@ class M3EvidenceGraph(ModuleProtocol):
             )
 
         # --- Step 4: M3 grounding (optional — consumes M2KnowledgeExport) ---
+        # Grounding runs when it is enabled AND there is evidence to ground,
+        # regardless of whether this round contributed new entries.  This
+        # supports checkpoint resume: a previously-built rule-only graph can
+        # be grounded on resume if M2 evidence is now available.
         result: Dict[str, Any] = {"evidence_graph": graph}
         if correction_updates != state.graph_correction_requests:
             result["graph_correction_requests"] = correction_updates
-        if new_entries and self.grounding_enabled and self._grounder is not None:
-            if state.m2_knowledge_export is None:
-                logger.warning(
-                    "M3 grounding is enabled but m2_knowledge_export is None. "
-                    "Grounding requires the agentic M2 pipeline "
-                    "(search.implementation='agentic'). Skipping grounding."
+        should_ground = (
+            self.grounding_enabled
+            and self._grounder is not None
+            and state.m2_knowledge_export is not None
+            and any(
+                hasattr(run, "evidence") and run.evidence
+                for run in state.m2_knowledge_export.runs
+            )
+        )
+        if should_ground:
+            # m2_knowledge_export is verified non-None by should_ground above.
+            assert state.m2_knowledge_export is not None
+            try:
+                grounded = await self._grounder.run(state)
+                graph = self._merge_grounding(
+                    graph,
+                    grounded.get("evidence_records", []),
+                    grounded.get("claims", []),
+                    grounded.get("relations", []),
+                    grounded.get("report"),
+                    entity_normalizer=self._normalise_task_entity,
                 )
-                result["errors"] = state.errors + [
-                    "[m3] grounding.enabled=True but no m2_knowledge_export "
-                    "available — run the agentic M2 pipeline first."
-                ]
-            else:
-                try:
-                    grounded = await self._grounder.run(state)
-                    graph = self._merge_grounding(
-                        graph,
-                        grounded.get("evidence_records", []),
-                        grounded.get("claims", []),
-                        grounded.get("relations", []),
-                        grounded.get("report"),
-                        entity_normalizer=self._normalise_task_entity,
-                    )
-                    result["evidence_graph"] = graph
-                except Exception as exc:
-                    logger.exception(
-                        "M3 grounding workflow failed; retaining non-grounded graph: %s",
-                        exc,
-                    )
+                result["evidence_graph"] = graph
+            except Exception as exc:
+                if self.grounding_enabled:
+                    raise RuntimeError(
+                        "M3 grounding workflow failed.  "
+                        "grounding.enabled=True requires a successful "
+                        "grounding run; a non-grounded graph does not "
+                        "satisfy the evidence contract."
+                    ) from exc
+                logger.exception(
+                    "M3 grounding workflow failed; retaining non-grounded graph: %s",
+                    exc,
+                )
 
         # Track existing IDs for next incremental run
         # (rebuilt on the fly from the graph itself — no instance state).

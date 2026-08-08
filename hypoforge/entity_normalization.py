@@ -74,6 +74,59 @@ def _cosine(left: list[float], right: list[float]) -> float:
     return numerator / (left_norm * right_norm)
 
 
+async def _embed_raw(
+    *,
+    model: str,
+    inputs: list[str],
+    base_url: str = "",
+    api_key: str = "",
+) -> list[list[float]]:
+    """Call the OpenAI-compatible ``/embeddings`` endpoint directly.
+
+    Avoids langchain_openai whose openai-SDK client wraps payloads in ways
+    that MaaS providers reject (e.g. ``input.contents`` instead of the
+    expected ``input: [str, …]``).
+
+    Batches are limited to *batch_size* inputs per request because MaaS
+    endpoints typically reject more than 10 inputs at once.
+
+    Endpoint resolution order (highest priority first):
+      1. ``base_url`` / ``api_key`` kwargs (caller-supplied)
+      2. ``ENTITY_EMBEDDING_BASE_URL`` / ``ENTITY_EMBEDDING_API_KEY`` env vars
+      3. ``OPENAI_BASE_URL`` / ``OPENAI_API_KEY`` env vars (shared fallback)
+    """
+    import httpx
+
+    resolved_base = (
+        base_url
+        or os.getenv("ENTITY_EMBEDDING_BASE_URL", "")
+        or os.getenv("OPENAI_BASE_URL", "")
+    )
+    resolved_key = (
+        api_key
+        or os.getenv("ENTITY_EMBEDDING_API_KEY", "")
+        or os.getenv("OPENAI_API_KEY", "")
+    )
+    endpoint = resolved_base.rstrip("/") + "/embeddings"
+    # MaaS limit: 10 inputs per request (see Algo.InvalidParameter errors).
+    batch_size = 10
+    all_embeddings: list[list[float]] = []
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        for i in range(0, len(inputs), batch_size):
+            batch = inputs[i : i + batch_size]
+            resp = await client.post(
+                endpoint,
+                headers={"Authorization": f"Bearer {resolved_key}"},
+                json={"model": model, "input": batch},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            all_embeddings.extend(
+                item["embedding"] for item in data["data"]
+            )
+    return all_embeddings
+
+
 class EntityNormalizationService:
     """Normalize entities within a domain namespace and persist pair decisions."""
 
@@ -94,6 +147,11 @@ class EntityNormalizationService:
         self.embedding_backend = embedding_backend
         self.embedding_model = embedding_model or os.getenv("EMBEDDING_MODEL", "")
         self.similarity_threshold = max(0.0, min(1.0, similarity_threshold))
+        # Whether embedding was explicitly requested (vs. unconfigured).
+        # Check the resolved value so env-var-only configuration is also detected.
+        self._embedding_configured: bool = bool(
+            self.embedding_model or embedding_backend
+        )
         self.records: dict[str, NormalizedEntity] = {}
         self.alias_to_id: dict[str, str] = {}
         self.pair_decisions: dict[str, EntityPairDecision] = {}
@@ -245,26 +303,45 @@ class EntityNormalizationService:
         self,
         surfaces: list[str],
         canonical_names: list[str],
+        _base_url: str = "",
+        _api_key: str = "",
     ) -> dict[str, list[str]]:
         if (
             not self.embedding_backend and not self.embedding_model
         ) or not surfaces or not canonical_names:
             return {}
         try:
-            backend = self.embedding_backend
-            if backend is None:
-                from langchain_openai import OpenAIEmbeddings
-
-                kwargs: dict[str, Any] = {"model": self.embedding_model}
-                if os.getenv("OPENAI_API_KEY"):
-                    kwargs["api_key"] = os.getenv("OPENAI_API_KEY")
-                if os.getenv("OPENAI_BASE_URL"):
-                    kwargs["base_url"] = os.getenv("OPENAI_BASE_URL")
-                backend = OpenAIEmbeddings(**kwargs)
-            vectors = await backend.aembed_documents(
-                [*surfaces, *canonical_names]
-            )
-        except Exception:
+            if self.embedding_backend is not None:
+                # User-supplied backend (e.g. test fixture) — delegate.
+                vectors = await self.embedding_backend.aembed_documents(
+                    [*surfaces, *canonical_names]
+                )
+            else:
+                # Call the OpenAI-compatible embeddings API directly.  We avoid
+                # langchain_openai because its openai-SDK client wraps payloads
+                # in ways that MaaS providers reject (e.g. ``input.contents``
+                # instead of ``input: [str, …]``).
+                vectors = await _embed_raw(
+                    model=self.embedding_model,
+                    inputs=[*surfaces, *canonical_names],
+                    base_url=_base_url,
+                    api_key=_api_key,
+                )
+            if len(vectors) != len(surfaces) + len(canonical_names):
+                raise RuntimeError(
+                    f"Embedding backend returned {len(vectors)} vectors "
+                    f"for {len(surfaces)} surfaces + {len(canonical_names)} "
+                    f"canonical names — expected "
+                    f"{len(surfaces) + len(canonical_names)}."
+                )
+        except Exception as exc:
+            if self._embedding_configured:
+                raise RuntimeError(
+                    f"Entity embedding failed.  Embedding is explicitly "
+                    f"configured (model={self.embedding_model!r}, "
+                    f"backend={'injected' if self.embedding_backend else 'auto'}). "
+                    f"Original error: {exc}"
+                ) from exc
             return {}
         surface_vectors = vectors[:len(surfaces)]
         canonical_vectors = vectors[len(surfaces):]
@@ -303,6 +380,16 @@ class EntityNormalizationService:
         self,
         requests: list[dict[str, Any]],
     ) -> dict[str, tuple[str, str]]:
+        """Return ``{surface: (canonical_name, rationale)}`` for every pair the
+        LLM confirms as ``same_concept=True``.
+
+        Returns an empty dict when no client is configured, when there are no
+        requests, or when the LLM returns no positive identity decisions.
+
+        Pairs that reach the judge but are NOT returned (``same_concept=False``
+        or absent from the response) stay unresolved — callers must NOT treat
+        them as confirmed-negative.
+        """
         if self.client is None or not requests:
             return {}
         schema = {
@@ -340,19 +427,36 @@ class EntityNormalizationService:
                 temperature=0.0,
                 disable_thinking=True,
             )
-        except Exception:
+        except Exception as exc:
+            if self.client is not None:
+                raise RuntimeError(
+                    "Entity identity judge LLM call failed.  A client is "
+                    "explicitly configured and the judge is required for "
+                    "unresolved entity pairs."
+                ) from exc
             return {}
-        output: dict[str, tuple[str, str]] = {}
         allowed = {
             (clean_entity_surface(item["surface"]), clean_entity_surface(candidate))
             for item in requests
             for candidate in item["candidates"]
         }
-        for decision in payload.get("decisions", []) if isinstance(payload, dict) else []:
+        output: dict[str, tuple[str, str]] = {}
+        for decision in (
+            payload.get("decisions", []) if isinstance(payload, dict) else []
+        ):
             surface = clean_entity_surface(decision.get("surface", ""))
             canonical = clean_entity_surface(decision.get("canonical_name", ""))
-            if decision.get("same_concept") is True and (surface, canonical) in allowed:
-                output[surface] = (canonical, str(decision.get("rationale", ""))[:500])
+            if not surface or not canonical:
+                continue
+            if (surface, canonical) not in allowed:
+                continue
+            is_same = decision.get("same_concept")
+            if isinstance(is_same, bool):
+                # same_concept=True  → merge; same_concept=False → explicit negative.
+                # Both are stored so future runs skip the LLM for this pair.
+                # Only True values trigger a merge (the canonical is the resolved name).
+                rationale = str(decision.get("rationale", ""))[:500]
+                output[surface] = (canonical if is_same else "", rationale)
         return output
 
     async def resolve_batch(self, names: Iterable[str]) -> dict[str, NormalizedEntity]:
@@ -396,18 +500,38 @@ class EntityNormalizationService:
             {"surface": surface, "candidates": candidates}
             for surface, candidates in candidate_map.items()
         ])
+        # Only persist pair decisions when the judge produced results for a
+        # given surface.  Three-state semantics:
+        #   same (canonical non-empty)   → merge + cache positive
+        #   different (canonical empty)  → no merge, cache explicit negative
+        #   unresolved (judge absent)    → no cache (keep surface new)
         for surface, candidates in candidate_map.items():
             selected = judged.get(surface)
+            if selected is None:
+                continue  # unresolved — leave this surface as a new entity
+            matched_canonical, matched_rationale = selected
+            if not matched_canonical:
+                # Explicit negative: judge says surface ≠ any candidate.
+                for candidate in candidates:
+                    self.pair_decisions[self._pair_key(surface, candidate)] = (
+                        EntityPairDecision(
+                            left=surface, right=candidate,
+                            same_concept=False,
+                            rationale=matched_rationale or "judge determined different concepts",
+                        )
+                    )
+                continue
             for candidate in candidates:
-                same = bool(selected and selected[0] == candidate)
-                self.pair_decisions[self._pair_key(surface, candidate)] = EntityPairDecision(
-                    left=surface,
-                    right=candidate,
-                    same_concept=same,
-                    rationale=selected[1] if same and selected else "not selected as identical",
+                same = bool(matched_canonical == candidate)
+                self.pair_decisions[self._pair_key(surface, candidate)] = (
+                    EntityPairDecision(
+                        left=surface, right=candidate,
+                        same_concept=same,
+                        rationale=selected[1] if same else "not selected as identical",
+                    )
                 )
-            if selected:
-                canonical_id = self.alias_to_id.get(selected[0])
+            if matched_canonical:
+                canonical_id = self.alias_to_id.get(matched_canonical)
                 if canonical_id:
                     record = self.records[canonical_id]
                     self._upsert(

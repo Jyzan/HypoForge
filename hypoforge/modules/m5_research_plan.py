@@ -96,6 +96,7 @@ class M5ResearchPlan(ModuleProtocol):
 
         valid_evidence = set(context.available_evidence_ids)
         valid_papers = set(context.available_paper_ids)
+        evidence_to_paper = context.evidence_to_paper
         evidence_ids = list(dict.fromkeys(
             identifier
             for identifier in plan.supporting_evidence_ids
@@ -119,8 +120,19 @@ class M5ResearchPlan(ModuleProtocol):
                 if identifier in valid_papers
             ))
             status = link.support_status
-            if status == "supported" and not link_evidence:
+            if status == "supported" and (not link_evidence or not link_papers):
                 status = "hypothesis_to_validate"
+            elif status == "supported":
+                # Verify provenance: each evidence must belong to at least
+                # one of the cited papers (not just be in two independent
+                # whitelists).
+                linked_paper_set = set(link_papers)
+                paired = any(
+                    evidence_to_paper.get(ev_id, "") in linked_paper_set
+                    for ev_id in link_evidence
+                )
+                if not paired:
+                    status = "hypothesis_to_validate"
             links.append(link.model_copy(update={
                 "supporting_evidence_ids": link_evidence,
                 "source_paper_ids": link_papers,
@@ -197,6 +209,7 @@ class M5ResearchPlan(ModuleProtocol):
                     plan_text,
                     subject_text=plan.study_subjects,
                     trace=plan.task_trace,
+                    semantic_client=self.client,
                 )
                 if alignment.passed:
                     break
@@ -212,6 +225,7 @@ class M5ResearchPlan(ModuleProtocol):
                 plan.model_dump_json(exclude={"task_trace"}),
                 subject_text=plan.study_subjects,
                 trace=plan.task_trace,
+                semantic_client=self.client,
             )
             if not final_alignment.passed:
                 raise ValueError(

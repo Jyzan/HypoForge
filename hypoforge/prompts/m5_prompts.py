@@ -8,8 +8,10 @@ The original question, ProblemCard, and evidence graph are binding constraints.
 The study subject must be the same research object; never substitute a different
 organism, machine, population, or task. Every evidence citation must be an exact
 ID from the supplied graph context. For each critical procedure, parameter,
-control, and risk claim, add an ``evidence_links`` item. Mark novel design choices
-as ``hypothesis_to_validate`` rather than fabricating support.
+control, and risk claim, add an ``evidence_links`` item that includes both
+``supporting_evidence_ids`` and ``source_paper_ids`` (from the graph context).
+Mark novel design choices as ``hypothesis_to_validate`` rather than fabricating
+support.
 Populate ``task_trace`` for every required task entity and requirement. Each
 trace item must use an exact contract ID and an ``output_excerpt`` copied
 verbatim from this plan. The required ``primary_object`` must be named in

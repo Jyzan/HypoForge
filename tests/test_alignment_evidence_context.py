@@ -301,6 +301,9 @@ class HypothesisRepairClient:
         self.calls.append(kwargs)
         return self.responses.pop(0)
 
+    async def chat(self, prompt: str) -> str:
+        return "yes — test semantic client is consistent"
+
 
 @pytest.mark.asyncio
 async def test_m4_repairs_contract_diagnostics_once_without_weakening_gate() -> None:
@@ -399,6 +402,9 @@ class PlanClient:
     def __init__(self) -> None:
         self.calls = []
 
+    async def chat(self, prompt: str) -> str:
+        return "yes — test semantic client is consistent"
+
     async def structured_chat(self, **kwargs):
         self.calls.append(kwargs)
         if len(self.calls) == 1:
@@ -450,6 +456,12 @@ async def test_m5_retries_object_drift_and_sanitizes_citations() -> None:
 
 
 class ReviewClient:
+    def __init__(self, chat_response: str = "yes — consistent") -> None:
+        self._chat_response = chat_response
+
+    async def chat(self, prompt: str) -> str:
+        return self._chat_response
+
     async def structured_chat(self, **kwargs):
         prompt = kwargs["system_prompt"]
         base = {
@@ -519,7 +531,7 @@ async def test_m6_rejects_legged_plan_even_if_llm_scores_it_five() -> None:
         )],
     })
     module = M6ReviewIteration()
-    module.client = ReviewClient()
+    module.client = ReviewClient(chat_response="no — semantic mismatch for legged robot")
 
     result = await module(state)
     task_review = next(
@@ -572,3 +584,123 @@ async def test_m3_loads_task_relevant_persistent_graph(tmp_path) -> None:
         node.metadata.get("entry_id") == "persistent-arm-fact"
         for node in second["evidence_graph"].nodes
     )
+
+
+# ---- fail-closed regression tests ----
+
+
+def test_assess_task_alignment_raises_on_missing_card() -> None:
+    """Missing ProblemCard with require_contract=True must raise."""
+    from hypoforge.task_alignment import assess_task_alignment
+    from hypoforge.state import PipelineState
+    state = PipelineState(input_question="test?")
+    state.problem_card = None
+    with pytest.raises(RuntimeError, match="no M1 ProblemCard"):
+        assess_task_alignment(state, "test candidate")
+
+
+def test_assess_task_alignment_permissive_when_require_contract_false() -> None:
+    """Missing ProblemCard with require_contract=False is backward-compatible."""
+    from hypoforge.task_alignment import assess_task_alignment
+    from hypoforge.state import PipelineState
+    state = PipelineState(input_question="test?")
+    state.problem_card = None
+    assessment = assess_task_alignment(
+        state, "test candidate", require_contract=False,
+    )
+    assert assessment.passed
+    assert assessment.score == 0.5
+
+
+class FailingSemanticClient:
+    async def chat(self, prompt: str) -> str:
+        raise ConnectionError("simulated semantic judge failure")
+
+
+class InconsistentSemanticClient:
+    async def chat(self, prompt: str) -> str:
+        return "no — subject text describes a different research object"
+
+
+class ConsistentSemanticClient:
+    async def chat(self, prompt: str) -> str:
+        return "yes — subject text is about the same research object"
+
+
+def test_semantic_client_consistency_passes() -> None:
+    """Semantic judge returns yes, contract satisfied → alignment passes."""
+    state = robot_state()
+    trace = TaskTrace(
+        entity_mentions=[
+            TaskTraceReference(contract_id="E1", output_excerpt="机械臂"),
+            TaskTraceReference(contract_id="E2", output_excerpt="sim-to-real"),
+        ],
+        requirement_mentions=[
+            TaskTraceReference(
+                contract_id="R1",
+                output_excerpt="机械臂 sim-to-real 迁移实验",
+            ),
+        ],
+    )
+    client = ConsistentSemanticClient()
+    assessment = assess_task_alignment(
+        state,
+        "机械臂 sim-to-real 迁移实验",
+        subject_text="机械臂 sim-to-real 迁移实验",
+        semantic_client=client,
+        trace=trace,
+    )
+    assert assessment.passed
+
+
+def test_semantic_client_inconsistency_is_hard_fail() -> None:
+    """Semantic judge returns no → hard gate fail."""
+    state = robot_state()
+    trace = TaskTrace(
+        entity_mentions=[
+            TaskTraceReference(contract_id="E1", output_excerpt="leg"),
+            TaskTraceReference(contract_id="E2", output_excerpt="design"),
+        ],
+        requirement_mentions=[
+            TaskTraceReference(
+                contract_id="R1",
+                output_excerpt="leg design for walking robots",
+            ),
+        ],
+    )
+    client = InconsistentSemanticClient()
+    assessment = assess_task_alignment(
+        state,
+        "leg design for walking robots",
+        subject_text="leg design for walking robots",
+        semantic_client=client,
+        trace=trace,
+    )
+    assert not assessment.passed
+    assert len(assessment.semantic_conflicts) > 0
+
+
+def test_semantic_client_failure_propagates() -> None:
+    """Semantic judge raises → RuntimeError, not silent pass."""
+    state = robot_state()
+    trace = TaskTrace(
+        entity_mentions=[
+            TaskTraceReference(contract_id="E1", output_excerpt="test"),
+            TaskTraceReference(contract_id="E2", output_excerpt="candidate"),
+        ],
+        requirement_mentions=[
+            TaskTraceReference(
+                contract_id="R1",
+                output_excerpt="test candidate",
+            ),
+        ],
+    )
+    client = FailingSemanticClient()
+    with pytest.raises(RuntimeError, match="Semantic object-consistency"):
+        assess_task_alignment(
+            state,
+            "test candidate",
+            subject_text="test candidate",
+            semantic_client=client,
+            trace=trace,
+        )

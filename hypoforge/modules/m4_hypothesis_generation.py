@@ -192,6 +192,8 @@ class M4HypothesisGeneration(ModuleProtocol):
         state: PipelineState,
         context: GraphContext,
         cards: List[HypothesisCard],
+        *,
+        semantic_client: object | None = None,
     ) -> tuple[List[HypothesisCard], List[Dict[str, Any]]]:
         """Return accepted cards and machine-readable contract diagnostics."""
 
@@ -210,6 +212,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                 candidate_text,
                 subject_text="\n".join([card.statement, card.mechanism]),
                 trace=card.task_trace,
+                semantic_client=semantic_client,
             )
             if not alignment.passed:
                 failures.append({
@@ -239,7 +242,19 @@ class M4HypothesisGeneration(ModuleProtocol):
                     "M4 removed unresolved evidence references from %s",
                     card.hypothesis_id,
                 )
-            accepted.append(card.model_copy(update={"supporting_evidence": references}))
+            valid_papers = set(context.available_paper_ids)
+            paper_ids = list(dict.fromkeys(
+                pid for pid in card.source_paper_ids if pid in valid_papers
+            ))
+            if len(paper_ids) != len(card.source_paper_ids):
+                logger.warning(
+                    "M4 removed unresolved paper references from %s",
+                    card.hypothesis_id,
+                )
+            accepted.append(card.model_copy(update={
+                "supporting_evidence": references,
+                "source_paper_ids": paper_ids,
+            }))
         return accepted, failures
 
     @staticmethod
@@ -247,11 +262,13 @@ class M4HypothesisGeneration(ModuleProtocol):
         state: PipelineState,
         context: GraphContext,
         cards: List[HypothesisCard],
+        *,
+        semantic_client: object | None = None,
     ) -> List[HypothesisCard]:
         """Compatibility wrapper returning only contract-compliant cards."""
 
         accepted, _ = M4HypothesisGeneration._check_context_contract(
-            state, context, cards
+            state, context, cards, semantic_client=semantic_client,
         )
         return accepted
 
@@ -310,7 +327,9 @@ class M4HypothesisGeneration(ModuleProtocol):
             },
         )
         repaired_candidates = self._normalise_hypotheses(repaired)
-        return self._check_context_contract(state, context, repaired_candidates)
+        return self._check_context_contract(
+            state, context, repaired_candidates, semantic_client=self.client,
+        )
 
     def _normalise_hypotheses(self, payload: Any) -> List[HypothesisCard]:
         if isinstance(payload, dict):
@@ -625,7 +644,7 @@ class M4HypothesisGeneration(ModuleProtocol):
         )
         candidates = self._normalise_hypotheses(generated)
         candidates, contract_failures = self._check_context_contract(
-            state, graph_context, candidates
+            state, graph_context, candidates, semantic_client=self.client,
         )
         if not candidates:
             candidates, contract_failures = await self._repair_context_contract(
@@ -758,8 +777,10 @@ class M4HypothesisGeneration(ModuleProtocol):
                 details={"candidates": len(candidates)},
             )
         except Exception as exc:
-            logger.warning("M4 critic failed (%s); keeping all candidates", exc)
-            return candidates
+            raise RuntimeError(
+                "M4 Critic stage failed — when multi-agent mode is active "
+                "the Critic is a required quality gate and cannot be skipped."
+            ) from exc
 
         reviews = result if isinstance(result, list) else []
         id_to_candidate = {h.hypothesis_id: h for h in candidates}
@@ -825,8 +846,11 @@ class M4HypothesisGeneration(ModuleProtocol):
                 details={"candidates": len(candidates)},
             )
         except Exception as exc:
-            logger.warning("M4 falsifiability checker failed (%s); keeping all candidates", exc)
-            return candidates
+            raise RuntimeError(
+                "M4 Falsifiability Checker failed — when multi-agent mode "
+                "is active the Falsifiability check is a required quality "
+                "gate and cannot be skipped."
+            ) from exc
 
         reviews = result if isinstance(result, list) else []
         id_to_candidate = {h.hypothesis_id: h for h in candidates}

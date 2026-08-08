@@ -349,6 +349,7 @@ class HypothesisCard(BaseModel):
     observable_predictions: List[str] = Field(default_factory=list)
     falsification_conditions: List[str] = Field(default_factory=list)
     supporting_evidence: List[str] = Field(default_factory=list)
+    source_paper_ids: List[str] = Field(default_factory=list)
     task_trace: TaskTrace = Field(default_factory=TaskTrace)
 
     # Reasoning written by the Ranker *before* the numeric scores (reason-before-score).

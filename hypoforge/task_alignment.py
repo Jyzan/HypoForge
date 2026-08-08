@@ -7,7 +7,9 @@ literal excerpts that show where those contract items were addressed.
 
 from __future__ import annotations
 
+import asyncio
 import re
+import threading
 import unicodedata
 from dataclasses import dataclass
 from typing import Iterable
@@ -98,10 +100,77 @@ class AlignmentAssessment:
     matched_anchors: tuple[str, ...] = ()
     missing_anchors: tuple[str, ...] = ()
     conflicts: tuple[str, ...] = ()
+    semantic_conflicts: tuple[str, ...] = ()
     matched_entity_ids: tuple[str, ...] = ()
     missing_requirement_ids: tuple[str, ...] = ()
     invalid_trace_references: tuple[str, ...] = ()
     rationale: str = ""
+
+
+def _call_chat(client: object, prompt: str) -> str:
+    """Call ``client.chat(prompt)``, bridging sync and async clients."""
+    if not hasattr(client, "chat"):
+        return ""
+    import inspect
+    if inspect.iscoroutinefunction(client.chat):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return str(asyncio.run(client.chat(prompt)) or "")
+        # Running loop — run in a dedicated thread with a fresh coroutine.
+        result_container: list[str] = []
+        error_container: list[BaseException] = []
+        async def _resolve() -> None:
+            try:
+                result_container.append(str(await client.chat(prompt) or ""))
+            except BaseException as exc:
+                error_container.append(exc)
+        def _run() -> None:
+            asyncio.run(_resolve())
+        thread = threading.Thread(target=_run)
+        thread.start()
+        thread.join()
+        if error_container:
+            raise error_container[0]
+        return result_container[0] if result_container else ""
+    return str(client.chat(prompt) or "")
+
+
+def _check_semantic_consistency(
+    entity: TaskEntity,
+    subject_text: str,
+    client: object | None,
+) -> tuple[bool, str]:
+    """Ask an LLM whether *subject_text* is semantically about *entity*.
+
+    Returns ``(is_consistent, rationale)``.  The prompt is domain-neutral:
+    it contains no hardcoded vocabulary, only the entity's names and aliases.
+    When *client* is ``None`` the check is skipped (pass-through).
+    """
+    if client is None:
+        return True, ""
+    names = [entity.name, *entity.aliases]
+    aliases_str = ", ".join(dict.fromkeys(n.strip() for n in names if n.strip()))
+    if not aliases_str or not subject_text.strip():
+        return True, ""
+    prompt = (
+        f'Is the research object described in the following text semantically '
+        f'the same type of thing as "{aliases_str}"?\n\n'
+        f"Text: {subject_text[:1200]}\n\n"
+        f"Answer ONLY yes or no, then one sentence why."
+    )
+    try:
+        response = _call_chat(client, prompt)
+    except Exception as exc:
+        raise RuntimeError(
+            "Semantic object-consistency judge failed.  A client is "
+            "explicitly configured; semantic alignment is required for "
+            "primary_object entities."
+        ) from exc
+    answer = response.strip().lower()
+    if answer.startswith("yes"):
+        return True, answer
+    return False, answer
 
 
 def assess_task_alignment(
@@ -110,6 +179,8 @@ def assess_task_alignment(
     *,
     subject_text: str | None = None,
     trace: TaskTrace | None = None,
+    semantic_client: object | None = None,
+    require_contract: bool = True,
 ) -> AlignmentAssessment:
     """Validate an output against the task-local M1 contract.
 
@@ -117,10 +188,27 @@ def assess_task_alignment(
     (for example a hypothesis statement or ``ResearchPlan.study_subjects``).
     Requiring the primary object there prevents an incidental mention elsewhere
     from satisfying the hard gate.
+
+    When *semantic_client* is provided, each ``primary_object`` entity is
+    additionally checked for semantic consistency — the LLM judges whether
+    *subject_text* is genuinely about that research object, not just whether
+    the entity name appears somewhere in the text.
+
+    When *require_contract* is ``True`` (the default), a missing or empty M1
+    ``ProblemCard`` / ``TaskContract`` causes a ``RuntimeError`` — alignment
+    cannot be verified without a binding contract.  Legacy callers (e.g.
+    scorer, historical snapshots) may set it to ``False`` to get a permissive
+    ``passed=True, score=0.5`` instead.
     """
 
     card = state.problem_card
     if card is None:
+        if require_contract:
+            raise RuntimeError(
+                "Task alignment cannot be evaluated because no M1 ProblemCard "
+                "exists.  A binding M1 contract is required for M4/M5/M6 "
+                "hard-gate alignment checks."
+            )
         return AlignmentAssessment(
             passed=True,
             score=0.5,
@@ -129,6 +217,12 @@ def assess_task_alignment(
 
     contract = card.task_contract
     if not contract.entities and not contract.requirements:
+        if require_contract:
+            raise RuntimeError(
+                "Task alignment cannot be evaluated because the M1 TaskContract "
+                "has no entities or requirements.  A binding contract is "
+                "required for M4/M5/M6 hard-gate alignment checks."
+            )
         return AlignmentAssessment(
             passed=True,
             score=0.5,
@@ -181,6 +275,24 @@ def assess_task_alignment(
         entity.name for entity in contract.entities
         if entity.entity_id in matched_entity_ids
     ]
+
+    # ---- semantic object consistency (hard gate for primary_object) ----
+    semantic_conflicts: list[str] = []
+    if semantic_client is not None:
+        for entity in contract.entities:
+            if entity.role != "primary_object":
+                continue
+            consistent, rationale = _check_semantic_consistency(
+                entity, subject, semantic_client,
+            )
+            if not consistent:
+                semantic_conflicts.append(
+                    f"semantic object mismatch: expected "
+                    f"{entity.name} ({', '.join(entity.aliases[:3])}), "
+                    f"but subject_text is about something else — {rationale}"
+                )
+                passed = False
+
     problems: list[str] = []
     if missing_entities:
         problems.append(
@@ -192,12 +304,20 @@ def assess_task_alignment(
             "missing auditable requirement traces: " + ", ".join(missing_requirements)
         )
     problems.extend(invalid_trace)
+    # Semantic conflicts for primary_object entities are a hard gate.
+    if semantic_conflicts:
+        problems.append(
+            "semantic object mismatch (hard gate): "
+            + "; ".join(semantic_conflicts)
+        )
+        score = min(score, 2.0)
     return AlignmentAssessment(
         passed=passed,
         score=score,
         matched_anchors=tuple(matched_names),
         missing_anchors=tuple(entity.name for entity in missing_entities),
         conflicts=tuple(invalid_trace),
+        semantic_conflicts=tuple(semantic_conflicts),
         matched_entity_ids=tuple(sorted(matched_entity_ids)),
         missing_requirement_ids=tuple(missing_requirements),
         invalid_trace_references=tuple(invalid_trace),

@@ -246,6 +246,10 @@ class PipelineRunner:
         "m5": ("research_plans",),
     }
 
+    # Every core science module (M1–M6) is required for evidence integrity.
+    # An unhandled exception in any of them must stop the pipeline immediately.
+    _CORE_MODULES = frozenset({"m1", "m2", "m3", "m4", "m5", "m6"})
+
     def __init__(
         self,
         config: PipelineConfig,
@@ -750,10 +754,10 @@ class PipelineRunner:
                     console.print(f"  [{COLORS['error']}][ERR] [{name.upper()}] ERROR: {exc}[/{COLORS['error']}]")
                 if isinstance(exc, (SkillHookError, SkillPatchError)):
                     raise
-                standard_core_fields = set(
-                    self._CORE_REQUIRED_OUTPUTS.get(name, ())
-                ) & output_fields
-                if standard_core_fields:
+                # Core science modules (M1–M6) must fail-fast.
+                # A suppressed exception here would silently corrupt the
+                # evidence chain for downstream modules.
+                if name in self._CORE_MODULES:
                     raise
                 return {"errors": state.errors + [f"[{name}] {exc}\n{traceback.format_exc()}"]}
 
@@ -1295,9 +1299,11 @@ class PipelineRunner:
         # ---- automated scoring report (single source: config.scoring) ----
         if self.config.scoring.auto_score:
             from .evaluation.scorer import save_scoring_report_async
-            # The independent metrics use a lightweight (turbo) model for
-            # LLM-as-judge evaluations so they don't add meaningful latency.
-            metric_llm_config = self.config.get_llm_for_tier("turbo")
+            # The independent metrics use a lightweight model for LLM-as-judge
+            # evaluations so they don't add meaningful latency.
+            metric_llm_config = self.config.get_llm_for_tier(
+                self.config.evaluation_model_tier
+            )
             try:
                 score_started_at = time.perf_counter()
                 self._record_event(

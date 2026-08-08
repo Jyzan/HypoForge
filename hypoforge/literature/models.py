@@ -141,13 +141,20 @@ class ScoutNote(LiteratureModel):
 
 
 class PaperRetentionDecision(LiteratureModel):
-    """Auditable Final-K/diversity decision derived from Scout semantics."""
+    """Auditable Final-K/diversity decision derived from Scout semantics.
+
+    When an LLM retention judge is available, boundary papers may receive
+    an override — the fields ``llm_override`` and ``llm_rationale`` record
+    the result so the decision remains auditable.
+    """
 
     paper_id: NonEmptyStr
     decision: Literal["retain", "reject"]
     roles: List[str] = Field(default_factory=list)
     reason: NonEmptyStr
     rank_position: int = Field(ge=1)
+    llm_override: bool = False
+    llm_rationale: str = ""
 
 
 class CoverageReport(LiteratureModel):

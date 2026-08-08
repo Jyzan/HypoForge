@@ -207,6 +207,7 @@ def _quality_gates(state: PipelineState) -> Dict[str, Any]:
             hypothesis.model_dump_json(exclude={"task_trace"}),
             subject_text="\n".join([hypothesis.statement, hypothesis.mechanism]),
             trace=hypothesis.task_trace,
+            require_contract=False,
         )
         plan_assessment = (
             assess_task_alignment(
@@ -214,6 +215,7 @@ def _quality_gates(state: PipelineState) -> Dict[str, Any]:
                 plan.model_dump_json(exclude={"task_trace"}),
                 subject_text=plan.study_subjects,
                 trace=plan.task_trace,
+                require_contract=False,
             ) if plan else None
         )
         passed = hypothesis_assessment.passed and bool(

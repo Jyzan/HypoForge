@@ -32,6 +32,7 @@ class GraphContext(BaseModel):
     unresolved_entry_ids: list[str] = Field(default_factory=list)
     available_evidence_ids: list[str] = Field(default_factory=list)
     available_paper_ids: list[str] = Field(default_factory=list)
+    evidence_to_paper: dict[str, str] = Field(default_factory=dict)
 
     @property
     def available_reference_ids(self) -> set[str]:
@@ -106,12 +107,14 @@ def build_graph_context(
             if entry.source_paper_id and entry.source_paper_title:
                 paper_title[entry.source_paper_id] = entry.source_paper_title
 
+    evidence_to_paper: dict[str, str] = {}
     if state.m2_knowledge_export:
         for run in state.m2_knowledge_export.runs:
             for paper in run.papers:
                 paper_title[paper.paper_id] = paper.title
             for evidence in run.evidence:
                 evidence_by_id[evidence.evidence_id] = evidence
+                evidence_to_paper[evidence.evidence_id] = evidence.paper_id
             for entry in run.knowledge_entries:
                 entry_by_id[entry.id] = entry
 
@@ -228,4 +231,5 @@ def build_graph_context(
         unresolved_entry_ids=_unique(unresolved),
         available_evidence_ids=evidence_ids,
         available_paper_ids=_unique(paper_title),
+        evidence_to_paper=evidence_to_paper,
     )

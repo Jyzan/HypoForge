@@ -136,7 +136,7 @@ async def test_agent_returns_complete_result_when_first_round_is_sufficient() ->
     result = await agent.run(
         "Does the mechanism hold?",
         key_entities=["mechanism"],
-        domains=["biology"],
+        domains=[],
         question_type="mechanism",
         budget=SearchBudget(max_rounds=3),
     )

@@ -23,6 +23,9 @@ be true if the hypothesis is correct.
 *disprove* the hypothesis.
 5. **supporting_evidence** — canonical evidence IDs from the evidence graph that \
 provide indirect support.
+5b. **source_paper_ids** — for each evidence ID in ``supporting_evidence``, include
+its source paper ID from the graph context.  No paper IDs should appear here that
+are not linked to a referenced evidence item.
 6. **task_trace** — for every required task entity and requirement in the supplied
 task contract, return its exact contract ID plus a short literal excerpt copied
 from this hypothesis's statement, mechanism, or prediction. Never claim an ID
@@ -88,9 +91,9 @@ Binding rules:
   statement, mechanism, observable predictions, or falsification conditions.
 - A requirement excerpt must name its primary entity and express the requested
   relation or action.
-- Cite only canonical evidence IDs listed in the graph context. If no canonical
-  evidence supports the repaired hypothesis, use an empty `supporting_evidence`
-  list; never invent an ID.
+- Cite only canonical evidence and paper IDs listed in the graph context. If no
+  canonical evidence supports the repaired hypothesis, use empty
+  ``supporting_evidence`` and ``source_paper_ids`` lists; never invent an ID.
 - Keep each statement objective, scientific, measurable, and falsifiable.
 - Correct every diagnostic supplied by the validator. Do not weaken or work
   around the contract.

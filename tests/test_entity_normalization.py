@@ -120,3 +120,83 @@ async def test_negative_identity_decision_keeps_related_entities_separate(tmp_pa
 
     assert result["regional rainfall bias"].canonical_name == "regional rainfall bias"
     assert client.calls == 1
+
+
+# ---- fail-closed regression tests ----
+
+
+class FailingEmbeddings:
+    async def aembed_documents(self, texts):
+        raise ConnectionError("simulated embedding API outage")
+
+
+@pytest.mark.asyncio
+async def test_configured_embedding_failure_propagates(tmp_path) -> None:
+    """Embedding explicitly configured → failure must raise, not silently lexical."""
+    service = EntityNormalizationService(
+        cache_dir=tmp_path,
+        embedding_backend=FailingEmbeddings(),
+    )
+    service.register_alias_group("known-entity", [])
+    with pytest.raises(RuntimeError, match="Entity embedding failed"):
+        await service.resolve_batch(["test surface"])
+
+
+@pytest.mark.asyncio
+async def test_embedding_not_configured_is_lexical_only(tmp_path) -> None:
+    """No embedding configured → lexical-only is a legitimate mode."""
+    service = EntityNormalizationService(cache_dir=tmp_path)
+    result = await service.resolve_batch(["test surface"])
+    assert "test surface" in result
+
+
+@pytest.mark.asyncio
+async def test_embedding_malformed_vector_count_propagates(tmp_path) -> None:
+    """Embedding returns wrong count → must raise."""
+    class WrongCountEmbeddings:
+        async def aembed_documents(self, texts):
+            return [[0.1, 0.2]]  # 1 vector for 2+ texts
+
+    service = EntityNormalizationService(
+        cache_dir=tmp_path,
+        embedding_backend=WrongCountEmbeddings(),
+    )
+    service.register_alias_group("alpha", [])
+    with pytest.raises(RuntimeError, match="Embedding backend returned"):
+        await service.resolve_batch(["beta"])
+
+
+class FailingJudgeClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def structured_chat(self, **kwargs):
+        self.calls += 1
+        raise ConnectionError("simulated judge API outage")
+
+
+@pytest.mark.asyncio
+async def test_judge_failure_propagates(tmp_path) -> None:
+    """Configured judge fails → must raise."""
+    service = EntityNormalizationService(
+        cache_dir=tmp_path,
+        client=FailingJudgeClient(),
+        embedding_backend=FixedEmbeddings(),
+    )
+    service.register_alias_group("alpha", [])
+    with pytest.raises(RuntimeError, match="Entity identity judge"):
+        await service.resolve_batch(["beta"])
+
+
+@pytest.mark.asyncio
+async def test_judge_failure_writes_no_false_negative_cache(tmp_path) -> None:
+    """Judge unavailable → must NOT write same_concept=False decisions."""
+    service = EntityNormalizationService(
+        cache_dir=tmp_path,
+        client=None,
+    )
+    service.register_alias_group("robotic arm", ["robot manipulator"])
+    await service.resolve_batch(["mechanical arm", "robot gripper"])
+    # No client → no pair decisions should have been written
+    # because the for loop skips when selected is None
+    assert len(service.pair_decisions) == 0

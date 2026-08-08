@@ -43,6 +43,29 @@ _CLOSE_EVIDENCE_MARGIN = 0.25
 _SCORE_EPSILON = 1e-9
 
 
+def domain_token_overlap(paper: PaperRecord, domains: set[str]) -> float:
+    """Return 1.0 when at least one domain term shares a token with the paper.
+
+    Returns 0.0 when *domains* is non-empty but no domain term token appears
+    in the paper's title or abstract.
+
+    The check is purely lexical and domain-neutral: it compares whatever
+    domain labels M1 produced against whatever text the paper carries.
+    A single matching domain term is sufficient to pass the filter.
+    """
+    if not domains:
+        return 1.0
+    from ._text import tokenize
+    paper_text = " ".join(filter(None, [paper.title, paper.abstract or ""]))
+    if not paper_text.strip():
+        return 0.0
+    paper_tokens = set(tokenize(paper_text))
+    for domain in domains:
+        if set(tokenize(domain)) & paper_tokens:
+            return 1.0
+    return 0.0
+
+
 def _clamp(value: float) -> float:
     return max(0.0, min(1.0, value))
 
@@ -231,9 +254,9 @@ def select_retained_papers(
 ) -> tuple[list[PaperRecord], list[PaperRetentionDecision]]:
     """Retain the ranked core plus credible missing evidence roles.
 
-    The expansion is bounded by ``max(final_k*2, final_k+3)``. It is not a
-    relevance bypass: only papers inside that ranked window and above the Scout
-    credibility threshold may be added to cover a missing role.
+    The expansion is bounded by ``max(final_k*2, final_k+3)`` and is purely
+    deterministic.  LLM boundary review, when enabled, is performed by the
+    caller so that async clients can be properly awaited.
     """
 
     if final_k <= 0:
@@ -302,6 +325,7 @@ def select_retained_papers(
             reason=reason,
             rank_position=index,
         ))
+
     return retained, decisions
 
 

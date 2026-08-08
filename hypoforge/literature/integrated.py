@@ -52,6 +52,7 @@ def build_integrated_search_adapter(
     resolver_timeout_seconds: float = 210.0,
     reader_timeout_seconds: float = 120.0,
     reading_workflow_timeout_seconds: float = 600.0,
+    entity_embedding_model: str = "",
 ) -> AgenticM2Adapter:
     if final_k <= 0:
         raise ValueError("final_k must be positive")
@@ -98,6 +99,7 @@ def build_integrated_search_adapter(
         candidate_limit=max(20, final_k),
         per_query_limit=per_query_limit or final_k,
         source_timeout_seconds=source_timeout_seconds,
+        retention_judge_client=client,
     )
     store = InMemoryChunkStore()
     pmc_resolver = PMCFulltextResolver(
@@ -133,5 +135,5 @@ def build_integrated_search_adapter(
         reading_workflow=reading_workflow,
         budget=resolved_budget,
         entity_judge_client=client,
-        entity_embedding_model=os.getenv("EMBEDDING_MODEL", ""),
+        entity_embedding_model=entity_embedding_model,
     )

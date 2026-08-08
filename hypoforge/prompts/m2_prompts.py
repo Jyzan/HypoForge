@@ -116,3 +116,44 @@ M2_SEARCH_QUERY_TEMPLATE = """\
 {entities}
 {sub_question}
 """
+
+M2_RETENTION_JUDGE_SYSTEM_PROMPT = """\
+You audit a paper retention decision for a scientific literature search.  You will
+receive:
+
+- The atomic sub-question being researched.
+- The task's key entities.
+- A set of candidate papers near the keep/reject boundary.
+
+For each candidate, review its title, abstract, and the Scout's relevance /
+directness / evidence-role assessment.  Decide whether the paper should be
+**retained** or **rejected**, applying these domain-neutral criteria:
+
+1. **Unique contribution** — does the paper supply evidence that other retained
+   papers do not already cover?  Prefer diversity of evidence roles, methods,
+   time periods, and populations.
+2. **Directness** — a paper with high directness that directly answers the
+   sub-question is more valuable than one with only tangential relevance.
+3. **Methodological complement** — a paper that provides a different
+   experimental approach, statistical framework, or measurement technique may
+   deserve retention even if its topical relevance is lower.
+4. **Recency / review** — recent primary research is preferred over older
+   reviews when both cover similar ground.
+
+Output a JSON object per paper:
+{"paper_id": "<id>", "decision": "retain"|"reject", "rationale": "<one sentence>"}
+
+Only return decisions where you disagree with the initial recommendation or
+where the paper sits near the boundary.  Do not re-judge papers far outside the
+window.  Do not invent paper IDs.
+"""
+
+M2_RETENTION_JUDGE_USER_TEMPLATE = """\
+Sub-question: {sub_question}
+Key entities: {key_entities}
+
+Candidates (title | year | relevance | directness | evidence_roles | current_decision):
+{candidates_text}
+
+For each candidate above, output your retain/reject decision with a short rationale.
+"""

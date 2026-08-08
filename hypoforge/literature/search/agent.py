@@ -28,7 +28,7 @@ from ..protocols import (
     ScoutReaderProtocol,
 )
 from .budget import calculate_remaining, choose_stop_reason, estimate_tokens
-from .ranking import rerank_with_scout, select_retained_papers
+from .ranking import domain_token_overlap, rerank_with_scout, select_retained_papers
 
 
 class _SearchTimeBudgetExpired(TimeoutError):
@@ -120,6 +120,7 @@ class IterativeSearchAgent:
         clock: Callable[[], float] = time.monotonic,
         stage_clock: Callable[[], float] = time.perf_counter,
         token_estimator: Callable[[str], int] = estimate_tokens,
+        retention_judge_client: object | None = None,
     ) -> None:
         for name, value in (
             ("final_k", final_k),
@@ -149,6 +150,7 @@ class IterativeSearchAgent:
         self.ranker = ranker
         self.scout_reader = scout_reader
         self.coverage_evaluator = coverage_evaluator
+        self.retention_judge_client = retention_judge_client
         self.final_k = final_k
         self.candidate_limit = candidate_limit
         self.per_query_limit = per_query_limit
@@ -182,7 +184,7 @@ class IterativeSearchAgent:
             sub_question,
             "Task entities for this atomic sub-question: " + ", ".join(key_entities)
             if key_entities else "",
-            "Task domains (context, not mandatory literal keywords): " + ", ".join(domains)
+            "Task domains (required subject areas — papers outside these domains are not applicable): " + ", ".join(domains)
             if domains else "",
         ]))
         state.remaining_budget = calculate_remaining(limits, state)
@@ -596,11 +598,31 @@ class IterativeSearchAgent:
             for paper in ranked
             if paper.rank_scores.get("semantic_not_applicable", 0.0) < 0.5
         ]
+        # Domain token overlap is a weak prior, NOT a hard reject.  Literal
+        # token mismatch can produce false negatives (e.g. "robotics" vs
+        # "robotic", "machine learning" vs "neural network").  The primary
+        # hard gate remains Scout `semantic_not_applicable`.
+        if state.domains:
+            for paper in applicable_finalists:
+                if domain_token_overlap(paper, state.domains) == 0.0:
+                    paper.rank_scores["domain_token_mismatch"] = True
+        # Note: we do NOT re-filter based on domain_token_mismatch alone.
+        # Scout's semantic applicability judgment is the definitive gate.
         final_papers, applicable_decisions = select_retained_papers(
             applicable_finalists,
             list(scout_by_paper.values()),
             final_k=self.final_k,
         )
+        if self.retention_judge_client is not None:
+            final_papers, applicable_decisions = (
+                await self._review_retention_boundary(
+                    applicable_finalists,
+                    applicable_decisions,
+                    list(scout_by_paper.values()),
+                    sub_question,
+                    key_entities,
+                )
+            )
         decisions_by_id = {
             decision.paper_id: decision for decision in applicable_decisions
         }
@@ -642,6 +664,121 @@ class IterativeSearchAgent:
             retention_decisions=retention_decisions,
             final_state=state,
         )
+
+    async def _review_retention_boundary(
+        self,
+        ranked: list[PaperRecord],
+        decisions: list[PaperRetentionDecision],
+        notes: list[ScoutNote],
+        sub_question: str,
+        key_entities: list[str],
+    ) -> tuple[list[PaperRecord], list[PaperRetentionDecision]]:
+        """Apply LLM boundary review to rule-based retention decisions.
+
+        This is called from the async ``run()`` context, so the QwenClient
+        async ``chat`` method is properly awaited.  Failure propagates as a
+        ``RuntimeError`` — the retention judge, once enabled, is required.
+        """
+        if self.retention_judge_client is None:
+            return ranked, decisions
+
+        note_by_id = {note.paper_id: note for note in notes}
+        from .ranking import paper_retention_roles, _safe_score
+
+        window_size = min(len(ranked), max(self.final_k * 2, self.final_k + 3))
+        retained_ids = {dec.paper_id for dec in decisions if dec.decision == "retain"}
+        boundary_ids: set[str] = set()
+
+        # Rejected papers inside the window
+        for dec in decisions:
+            if dec.decision == "reject" and dec.rank_position <= window_size:
+                boundary_ids.add(dec.paper_id)
+
+        # Lowest-scoring retained papers (up to 2)
+        retained_by_score = sorted(
+            [dec for dec in decisions
+             if dec.decision == "retain" and dec.paper_id not in boundary_ids],
+            key=lambda d: _safe_score(
+                ranked[d.rank_position - 1].rank_scores.get("post_scout_total"), 0.0,
+            ),
+        )
+        for dec in retained_by_score[:2]:
+            boundary_ids.add(dec.paper_id)
+
+        if not boundary_ids:
+            return ranked, decisions
+
+        boundary_papers = [p for p in ranked if p.paper_id in boundary_ids]
+        candidates_text = "\n".join(
+            f"- {p.paper_id} | {p.title or '?'} | {p.year or '?'} | "
+            f"rel={p.rank_scores.get('scout_relevance', 0.0):.2f} | "
+            f"dir={p.rank_scores.get('scout_directness', 0.0):.2f} | "
+            f"roles={','.join(paper_retention_roles(p, note_by_id.get(p.paper_id)))} | "
+            f"current={'retain' if p.paper_id in retained_ids else 'reject'}"
+            for p in boundary_papers
+        )
+        prompt = (
+            f"Sub-question: {sub_question}\n"
+            f"Key entities: {', '.join(key_entities) if key_entities else ''}\n\n"
+            f"Candidates (title | year | relevance | directness | evidence_roles | current_decision):\n"
+            f"{candidates_text}\n\n"
+            f"For each candidate above, output your retain/reject decision "
+            f"as JSON: {{\"paper_id\": \"...\", \"decision\": \"retain\"|\"reject\", "
+            f"\"rationale\": \"...\"}}.  Only re-judge boundary papers."
+        )
+        import json as _json
+        try:
+            raw = await self.retention_judge_client.chat(
+                system_prompt=(
+                    "You audit a paper retention decision for a scientific "
+                    "literature search. Decide whether each boundary candidate "
+                    "should be retained or rejected based on its unique "
+                    "contribution, directness, methodological complement, and "
+                    "recency.  Output JSON only."
+                ),
+                user_prompt=prompt,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Retention judge LLM call failed — the judge is enabled and "
+                "required. Check the retention judge client configuration."
+            ) from exc
+        try:
+            rulings = _json.loads(str(raw)) if isinstance(raw, str) else raw
+        except Exception as exc:
+            raise RuntimeError(
+                "Retention judge returned invalid JSON — structured output "
+                "is required when the retention judge is enabled."
+            ) from exc
+        if isinstance(rulings, dict):
+            rulings = [rulings]
+        if not isinstance(rulings, list):
+            raise RuntimeError(
+                "Retention judge returned unexpected output type "
+                f"{type(rulings).__name__}; expected a JSON array."
+            )
+        for ruling in rulings:
+            pid = str(ruling.get("paper_id", ""))
+            new_decision = str(ruling.get("decision", "")).lower()
+            rationale = str(ruling.get("rationale", ""))
+            if new_decision not in ("retain", "reject"):
+                continue
+            for dec in decisions:
+                if dec.paper_id == pid:
+                    if new_decision != dec.decision:
+                        dec.decision = new_decision
+                        dec.llm_override = True
+                        dec.llm_rationale = rationale
+                        if new_decision == "retain":
+                            dec.reason = f"LLM override: {rationale}"
+                        else:
+                            dec.reason = f"LLM rejected: {rationale}"
+                    break
+        retained = [
+            ranked[dec.rank_position - 1]
+            for dec in decisions if dec.decision == "retain"
+        ]
+        return retained, decisions
 
     async def _search(self, query: SearchQuery) -> list[PaperRecord]:
         source = self.sources.get(query.target_source.casefold())

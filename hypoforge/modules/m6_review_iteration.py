@@ -138,15 +138,28 @@ class M6ReviewIteration(ModuleProtocol):
                 "M6 requires an LLM client — pass llm_config / set OPENAI_API_KEY."
             )
 
-        # Nothing to review yet — just advance the iteration counter.
-        if not (state.top_hypotheses and state.research_plans):
-            return {"iteration_count": version}
+        if not state.top_hypotheses:
+            raise RuntimeError(
+                "M6 requires at least one top hypothesis to review. "
+                "Ensure M4 completed and produced candidate hypotheses."
+            )
+        if not state.research_plans:
+            raise RuntimeError(
+                "M6 requires at least one research plan to review. "
+                "Ensure M5 completed and produced plans."
+            )
 
         hypothesis = state.top_hypotheses[0]
         plan = next(
             (p for p in state.research_plans if p.hypothesis_id == hypothesis.hypothesis_id),
-            state.research_plans[0],
+            None,
         )
+        if plan is None:
+            raise RuntimeError(
+                f"M6 cannot find a research plan matching top hypothesis "
+                f"{hypothesis.hypothesis_id!r}.  M6 must review a "
+                f"hypothesis-plan pair that were designed together."
+            )
         graph = state.evidence_graph
         graph_context = build_graph_context(state)
         rendered_graph_context = graph_context.render()
@@ -156,12 +169,14 @@ class M6ReviewIteration(ModuleProtocol):
             hypothesis.model_dump_json(exclude={"task_trace"}),
             subject_text="\n".join([hypothesis.statement, hypothesis.mechanism]),
             trace=hypothesis.task_trace,
+            semantic_client=self.client,
         )
         plan_alignment = assess_task_alignment(
             state,
             plan.model_dump_json(exclude={"task_trace"}),
             subject_text=plan.study_subjects,
             trace=plan.task_trace,
+            semantic_client=self.client,
         )
         deterministic_alignment_passed = (
             hypothesis_alignment.passed and plan_alignment.passed

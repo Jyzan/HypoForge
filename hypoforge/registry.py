@@ -134,6 +134,20 @@ class ModuleRegistry:
             "m6": "plus",
         }
 
+        embedding_cfg = getattr(
+            getattr(config, "evaluation", None), "embedding", None
+        )
+        if hasattr(config, "entity_embedding_model"):
+            # Respect an explicit empty string: it means lexical-only entity
+            # normalization. Do not silently re-enable embeddings from the
+            # evaluation defaults.
+            resolved_entity_embedding_model = str(
+                getattr(config, "entity_embedding_model", "") or ""
+            )
+        else:
+            resolved_entity_embedding_model = str(
+                getattr(embedding_cfg, "model_name", "") or ""
+            )
         instances: Dict[str, ModuleProtocol] = {}
         for name in cls.list_all():
             kwargs = dict(config.get_module_kwargs(name)) if hasattr(config, "get_module_kwargs") else {}
@@ -142,21 +156,59 @@ class ModuleRegistry:
             if override is not None and override.class_name:
                 module_cls = cls._load_module_class(override.class_name, name)
             elif name == "m2" and config.search.implementation == "agentic":
-                dotted_path = "hypoforge.literature.adapter.AgenticM2Module"
-                try:
-                    module_cls = cls._load_module_class(dotted_path, "m2")
-                except ImportError as exc:
-                    raise ImportError(
-                        "Agentic M2 was selected, but AgenticM2Module is unavailable. "
-                        "Install agentic dependencies and merge Track A's adapter."
-                    ) from exc
+                # Agentic M2 is an explicit pipeline configuration choice, as
+                # in the pre-strict registry behaviour.
+                module_cls = cls._load_module_class(
+                    "hypoforge.strict_contracts.StrictAgenticM2Module", "m2"
+                )
+            elif (
+                name == "m2"
+                and module_cls.__module__ == "hypoforge.modules.m2_literature_search"
+                and module_cls.__name__ == "M2LiteratureSearch"
+            ):
+                module_cls = cls._load_module_class(
+                    "hypoforge.strict_contracts.StrictM2LiteratureSearch", "m2"
+                )
+            elif (
+                name == "m3"
+                and module_cls.__module__ == "hypoforge.modules.m3_evidence_graph"
+                and module_cls.__name__ == "M3EvidenceGraph"
+            ):
+                module_cls = cls._load_module_class(
+                    "hypoforge.strict_contracts.StrictM3EvidenceGraph", "m3"
+                )
+            elif (
+                name == "m4"
+                and module_cls.__module__ == "hypoforge.modules.m4_hypothesis_generation"
+                and module_cls.__name__ == "M4HypothesisGeneration"
+            ):
+                module_cls = cls._load_module_class(
+                    "hypoforge.strict_contracts.StrictM4HypothesisGeneration", "m4"
+                )
+            elif (
+                name == "m5"
+                and module_cls.__module__ == "hypoforge.modules.m5_research_plan"
+                and module_cls.__name__ == "M5ResearchPlan"
+            ):
+                module_cls = cls._load_module_class(
+                    "hypoforge.strict_contracts.StrictM5ResearchPlan", "m5"
+                )
+            elif (
+                name == "m6"
+                and module_cls.__module__ == "hypoforge.modules.m6_review_iteration"
+                and module_cls.__name__ == "M6ReviewIteration"
+            ):
+                module_cls = cls._load_module_class(
+                    "hypoforge.strict_contracts.StrictM6ReviewIteration", "m6"
+                )
             tier = kwargs.pop("llm_tier", default_tiers.get(name, "base"))
             if hasattr(config, "get_llm_for_tier"):
                 kwargs.setdefault("llm_config", config.get_llm_for_tier(tier))
             # M2 query generation needs a more reliable model (turbo-tier
             # returns empty output for translation tasks on some endpoints).
             if name == "m2" and hasattr(config, "get_llm_for_tier"):
-                kwargs.setdefault("query_llm_config", config.get_llm_for_tier("plus"))
+                secondary_tier = getattr(config, "secondary_model_tier", "base")
+                kwargs.setdefault("query_llm_config", config.get_llm_for_tier(secondary_tier))
 
                 if config.search.implementation == "legacy":
                     kwargs.setdefault("search_tools", config.search.tools)
@@ -170,6 +222,24 @@ class ModuleRegistry:
                         "supplement_paper_budget",
                         getattr(config, "supplement_paper_budget", 6),
                     )
+
+            if (
+                name in {"m2", "m3"}
+                and module_cls.__module__ == "hypoforge.strict_contracts"
+                and embedding_cfg is not None
+            ):
+                kwargs.setdefault(
+                    "entity_embedding_model",
+                    resolved_entity_embedding_model,
+                )
+                kwargs.setdefault(
+                    "entity_embedding_base_url",
+                    getattr(embedding_cfg, "base_url", ""),
+                )
+                kwargs.setdefault(
+                    "entity_embedding_key_env",
+                    getattr(embedding_cfg, "api_key_env_var", ""),
+                )
 
             # ---- M3 grounding config injection ----
             # The top-level `grounding:` block (GroundingConfig) is the single
@@ -220,10 +290,11 @@ class ModuleRegistry:
                 if scoring is not None:
                     kwargs.setdefault("weights", dict(scoring.hypothesis_weights))
                 kwargs.setdefault("interactive", getattr(config, "interactive", False))
-                # Ranker uses a separate (plus) tier so the model that scores
+                # Ranker uses a separate tier so the model that scores
                 # hypotheses is not the same model that generated them.
                 if hasattr(config, "get_llm_for_tier") and "ranker_llm_config" not in kwargs:
-                    kwargs["ranker_llm_config"] = config.get_llm_for_tier("plus")
+                    secondary_tier = getattr(config, "secondary_model_tier", "base")
+                    kwargs["ranker_llm_config"] = config.get_llm_for_tier(secondary_tier)
 
             instances[name] = module_cls(**kwargs)
         return instances

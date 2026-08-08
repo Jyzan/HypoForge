@@ -218,6 +218,7 @@ class M2LiteratureSearch(ModuleProtocol):
         query_disable_thinking: bool = True,
         query_max_attempts: int = 2,
         supplement_paper_budget: int = 6,
+        entity_embedding_model: str = "",
         **kwargs,
     ):
         self.search_tools = search_tools or ["semantic_scholar", "pubmed"]
@@ -235,6 +236,7 @@ class M2LiteratureSearch(ModuleProtocol):
         # (mirrors config.supplement_paper_budget; the agentic adapter is the
         # primary supplement path, legacy keeps the same cap for parity).
         self.supplement_paper_budget = max(1, int(supplement_paper_budget))
+        self.entity_embedding_model = entity_embedding_model
         self.client = QwenClient.from_config(llm_config) if llm_config else None
         # Query generation uses a separate (more reliable) model tier because
         # the turbo model often returns empty output for translation tasks on
@@ -306,6 +308,7 @@ class M2LiteratureSearch(ModuleProtocol):
                 domains=state.problem_card.domain,
                 cache_dir=state.entity_cache_dir or state.memory_cache_dir,
                 client=self.client,
+                embedding_model=self.entity_embedding_model,
             )
             entity_names = [
                 entity
@@ -404,7 +407,8 @@ class M2LiteratureSearch(ModuleProtocol):
         academic: Optional[Any] = None
         new_query_texts: List[str] = []
         new_paper_keys: List[str] = []
-        attempted_gap_ids: set = set()
+        attempted_gap_ids: set[str] = set()
+        grounded_gap_ids: set[str] = set()
         remaining_budget = self.supplement_paper_budget
 
         for gap in open_gaps:
@@ -454,6 +458,7 @@ class M2LiteratureSearch(ModuleProtocol):
 
             # -- Step 2: live gap search ----------------------------------
             attempted_gap_ids.add(gap.gap_id)
+            grounded_gap_ids.add(gap.gap_id)
             fresh_queries = dedupe_queries(candidates, issued_norms)
             if not fresh_queries or remaining_budget <= 0:
                 continue
@@ -468,10 +473,10 @@ class M2LiteratureSearch(ModuleProtocol):
             search_calls = []
             for query in fresh_queries:
                 search_calls.append(
-                    ("pubmed", pubmed.search(query, limit=remaining_budget))
+                    ("pubmed", pubmed.search_strict(query, limit=remaining_budget))
                 )
                 search_calls.append(
-                    ("academic", academic.search(query, limit=remaining_budget))
+                    ("academic", academic.search_strict(query, limit=remaining_budget))
                 )
             raw_results = await asyncio.gather(
                 *(call for _, call in search_calls),
@@ -542,7 +547,7 @@ class M2LiteratureSearch(ModuleProtocol):
         # -- Step 3: gap status + ledger (full-list return) ---------------
         updated_gaps: List[EvidenceGap] = []
         for gap in state.evidence_gaps:
-            if gap.gap_id in attempted_gap_ids and gap.status == "open":
+            if gap.gap_id in grounded_gap_ids and gap.status == "open":
                 updated_gaps.append(
                     gap.model_copy(update={"status": "pending_grounding"})
                 )
@@ -602,10 +607,13 @@ class M2LiteratureSearch(ModuleProtocol):
             logger.info("M2: %d search queries: %s", len(queries), [q[:60] for q in queries])
 
             # --- Step 1: search every query across both backends ---
+            # Use strict APIs that propagate backend failures rather than
+            # silently returning [].  This lets us distinguish "backend error"
+            # from "successful search that returned zero results".
             search_calls = []
             for q in queries:
-                search_calls.append(("pubmed", pubmed.search(q, limit=limit)))
-                search_calls.append(("academic", academic.search(q, limit=limit)))
+                search_calls.append(("pubmed", pubmed.search_strict(q, limit=limit)))
+                search_calls.append(("academic", academic.search_strict(q, limit=limit)))
             raw_results = await asyncio.gather(
                 *(call for _, call in search_calls),
                 return_exceptions=True,
@@ -613,11 +621,26 @@ class M2LiteratureSearch(ModuleProtocol):
 
             pubmed_papers: List[dict] = []
             acad_papers: List[dict] = []
+            successful_backends: set[str] = set()
+            failed_backends: set[str] = set()
             for (backend, _), res in zip(search_calls, raw_results):
                 if isinstance(res, Exception):
                     logger.warning("%s search failed: %s", backend, res)
+                    failed_backends.add(backend)
                     continue
+                successful_backends.add(backend)
                 (pubmed_papers if backend == "pubmed" else acad_papers).extend(res)
+
+            # Total API failure: zero backends produced a response.
+            # A backend that returned [] is a successful search with zero
+            # results — it is NOT a backend failure.
+            if not successful_backends:
+                attempted = {b for b, _ in search_calls}
+                raise RuntimeError(
+                    f"M2 search total failure for sub-question {sq!r}: "
+                    f"all attempted backends ({', '.join(sorted(attempted))}) "
+                    f"raised exceptions.  Cannot produce any results."
+                )
 
             # --- Step 2: merge & deduplicate ---
             all_papers = _merge_deduplicate(pubmed_papers, acad_papers)
@@ -650,11 +673,25 @@ class M2LiteratureSearch(ModuleProtocol):
                     *[_bounded_batch(b) for b in batches],
                     return_exceptions=True,
                 )
+                failed_batches = 0
                 for entries in entry_lists:
                     if isinstance(entries, Exception):
                         logger.warning("M2 batch extraction failed: %s", entries)
+                        failed_batches += 1
                         continue
                     all_entries.extend(entries)
+                if failed_batches == len(batches) and top_papers:
+                    raise RuntimeError(
+                        f"M2 extraction total failure for sub-question {sq!r}: "
+                        f"all {len(batches)} batch(es) for {len(top_papers)} "
+                        f"paper(s) failed.  Cannot produce knowledge entries."
+                    )
+                if top_papers and not all_entries:
+                    raise RuntimeError(
+                        f"M2 extraction produced no knowledge entries for "
+                        f"sub-question {sq!r} despite {len(top_papers)} "
+                        f"retrieved paper(s)."
+                    )
 
             results.append(LiteratureResult(
                 sub_question=sq,
@@ -805,7 +842,13 @@ class M2LiteratureSearch(ModuleProtocol):
                 max_tokens=16384,
                 temperature=getattr(self.llm_config, "temperature", 0.1),
             )
-        except Exception:
+        except Exception as exc:
+            if self.client is not None:
+                raise RuntimeError(
+                    f"M2 batch knowledge extraction failed for "
+                    f"{len(papers)} paper(s).  An LLM client is explicitly "
+                    f"configured and extraction is required."
+                ) from exc
             logger.exception("Batch extraction failed (%d papers)", len(papers))
             return []
 
@@ -907,7 +950,13 @@ class M2LiteratureSearch(ModuleProtocol):
                 max_tokens=16384,  # Knowledge extraction can produce large responses
                 temperature=getattr(self.llm_config, "temperature", 0.1),
             )
-        except Exception:
+        except Exception as exc:
+            if self.client is not None:
+                raise RuntimeError(
+                    f"M2 knowledge extraction failed for {source_id}.  "
+                    f"An LLM client is explicitly configured and extraction "
+                    f"is required."
+                ) from exc
             logger.exception("Qwen extraction failed for %s", source_id)
             return []
 
