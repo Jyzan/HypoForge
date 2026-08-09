@@ -742,7 +742,6 @@ class StrictAgenticM2Adapter(AgenticM2Adapter):
         card = state.problem_card
         key_entities = card.key_entities if card else []
         domains = card.domain if card else []
-        question_type = card.question_type.value if card else ""
         store = None
         if state.memory_cache_dir:
             try:
@@ -840,7 +839,6 @@ class StrictAgenticM2Adapter(AgenticM2Adapter):
                 fresh_queries,
                 key_entities=key_entities,
                 domains=domains,
-                question_type=question_type,
                 paper_limit=remaining_budget,
             )
             new_query_texts.extend(fresh_queries)

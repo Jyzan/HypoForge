@@ -241,8 +241,6 @@ class AgenticM2Adapter(ModuleProtocol):
             else [state.input_question]
         )
         domains = problem_card.domain if problem_card else []
-        question_type = problem_card.question_type.value if problem_card else ""
-
         literature_results: list[LiteratureResult] = []
         export_runs = []
         executed_queries: dict[str, list[str]] = {}
@@ -252,7 +250,6 @@ class AgenticM2Adapter(ModuleProtocol):
                 sub_question,
                 key_entities=key_entities,
                 domains=domains,
-                question_type=question_type,
                 budget=self.budget,
             )
             if search_result.stop_reason is StopReason.ERROR:
@@ -371,8 +368,6 @@ class AgenticM2Adapter(ModuleProtocol):
         problem_card = state.problem_card
         key_entities = problem_card.key_entities if problem_card else []
         domains = problem_card.domain if problem_card else []
-        question_type = problem_card.question_type.value if problem_card else ""
-
         # Cache availability degrades gracefully: no memory_cache_dir → skip
         # the lookup step and go straight to searching.
         store: Optional[PaperStore] = None
@@ -468,7 +463,6 @@ class AgenticM2Adapter(ModuleProtocol):
                 fresh_queries,
                 key_entities=key_entities,
                 domains=domains,
-                question_type=question_type,
                 paper_limit=remaining_budget,
             )
             new_query_texts.extend(fresh_queries)
@@ -677,7 +671,6 @@ class AgenticM2Adapter(ModuleProtocol):
         *,
         key_entities: Sequence[str],
         domains: Sequence[str],
-        question_type: str,
         paper_limit: int,
     ):
         """Run one bounded search round for a gap's queries."""
@@ -728,7 +721,6 @@ class AgenticM2Adapter(ModuleProtocol):
             sub_question,
             key_entities=key_entities,
             domains=domains,
-            question_type=question_type,
             budget=budget,
         )
         if result.stop_reason is StopReason.ERROR:

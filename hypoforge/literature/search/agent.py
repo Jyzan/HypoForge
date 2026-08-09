@@ -304,7 +304,6 @@ class IterativeSearchAgent:
         started_at = self.clock()
         deadline_started_at = time.monotonic()
         state = SearchState(
-            question_type=question_type,
             key_entities=set(key_entities),
             domains=set(domains),
         )
@@ -411,7 +410,6 @@ class IterativeSearchAgent:
                         sub_question,
                         key_entities=key_entities,
                         domains=domains,
-                        question_type=question_type,
                         state=state.model_copy(deep=True),
                     ),
                 )
@@ -888,7 +886,7 @@ class IterativeSearchAgent:
             module="m2",
             tool="retention_judge",
             status="running",
-            message="M2 ???? LLM ??/??????",
+            message="M2 开始进行 LLM 论文保留裁决",
             details={"candidates": len(boundary_papers), "window_size": window_size},
         )
         try:
@@ -916,11 +914,11 @@ class IterativeSearchAgent:
                 module="m2",
                 tool="retention_judge",
                 status="failed",
-                message=f"LLM ??????: {type(exc).__name__}: {exc}",
+                message=f"LLM 论文保留裁决失败: {type(exc).__name__}: {exc}",
                 details={"candidates": len(boundary_papers)},
             )
             raise RuntimeError(
-                "Retention judge LLM call failed ? the judge is enabled and "
+                "Retention judge LLM call failed — the judge is enabled and "
                 "required. Check the retention judge client configuration."
             ) from exc
         try:
@@ -965,7 +963,7 @@ class IterativeSearchAgent:
             module="m2",
             tool="retention_judge",
             status="completed",
-            message="LLM ??????",
+            message="LLM 论文保留裁决完成",
             details={
                 "candidates": len(boundary_papers),
                 "retained": len(retained),

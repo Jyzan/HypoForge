@@ -119,7 +119,7 @@ async def test_mechanism_coverage_requires_grounded_support_but_not_contradictio
 
 
 @pytest.mark.asyncio
-async def test_method_profile_uses_methodological_directness() -> None:
+async def test_methodological_bucket_alone_does_not_bypass_grounded_support() -> None:
     papers = [paper(index, year=2024) for index in range(3)]
     notes = [
         note(
@@ -152,12 +152,13 @@ async def test_method_profile_uses_methodological_directness() -> None:
         SearchState(question_type="method_development"),
     )
 
-    assert report.sufficient is True
+    assert report.sufficient is False
     assert EvidenceBucket.METHODOLOGICAL in report.covered_buckets
+    assert any("citable evidence" in gap for gap in report.missing_topics)
 
 
 @pytest.mark.asyncio
-async def test_discovery_profile_requires_support_recent_and_two_papers() -> None:
+async def test_all_questions_use_the_same_minimum_relevant_paper_gate() -> None:
     papers = [paper(index, year=2026) for index in range(2)]
     notes = [note(0, support=True), note(1)]
     report = await CoverageEvaluator(
@@ -168,7 +169,8 @@ async def test_discovery_profile_requires_support_recent_and_two_papers() -> Non
         notes,
         SearchState(question_type="phenomenon_discovery"),
     )
-    assert report.sufficient is True
+    assert report.sufficient is False
+    assert any("1 more needed" in gap for gap in report.missing_topics)
 
     sparse = await CoverageEvaluator(
         FakeStructuredClient(), current_year=2026
@@ -189,6 +191,31 @@ async def test_unknown_question_type_uses_conservative_general_gate() -> None:
         FakeStructuredClient(), current_year=2026
     ).evaluate("question", papers, notes, SearchState())
     assert report.sufficient is True
+
+
+@pytest.mark.asyncio
+async def test_legacy_question_type_cannot_change_the_evidence_gate() -> None:
+    """Old snapshots may carry this field, but M2 must ignore it."""
+
+    papers, notes = mechanism_inputs()
+    reports = []
+    for legacy_value in [
+        "mechanism_explanation",
+        "method_development",
+        "phenomenon_discovery",
+        "",
+    ]:
+        reports.append(await CoverageEvaluator(
+            FakeStructuredClient(), current_year=2026
+        ).evaluate(
+            "How does Hsp70 regulate folding?",
+            papers,
+            notes,
+            SearchState(question_type=legacy_value),
+        ))
+
+    first = reports[0].model_dump(mode="json")
+    assert all(report.model_dump(mode="json") == first for report in reports[1:])
 
 
 @pytest.mark.asyncio

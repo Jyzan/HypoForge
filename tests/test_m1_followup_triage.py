@@ -1,255 +1,206 @@
-"""Tests for M1 followup triage hardening (task #22).
-
-Covers:
-* deterministic format-only shortcut — hit with plans / best_hypotheses,
-  miss when the parent run has no downstream artefacts, miss for semantic
-  follow-ups;
-* prompt rule existence (formatting class, no-new-entity guard, rationale);
-* audit trail — rationale / decision_source land in ``tool_completed``
-  event details on both the shortcut and the LLM path.
-"""
+"""Behavior tests for mandatory LLM-based M1 follow-up triage."""
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any
 
 import pytest
 
 from hypoforge.modules.m1_problem_understanding import M1ProblemUnderstanding
-from hypoforge.prompts.m1_prompts import (
-    M1_FOLLOWUP_SYSTEM_PROMPT,
-    M1_FOLLOWUP_USER_TEMPLATE,
-)
 from hypoforge.state import (
+    EvidenceGraph,
+    EvidenceNode,
     FollowupRequest,
     HypothesisCard,
-    LiteratureResult,
     PipelineState,
     ProblemCard,
-    ResearchPlan,
 )
 
 
-# --------------------------------------------------------------------------- #
-# Fixtures / helpers
-# --------------------------------------------------------------------------- #
+class ScriptedClient:
+    def __init__(self, *payloads: Any):
+        self.payloads = list(payloads)
+        self.calls: list[dict[str, Any]] = []
 
-class _FakeClient:
-    """Records structured_chat calls and returns a canned payload."""
-
-    def __init__(self, payload: Dict[str, Any]):
-        self.payload = payload
-        self.calls: List[Dict[str, Any]] = []
-
-    async def structured_chat(self, **kwargs: Any) -> Dict[str, Any]:
+    async def structured_chat(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(kwargs)
-        return self.payload
+        if not self.payloads:
+            raise AssertionError("unexpected extra M1 LLM call")
+        payload = self.payloads.pop(0)
+        if isinstance(payload, BaseException):
+            raise payload
+        return payload
 
 
-class _ExplodingClient:
-    """Any LLM call fails loudly — proves the shortcut avoided the model."""
-
-    async def structured_chat(self, **kwargs: Any) -> Dict[str, Any]:
-        raise AssertionError("LLM must not be called for format-only followups")
-
-
-def _module(client: Any) -> M1ProblemUnderstanding:
-    mod = M1ProblemUnderstanding(mode="llm", followup_routing=True)
-    mod.client = client
-    return mod
+def make_module(client: Any, *, threshold: float = 0.75) -> M1ProblemUnderstanding:
+    module = M1ProblemUnderstanding(
+        mode="llm",
+        followup_routing=True,
+        followup_triage_confidence_threshold=threshold,
+    )
+    module.client = client
+    return module
 
 
-def _parent_state(
-    followup_text: str,
+def triage_payload(
+    category: str = "presentation_adjustment",
     *,
-    plans: bool = True,
-    best: bool = False,
-    literature: bool = True,
-) -> PipelineState:
+    skip_search: bool = True,
+    rebuild_problem_card: bool = False,
+    confidence: float = 0.99,
+) -> dict[str, Any]:
+    return {
+        "category": category,
+        "skip_search": skip_search,
+        "rebuild_problem_card": rebuild_problem_card,
+        "rationale": "仅调整语言和呈现方式。",
+        "confidence": confidence,
+    }
+
+
+def parent_state(text: str, *, graph: bool = True) -> PipelineState:
+    evidence_graph = None
+    if graph:
+        evidence_graph = EvidenceGraph(nodes=[
+            EvidenceNode(id="n1", type="claim", label="NRF2 evidence")
+        ])
     return PipelineState(
-        input_question=followup_text,
+        input_question=text,
         problem_card=ProblemCard(
             original_question="Nrf2 激动剂在阿尔茨海默病中的神经保护机制",
             domain=["neuroscience"],
             sub_questions=["Nrf2 通路如何调控氧化应激？"],
-            key_entities=["NRF2"],
+            key_entities=["Nrf2 激动剂", "阿尔茨海默病"],
         ),
-        followup=FollowupRequest(text=followup_text, parent_run_id="run-parent"),
-        literature_results=(
-            [LiteratureResult(sub_question="q1", papers_retrieved=10)]
-            if literature
-            else []
-        ),
-        research_plans=[ResearchPlan(hypothesis_id="h1")] if plans else [],
-        best_hypotheses=(
-            [HypothesisCard(hypothesis_id="h1", statement="s1")] if best else []
-        ),
+        followup=FollowupRequest(text=text, parent_run_id="parent-run"),
+        evidence_graph=evidence_graph,
+        best_hypotheses=[HypothesisCard(hypothesis_id="h1", statement="s1")],
     )
 
 
-def _collect_events(monkeypatch) -> List[Dict[str, Any]]:
-    events: List[Dict[str, Any]] = []
-
-    def _spy(event_type: str, **kwargs: Any) -> None:
-        events.append({"event_type": event_type, **kwargs})
-
-    monkeypatch.setattr(
-        "hypoforge.modules.m1_problem_understanding.emit_event", _spy
-    )
-    return events
-
-
-def _llm_payload(skip_search: bool = True) -> Dict[str, Any]:
-    return {
-        "problem_card": {
-            "original_question": "Nrf2 激动剂在阿尔茨海默病中的神经保护机制",
-            "domain": ["neuroscience"],
-            "sub_questions": ["Nrf2 通路如何调控氧化应激？"],
-            "key_entities": ["NRF2"],
-            "question_type": "mechanism_explanation",
-        },
-        "skip_search": skip_search,
-        "rationale": "格式类追问，沿用父卡，无需检索。",
-    }
-
-
-# --------------------------------------------------------------------------- #
-# Deterministic shortcut — hits
-# --------------------------------------------------------------------------- #
-
 @pytest.mark.asyncio
-@pytest.mark.parametrize("followup_text", [
-    "请你给我中文方案",
-    "给我中文版",
-    "翻译成中文",
-    "把方案改成英文",
-    "重新排版",
-    "再给我一遍方案",
-])
-async def test_format_followup_shortcircuits_with_plans(
-    monkeypatch, followup_text
-):
-    events = _collect_events(monkeypatch)
-    mod = _module(_ExplodingClient())  # LLM must never be called
-    patch = await mod(_parent_state(followup_text, plans=True))
+@pytest.mark.parametrize(
+    "text",
+    ["给我中文方案", "翻译成英文", "改成表格", "写得更简洁"],
+)
+async def test_presentation_followup_always_calls_llm_and_reuses_parent_card(
+    text: str,
+) -> None:
+    """Removing the LLM triage call would silently bypass user-intent review."""
 
+    client = ScriptedClient(triage_payload())
+    module = make_module(client)
+    state = parent_state(text)
+
+    patch = await module(state)
+
+    assert len(client.calls) == 1
     assert patch["followup"].skip_search is True
-    # ProblemCard must be the parent card verbatim — no invented entities.
-    assert patch["problem_card"].key_entities == ["NRF2"]
-    assert patch["problem_card"].domain == ["neuroscience"]
-
-    completed = [
-        e for e in events
-        if e["event_type"] == "tool_completed"
-        and e["tool"] == "followup_format_shortcut"
-    ]
-    assert len(completed) == 1
-    details = completed[0]["details"]
-    assert details["skip_search"] is True
-    assert details["decision_source"] == "deterministic_shortcut"
-    assert details["rationale"]
-    assert details["matched_pattern"]
+    assert patch["problem_card"] == state.problem_card
+    assert patch["problem_card"] is not state.problem_card
 
 
 @pytest.mark.asyncio
-async def test_format_followup_shortcircuits_with_best_hypotheses_only(
-    monkeypatch,
-):
-    _collect_events(monkeypatch)
-    mod = _module(_ExplodingClient())
-    state = _parent_state("请你给我中文方案", plans=False, best=True)
-    patch = await mod(state)
-    assert patch["followup"].skip_search is True
+async def test_presentation_followup_without_reusable_graph_fails_open_to_search() -> None:
+    """A formatting decision cannot route into an evidence-free M4 run."""
 
+    client = ScriptedClient(triage_payload())
+    module = make_module(client)
 
-# --------------------------------------------------------------------------- #
-# Deterministic shortcut — misses
-# --------------------------------------------------------------------------- #
+    patch = await module(parent_state("给我中文方案", graph=False))
 
-@pytest.mark.asyncio
-async def test_format_followup_without_artifacts_falls_back_to_llm(monkeypatch):
-    _collect_events(monkeypatch)
-    client = _FakeClient(_llm_payload(skip_search=True))
-    mod = _module(client)
-    state = _parent_state("请你给我中文方案", plans=False, best=False)
-    patch = await mod(state)
-
-    assert len(client.calls) == 2  # triage + TaskContract repair retry
-    assert patch["followup"].skip_search is True
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("followup_text", [
-    "聚焦阿尔茨海默方向",
-    "换成帕金森模型重新分析",
-    "用中文总结最新的Nrf2激动剂",
-    "补充关于线粒体自噬的证据",
-])
-async def test_semantic_followup_never_shortcircuits(monkeypatch, followup_text):
-    _collect_events(monkeypatch)
-    client = _FakeClient(_llm_payload(skip_search=False))
-    mod = _module(client)
-    patch = await mod(_parent_state(followup_text, plans=True))
-
-    assert len(client.calls) == 2  # triage + TaskContract repair, not shortcut
+    assert len(client.calls) == 1
     assert patch["followup"].skip_search is False
 
 
-# --------------------------------------------------------------------------- #
-# Prompt rules
-# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_low_confidence_followup_fails_open_to_search() -> None:
+    """Uncertain triage must spend search cost rather than reuse wrong evidence."""
 
-def test_followup_prompt_has_formatting_rules():
-    prompt = M1_FOLLOWUP_SYSTEM_PROMPT
-    assert "formatting/language/presentation" in prompt
-    assert "skip_search=true" in prompt
-    # format-only follow-ups must never add new entities
-    assert "NEVER add new entities" in prompt
-    # the search-bias is scoped to genuinely new directions
-    assert "search when in doubt" in prompt
-    assert "rationale" in prompt
-    assert "{parent_artifacts_summary}" in M1_FOLLOWUP_USER_TEMPLATE
+    client = ScriptedClient(triage_payload(confidence=0.40))
+    module = make_module(client)
 
+    patch = await module(parent_state("帮我调整一下"))
 
-def test_parent_artifacts_summary_mentions_completeness():
-    state = _parent_state("x", plans=True, best=True)
-    summary = M1ProblemUnderstanding._parent_artifacts_summary(state)
-    assert "10 paper(s)" in summary
-    assert "best_hypotheses: already produced" in summary
-    assert "research_plans: already produced" in summary
-    assert "ONLY if the follow-up" in summary
+    assert patch["followup"].skip_search is False
 
-
-# --------------------------------------------------------------------------- #
-# Audit trail — rationale in events (both paths)
-# --------------------------------------------------------------------------- #
 
 @pytest.mark.asyncio
-async def test_llm_triage_rationale_lands_in_event(monkeypatch):
-    events = _collect_events(monkeypatch)
-    mod = _module(_FakeClient(_llm_payload(skip_search=True)))
-    state = _parent_state("帮我精简一点", plans=True)  # not whitelisted
-    await mod(state)
+async def test_inconsistent_presentation_flags_fail_open_to_search() -> None:
+    """A malformed decision cannot claim presentation-only while rebuilding."""
 
-    assert len(events) > 0
+    client = ScriptedClient(triage_payload(rebuild_problem_card=True))
+    module = make_module(client)
+
+    patch = await module(parent_state("给我中文方案"))
+
+    assert patch["followup"].skip_search is False
+
+
+@pytest.mark.asyncio
+async def test_research_change_requests_full_m1_path() -> None:
+    client = ScriptedClient(triage_payload(
+        "research_change",
+        skip_search=False,
+        rebuild_problem_card=True,
+    ))
+    module = make_module(client)
+    rebuilt = ProblemCard(
+        original_question="combined research task",
+        domain=["neuroscience"],
+        sub_questions=["new atomic question"],
+        key_entities=["new object"],
+    )
+    received: list[str] = []
+
+    async def rebuild(question: str) -> ProblemCard:
+        received.append(question)
+        return rebuilt
+
+    module._understand_question = rebuild
+
+    patch = await module(parent_state("加入帕金森病模型重新研究"))
+
+    assert patch["followup"].skip_search is False
+    assert patch["problem_card"] is rebuilt
+    assert len(received) == 1
+    assert "Original research question:" in received[0]
+    assert "research-changing follow-up:" in received[0]
+
+
+@pytest.mark.asyncio
+async def test_triage_event_records_llm_rationale(monkeypatch) -> None:
+    events: list[dict[str, Any]] = []
+
+    def record(event_type: str, **kwargs: Any) -> None:
+        events.append({"event_type": event_type, **kwargs})
+
+    monkeypatch.setattr(
+        "hypoforge.modules.m1_problem_understanding.emit_event",
+        record,
+    )
+    module = make_module(ScriptedClient(triage_payload()))
+
+    await module(parent_state("给我中文方案"))
+
     completed = [
-        e for e in events
-        if e["event_type"] == "tool_completed"
-        and e["tool"] == "qwen_followup_triage"
+        event for event in events
+        if event["event_type"] == "tool_completed"
+        and event.get("tool") == "qwen_followup_triage"
     ]
     assert len(completed) == 1
-    details = completed[0]["details"]
-    assert details["rationale"] == "格式类追问，沿用父卡，无需检索。"
-    assert details["decision_source"] == "llm_triage"
+    assert completed[0]["details"]["decision_source"] == "llm_triage"
+    assert completed[0]["details"]["rationale"] == "仅调整语言和呈现方式。"
 
 
 @pytest.mark.asyncio
-async def test_llm_triage_receives_parent_artifact_summary(monkeypatch):
-    _collect_events(monkeypatch)
-    client = _FakeClient(_llm_payload(skip_search=True))
-    mod = _module(client)
-    await mod(_parent_state("聚焦阿尔茨海默方向", plans=True))
+async def test_triage_receives_parent_artifact_summary() -> None:
+    client = ScriptedClient(triage_payload())
+    module = make_module(client)
 
-    user_prompt = client.calls[0]["user_prompt"]
-    assert "Parent run artefacts:" in user_prompt
-    assert "10 paper(s) already retrieved" in user_prompt
+    await module(parent_state("给我中文方案"))
+
+    prompt = client.calls[0]["user_prompt"]
+    assert "Parent run artefacts:" in prompt
+    assert "best_hypotheses: already produced" in prompt
+    assert "给我中文方案" in prompt

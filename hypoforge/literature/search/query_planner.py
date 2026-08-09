@@ -150,7 +150,6 @@ _QUERY_PLANNING_USER_FIRST = """\
 ## Domain & Context
 - Domains: {domains}
 - Key Entities: {entities}
-- Question Type: {question_type}
 
 ## Current Search State
 - Round: 1/{max_rounds}
@@ -177,7 +176,6 @@ _QUERY_PLANNING_USER_RETRY = """\
 ## Domain & Context
 - Domains: {domains}
 - Key Entities: {entities}
-- Question Type: {question_type}
 
 ## Current Search State
 - Round: {round}/{max_rounds}
@@ -247,6 +245,8 @@ class QueryPlanner(QueryPlannerProtocol):
         round/gap information from a prior iteration, the planner
         produces targeted follow-up queries.
         """
+        # ``question_type`` is accepted only for historical caller
+        # compatibility; planning is derived from the atomic sub-question.
         if state is not None:
             # Iterative round — use state to inform gap-filling queries
             round_num = state.round_index + 1
@@ -268,7 +268,6 @@ class QueryPlanner(QueryPlannerProtocol):
             sub_question=sub_question,
             domains=list(domains),
             entities=list(key_entities),
-            question_type=question_type,
             round_num=round_num,
             paper_count=paper_count,
             queries_used=queries_used,
@@ -299,7 +298,6 @@ class QueryPlanner(QueryPlannerProtocol):
             sub_question=sub_question,
             domains=domains or [],
             entities=entities or [],
-            question_type=question_type,
             round_num=round_num,
             paper_count=paper_count,
             queries_used=queries_used,
@@ -316,7 +314,6 @@ class QueryPlanner(QueryPlannerProtocol):
         sub_question: str,
         domains: List[str],
         entities: List[str],
-        question_type: str,
         round_num: int,
         paper_count: int,
         queries_used: List[str],
@@ -336,7 +333,6 @@ class QueryPlanner(QueryPlannerProtocol):
                 sub_question=sub_question,
                 domains=", ".join(domains) if domains else "unknown",
                 entities=", ".join(entities) if entities else "unknown",
-                question_type=question_type or "unknown",
                 max_rounds=self._max_rounds,
                 unavailable_sources=(
                     ", ".join(unavailable_sources) if unavailable_sources else "(none)"
@@ -347,7 +343,6 @@ class QueryPlanner(QueryPlannerProtocol):
                 sub_question=sub_question,
                 domains=", ".join(domains) if domains else "unknown",
                 entities=", ".join(entities) if entities else "unknown",
-                question_type=question_type or "unknown",
                 round=round_num,
                 max_rounds=self._max_rounds,
                 paper_count=paper_count,

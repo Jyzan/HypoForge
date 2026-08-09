@@ -9,63 +9,30 @@ For the given question, you must:
 1. **Identify domains** — which scientific or engineering fields does this question span?
    (e.g. structural biology, robotics, control, materials science, genomics, …)
 
-2. **Decompose into 3–5 atomic sub-questions** — each must contain exactly one
+2. **Decompose into atomic sub-questions** — target 3–5 and never exceed 5.
+Each must contain exactly one
 research object and one relation/action. Split mechanism, method, modification,
 environment, or evaluation tasks into separate questions. Do not use semicolons,
 parenthesized enumerations, parallel requests, or more than one question mark.
 
-3. **Extract key entities** — short domain-specific noun phrases central to the
-question (for example proteins, drugs, robot manipulators, domain randomization,
-control latency, materials, populations). Do not output definitions or sentences.
+3. At least one sub-question must directly preserve the original core action.
+If the user asks how to implement something, a background or influencing-factor
+question cannot replace the requested implementation question.
 
-4. **Build a task contract** — assign stable IDs to task entities and atomic
-requirements. This is a domain-neutral identity contract consumed by every later
-module:
-   - Mark the actual system/population/material being studied as
-     ``primary_object`` and ``required=true``.
-   - Give each entity its common aliases, including a standard English search
-     term when the question is not English. Aliases must mean the same concept;
-     do not add related-but-different objects.
-   - Create exactly one requirement for each sub-question. Each requirement has
-     one ``primary_entity_id``, one short relation/action, and only the additional
-     entity IDs needed for that atomic question.
-   - IDs must be unique and stable within the card (``E1``, ``E2``, ... and
-     ``R1``, ``R2``, ...). Set ``source`` to ``m1``.
+4. Never promote a concrete technique that the user did not name into a core
+sub-question. Keep the question at the method-category level and let literature
+retrieval discover candidate techniques.
 
-5. **Classify the question type**:
-   - *mechanism_explanation* — "how does X work?"
-   - *method_development* — "can we build a tool to do X?"
-   - *phenomenon_discovery* — "does X exist / happen?"
+5. Merge parallel aspects of the same relation rather than fragmenting them
+into separate questions.
+
+Do not generate key entities, aliases, task contracts, or question categories
+in this call. They are handled by later isolated stages.
 
 Output a valid JSON object with the following schema:
 {
-  "original_question": "...",
   "domain": ["...", "..."],
-  "sub_questions": ["...", "..."],
-  "key_entities": ["...", "..."],
-  "question_type": "mechanism_explanation",
-  "task_contract": {
-    "source": "m1",
-    "entities": [
-      {
-        "entity_id": "E1",
-        "name": "...",
-        "aliases": ["..."],
-        "role": "primary_object",
-        "required": true
-      }
-    ],
-    "requirements": [
-      {
-        "requirement_id": "R1",
-        "sub_question": "exact text from sub_questions",
-        "primary_entity_id": "E1",
-        "related_entity_ids": ["E2"],
-        "relation": "one short relation or action",
-        "required": true
-      }
-    ]
-  }
+  "sub_questions": ["...", "..."]
 }
 """
 
@@ -74,60 +41,188 @@ Original question: {question}
 """
 
 
+M1_COVERAGE_CHECK_SYSTEM_PROMPT = """\
+You audit whether a list of scientific sub-questions preserves the user's
+original intent and has an appropriate granularity.
+
+Judge all of these independently:
+- `sufficient`: the answers together can reconstruct the requested answer;
+- `core_intent_covered`: at least one sub-question directly carries the
+  original core action (for example how to implement, why it happens, or
+  whether it exists);
+- `missing_aspects`: only aspects explicitly required or necessarily implied
+  by the original question;
+- `over_fragmented`: parallel aspects of the same relation were split into
+  separate questions;
+- `merge_instructions`: exact groups to merge when over-fragmented.
+
+Do not invent a concrete technology that the original question did not name.
+Return JSON only.
+"""
+
+M1_COVERAGE_CHECK_USER_TEMPLATE = """\
+Original user question:
+{question}
+
+Current sub-questions:
+{sub_questions_text}
+"""
+
+M1_COVERAGE_SUPPLEMENT_SYSTEM_PROMPT = """\
+Generate exactly one short atomic sub-question for each supplied missing
+aspect. Each result contains one research object, one relation/action, and at
+most one question mark. Do not introduce a concrete method not named by the
+user. Return JSON with only `sub_questions`.
+"""
+
+M1_COVERAGE_SUPPLEMENT_USER_TEMPLATE = """\
+Original user question:
+{question}
+
+Existing sub-questions:
+{sub_questions_text}
+
+Missing aspects:
+{missing_aspects_text}
+"""
+
+M1_COVERAGE_MERGE_SYSTEM_PROMPT = """\
+Merge only the over-fragmented groups described by the audit. Return the full
+sub-question list, preserve all unmerged questions and the original core
+action, keep every result atomic, and never return more than 5 sub-questions.
+Return JSON with only `sub_questions`.
+"""
+
+M1_COVERAGE_MERGE_USER_TEMPLATE = """\
+Original user question:
+{question}
+
+Current sub-questions:
+{sub_questions_text}
+
+Merge instructions:
+{merge_instructions_text}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Source-bounded entity extraction and independent audit
+# ---------------------------------------------------------------------------
+
+M1_ENTITY_EXTRACTION_SYSTEM_PROMPT = """\
+Extract task entities from the original user question only.
+
+Rules:
+- Every entity name and `source_mention` must be the same literal professional
+  term or role that appears verbatim in the original question.
+- Include the directly discussed research object as a required
+  `primary_object`.
+- Also include explicitly named methods, interventions, outcomes, contexts,
+  and constraints when they are important to the task.
+- Do not use generated sub-questions, background knowledge, inferred methods,
+  examples, or likely solutions as entity sources.
+- Aliases may clarify an entity, but aliases are not independent entities and
+  cannot justify an entity absent from the original question.
+
+Return JSON with only `entities`.
+"""
+
+M1_ENTITY_EXTRACTION_USER_TEMPLATE = """\
+Original user question:
+{question}
+"""
+
+M1_ENTITY_AUDIT_SYSTEM_PROMPT = """\
+You are an independent source-grounding auditor. Compare candidate entities
+only with the original user question.
+
+For every candidate, accept it only when its name is a literal professional
+term or role in the original question. Report the exact source mention. Also
+list important explicit task entities that extraction missed. At least one
+accepted required `primary_object` must represent the object directly studied
+by the question. Do not infer entities from scientific knowledge or possible
+answers. Return JSON only.
+"""
+
+M1_ENTITY_AUDIT_USER_TEMPLATE = """\
+Original user question:
+{question}
+
+Candidate entities:
+{candidate_entities_json}
+"""
+
+M1_ENTITY_REPAIR_NOTE_TEMPLATE = """\
+
+The previous independent audit found these issues:
+{audit_feedback}
+Return a corrected entity list grounded only in the original user question.
+"""
+
+
+M1_REQUIREMENT_SYSTEM_PROMPT = """\
+Build a requirement mapping from the supplied final sub-questions and fixed
+audited entities.
+
+Rules:
+- Return exactly one requirement for every supplied sub-question.
+- Copy every sub-question verbatim; do not rewrite, merge, or add questions.
+- Use only the supplied entity IDs. Never create, rename, or infer an entity.
+- `primary_entity_id` must be non-empty and identify the main object addressed
+  by that sub-question.
+- `related_entity_ids` may contain only other relevant supplied IDs.
+- `relation` must concisely state the single relation or action investigated.
+- Assign stable requirement IDs R1, R2, ... in sub-question order.
+
+Return JSON with only `requirements`.
+"""
+
+M1_REQUIREMENT_USER_TEMPLATE = """\
+Final sub-questions (copy verbatim):
+{sub_questions_json}
+
+Fixed audited entities (these are the only allowed entities):
+{entities_json}
+{repair_note}
+"""
+
+
 # ---------------------------------------------------------------------------
 # Followup triage (iteration core; only when followup_routing is enabled)
 # ---------------------------------------------------------------------------
 
 M1_FOLLOWUP_SYSTEM_PROMPT = """\
-You are an expert in biomedical research methodology. A user has asked a \
-FOLLOW-UP question on top of an already-analysed scientific problem. You must:
+You are a cross-disciplinary follow-up routing judge. Classify the user's
+follow-up without generating, rewriting, or returning any ProblemCard,
+sub-question, domain, entity, hypothesis, or plan.
 
-1. **Classify the follow-up first** — exactly one of:
-   - *formatting/language/presentation* — asks to change HOW the existing \
-results are presented, never WHAT was researched: translation (e.g. "给我中文\
-版" / "give it in English"), re-layout, re-formatting, changing length or \
-style, or simply asking for the same deliverable again (e.g. "再给我一遍方案").
-   - *direction_refinement* — narrows or re-emphasises the research focus \
-without introducing anything genuinely new.
-   - *new_direction* — introduces new biomedical entities, mechanisms, or \
-research domains.
+Choose exactly one category:
 
-2. **Update the ProblemCard**:
-   - For formatting/language/presentation follow-ups you MUST return the \
-parent ProblemCard UNCHANGED. Do NOT add, remove, or reinterpret any domain, \
-sub-question, or key entity. Words such as "方案" / "plan" / "version" that \
-merely refer back to the existing deliverable are NOT new research \
-directions, and format-only follow-ups must NEVER add new entities to the \
-ProblemCard.
-   - For the other two classes, update the card to reflect the combined \
-intent of the original question and the follow-up (domains, 3–5 \
-sub-questions, key entities, question type).
+1. `presentation_adjustment`: only changes language, format, length, layout,
+   explanation style, or re-emits the same deliverable. It changes HOW the
+   existing result is presented, not WHAT is researched.
+2. `evidence_reuse_refinement`: changes emphasis inside the existing task but
+   adds no new user entity, mechanism, domain, constraint, or evidence need.
+3. `research_change`: adds a new research object, named method, mechanism,
+   domain, constraint, evidence requirement, or scientific question that the
+   parent evidence may not support.
 
-3. **Decide `skip_search`**:
-   - `true`  — ALWAYS for formatting/language/presentation follow-ups; also \
-for refinements that introduce NO new entities, mechanisms, or research \
-domains (the existing evidence base can be reused).
-   - `false` — the follow-up introduces new entities, mechanisms, or \
-research domains, so a fresh literature search is required.
+Required flags:
 
-The "search when in doubt" bias applies ONLY when a genuinely new biomedical \
-entity, mechanism, or research domain may be involved. When in doubt about a \
-formatting, language, or presentation request, choose `skip_search=true`.
+- presentation_adjustment: `skip_search=true`, `rebuild_problem_card=false`.
+- evidence_reuse_refinement: `skip_search=true`, `rebuild_problem_card=false`.
+- research_change: `skip_search=false`, `rebuild_problem_card=true`.
 
-4. **Provide `rationale`** — one concise sentence explaining the \
-classification and the resulting `skip_search` decision.
+When uncertain whether the evidence base is reusable, choose research_change.
+Provide one concise rationale and a calibrated confidence from 0.0 to 1.0.
 
 Output a valid JSON object with the following schema:
 {
-  "problem_card": {
-    "original_question": "...",
-    "domain": ["..."],
-    "sub_questions": ["..."],
-    "key_entities": ["..."],
-    "question_type": "mechanism_explanation"
-  },
-  "skip_search": false,
-  "rationale": "..."
+  "category": "presentation_adjustment",
+  "skip_search": true,
+  "rebuild_problem_card": false,
+  "rationale": "...",
+  "confidence": 0.95
 }
 """
 

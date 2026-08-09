@@ -118,6 +118,8 @@ module_overrides:
         model_name="qwen-custom",
         qwen_api_key="qwen-secret-for-test",
         semantic_scholar_api_key="s2-secret-for-test",
+        openalex_api_key="oa-secret-for-test",
+        openalex_mailto="lab@example.org",
     )
     assert "secret" not in json.dumps(run)
 
@@ -129,11 +131,32 @@ module_overrides:
         config.module_overrides["m2"].kwargs["semantic_scholar_api_key"]
         == "s2-secret-for-test"
     )
+    assert (
+        config.module_overrides["m2"].kwargs["openalex_api_key"]
+        == "oa-secret-for-test"
+    )
+    assert (
+        config.module_overrides["m2"].kwargs["openalex_mailto"]
+        == "lab@example.org"
+    )
     persisted = (
         tmp_path / "runs" / run["run_id"] / "manifest.json"
     ).read_text(encoding="utf-8")
     assert "qwen-secret-for-test" not in persisted
     assert "s2-secret-for-test" not in persisted
+    assert "oa-secret-for-test" not in persisted
+
+
+def test_run_manager_rejects_malformed_openalex_credentials(
+    tmp_path: Path,
+) -> None:
+    manager = RunManager(
+        config_path=_write_config(tmp_path), output_root=tmp_path / "runs"
+    )
+    with pytest.raises(ValueError, match="API Key 长度异常"):
+        manager.start("q", openalex_api_key="x" * 4097)
+    with pytest.raises(ValueError, match="Mailto 长度异常"):
+        manager.start("q", openalex_mailto="a" * 321)
 
 
 def test_web_ui_preserves_open_event_details_and_has_ephemeral_key_fields() -> None:
@@ -148,7 +171,11 @@ def test_web_ui_preserves_open_event_details_and_has_ephemeral_key_fields() -> N
     assert 'id="modelName"' in html
     assert 'id="qwenApiKey"' in html
     assert 'id="semanticApiKey"' in html
+    assert 'id="openalexApiKey"' in html
+    assert 'id="openalexMailto"' in html
+    # Ephemeral keys: never echoed back, persisted, or sent in plaintext.
     assert "localStorage" not in html
+    assert 'id="openalexApiKey" type="password"' in html
     assert "openSequences" in html
     assert "data-event-sequence" in html
 

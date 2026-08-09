@@ -169,6 +169,9 @@ async def test_semantic_scholar_constructor_key_selects_instance_backend(
 
     monkeypatch.setattr(semantic_scholar, "_s2_search", search)
     monkeypatch.setattr(semantic_scholar, "_oa_search", openalex_search)
+    # Keep the constructor contract test independent from a developer's real
+    # local OpenAlex credential loaded through .env.
+    monkeypatch.setattr(semantic_scholar, "_OPENALEX_API_KEY", "")
     tool = SemanticScholarTool(api_key="instance-key")
 
     await tool.search_strict("Hippo", limit=3)

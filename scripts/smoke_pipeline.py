@@ -6,7 +6,7 @@ without the full ``run_hypoforge.py`` runtime.
 
 It still calls Qwen at every LLM stage (M1–M6); it just shrinks the workload:
 
-    M1  → keep only 1 sub-question         (max_sub_questions=1)
+    M1  → fixed semantic decomposition of at most 5 sub-questions
     M2  → search 1 paper, batch size 1      (max_papers_per_query=1, batch_size=1)
     M3  → LLM edges, 1 small batch, no bridges (enable_cross_batch=False)
     M4  → 2 candidates, keep top 1          (num_candidates=2, top_k=1)
@@ -68,7 +68,7 @@ def build_fast_config(
         override.kwargs.setdefault("mode", "llm")  # every stage still calls Qwen
         config.module_overrides[name] = override
 
-    _fast("m1", max_sub_questions=1)
+    _fast("m1")
     _fast(
         "m2",
         max_papers_per_query=1,

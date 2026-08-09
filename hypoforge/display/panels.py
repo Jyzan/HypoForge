@@ -273,9 +273,6 @@ def render_problem_card(card: ProblemCard) -> None:
         _labelled_wrapped_table("Key entities:", ", ".join(card.key_entities)),
         (0, 0, 0, 2),
     ))
-    console.print(f"  [{COLORS['muted']}]Question type:[/] {card.question_type.value}")
-
-
 # ============================================================================
 # Literature Search (M2)
 # ============================================================================

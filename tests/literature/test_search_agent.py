@@ -9,6 +9,7 @@ import pytest
 from hypoforge.literature.models import (
     CoverageReport,
     PaperRecord,
+    PaperRetentionDecision,
     QueryIntent,
     ScoutNote,
     SearchBudget,
@@ -46,6 +47,57 @@ def paper(paper_id: str, source: str) -> PaperRecord:
         abstract=f"Abstract for {paper_id}",
         sources=[source],
     )
+
+
+@pytest.mark.asyncio
+async def test_retention_judge_events_are_readable_for_web_and_terminal(
+    monkeypatch,
+) -> None:
+    """Mojibake in emitted messages is user-visible in the shared event stream."""
+
+    class Judge:
+        async def structured_chat(self, **kwargs):
+            return {"rulings": [{
+                "paper_id": "paper-1",
+                "decision": "retain",
+                "roles": ["core_evidence"],
+                "rationale": "direct evidence",
+            }]}
+
+    events = []
+    monkeypatch.setattr(
+        "hypoforge.literature.search.agent.emit_event",
+        lambda event_type, **kwargs: events.append({
+            "event_type": event_type,
+            **kwargs,
+        }),
+    )
+    agent = IterativeSearchAgent(
+        query_planner=FakePlanner([]),
+        sources=[FakeSource("pubmed", {})],
+        deduplicator=FakeDeduplicator(),
+        ranker=FakeRanker(),
+        scout_reader=FakeScoutReader(),
+        coverage_evaluator=FakeCoverageEvaluator([]),
+        retention_judge_client=Judge(),
+        final_k=1,
+    )
+    candidate = paper("paper-1", "pubmed")
+    candidate.rank_scores["post_scout_total"] = 0.8
+    decision = PaperRetentionDecision(
+        paper_id="paper-1",
+        decision="retain",
+        roles=["core_evidence"],
+        reason="primary set",
+        rank_position=1,
+    )
+
+    await agent._review_retention_boundary(
+        [candidate], [decision], [], "question", ["entity"]
+    )
+
+    messages = [str(event.get("message", "")) for event in events]
+    assert messages == ["M2 开始进行 LLM 论文保留裁决", "LLM 论文保留裁决完成"]
 
 
 @pytest.mark.asyncio

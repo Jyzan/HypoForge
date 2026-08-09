@@ -378,11 +378,7 @@ class CoverageEvaluator(CoverageEvaluatorProtocol):
         directional_ids: set[str],
     ) -> list[str]:
         gaps: list[str] = []
-        question_type = state.question_type
-        required_count = (
-            2 if question_type == "phenomenon_discovery"
-            else self.min_relevant_papers
-        )
+        required_count = self.min_relevant_papers
         if len(relevant) < required_count:
             gaps.append(
                 f"additional relevant studies ({required_count - len(relevant)} more needed)"
@@ -390,26 +386,18 @@ class CoverageEvaluator(CoverageEvaluatorProtocol):
 
         direct = any(
             (note.directness_to_question or 0.0) >= self.relevance_threshold
-            and (
-                note.study_design in {"experimental", "observational"}
-                or question_type == "method_development"
-                and note.study_design in {"method", "protocol", "computational"}
-            )
+            and note.study_design in {
+                "experimental", "observational", "method", "protocol",
+                "computational",
+            }
             for note, _ in relevant
         )
-        if question_type == "method_development":
-            if EvidenceBucket.METHODOLOGICAL not in covered:
-                gaps.append("direct methodological evidence")
-            if not direct:
-                gaps.append("a method directly addressing the sub-question")
-        elif question_type == "phenomenon_discovery":
-            if not supporting_papers:
-                gaps.append("evidence supporting the reported phenomenon")
-        else:
-            if not supporting_papers:
-                gaps.append("evidence supporting the proposed mechanism")
-            if not direct or not directional_ids:
-                gaps.append("direct mechanism evidence")
+        if not supporting_papers:
+            gaps.append("citable evidence supporting the sub-question")
+        if not direct:
+            gaps.append("a study directly addressing the sub-question")
+        if not directional_ids:
+            gaps.append("sentence-level directional evidence")
 
         return _stable_strings(gaps)
 
@@ -510,7 +498,6 @@ class CoverageEvaluator(CoverageEvaluatorProtocol):
             system_prompt=_SYSTEM_PROMPT,
             user_prompt=(
                 f"Research sub-question: {sub_question}\n"
-                f"Question type: {state.question_type or 'unknown'}\n"
                 f"Key entities present in this sub-question: {context_entities}\n"
                 f"Domains: {sorted(state.domains)}\n"
                 f"Previous missing topics: {sorted(state.missing_topics)}\n\n"

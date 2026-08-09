@@ -96,6 +96,26 @@ async def test_scout_batches_requests_and_restores_input_order() -> None:
 
 
 @pytest.mark.asyncio
+async def test_scout_rejects_unbalanced_or_sentence_like_chinese_entities() -> None:
+    """Broken Chinese punctuation checks must not admit malformed graph nodes."""
+
+    def respond(_: dict[str, Any]) -> dict[str, Any]:
+        note = semantic_note("paper-0")
+        note["entities"] = [
+            "机械臂（sim-to-real",
+            "机械臂可以实现策略迁移。",
+            "机械臂",
+        ]
+        return {"notes": [note]}
+
+    result = await ScoutReader(
+        FakeStructuredClient(responder=respond), current_year=2026
+    ).read("机械臂如何实现仿真到现实迁移？", [paper(0)])
+
+    assert result[0].entities == ["机械臂"]
+
+
+@pytest.mark.asyncio
 async def test_scout_invalid_duplicate_and_missing_results_fallback_per_paper() -> None:
     def respond(_: dict[str, Any]) -> dict[str, Any]:
         return {

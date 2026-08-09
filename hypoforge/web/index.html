@@ -139,7 +139,7 @@
   .cred-card summary::-webkit-details-marker{display:none}
   .cred-card summary::before{content:"▸";color:var(--ink3);transition:transform .15s}
   .cred-card[open] summary::before{transform:rotate(90deg)}
-  .cred-grid{display:grid;grid-template-columns:1fr 1.2fr 1.2fr;gap:12px;padding:0 20px 6px}
+  .cred-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;padding:0 20px 6px}
   .config-field{padding:11px 13px;border:1px solid var(--line);border-radius:14px;background:var(--bg)}
   .config-field label{display:block;margin-bottom:6px;color:var(--ink3);font-size:10px;font-weight:750;letter-spacing:.04em}
   .config-field input{width:100%;border:0;outline:0;background:transparent;color:var(--ink);font-size:12px}
@@ -400,6 +400,11 @@
   .log-box .bad{color:#f87171}
   .log-empty{color:#475569;font-style:italic}
   .output-box{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:14px 16px;font-size:13px;color:var(--ink2)}
+  .src-stats{display:flex;flex-direction:column;gap:6px}
+  .src-row{display:flex;align-items:center;gap:8px;padding:7px 12px;border:1px solid var(--line);border-radius:10px;font-size:12.5px;background:var(--bg)}
+  .src-row .src-name{color:var(--ink2);font-weight:600}
+  .src-row b{margin-left:auto;color:var(--accent);font-variant-numeric:tabular-nums}
+  .src-row .src-unit{color:var(--ink3);font-size:11px}
   /* ---------- 响应式 ---------- */
   @media (max-width:960px){
     .row-nodes{grid-template-columns:repeat(2,1fr)}
@@ -489,6 +494,14 @@
           <div class="config-field">
             <label for="semanticApiKey">Semantic Scholar API Key</label>
             <input id="semanticApiKey" type="password" placeholder="留空则使用本机配置或 OpenAlex" autocomplete="new-password" spellcheck="false">
+          </div>
+          <div class="config-field">
+            <label for="openalexApiKey">OpenAlex API Key</label>
+            <input id="openalexApiKey" type="password" placeholder="留空则使用本机配置或匿名请求" autocomplete="new-password" spellcheck="false">
+          </div>
+          <div class="config-field">
+            <label for="openalexMailto">OpenAlex Mailto（可选）</label>
+            <input id="openalexMailto" type="text" placeholder="邮箱，进入礼貌池；留空则使用本机配置" autocomplete="off" spellcheck="false">
           </div>
         </div>
         <div class="security-note">凭证仅用于本次运行，不写入运行记录、浏览器存储或项目文件。</div>
@@ -1320,10 +1333,32 @@ function renderDrawer(){
     ? logs.map(e => `<div><span class="t">${eventClock(e.timestamp)}</span>${esc(e.event_type)} · ${esc(e.message)}${e.status === "completed" ? ' <span class="ok">✓</span>' : ""}${e.status === "failed" ? ' <span class="bad">✗</span>' : ""}</div>`).join("")
     : '<div class="log-empty">尚未产生执行日志</div>';
   const completed = [...logs].reverse().find(e => e.event_type === "module_completed" && e.details && Object.keys(e.details).length);
+  // M2 按源分离的检索统计：优先用 module_completed 的 per_source 聚合，
+  // 否则从各引擎独立的 source:xxx 完成事件里累加 papers 条数。
+  let sourceStatsHtml = "";
+  if(drawerModule === "m2"){
+    let perSource = (completed && completed.details && completed.details.per_source) || null;
+    if(!perSource || !Object.keys(perSource).length){
+      perSource = {};
+      logs.filter(e => e.event_type === "tool_completed" && String(e.tool || "").startsWith("source:"))
+          .forEach(e => {
+            const name = String(e.tool).slice("source:".length);
+            perSource[name] = (perSource[name] || 0) + Number((e.details || {}).papers || 0);
+          });
+    }
+    const SOURCE_LABELS = { pubmed:"PubMed", semantic_scholar:"Semantic Scholar", openalex:"OpenAlex", arxiv:"arXiv" };
+    sourceStatsHtml = Object.keys(perSource).length
+      ? `<div class="d-sec-title">检索源统计（按引擎分离）</div><div class="src-stats">` +
+        Object.entries(perSource).map(([name, count]) =>
+          `<div class="src-row"><span class="src-name">${esc(SOURCE_LABELS[name] || name)}</span><b>${Number(count) || 0}</b><span class="src-unit">条记录</span></div>`
+        ).join("") + `</div>`
+      : "";
+  }
   const outputHtml = completed
     ? `<div class="output-box"><details open><summary>输出摘要</summary><pre>${pretty(completed.details)}</pre></details></div>`
     : `<div class="output-box" style="color:var(--ink3)">${st.status === "running" ? "模块运行中，输出将在完成后生成…" : "模块尚未完成，暂无历史输出"}</div>`;
   $("drawerBody").innerHTML = `
+    ${sourceStatsHtml}
     <div class="d-sec-title">实时日志（${logs.length} 条）</div>
     <div class="log-box" id="drawerLogs">${logsHtml}</div>
     <div class="d-sec-title">历史输出</div>
@@ -1696,6 +1731,8 @@ async function submitFollowup(){
         model_name: $("modelName").value.trim(),
         qwen_api_key: $("qwenApiKey").value.trim(),
         semantic_scholar_api_key: $("semanticApiKey").value.trim(),
+        openalex_api_key: $("openalexApiKey").value.trim(),
+        openalex_mailto: $("openalexMailto").value.trim(),
         parent_run_id: currentRun,
         followup: text,
       }),
@@ -1709,6 +1746,7 @@ async function submitFollowup(){
     }
     input.value = "";
     $("qwenApiKey").value = ""; $("semanticApiKey").value = "";
+    $("openalexApiKey").value = ""; $("openalexMailto").value = "";
     await attachRun(data.run);
     await loadHistory();
     updateHint();
@@ -1747,6 +1785,8 @@ async function submit(){
     model_name: $("modelName").value.trim(),
     qwen_api_key: $("qwenApiKey").value.trim(),
     semantic_scholar_api_key: $("semanticApiKey").value.trim(),
+    openalex_api_key: $("openalexApiKey").value.trim(),
+    openalex_mailto: $("openalexMailto").value.trim(),
   };
   if(isFollowup){ payload.parent_run_id = currentRun; payload.followup = text; }
   try{
@@ -1759,6 +1799,7 @@ async function submit(){
     if(!response.ok) throw new Error(data.error || `启动失败（HTTP ${response.status}）`);
     input.value = ""; autoGrow(input);
     $("qwenApiKey").value = ""; $("semanticApiKey").value = "";
+    $("openalexApiKey").value = ""; $("openalexMailto").value = "";
     await attachRun(data.run);
     await loadHistory();
     updateHint();

@@ -306,6 +306,13 @@ class PipelineRunner:
                     "export_runs": len(export.runs) if export is not None else 0,
                 }
             )
+            if export is not None:
+                per_source: Dict[str, int] = {}
+                for run in export.runs:
+                    for source, count in (run.search_provenance.source_result_counts or {}).items():
+                        per_source[source] = per_source.get(source, 0) + int(count)
+                if per_source:
+                    summary["per_source"] = per_source
         elif name == "m3" and result.get("evidence_graph") is not None:
             graph = result["evidence_graph"]
             summary.update({"nodes": len(graph.nodes), "edges": len(graph.edges)})

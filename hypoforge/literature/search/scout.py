@@ -105,13 +105,16 @@ def _valid_entity(value: object) -> bool:
     text = _clean_text(value)
     if not text or len(text) > 100 or len(text.split()) > 8:
         return False
-    if text.count("(") != text.count(")") or text.count("?") != text.count("?"):
+    if (
+        text.count("(") != text.count(")")
+        or text.count("（") != text.count("）")
+    ):
         return False
-    if text.endswith((".", "?", "!", "?", "?", "?", ":", "?", ";", "?")):
+    if text.endswith((".", "。", "?", "？", "!", "！", ":", "：", ";", "；")):
         return False
-    if re.search(r"[.!????](?:\s|$)", text):
+    if re.search(r"[.!?。！？](?:\s|$)", text):
         return False
-    if re.search(r"[,?;?:]", text):
+    if re.search(r"[,，;；:：]", text):
         return False
     if re.match(
         r"(?i)^(this|that|these|those|the|a|an|we|our|it|paper|study|本文|该研究|结果)",

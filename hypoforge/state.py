@@ -23,12 +23,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 # Enums
 # ============================================================================
 
-class QuestionType(str, Enum):
-    MECHANISM = "mechanism_explanation"
-    METHOD = "method_development"
-    DISCOVERY = "phenomenon_discovery"
-
-
 class ConfidenceLevel(str, Enum):
     HIGH = "high"
     MEDIUM = "medium"
@@ -80,6 +74,7 @@ class TaskEntity(BaseModel):
 
     entity_id: str
     name: str
+    source_mention: str = ""
     aliases: List[str] = Field(default_factory=list)
     role: Literal[
         "primary_object", "intervention", "outcome", "method",
@@ -87,7 +82,7 @@ class TaskEntity(BaseModel):
     ] = "other"
     required: bool = False
 
-    @field_validator("entity_id", "name", mode="before")
+    @field_validator("entity_id", "name", "source_mention", mode="before")
     @classmethod
     def normalize_scalar(cls, value: Any) -> str:
         return re.sub(r"\s+", " ", str(value or "")).strip()
@@ -181,7 +176,6 @@ class ProblemCard(BaseModel):
     domain: List[str] = Field(default_factory=list)
     sub_questions: List[str] = Field(default_factory=list)
     key_entities: List[str] = Field(default_factory=list)
-    question_type: QuestionType = QuestionType.MECHANISM
     task_contract: TaskContract = Field(default_factory=TaskContract)
 
     @field_validator("original_question", mode="before")
@@ -203,11 +197,18 @@ class ProblemCard(BaseModel):
         """Derive a conservative contract for snapshots created before v2."""
 
         if self.task_contract.entities or self.task_contract.requirements:
+            if self.task_contract.source == "m1":
+                self.key_entities = [
+                    entity.name
+                    for entity in self.task_contract.entities
+                    if entity.name
+                ]
             return self
         entities = [
             TaskEntity(
                 entity_id=f"E{index}",
                 name=name,
+                source_mention=name,
                 role="primary_object" if index == 1 else "other",
                 required=index == 1,
             )

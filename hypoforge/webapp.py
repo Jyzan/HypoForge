@@ -73,6 +73,8 @@ class RunManager:
         model_name: str = "",
         qwen_api_key: str = "",
         semantic_scholar_api_key: str = "",
+        openalex_api_key: str = "",
+        openalex_mailto: str = "",
         parent_run_id: str = "",
         followup: str = "",
     ) -> dict[str, Any]:
@@ -80,6 +82,8 @@ class RunManager:
         model_name = " ".join(str(model_name or "").split())
         qwen_api_key = str(qwen_api_key or "").strip()
         semantic_scholar_api_key = str(semantic_scholar_api_key or "").strip()
+        openalex_api_key = str(openalex_api_key or "").strip()
+        openalex_mailto = " ".join(str(openalex_mailto or "").split())
         parent_run_id = " ".join(str(parent_run_id or "").split())
         followup = " ".join(str(followup or "").split())
         if not question:
@@ -88,8 +92,14 @@ class RunManager:
             raise ValueError("问题过长，请控制在 4000 字以内")
         if len(model_name) > 128:
             raise ValueError("模型名称过长")
-        if len(qwen_api_key) > 4096 or len(semantic_scholar_api_key) > 4096:
+        if (
+            len(qwen_api_key) > 4096
+            or len(semantic_scholar_api_key) > 4096
+            or len(openalex_api_key) > 4096
+        ):
             raise ValueError("API Key 长度异常")
+        if len(openalex_mailto) > 320:
+            raise ValueError("OpenAlex Mailto 长度异常")
         if len(followup) > 4000:
             raise ValueError("追问内容过长，请控制在 4000 字以内")
         seed_state: dict[str, Any] | None = None
@@ -127,6 +137,8 @@ class RunManager:
                 "model_name": model_name,
                 "qwen_api_key": qwen_api_key,
                 "semantic_scholar_api_key": semantic_scholar_api_key,
+                "openalex_api_key": openalex_api_key,
+                "openalex_mailto": openalex_mailto,
             }
             if seed_state is not None:
                 # Memory-only, consumed once by the worker (like credentials).
@@ -235,6 +247,8 @@ class RunManager:
             semantic_scholar_api_key = credentials.get(
                 "semantic_scholar_api_key", ""
             )
+            openalex_api_key = credentials.get("openalex_api_key", "")
+            openalex_mailto = credentials.get("openalex_mailto", "")
             for tier in (
                 config.qwen.base,
                 config.qwen.max,
@@ -252,6 +266,14 @@ class RunManager:
                 m2_override.kwargs["semantic_scholar_api_key"] = (
                     semantic_scholar_api_key
                 )
+            if openalex_api_key or openalex_mailto:
+                m2_override = config.module_overrides.setdefault(
+                    "m2", ModuleOverride()
+                )
+                if openalex_api_key:
+                    m2_override.kwargs["openalex_api_key"] = openalex_api_key
+                if openalex_mailto:
+                    m2_override.kwargs["openalex_mailto"] = openalex_mailto
             manifest = {
                 "run_id": run_id,
                 "question": question,
@@ -823,6 +845,8 @@ class HypoForgeRequestHandler(BaseHTTPRequestHandler):
                 semantic_scholar_api_key=payload.get(
                     "semantic_scholar_api_key", ""
                 ),
+                openalex_api_key=payload.get("openalex_api_key", ""),
+                openalex_mailto=payload.get("openalex_mailto", ""),
                 parent_run_id=payload.get("parent_run_id", ""),
                 followup=payload.get("followup", ""),
             )

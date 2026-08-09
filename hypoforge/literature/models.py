@@ -207,6 +207,8 @@ class RemainingSearchBudget(LiteratureModel):
 
 
 class SearchState(LiteratureModel):
+    # Deprecated compatibility field for historical snapshots. Search logic
+    # must not branch on this value.
     question_type: str = ""
     key_entities: Set[str] = Field(default_factory=set)
     domains: Set[str] = Field(default_factory=set)

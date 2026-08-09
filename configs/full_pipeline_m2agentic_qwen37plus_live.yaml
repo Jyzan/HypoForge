@@ -53,7 +53,10 @@ module_overrides:
     kwargs:
       mode: "llm"
       llm_tier: "base"
-      max_sub_questions: 2
+      coverage_max_rounds: 2
+      entity_repair_attempts: 1
+      requirement_repair_attempts: 1
+      followup_triage_confidence_threshold: 0.75
   m2:
     kwargs:
       variant: integrated

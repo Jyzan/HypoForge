@@ -2,7 +2,8 @@
 M1: Problem Understanding & Decomposition.
 
 Decomposes a frontier scientific question into structured sub-questions,
-identifies domains, extracts key entities, and classifies the question type.
+identifies domains, audits source-bounded key entities, and builds a task
+contract. No question-category label is generated or consumed.
 
 Iteration core: when ``followup_routing`` is enabled and the state carries a
 ``FollowupRequest``, M1 additionally decides ``skip_search`` — whether the
@@ -19,86 +20,127 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+import unicodedata
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..observability import emit_event
 from ..protocol import ModuleProtocol
 from ..prompts.m1_prompts import (
+    M1_COVERAGE_CHECK_SYSTEM_PROMPT,
+    M1_COVERAGE_CHECK_USER_TEMPLATE,
+    M1_COVERAGE_MERGE_SYSTEM_PROMPT,
+    M1_COVERAGE_MERGE_USER_TEMPLATE,
+    M1_COVERAGE_SUPPLEMENT_SYSTEM_PROMPT,
+    M1_COVERAGE_SUPPLEMENT_USER_TEMPLATE,
+    M1_ENTITY_AUDIT_SYSTEM_PROMPT,
+    M1_ENTITY_AUDIT_USER_TEMPLATE,
+    M1_ENTITY_EXTRACTION_SYSTEM_PROMPT,
+    M1_ENTITY_EXTRACTION_USER_TEMPLATE,
+    M1_ENTITY_REPAIR_NOTE_TEMPLATE,
+    M1_REQUIREMENT_SYSTEM_PROMPT,
+    M1_REQUIREMENT_USER_TEMPLATE,
     M1_FOLLOWUP_SYSTEM_PROMPT,
     M1_FOLLOWUP_USER_TEMPLATE,
     M1_SYSTEM_PROMPT,
     M1_USER_TEMPLATE,
 )
 from ..registry import ModuleRegistry
-from ..state import PipelineState, ProblemCard
+from ..state import (
+    PipelineState,
+    ProblemCard,
+    TaskContract,
+    TaskEntity,
+    TaskRequirement,
+)
 from ..tools.qwen_client import QwenClient
 
 logger = logging.getLogger(__name__)
 
 
-class _FollowupUnderstanding(BaseModel):
-    """Structured output schema for the followup triage call."""
+class _CandidateDecomposition(BaseModel):
+    """First-pass output intentionally excludes entities and contracts."""
 
-    problem_card: ProblemCard
-    skip_search: bool = False
-    rationale: str = ""
+    domain: List[str] = []
+    sub_questions: List[str] = []
 
 
-# ---------------------------------------------------------------------------
-# Deterministic shortcut for pure formatting / language / presentation
-# follow-ups.
-#
-# A match short-circuits triage to ``skip_search=True`` with the parent
-# ProblemCard reused verbatim, *before* any LLM call — so the triage model
-# can never reinterpret e.g. "请你给我中文方案" as a new research direction
-# and invent extra entities to justify a fresh search.
-#
-# The whitelist is deliberately conservative: every pattern is anchored
-# (``fullmatch`` on whitespace-stripped, length-bounded text), so semantic
-# follow-ups such as "聚焦阿尔茨海默方向" can never match.
-# ---------------------------------------------------------------------------
+class _FollowupTriageDecision(BaseModel):
+    """Routing-only output.  It can never rewrite the parent ProblemCard."""
 
-_FO_PREFIX = r"(?:请(?:你)?给(?:我)?|请(?:你)?|麻烦(?:你)?|帮我|给我)?"
-_FO_LANG = r"(?:中文|简体中文|繁體中文|繁体中文|英文|英语)"
-_FO_ARTIFACT = r"(?:研究方案|方案|结果|内容|回答|报告)"
+    category: Literal[
+        "presentation_adjustment",
+        "evidence_reuse_refinement",
+        "research_change",
+    ]
+    skip_search: bool
+    rebuild_problem_card: bool
+    rationale: str
+    confidence: float
 
-_FORMAT_SHORTCUT_PATTERNS: Tuple["re.Pattern[str]", ...] = tuple(
-    re.compile(p) for p in (
-        # Language-version requests: "中文方案" / "给我中文版" / "英文结果"
-        rf"^{_FO_PREFIX}{_FO_LANG}(?:版|版本)?{_FO_ARTIFACT}?$",
-        # Translation requests: "翻译成中文" / "把方案改成英文"
-        rf"^{_FO_PREFIX}(?:把|将)?(?:它|这些|上面的|之前的)?{_FO_ARTIFACT}?"
-        rf"(?:翻译成?|译为|改成|换成|转成){_FO_LANG}$",
-        # Re-answer in a given language: "用中文重新回答" / "用中文给我"
-        rf"^{_FO_PREFIX}用{_FO_LANG}(?:重新)?(?:回答|输出|描述|展示|给我|"
-        rf"写一(?:遍|份)|说一(?:遍|下))$",
-        # Re-layout / re-formatting: "重新排版" / "换个格式" / "改成表格"
-        rf"^{_FO_PREFIX}(?:把|将)?(?:它|这些|上面的)?(?:重新)?(?:排版|"
-        rf"换(?:一?个|一?种)格式|改格式)$",
-        rf"^{_FO_PREFIX}(?:把|将)?(?:它|这些|上面的)?{_FO_ARTIFACT}?"
-        rf"改(?:成|为)(?:表格|markdown|列表|要点|简洁版)$",
-        # Re-emit the same deliverable: "再给我一遍方案" / "重新输出一份"
-        rf"^{_FO_PREFIX}(?:再|重新)(?:给我|来|输出|发|写|生成|说)"
-        rf"(?:一(?:遍|份|次|下))?{_FO_ARTIFACT}?$",
-    )
-)
 
-# Upper bound for shortcut candidates — genuinely format-only requests are
-# short; anything longer must go through LLM triage.
-_FORMAT_SHORTCUT_MAX_CHARS = 40
+class _SubQuestionCoverage(BaseModel):
+    sufficient: bool = False
+    core_intent_covered: bool = False
+    missing_aspects: List[str] = []
+    over_fragmented: bool = False
+    merge_instructions: List[str] = []
+    reason: str = ""
+
+
+class _SubQuestionSupplement(BaseModel):
+    sub_questions: List[str] = []
+
+
+class _CandidateEntity(BaseModel):
+    name: str
+    source_mention: str
+    aliases: List[str] = Field(default_factory=list)
+    role: Literal[
+        "primary_object", "intervention", "outcome", "method",
+        "context", "constraint", "other",
+    ] = "other"
+    required: bool = False
+    extraction_reason: str = ""
+
+
+class _CandidateEntityList(BaseModel):
+    entities: List[_CandidateEntity] = Field(default_factory=list)
+
+
+class _EntityAuditItem(BaseModel):
+    candidate_name: str
+    accepted: bool
+    source_mention: str = ""
+    reason: str = ""
+
+
+class _EntitySourceAudit(BaseModel):
+    items: List[_EntityAuditItem] = Field(default_factory=list)
+    missing_explicit_entities: List[str] = Field(default_factory=list)
+    complete: bool = False
+
+
+class _RequirementList(BaseModel):
+    requirements: List[TaskRequirement] = Field(default_factory=list)
 
 
 @ModuleRegistry.register
 class M1ProblemUnderstanding(ModuleProtocol):
     module_name = "m1"
-    module_version = "0.2.0"
+    module_version = "0.3.0"
     description = "Problem decomposition: sub-questions, domain tagging, entity extraction"
+    MAX_SUB_QUESTIONS = 5
 
     @staticmethod
     def _sub_question_violations(sub_questions: List[str]) -> List[str]:
         violations: List[str] = []
+        if len(sub_questions) > M1ProblemUnderstanding.MAX_SUB_QUESTIONS:
+            violations.append(
+                "sub-question list must contain at most 5 items; "
+                f"found {len(sub_questions)}"
+            )
         for index, value in enumerate(sub_questions, start=1):
             text = " ".join(str(value or "").split())
             reasons: List[str] = []
@@ -155,18 +197,23 @@ class M1ProblemUnderstanding(ModuleProtocol):
         self,
         mode: str = "llm",
         llm_config: Optional[Any] = None,
-        max_sub_questions: Optional[int] = None,
+        coverage_max_rounds: int = 2,
+        entity_repair_attempts: int = 1,
+        requirement_repair_attempts: int = 1,
         followup_routing: bool = False,
+        followup_triage_confidence_threshold: float = 0.75,
         **kwargs,
     ):
         self.mode = mode
         self.llm_config = llm_config
-        # Optional cap on the number of sub-questions carried forward — mainly a
-        # cost/speed knob for smoke tests (fewer sub-questions → less M2 search).
-        self.max_sub_questions = max_sub_questions
-        # Iteration-core switch: enables the search-free followup triage.
-        # Off ⇒ behaviour is byte-for-byte identical to the legacy module.
+        self.coverage_max_rounds = max(0, int(coverage_max_rounds))
+        self.entity_repair_attempts = max(0, int(entity_repair_attempts))
+        self.requirement_repair_attempts = max(0, int(requirement_repair_attempts))
+        # Iteration-core switch: enables mandatory LLM follow-up triage.
         self.followup_routing = followup_routing
+        self.followup_triage_confidence_threshold = max(
+            0.0, min(1.0, float(followup_triage_confidence_threshold))
+        )
         self.client = QwenClient.from_config(llm_config) if llm_config else None
 
     async def __call__(
@@ -215,7 +262,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
             payload = await self.client.structured_chat(
                 system_prompt=M1_SYSTEM_PROMPT,
                 user_prompt=M1_USER_TEMPLATE.format(question=question),
-                output_schema=ProblemCard.model_json_schema(),
+                output_schema=_CandidateDecomposition.model_json_schema(),
                 max_tokens=8192,
                 temperature=getattr(self.llm_config, "temperature", 0.1),
             )
@@ -229,46 +276,63 @@ class M1ProblemUnderstanding(ModuleProtocol):
                 elapsed_seconds=time.monotonic() - started_at,
             )
             raise
-        card = ProblemCard.model_validate(payload)
-        violations = [
-            *self._sub_question_violations(card.sub_questions),
-            *self._contract_violations(card),
-        ]
+        decomposition = _CandidateDecomposition.model_validate(payload)
+        violations = self._sub_question_violations(decomposition.sub_questions)
         if violations:
             retry_prompt = "\n".join([
                 M1_USER_TEMPLATE.format(question=question),
                 "The previous decomposition violated the atomic-sub-question contract:",
                 *[f"- {violation}" for violation in violations],
-                "Return a corrected ProblemCard. Split parallel tasks into separate atomic questions.",
+                "Return corrected domains and sub-questions only.",
             ])
             retry_payload = await self.client.structured_chat(
                 system_prompt=M1_SYSTEM_PROMPT,
                 user_prompt=retry_prompt,
-                output_schema=ProblemCard.model_json_schema(),
+                output_schema=_CandidateDecomposition.model_json_schema(),
                 max_tokens=8192,
                 temperature=0.0,
             )
-            retried = ProblemCard.model_validate(retry_payload)
-            retry_violations = [
-                *self._sub_question_violations(retried.sub_questions),
-                *self._contract_violations(retried),
-            ]
+            retried = _CandidateDecomposition.model_validate(retry_payload)
+            retry_violations = self._sub_question_violations(
+                retried.sub_questions
+            )
             if retry_violations:
                 raise ValueError(
-                    "ProblemCard still violates the atomic task contract "
+                    "Decomposition still violates the atomic task contract "
                     "after deterministic repair: "
                     + "; ".join(retry_violations)
                 )
-            card = retried
-        if not card.original_question:
-            card.original_question = question
-        if self.max_sub_questions and self.max_sub_questions > 0:
-            card.sub_questions = card.sub_questions[: self.max_sub_questions]
-            retained = {" ".join(item.split()).casefold() for item in card.sub_questions}
-            card.task_contract.requirements = [
-                requirement for requirement in card.task_contract.requirements
-                if " ".join(requirement.sub_question.split()).casefold() in retained
-            ]
+            decomposition = retried
+        sub_questions = await self._check_subquestion_coverage(
+            question,
+            decomposition.sub_questions,
+        )
+        final_sub_question_violations = self._sub_question_violations(
+            sub_questions
+        )
+        if final_sub_question_violations:
+            raise ValueError(
+                "Final decomposition violates the sub-question contract: "
+                + "; ".join(final_sub_question_violations)
+            )
+        entities = await self._extract_and_audit_entities(question)
+        requirements = await self._build_requirements(sub_questions, entities)
+        card = ProblemCard(
+            original_question=question,
+            domain=decomposition.domain,
+            sub_questions=sub_questions,
+            task_contract=TaskContract(
+                source="m1",
+                entities=entities,
+                requirements=requirements,
+            ),
+        )
+        final_violations = self._contract_violations(card)
+        if final_violations:
+            raise ValueError(
+                "M1 final task contract validation failed: "
+                + "; ".join(final_violations)
+            )
         emit_event(
             "tool_completed",
             module="m1",
@@ -286,25 +350,422 @@ class M1ProblemUnderstanding(ModuleProtocol):
         )
         return card
 
+    async def _check_subquestion_coverage(
+        self,
+        question: str,
+        sub_questions: List[str],
+    ) -> List[str]:
+        """Audit, supplement, and merge sub-questions within a bounded loop."""
+
+        questions = list(dict.fromkeys(
+            " ".join(str(item or "").split())
+            for item in sub_questions
+            if str(item or "").strip()
+        ))
+        if not questions or self.coverage_max_rounds <= 0:
+            return questions
+
+        started_at = time.monotonic()
+
+        def render(items: List[str]) -> str:
+            return "\n".join(f"- {item}" for item in items)
+
+        for round_index in range(1, self.coverage_max_rounds + 1):
+            payload = await self.client.structured_chat(
+                system_prompt=M1_COVERAGE_CHECK_SYSTEM_PROMPT,
+                user_prompt=M1_COVERAGE_CHECK_USER_TEMPLATE.format(
+                    question=question,
+                    sub_questions_text=render(questions),
+                ),
+                output_schema=_SubQuestionCoverage.model_json_schema(),
+                max_tokens=4096,
+                temperature=0.0,
+            )
+            audit = _SubQuestionCoverage.model_validate(payload)
+            emit_event(
+                "m1_subquestion_coverage",
+                module="m1",
+                tool="qwen_subquestion_coverage",
+                status="running",
+                message=f"子问题覆盖审查第 {round_index} 轮完成",
+                details={
+                    "round": round_index,
+                    "sufficient": audit.sufficient,
+                    "core_intent_covered": audit.core_intent_covered,
+                    "missing_aspects": list(audit.missing_aspects),
+                    "over_fragmented": audit.over_fragmented,
+                    "merge_instructions": list(audit.merge_instructions),
+                },
+            )
+
+            if (
+                audit.sufficient
+                and audit.core_intent_covered
+                and not audit.over_fragmented
+            ):
+                emit_event(
+                    "m1_subquestion_coverage",
+                    module="m1",
+                    tool="qwen_subquestion_coverage",
+                    status="completed",
+                    message=f"子问题覆盖审查通过（第 {round_index} 轮）",
+                    elapsed_seconds=time.monotonic() - started_at,
+                    details={"sub_question_count": len(questions)},
+                )
+                return questions
+
+            if round_index >= self.coverage_max_rounds:
+                break
+
+            if audit.over_fragmented:
+                merged_payload = await self.client.structured_chat(
+                    system_prompt=M1_COVERAGE_MERGE_SYSTEM_PROMPT,
+                    user_prompt=M1_COVERAGE_MERGE_USER_TEMPLATE.format(
+                        question=question,
+                        sub_questions_text=render(questions),
+                        merge_instructions_text=render(audit.merge_instructions),
+                    ),
+                    output_schema=_SubQuestionSupplement.model_json_schema(),
+                    max_tokens=4096,
+                    temperature=0.0,
+                )
+                merged = _SubQuestionSupplement.model_validate(merged_payload)
+                replacement = [
+                    " ".join(item.split())
+                    for item in merged.sub_questions
+                    if item.strip()
+                ]
+                if replacement:
+                    questions = list(dict.fromkeys(replacement))
+
+            if not audit.sufficient:
+                supplement_payload = await self.client.structured_chat(
+                    system_prompt=M1_COVERAGE_SUPPLEMENT_SYSTEM_PROMPT,
+                    user_prompt=M1_COVERAGE_SUPPLEMENT_USER_TEMPLATE.format(
+                        question=question,
+                        sub_questions_text=render(questions),
+                        missing_aspects_text=render(audit.missing_aspects),
+                    ),
+                    output_schema=_SubQuestionSupplement.model_json_schema(),
+                    max_tokens=4096,
+                    temperature=0.0,
+                )
+                supplement = _SubQuestionSupplement.model_validate(
+                    supplement_payload
+                )
+                questions = list(dict.fromkeys([
+                    *questions,
+                    *(
+                        " ".join(item.split())
+                        for item in supplement.sub_questions
+                        if item.strip()
+                    ),
+                ]))
+
+            if len(questions) > self.MAX_SUB_QUESTIONS:
+                questions = await self._merge_subquestions_to_limit(
+                    question,
+                    questions,
+                )
+
+            violations = self._sub_question_violations(questions)
+            if violations:
+                raise ValueError(
+                    "coverage repair produced non-atomic sub-questions: "
+                    + "; ".join(violations)
+                )
+
+        final_payload = await self.client.structured_chat(
+            system_prompt=M1_COVERAGE_CHECK_SYSTEM_PROMPT,
+            user_prompt=M1_COVERAGE_CHECK_USER_TEMPLATE.format(
+                question=question,
+                sub_questions_text=render(questions),
+            ),
+            output_schema=_SubQuestionCoverage.model_json_schema(),
+            max_tokens=4096,
+            temperature=0.0,
+        )
+        final_audit = _SubQuestionCoverage.model_validate(final_payload)
+        if not final_audit.core_intent_covered:
+            raise ValueError("core user intent remains uncovered after coverage repair")
+        if final_audit.over_fragmented:
+            raise ValueError("sub-questions remain over-fragmented after coverage repair")
+        emit_event(
+            "m1_subquestion_coverage",
+            module="m1",
+            tool="qwen_subquestion_coverage",
+            status="warning",
+            message="覆盖轮次耗尽，保留已覆盖核心意图的子问题",
+            elapsed_seconds=time.monotonic() - started_at,
+            details={
+                "missing_aspects": list(final_audit.missing_aspects),
+                "sub_question_count": len(questions),
+            },
+        )
+        return questions
+
+    async def _merge_subquestions_to_limit(
+        self,
+        question: str,
+        sub_questions: List[str],
+    ) -> List[str]:
+        """Semantically merge overflow instead of dropping questions by position."""
+
+        rendered = "\n".join(f"- {item}" for item in sub_questions)
+        payload = await self.client.structured_chat(
+            system_prompt=M1_COVERAGE_MERGE_SYSTEM_PROMPT,
+            user_prompt=M1_COVERAGE_MERGE_USER_TEMPLATE.format(
+                question=question,
+                sub_questions_text=rendered,
+                merge_instructions_text=(
+                    "Merge overlapping or adjacent aspects so the complete "
+                    "list contains at most 5 atomic sub-questions. Preserve "
+                    "the original core action and every indispensable aspect."
+                ),
+            ),
+            output_schema=_SubQuestionSupplement.model_json_schema(),
+            max_tokens=4096,
+            temperature=0.0,
+        )
+        merged = _SubQuestionSupplement.model_validate(payload)
+        result = list(dict.fromkeys(
+            " ".join(item.split())
+            for item in merged.sub_questions
+            if item.strip()
+        ))
+        violations = self._sub_question_violations(result)
+        if violations:
+            raise ValueError(
+                "sub-question limit merge produced an invalid decomposition: "
+                + "; ".join(violations)
+            )
+        if not result:
+            raise ValueError("sub-question limit merge returned no questions")
+        return result
+
+    @staticmethod
+    def _normalize_source_text(value: str) -> str:
+        """Normalize only for literal source checks, never for entity invention."""
+
+        return " ".join(
+            unicodedata.normalize("NFKC", str(value or "")).casefold().split()
+        )
+
+    async def _extract_and_audit_entities(self, question: str) -> List[TaskEntity]:
+        """Extract entities from the original question and independently audit them.
+
+        The LLM audit is intentionally followed by a deterministic literal-source
+        gate.  Therefore even an overly agreeable auditor cannot legitimize a term
+        introduced by a generated sub-question or by model background knowledge.
+        """
+
+        source = self._normalize_source_text(question)
+        audit_feedback = ""
+        last_missing: List[str] = []
+
+        for attempt in range(self.entity_repair_attempts + 1):
+            extraction_prompt = M1_ENTITY_EXTRACTION_USER_TEMPLATE.format(
+                question=question,
+            )
+            if audit_feedback:
+                extraction_prompt += M1_ENTITY_REPAIR_NOTE_TEMPLATE.format(
+                    audit_feedback=audit_feedback,
+                )
+            candidate_payload = await self.client.structured_chat(
+                system_prompt=M1_ENTITY_EXTRACTION_SYSTEM_PROMPT,
+                user_prompt=extraction_prompt,
+                output_schema=_CandidateEntityList.model_json_schema(),
+                max_tokens=4096,
+                temperature=0.0,
+            )
+            candidate_list = _CandidateEntityList.model_validate(candidate_payload)
+            audit_payload = await self.client.structured_chat(
+                system_prompt=M1_ENTITY_AUDIT_SYSTEM_PROMPT,
+                user_prompt=M1_ENTITY_AUDIT_USER_TEMPLATE.format(
+                    question=question,
+                    candidate_entities_json=json.dumps(
+                        [item.model_dump(mode="json") for item in candidate_list.entities],
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                ),
+                output_schema=_EntitySourceAudit.model_json_schema(),
+                max_tokens=4096,
+                temperature=0.0,
+            )
+            audit = _EntitySourceAudit.model_validate(audit_payload)
+            audit_by_name = {
+                self._normalize_source_text(item.candidate_name): item
+                for item in audit.items
+            }
+
+            accepted: List[TaskEntity] = []
+            seen: set[str] = set()
+            for candidate in candidate_list.entities:
+                name = self._normalize_source_text(candidate.name)
+                mention = self._normalize_source_text(candidate.source_mention)
+                audited = audit_by_name.get(name)
+                audited_mention = self._normalize_source_text(
+                    audited.source_mention if audited is not None else ""
+                )
+                literal_source_valid = bool(
+                    name
+                    and name == mention
+                    and name in source
+                    and audited_mention == name
+                )
+                if (
+                    audited is None
+                    or not audited.accepted
+                    or not literal_source_valid
+                    or name in seen
+                ):
+                    continue
+                seen.add(name)
+                accepted.append(TaskEntity(
+                    entity_id=f"E{len(accepted) + 1}",
+                    name=candidate.name,
+                    source_mention=candidate.source_mention,
+                    aliases=candidate.aliases,
+                    role=candidate.role,
+                    required=candidate.required,
+                ))
+
+            has_required_primary = any(
+                item.role == "primary_object" and item.required
+                for item in accepted
+            )
+            last_missing = list(audit.missing_explicit_entities)
+            if audit.complete and not last_missing and has_required_primary:
+                return accepted
+
+            audit_feedback = "; ".join(filter(None, [
+                (
+                    "No accepted required primary object was grounded in the "
+                    "original question."
+                    if not has_required_primary
+                    else ""
+                ),
+                (
+                    "Missing explicit entities: " + ", ".join(last_missing)
+                    if last_missing
+                    else ""
+                ),
+                "The audit marked the extraction incomplete." if not audit.complete else "",
+            ]))
+
+            emit_event(
+                "m1_entity_audit",
+                module="m1",
+                tool="qwen_entity_source_audit",
+                status="warning" if attempt < self.entity_repair_attempts else "failed",
+                message="关键实体来源复核未通过，正在修复" if attempt < self.entity_repair_attempts else "关键实体来源复核未通过",
+                details={
+                    "attempt": attempt + 1,
+                    "accepted_entities": [item.name for item in accepted],
+                    "missing_explicit_entities": last_missing,
+                    "has_required_primary": has_required_primary,
+                },
+            )
+
+        if not any(
+            item.role == "primary_object" and item.required
+            for item in accepted
+        ):
+            raise ValueError(
+                "entity extraction has no required primary object grounded in "
+                "the original user question"
+            )
+        raise ValueError(
+            "entity source audit remains incomplete after bounded repair"
+            + (f": missing {last_missing}" if last_missing else "")
+        )
+
+    @staticmethod
+    def _requirement_violations(
+        requirements: List[TaskRequirement],
+        sub_questions: List[str],
+        entities: List[TaskEntity],
+    ) -> List[str]:
+        """Validate requirement structure without changing audited entities."""
+
+        violations: List[str] = []
+        known_ids = {item.entity_id for item in entities}
+        required_questions = [" ".join(item.split()) for item in sub_questions]
+        actual_questions = [" ".join(item.sub_question.split()) for item in requirements]
+        if actual_questions != required_questions:
+            violations.append(
+                "requirements must map one-to-one to final sub-questions in order"
+            )
+        requirement_ids = [item.requirement_id for item in requirements]
+        expected_ids = [f"R{index}" for index in range(1, len(sub_questions) + 1)]
+        if requirement_ids != expected_ids:
+            violations.append("requirement IDs must be stable R1..Rn in order")
+        for item in requirements:
+            if not item.primary_entity_id:
+                violations.append(f"{item.requirement_id}: missing primary_entity_id")
+            elif item.primary_entity_id not in known_ids:
+                violations.append(f"{item.requirement_id}: unknown primary entity")
+            if any(entity_id not in known_ids for entity_id in item.related_entity_ids):
+                violations.append(f"{item.requirement_id}: unknown related entity")
+            if not item.relation.strip():
+                violations.append(f"{item.requirement_id}: empty relation")
+        return violations
+
+    async def _build_requirements(
+        self,
+        sub_questions: List[str],
+        entities: List[TaskEntity],
+    ) -> List[TaskRequirement]:
+        """Map final questions onto immutable, audited entity IDs."""
+
+        questions_json = json.dumps(sub_questions, ensure_ascii=False, indent=2)
+        entities_json = json.dumps(
+            [item.model_dump(mode="json") for item in entities],
+            ensure_ascii=False,
+            indent=2,
+        )
+        last_violations: List[str] = []
+        for attempt in range(self.requirement_repair_attempts + 1):
+            repair_note = ""
+            if attempt:
+                repair_note = (
+                    "\nThe previous mapping failed deterministic validation. "
+                    "Rebuild it using exactly the listed questions and entity IDs."
+                )
+            payload = await self.client.structured_chat(
+                system_prompt=M1_REQUIREMENT_SYSTEM_PROMPT,
+                user_prompt=M1_REQUIREMENT_USER_TEMPLATE.format(
+                    sub_questions_json=questions_json,
+                    entities_json=entities_json,
+                    repair_note=repair_note,
+                ),
+                output_schema=_RequirementList.model_json_schema(),
+                max_tokens=4096,
+                temperature=0.0,
+            )
+            result = _RequirementList.model_validate(payload)
+            last_violations = self._requirement_violations(
+                result.requirements,
+                sub_questions,
+                entities,
+            )
+            if not last_violations:
+                return result.requirements
+
+        raise ValueError(
+            "requirement mapping remains invalid after bounded repair: "
+            + "; ".join(last_violations)
+        )
+
     # ------------------------------------------------------------------
     # Followup triage (iteration core)
     # ------------------------------------------------------------------
 
     async def _understand_followup(self, state: PipelineState) -> Dict[str, Any]:
-        """Update the ProblemCard with the follow-up and decide skip_search."""
+        """Use an LLM for routing only; never let triage rewrite the parent card."""
         followup = state.followup
         assert followup is not None  # caller guarantees
-
-        # --- deterministic shortcut: pure format/language/presentation ---
-        # Only when the parent run already produced downstream artefacts
-        # (research plans or best hypotheses), so a search-free rerun is
-        # actually meaningful.
-        if state.problem_card is not None and (
-            state.research_plans or state.best_hypotheses
-        ):
-            matched = self._match_format_only_followup(followup.text)
-            if matched is not None:
-                return self._format_shortcut_result(state, followup, matched)
 
         # Low-cost graph overview (counts only) when available.
         graph = state.evidence_graph
@@ -343,11 +804,11 @@ class M1ProblemUnderstanding(ModuleProtocol):
                     graph_overview=graph_overview,
                     parent_artifacts_summary=parent_artifacts_summary,
                 ),
-                output_schema=_FollowupUnderstanding.model_json_schema(),
+                output_schema=_FollowupTriageDecision.model_json_schema(),
                 max_tokens=8192,
-                temperature=getattr(self.llm_config, "temperature", 0.1),
+                temperature=0.0,
             )
-            decision = _FollowupUnderstanding.model_validate(payload)
+            decision = _FollowupTriageDecision.model_validate(payload)
         except BaseException as exc:
             emit_event(
                 "tool_failed",
@@ -359,104 +820,69 @@ class M1ProblemUnderstanding(ModuleProtocol):
             )
             raise
 
-        card = decision.problem_card
-        violations = [
-            *self._sub_question_violations(card.sub_questions),
-            *self._contract_violations(card),
-        ]
-        if violations:
-            retry_prompt = "\n".join([
-                M1_FOLLOWUP_USER_TEMPLATE.format(
-                    problem_card_json=problem_card_json,
-                    followup_text=followup.text,
-                    graph_overview=graph_overview,
-                    parent_artifacts_summary=parent_artifacts_summary,
-                ),
-                "The proposed follow-up decomposition violated the atomic task contract:",
-                *[f"- {violation}" for violation in violations],
-                "Return a corrected follow-up decision with one atomic requirement per sub-question.",
-            ])
-            retry_payload = await self.client.structured_chat(
-                system_prompt=M1_FOLLOWUP_SYSTEM_PROMPT,
-                user_prompt=retry_prompt,
-                output_schema=_FollowupUnderstanding.model_json_schema(),
-                max_tokens=8192,
-                temperature=0.0,
-            )
-            retried = _FollowupUnderstanding.model_validate(retry_payload)
-            retry_violations = [
-                *self._sub_question_violations(retried.problem_card.sub_questions),
-                *self._contract_violations(retried.problem_card),
-            ]
-            if retry_violations:
-                logger.warning(
-                    "Follow-up ProblemCard still violates the atomic task "
-                    "contract after deterministic repair: %s",
-                    "; ".join(retry_violations),
-                )
-            decision = retried
-            card = decision.problem_card
-        if not card.original_question:
-            card.original_question = (
+        expected = {
+            "presentation_adjustment": (True, False),
+            "evidence_reuse_refinement": (True, False),
+            "research_change": (False, True),
+        }[decision.category]
+        graph_reusable = bool(
+            state.evidence_graph is not None
+            and (state.evidence_graph.nodes or state.evidence_graph.edges)
+        )
+        decision_consistent = (
+            (decision.skip_search, decision.rebuild_problem_card) == expected
+        )
+        confident = decision.confidence >= self.followup_triage_confidence_threshold
+        skip_search = bool(
+            decision.skip_search
+            and decision_consistent
+            and confident
+            and graph_reusable
+            and state.problem_card is not None
+        )
+        card = (
+            state.problem_card.model_copy(deep=True)
+            if state.problem_card is not None
+            else None
+        )
+        if decision.category == "research_change":
+            parent_question = (
                 state.problem_card.original_question
                 if state.problem_card is not None
-                else followup.text
+                else state.input_question
             )
-        if self.max_sub_questions and self.max_sub_questions > 0:
-            card.sub_questions = card.sub_questions[: self.max_sub_questions]
-            retained = {" ".join(item.split()).casefold() for item in card.sub_questions}
-            card.task_contract.requirements = [
-                requirement for requirement in card.task_contract.requirements
-                if " ".join(requirement.sub_question.split()).casefold() in retained
-            ]
-
-        skip_search = bool(decision.skip_search)
+            rebuild_input = (
+                "Original research question:\n"
+                f"{parent_question}\n\n"
+                "User's research-changing follow-up:\n"
+                f"{followup.text}"
+            )
+            card = await self._understand_question(rebuild_input)
         emit_event(
             "tool_completed",
             module="m1",
             tool="qwen_followup_triage",
             status="completed",
             message=(
-                f"追问判定完成：{'免检索（skip_search）' if skip_search else '需要新检索'}，"
-                f"{len(card.sub_questions)} 个子问题"
+                f"追问判定完成：{'免检索（skip_search）' if skip_search else '需要新检索'}"
             ),
             elapsed_seconds=time.monotonic() - started_at,
             details={
                 "skip_search": skip_search,
                 "rationale": decision.rationale,
                 "decision_source": "llm_triage",
-                "sub_questions": list(card.sub_questions),
-                "domains": list(card.domain),
-                "key_entities": list(card.key_entities),
+                "category": decision.category,
+                "confidence": decision.confidence,
+                "decision_consistent": decision_consistent,
+                "reusable_graph": graph_reusable,
             },
         )
-        return {
-            "problem_card": card,
+        patch: Dict[str, Any] = {
             "followup": followup.model_copy(update={"skip_search": skip_search}),
         }
-
-    # ------------------------------------------------------------------
-    # Deterministic format-only shortcut helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _match_format_only_followup(text: str) -> Optional[str]:
-        """Return the matched whitelist pattern if ``text`` is a pure
-        format/language/presentation request, else ``None``.
-
-        Matching is conservative: whitespace-stripped, length-bounded,
-        anchored full-match against the phrase whitelist — semantic
-        follow-ups (new entities/directions) can never match.
-        """
-        normalized = re.sub(r"\s+", "", text or "")
-        normalized = normalized.strip("。！!？?，,.、；;：:~～ ")
-        normalized = normalized.lower()
-        if not (2 <= len(normalized) <= _FORMAT_SHORTCUT_MAX_CHARS):
-            return None
-        for pattern in _FORMAT_SHORTCUT_PATTERNS:
-            if pattern.fullmatch(normalized):
-                return pattern.pattern
-        return None
+        if card is not None:
+            patch["problem_card"] = card
+        return patch
 
     @staticmethod
     def _parent_artifacts_summary(state: PipelineState) -> str:
@@ -491,57 +917,9 @@ class M1ProblemUnderstanding(ModuleProtocol):
         lines.append(
             "The parent run's knowledge base is as complete as summarised "
             "above; trigger a new literature search ONLY if the follow-up "
-            "introduces a genuinely new biomedical direction."
+            "introduces a genuinely new scientific or engineering direction."
         )
         return "\n".join(lines)
-
-    def _format_shortcut_result(
-        self,
-        state: PipelineState,
-        followup: Any,
-        matched_pattern: str,
-    ) -> Dict[str, Any]:
-        """Skip the LLM entirely for whitelisted format-only follow-ups:
-        reuse the parent ProblemCard verbatim and set ``skip_search=True``.
-        """
-        started_at = time.monotonic()
-        rationale = (
-            "确定性短路：追问命中格式/语言/呈现类白名单短语，父运行已有完整产物，"
-            "保持 ProblemCard 与父卡一致，免检索（skip_search=True）。"
-        )
-        emit_event(
-            "tool_started",
-            module="m1",
-            tool="followup_format_shortcut",
-            status="running",
-            message="追问命中格式类白名单，执行确定性短路",
-            details={"parent_run_id": followup.parent_run_id},
-        )
-        card = state.problem_card.model_copy(deep=True)
-        if self.max_sub_questions and self.max_sub_questions > 0:
-            card.sub_questions = card.sub_questions[: self.max_sub_questions]
-        emit_event(
-            "tool_completed",
-            module="m1",
-            tool="followup_format_shortcut",
-            status="completed",
-            message="格式类追问确定性短路：免检索（skip_search）",
-            elapsed_seconds=time.monotonic() - started_at,
-            details={
-                "skip_search": True,
-                "rationale": rationale,
-                "decision_source": "deterministic_shortcut",
-                "matched_pattern": matched_pattern,
-                "followup_text": followup.text,
-                "sub_questions": list(card.sub_questions),
-                "domains": list(card.domain),
-                "key_entities": list(card.key_entities),
-            },
-        )
-        return {
-            "problem_card": card,
-            "followup": followup.model_copy(update={"skip_search": True}),
-        }
 
     @classmethod
     def get_input_fields(cls) -> List[str]:
