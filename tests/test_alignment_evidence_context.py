@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import pytest
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from hypoforge.modules.m4_hypothesis_generation import M4HypothesisGeneration
 from hypoforge.modules.m5_research_plan import M5ResearchPlan
 from hypoforge.modules.m6_review_iteration import M6ReviewIteration
 from hypoforge.modules.m3_evidence_graph import M3EvidenceGraph
+from hypoforge.prompts.m5_prompts import M5_SYSTEM_PROMPT
 from hypoforge.pipeline import _route_after_m4, _should_continue_iterating
 from hypoforge.state import (
     EvidenceGapRequest,
@@ -301,7 +303,7 @@ class HypothesisRepairClient:
         self.calls.append(kwargs)
         return self.responses.pop(0)
 
-    async def chat(self, prompt: str) -> str:
+    async def chat(self, prompt: str = "", **kwargs) -> str:
         return "yes — test semantic client is consistent"
 
 
@@ -350,16 +352,141 @@ async def test_m4_repairs_contract_diagnostics_once_without_weakening_gate() -> 
             }],
         },
     }
-    client = HypothesisRepairClient([[invalid], [repaired]])
+    client = HypothesisRepairClient([
+        [invalid],
+        [repaired],
+        [{
+            "hypothesis_id": "H1",
+            "consistent": True,
+            "rationale": "same lithium-metal battery research object",
+        }],
+    ])
     module = M4HypothesisGeneration(num_candidates=1, top_k=1, mode="direct")
     module.client = client
 
     result = await module._run_llm(state)
 
-    assert len(client.calls) == 2
+    assert len(client.calls) == 3
     assert client.calls[1]["temperature"] == 0.0
     assert "missing required task entities" in client.calls[1]["user_prompt"]
+    assert "hypothesis_contract_auditor" not in client.calls[1]["user_prompt"]
+    assert "Primary task objects" in client.calls[2]["user_prompt"]
     assert result["top_hypotheses"][0].statement == valid_statement
+
+
+def _pose_estimation_contract_state() -> PipelineState:
+    question = "如何训练模型使之可以从单张图片识别出物体的位置、旋转等信息？"
+    return PipelineState(
+        input_question=question,
+        problem_card=ProblemCard(
+            original_question=question,
+            domain=["computer vision"],
+            sub_questions=[
+                "如何训练模型从单张图片联合估计物体的位置和旋转？",
+            ],
+            key_entities=["模型", "单张图片", "物体的位置", "旋转", "训练"],
+            task_contract=TaskContract(
+                entities=[
+                    TaskEntity(
+                        entity_id="E1", name="模型", role="primary_object",
+                        required=True,
+                    ),
+                    TaskEntity(
+                        entity_id="E2", name="单张图片", role="context",
+                        required=True,
+                    ),
+                    TaskEntity(
+                        entity_id="E3", name="物体的位置", role="outcome",
+                        required=True,
+                    ),
+                    TaskEntity(
+                        entity_id="E4", name="旋转", role="outcome",
+                        required=True,
+                    ),
+                    TaskEntity(
+                        entity_id="E5", name="训练", role="method",
+                        required=True,
+                    ),
+                ],
+                requirements=[
+                    TaskRequirement(
+                        requirement_id="R1",
+                        sub_question="如何训练模型从单张图片联合估计物体的位置和旋转？",
+                        primary_entity_id="E1",
+                        related_entity_ids=["E2", "E3", "E4", "E5"],
+                        relation="联合估计",
+                    ),
+                    TaskRequirement(
+                        requirement_id="R2",
+                        sub_question="如何评价模型的位置和旋转预测？",
+                        primary_entity_id="E1",
+                        related_entity_ids=["E3", "E4"],
+                        relation="评价预测",
+                    ),
+                ],
+            ),
+        ),
+    )
+
+
+def test_m4_canonicalizes_wrong_trace_excerpts_from_literal_content() -> None:
+    state = _pose_estimation_contract_state()
+    statement = "训练模型从单张图片联合预测物体的位置和旋转。"
+    candidate = HypothesisCard(
+        hypothesis_id="H1",
+        statement=statement,
+        mechanism="模型用共享视觉特征同时回归物体的位置与旋转。",
+        observable_predictions=["模型的位置和旋转误差均低于基线。"],
+        falsification_conditions=["模型在单张图片上的位置或旋转误差不下降。"],
+        task_trace=TaskTrace(
+            entity_mentions=[TaskTraceReference(
+                contract_id="E5", output_excerpt="模型",
+            )],
+            requirement_mentions=[
+                TaskTraceReference(contract_id="R1", output_excerpt="训练"),
+                TaskTraceReference(contract_id="R2", output_excerpt="旋转"),
+            ],
+        ),
+    )
+
+    canonical = M4HypothesisGeneration._canonicalize_task_traces(
+        state, [candidate],
+    )
+    accepted, failures = M4HypothesisGeneration._check_context_contract(
+        state, build_graph_context(state), canonical,
+    )
+
+    assert [card.hypothesis_id for card in accepted] == ["H1"]
+    assert failures == []
+    assert canonical[0].task_trace.entity_mentions[4].output_excerpt == statement
+    assert {
+        ref.contract_id for ref in canonical[0].task_trace.requirement_mentions
+    } == {"R1", "R2"}
+
+
+def test_m4_trace_canonicalization_does_not_invent_missing_content() -> None:
+    state = _pose_estimation_contract_state()
+    candidate = HypothesisCard(
+        hypothesis_id="H1",
+        statement="模型从单张图片联合预测物体的位置和旋转。",
+        mechanism="模型用共享视觉特征执行多任务预测。",
+        observable_predictions=["模型的位置和旋转误差均低于基线。"],
+        falsification_conditions=["模型的位置或旋转误差不下降。"],
+    )
+
+    canonical = M4HypothesisGeneration._canonicalize_task_traces(
+        state, [candidate],
+    )
+    accepted, failures = M4HypothesisGeneration._check_context_contract(
+        state, build_graph_context(state), canonical,
+    )
+
+    assert accepted == []
+    assert "训练" in failures[0]["missing_task_entities"]
+    assert all(
+        ref.contract_id != "E5"
+        for ref in canonical[0].task_trace.entity_mentions
+    )
 
 
 @pytest.mark.asyncio
@@ -402,7 +529,7 @@ class PlanClient:
     def __init__(self) -> None:
         self.calls = []
 
-    async def chat(self, prompt: str) -> str:
+    async def chat(self, prompt: str = "", **kwargs) -> str:
         return "yes — test semantic client is consistent"
 
     async def structured_chat(self, **kwargs):
@@ -438,6 +565,83 @@ class PlanClient:
         }
 
 
+class HangingPlanGenerationClient:
+    async def structured_chat(self, **kwargs):
+        await asyncio.Event().wait()
+
+
+class HangingPlanSemanticClient:
+    async def chat(self, **kwargs):
+        await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_m5_plan_generation_times_out_instead_of_hanging() -> None:
+    state = robot_state().model_copy(update={"top_hypotheses": [hypothesis()]})
+    module = M5ResearchPlan(generation_timeout_seconds=0.01)
+    module.client = HangingPlanGenerationClient()
+
+    with pytest.raises(RuntimeError, match="generation timed out"):
+        await asyncio.wait_for(module(state), timeout=0.5)
+
+
+@pytest.mark.asyncio
+async def test_m5_semantic_alignment_times_out_without_blocking_event_loop() -> None:
+    state = robot_state()
+    plan = ResearchPlan(study_subjects="机械臂 sim-to-real 抓取平台")
+    module = M5ResearchPlan(semantic_alignment_timeout_seconds=0.01)
+    module.client = HangingPlanSemanticClient()
+
+    with pytest.raises(RuntimeError, match="semantic task-contract audit timed out"):
+        await asyncio.wait_for(
+            module._audit_plan_semantics(state, plan),
+            timeout=0.5,
+        )
+
+
+def test_m5_requires_original_language_and_literal_contract_terms() -> None:
+    prompt = M5_SYSTEM_PROMPT.casefold()
+
+    assert "same language as the original question" in prompt
+    assert "verbatim" in prompt
+    assert "contract id alone" in prompt
+
+
+def test_m5_canonicalizes_trace_excerpts_from_plan_content() -> None:
+    state = _pose_estimation_contract_state()
+    plan = ResearchPlan(
+        hypothesis_id="H1",
+        study_subjects="训练模型从单张图片识别物体的位置和旋转。",
+        procedures=["使用单张图片训练模型并联合预测物体的位置和旋转。"],
+        measurement_metrics=["分别测量模型的位置误差和旋转误差。"],
+        task_trace=TaskTrace(
+            entity_mentions=[TaskTraceReference(
+                contract_id="E5", output_excerpt="模型",
+            )],
+            requirement_mentions=[TaskTraceReference(
+                contract_id="R1", output_excerpt="训练",
+            )],
+        ),
+    )
+
+    canonical = M5ResearchPlan._canonicalize_task_trace(state, plan)
+    assessment = assess_task_alignment(
+        state,
+        M5ResearchPlan._plan_alignment_text(canonical),
+        subject_text=canonical.study_subjects,
+        trace=canonical.task_trace,
+        semantic_client=None,
+    )
+
+    assert assessment.passed is True
+    assert {
+        item.contract_id for item in canonical.task_trace.entity_mentions
+    } == {"E1", "E2", "E3", "E4", "E5"}
+    assert {
+        item.contract_id for item in canonical.task_trace.requirement_mentions
+    } == {"R1", "R2"}
+
+
 @pytest.mark.asyncio
 async def test_m5_retries_object_drift_and_sanitizes_citations() -> None:
     state = robot_state().model_copy(update={"top_hypotheses": [hypothesis()]})
@@ -459,7 +663,7 @@ class ReviewClient:
     def __init__(self, chat_response: str = "yes — consistent") -> None:
         self._chat_response = chat_response
 
-    async def chat(self, prompt: str) -> str:
+    async def chat(self, prompt: str = "", **kwargs) -> str:
         return self._chat_response
 
     async def structured_chat(self, **kwargs):
@@ -476,6 +680,25 @@ class ReviewClient:
             # Deliberately claims a high score without an auditable citation.
             return base
         return base
+
+
+class HangingReviewSemanticClient:
+    async def chat(self, **kwargs):
+        await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_m6_pair_semantic_audit_times_out_without_blocking() -> None:
+    state = robot_state()
+    plan = ResearchPlan(study_subjects="机械臂 sim-to-real 抓取平台")
+    module = M6ReviewIteration(semantic_alignment_timeout_seconds=0.01)
+    module.client = HangingReviewSemanticClient()
+
+    with pytest.raises(RuntimeError, match="semantic task-contract audit timed out"):
+        await asyncio.wait_for(
+            module._audit_pair_semantics(state, hypothesis(), plan),
+            timeout=0.5,
+        )
 
 
 @pytest.mark.asyncio

@@ -42,8 +42,14 @@ from ..evaluation.rubric import (
     weights_summary,
 )
 from ..registry import ModuleRegistry
-from ..state import EvidenceGapRequest, HypothesisCard, PipelineState
-from ..task_alignment import assess_task_alignment
+from ..state import (
+    EvidenceGapRequest,
+    HypothesisCard,
+    PipelineState,
+    TaskTrace,
+    TaskTraceReference,
+)
+from ..task_alignment import _mentions_entity, assess_task_alignment
 from ..tools.qwen_client import QwenClient
 
 logger = logging.getLogger(__name__)
@@ -102,6 +108,7 @@ class M4HypothesisGeneration(ModuleProtocol):
         ranker_llm_config: Optional[Any] = None,
         weights: Optional[Dict[str, float]] = None,
         interactive: bool = False,
+        semantic_alignment_timeout_seconds: float = 60.0,
         **kwargs,
     ):
         self.num_candidates = num_candidates
@@ -114,6 +121,11 @@ class M4HypothesisGeneration(ModuleProtocol):
         # When True (and on a real TTY), pause between iterations to let the user
         # type guidance for the next revision — Claude-Code style.
         self.interactive = interactive
+        if semantic_alignment_timeout_seconds <= 0:
+            raise ValueError("semantic_alignment_timeout_seconds must be positive")
+        self.semantic_alignment_timeout_seconds = float(
+            semantic_alignment_timeout_seconds
+        )
         self.client = QwenClient.from_config(llm_config) if llm_config else None
         # Ranker uses a separate model tier to reduce self-scoring bias.
         # Falls back to the main client when no separate config is provided.
@@ -142,6 +154,17 @@ class M4HypothesisGeneration(ModuleProtocol):
         )
         try:
             result = await operation
+        except asyncio.CancelledError:
+            emit_event(
+                "tool_cancelled",
+                module="m4",
+                tool=tool,
+                status="cancelled",
+                message=f"M4 Agent 已取消：{tool}",
+                elapsed_seconds=time.monotonic() - started_at,
+                details=details,
+            )
+            raise
         except BaseException as exc:
             emit_event(
                 "tool_failed",
@@ -186,6 +209,101 @@ class M4HypothesisGeneration(ModuleProtocol):
             for item in items
         ]
         return "\n".join(lines) if lines else "- None available"
+
+    @staticmethod
+    def _canonicalize_task_traces(
+        state: PipelineState,
+        cards: List[HypothesisCard],
+    ) -> List[HypothesisCard]:
+        """Rebuild task traces from literal hypothesis output segments.
+
+        Models occasionally cover every binding task entity in the generated
+        hypothesis but attach a trace excerpt that points at the wrong words.
+        The trace is audit metadata, so derive it deterministically from the
+        actual output before applying the hard alignment gate.  Missing content
+        is never synthesized: an entity or requirement gets no trace unless a
+        literal output segment contains its required entity text.
+        """
+
+        problem_card = state.problem_card
+        if problem_card is None:
+            return cards
+        contract = problem_card.task_contract
+        if not contract.entities and not contract.requirements:
+            return cards
+
+        entity_by_id = {
+            entity.entity_id: entity for entity in contract.entities
+        }
+        canonical: List[HypothesisCard] = []
+        for card in cards:
+            segments = list(dict.fromkeys(
+                segment.strip()
+                for segment in [
+                    card.statement,
+                    card.mechanism,
+                    *card.observable_predictions,
+                    *card.falsification_conditions,
+                ]
+                if str(segment or "").strip()
+            ))
+
+            entity_mentions: List[TaskTraceReference] = []
+            for entity in contract.entities:
+                excerpt = next(
+                    (
+                        segment for segment in segments
+                        if _mentions_entity(segment, entity)
+                    ),
+                    "",
+                )
+                if excerpt:
+                    entity_mentions.append(TaskTraceReference(
+                        contract_id=entity.entity_id,
+                        output_excerpt=excerpt,
+                    ))
+
+            requirement_mentions: List[TaskTraceReference] = []
+            for requirement in contract.requirements:
+                primary = entity_by_id.get(requirement.primary_entity_id)
+                if primary is None:
+                    continue
+                requirement_entities = [
+                    entity_by_id[entity_id]
+                    for entity_id in [
+                        requirement.primary_entity_id,
+                        *requirement.related_entity_ids,
+                    ]
+                    if entity_id in entity_by_id
+                ]
+                candidates = [
+                    segment for segment in segments
+                    if _mentions_entity(segment, primary)
+                ]
+                if not candidates:
+                    continue
+                excerpt = max(
+                    candidates,
+                    key=lambda segment: (
+                        sum(
+                            _mentions_entity(segment, entity)
+                            for entity in requirement_entities
+                        ),
+                        -segments.index(segment),
+                    ),
+                )
+                requirement_mentions.append(TaskTraceReference(
+                    contract_id=requirement.requirement_id,
+                    output_excerpt=excerpt,
+                ))
+
+            canonical.append(card.model_copy(update={
+                "task_trace": TaskTrace(
+                    entity_mentions=entity_mentions,
+                    requirement_mentions=requirement_mentions,
+                ),
+            }))
+        return canonical
 
     @staticmethod
     def _check_context_contract(
@@ -257,6 +375,126 @@ class M4HypothesisGeneration(ModuleProtocol):
             }))
         return accepted, failures
 
+    async def _audit_context_contract_semantics(
+        self,
+        state: PipelineState,
+        candidates: List[HypothesisCard],
+    ) -> tuple[List[HypothesisCard], List[Dict[str, Any]]]:
+        """Batch-check candidate study objects without blocking the event loop."""
+
+        if not candidates:
+            return [], []
+        assert self.client is not None
+        contract = state.problem_card.task_contract if state.problem_card else None
+        primary_objects = [
+            {
+                "entity_id": entity.entity_id,
+                "name": entity.name,
+                "aliases": list(entity.aliases),
+            }
+            for entity in (contract.entities if contract is not None else [])
+            if entity.role == "primary_object" and entity.required
+        ]
+        if not primary_objects:
+            return list(candidates), []
+
+        schema = {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "hypothesis_id": {"type": "string"},
+                    "consistent": {"type": "boolean"},
+                    "rationale": {"type": "string"},
+                },
+                "required": ["hypothesis_id", "consistent", "rationale"],
+            },
+        }
+        user_prompt = (
+            "Check whether every candidate hypothesis studies the same type of "
+            "primary object required by the original task. Judge meaning, not "
+            "mere word overlap. Return exactly one verdict per hypothesis_id.\n\n"
+            "Primary task objects:\n"
+            + json.dumps(primary_objects, ensure_ascii=False, indent=2)
+            + "\n\nCandidate hypotheses:\n"
+            + json.dumps(
+                [
+                    {
+                        "hypothesis_id": card.hypothesis_id,
+                        "statement": card.statement,
+                        "mechanism": card.mechanism,
+                    }
+                    for card in candidates
+                ],
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        try:
+            verdicts = await self._observe_tool(
+                "hypothesis_contract_auditor",
+                asyncio.wait_for(
+                    self.client.structured_chat(
+                        system_prompt=(
+                            "You are a strict task-alignment auditor. Fail a "
+                            "candidate when its research object drifts from the "
+                            "task's required primary object."
+                        ),
+                        user_prompt=user_prompt,
+                        output_schema=schema,
+                        max_tokens=2048,
+                        temperature=0.0,
+                        disable_thinking=True,
+                    ),
+                    timeout=self.semantic_alignment_timeout_seconds,
+                ),
+                details={
+                    "candidates": len(candidates),
+                    "primary_objects": len(primary_objects),
+                    "timeout_seconds": self.semantic_alignment_timeout_seconds,
+                },
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                "M4 semantic task-contract audit timed out after "
+                f"{self.semantic_alignment_timeout_seconds:g} seconds"
+            ) from exc
+
+        by_id = {card.hypothesis_id: card for card in candidates}
+        seen: set[str] = set()
+        accepted: List[HypothesisCard] = []
+        failures: List[Dict[str, Any]] = []
+        for verdict in verdicts if isinstance(verdicts, list) else []:
+            if not isinstance(verdict, dict):
+                continue
+            hypothesis_id = str(verdict.get("hypothesis_id") or "")
+            if hypothesis_id not in by_id or hypothesis_id in seen:
+                continue
+            consistent = verdict.get("consistent")
+            if not isinstance(consistent, bool):
+                continue
+            seen.add(hypothesis_id)
+            if consistent:
+                accepted.append(by_id[hypothesis_id])
+            else:
+                failures.append({
+                    "hypothesis_id": hypothesis_id,
+                    "rationale": str(
+                        verdict.get("rationale")
+                        or "semantic task-object mismatch"
+                    ),
+                    "semantic_object_mismatch": True,
+                })
+        for hypothesis_id in by_id.keys() - seen:
+            failures.append({
+                "hypothesis_id": hypothesis_id,
+                "rationale": (
+                    "semantic task-contract auditor returned no valid verdict"
+                ),
+                "semantic_verdict_missing": True,
+            })
+        return accepted, failures
+
     @staticmethod
     def _enforce_context_contract(
         state: PipelineState,
@@ -326,10 +564,16 @@ class M4HypothesisGeneration(ModuleProtocol):
                 "iteration": state.iteration_count + 1,
             },
         )
-        repaired_candidates = self._normalise_hypotheses(repaired)
-        return self._check_context_contract(
-            state, context, repaired_candidates, semantic_client=self.client,
+        repaired_candidates = self._canonicalize_task_traces(
+            state, self._normalise_hypotheses(repaired),
         )
+        accepted, deterministic_failures = self._check_context_contract(
+            state, context, repaired_candidates, semantic_client=None,
+        )
+        accepted, semantic_failures = await self._audit_context_contract_semantics(
+            state, accepted
+        )
+        return accepted, [*deterministic_failures, *semantic_failures]
 
     def _normalise_hypotheses(self, payload: Any) -> List[HypothesisCard]:
         if isinstance(payload, dict):
@@ -642,10 +886,16 @@ class M4HypothesisGeneration(ModuleProtocol):
                 "iteration": state.iteration_count + 1,
             },
         )
-        candidates = self._normalise_hypotheses(generated)
-        candidates, contract_failures = self._check_context_contract(
-            state, graph_context, candidates, semantic_client=self.client,
+        candidates = self._canonicalize_task_traces(
+            state, self._normalise_hypotheses(generated),
         )
+        candidates, contract_failures = self._check_context_contract(
+            state, graph_context, candidates, semantic_client=None,
+        )
+        candidates, semantic_failures = await self._audit_context_contract_semantics(
+            state, candidates
+        )
+        contract_failures.extend(semantic_failures)
         if not candidates:
             candidates, contract_failures = await self._repair_context_contract(
                 state=state,

@@ -1680,7 +1680,7 @@ function setSendBtn(mode){
     btn.textContent = "停止"; btn.title = "停止当前运行";
   } else if(mode === "stopping"){
     btn.classList.add("stop"); btn.disabled = true;
-    btn.textContent = "正在停止…"; btn.title = "取消已请求：当前模块执行完成后停止";
+    btn.textContent = "正在停止…"; btn.title = "取消已请求：正在终止当前异步任务";
   } else {
     btn.classList.remove("stop"); btn.disabled = false;
     btn.innerHTML = SEND_BTN_SUBMIT_HTML; btn.title = "提交";
@@ -1696,7 +1696,7 @@ async function requestCancel(){
     if(!response.ok) throw new Error(data.error || `停止失败（HTTP ${response.status}）`);
     const hint = $("inputHint");
     hint.classList.remove("error");
-    hint.textContent = "已请求停止：当前模块执行完成后流程将停止，已有成果将保留…";
+    hint.textContent = "已请求停止：正在终止当前异步任务，已有成果将保留…";
   }catch(err){
     setSendBtn("stop");
     showInputError(`停止失败：${err.message || err}`);

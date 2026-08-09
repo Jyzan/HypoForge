@@ -237,13 +237,14 @@ async def test_query_planner_emits_both_teammate_backends() -> None:
 
     queries = await planner.plan("Hippo YAP TAZ", state=SearchState())
 
-    assert [q.target_source for q in queries] == [
-        "pubmed", "semantic_scholar", "arxiv"
-    ]
+    assert {q.target_source for q in queries} == {
+        "pubmed", "semantic_scholar", "openalex", "arxiv"
+    }
     assert [q.relation_to_question for q in queries[:2]] == [
         "Direct mechanism", "Cross-disciplinary evidence"
     ]
-    assert queries[2].purpose == "cross_source_coverage"
+    assert all(query.purpose == "cross_source_coverage" for query in queries[2:])
+    assert {query.target_source for query in queries[2:]} == {"openalex", "arxiv"}
     assert client.calls[0]["disable_thinking"] is True
 
 
@@ -257,7 +258,7 @@ async def test_query_planner_supplies_relation_when_model_omits_reasoning() -> N
 
     queries = await planner.plan("Hippo", state=SearchState())
 
-    assert len(queries) == 3
+    assert len(queries) == 4
     assert queries[0].text == "Hippo[tiab]"
     assert queries[0].target_source == "pubmed"
     assert (
@@ -295,9 +296,11 @@ async def test_query_planner_keeps_legacy_fallback_outside_strict_mode() -> None
         "q-fb-1",
         "q-fb-2",
         "q-fb-3",
+        "q-fb-4",
     ]
     assert [query.target_source for query in queries] == [
         "arxiv",
+        "openalex",
         "pubmed",
         "semantic_scholar",
     ]

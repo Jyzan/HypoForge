@@ -62,8 +62,8 @@ class RunManager:
         self._runs: dict[str, dict[str, Any]] = {}
         self._run_credentials: dict[str, dict[str, str]] = {}
         self._run_followups: dict[str, dict[str, Any]] = {}
-        # One cooperative cancellation flag per live run: set by
-        # ``request_cancel``, polled by the pipeline between modules.
+        # One cancellation flag per live run: set by ``request_cancel`` and
+        # polled by the pipeline both during and between async modules.
         self._cancel_events: dict[str, threading.Event] = {}
 
     def start(
@@ -159,9 +159,9 @@ class RunManager:
     def request_cancel(self, run_id: str) -> dict[str, Any]:
         """Request a cooperative stop for a running run.
 
-        Sets the run's cancellation flag; the pipeline checks it between
-        modules, finishes the module currently executing, then persists the
-        accumulated state and ends.  Raises ``ValueError`` for malformed
+        Sets the run's cancellation flag; the pipeline cancels active async
+        module work, persists the last completed state, then ends.  Raises
+        ``ValueError`` for malformed
         ids, ``LookupError`` for unknown runs, and ``RuntimeError`` when the
         run has already finished (cancel is idempotent while cancelling).
         """
@@ -195,7 +195,7 @@ class RunManager:
                 "cancel_requested",
                 status="cancelling",
                 message=(
-                    "收到停止请求：当前模块执行完成后流程将停止，"
+                    "收到停止请求：正在取消当前异步任务，"
                     "已完成模块的成果将保留"
                 ),
             )
@@ -305,7 +305,7 @@ class RunManager:
                     "seed_state": followup_info.get("seed_state"),
                 }
             runner = PipelineRunner(config, event_recorder=recorder)
-            # Cooperative cancellation flag (set by request_cancel).
+            # Active cancellation flag (set by request_cancel).
             runner.cancel_event = self._cancel_events.get(run_id)
             state = asyncio.run(
                 runner.run(

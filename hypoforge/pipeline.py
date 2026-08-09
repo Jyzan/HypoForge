@@ -7,6 +7,8 @@ conditional iteration edges, and compiles the graph.
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
 import logging
 import time
 from typing import Any, Dict, Literal
@@ -26,10 +28,10 @@ logger = logging.getLogger(__name__)
 class PipelineCancelled(Exception):
     """Raised by a node wrapper when a user-requested stop is pending.
 
-    Cooperative cancellation: the currently executing module is always
-    allowed to finish first; the *next* module refuses to start and raises
-    this exception, which :meth:`PipelineRunner.run` catches to persist the
-    accumulated state and emit the ``run_cancelled`` event.
+    Async modules are cancelled while running; a request observed between
+    modules prevents the next module from starting.  :meth:`PipelineRunner.run`
+    catches this exception to persist the last completed state and emit the
+    ``run_cancelled`` event.
     """
 
     def __init__(self, module: str) -> None:
@@ -236,7 +238,13 @@ class PipelineRunner:
         "m1": ["qwen_problem_understanding"],
         "m2": ["agentic_literature_pipeline"],
         "m3": ["rule_graph_builder", "qwen_relation_extractor"],
-        "m4": ["hypothesis_generator", "hypothesis_ranker"],
+        "m4": [
+            "hypothesis_generator",
+            "hypothesis_contract_auditor",
+            "hypothesis_critic",
+            "falsifiability_checker",
+            "hypothesis_ranker",
+        ],
         "m5": ["research_plan_designer"],
         "m6": ["specialist_reviewers", "overall_score_aggregator", "evidence_sufficiency_judge"],
     }
@@ -271,6 +279,38 @@ class PipelineRunner:
         return self.cancel_event is not None and bool(
             self.cancel_event.is_set()
         )
+
+    async def _await_module_or_cancel(self, operation, module_name: str):
+        """Await one module while polling the web cancellation flag."""
+
+        task = asyncio.create_task(operation)
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=0.2)
+                if task in done:
+                    return task.result()
+                if not self._cancel_requested():
+                    continue
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+                self._record_event(
+                    "module_cancelled",
+                    module=module_name,
+                    status="cancelled",
+                    message=(
+                        f"{module_name.upper()} 执行中收到停止请求，"
+                        "当前异步任务已取消"
+                    ),
+                    details={
+                        "tools": self._MODULE_TOOLS.get(module_name, []),
+                        "during_module": True,
+                    },
+                )
+                raise PipelineCancelled(module_name)
+        finally:
+            if not task.done():
+                task.cancel()
 
     def _record_event(self, event_type: str, **kwargs: Any) -> None:
         if self.event_recorder is not None:
@@ -637,7 +677,9 @@ class PipelineRunner:
                 state_before = state_for_module
 
                 # --- execute module ---
-                result = await mod(state_for_module)
+                result = await self._await_module_or_cancel(
+                    mod(state_for_module), name
+                )
                 if result is None:
                     result = {}
                 if not isinstance(result, dict):
@@ -748,6 +790,8 @@ class PipelineRunner:
                     details=details,
                 )
                 return final
+            except PipelineCancelled:
+                raise
             except Exception as exc:
                 import traceback
                 elapsed = (

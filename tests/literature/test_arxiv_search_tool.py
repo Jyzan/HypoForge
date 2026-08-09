@@ -51,17 +51,19 @@ def make_tool() -> tuple[LiteratureSearchTool, FakeSource, FakeSource, FakeSourc
     )
 
 
-def test_search_tool_exposes_three_independent_sources() -> None:
+def test_search_tool_exposes_four_independent_sources() -> None:
     tool, _, _, _ = make_tool()
 
     assert [item["name"] for item in tool.tool_definitions] == [
         "pubmed",
         "semantic_scholar",
+        "openalex",
         "arxiv",
     ]
     assert [item.source_name for item in tool.as_source_list()] == [
         "pubmed",
         "semantic_scholar",
+        "openalex",
         "arxiv",
     ]
     assert tool.is_valid_backend("arxiv") is True

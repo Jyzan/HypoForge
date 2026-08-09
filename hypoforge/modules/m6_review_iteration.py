@@ -11,6 +11,7 @@ Output: ``reviews`` appended; ``iteration_count`` incremented.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -99,8 +100,16 @@ class M6ReviewIteration(ModuleProtocol):
         llm_config: Optional[Any] = None,
         m6_evidence_revisit: bool = False,
         gap_no_gain_limit: int = 3,
+        semantic_alignment_timeout_seconds: float = 60.0,
+        reviewer_timeout_seconds: float = 180.0,
         **kwargs,
     ):
+        if semantic_alignment_timeout_seconds <= 0:
+            raise ValueError(
+                "semantic_alignment_timeout_seconds must be positive"
+            )
+        if reviewer_timeout_seconds <= 0:
+            raise ValueError("reviewer_timeout_seconds must be positive")
         self.reviewer_dims = reviewers or [
             "scientific_logic",
             "evidence_consistency",
@@ -120,7 +129,96 @@ class M6ReviewIteration(ModuleProtocol):
         # Default mirrors config.gap_no_gain_limit; overridable via
         # module_overrides.m6.kwargs.gap_no_gain_limit.
         self.gap_no_gain_limit = max(1, int(gap_no_gain_limit))
+        self.semantic_alignment_timeout_seconds = float(
+            semantic_alignment_timeout_seconds
+        )
+        self.reviewer_timeout_seconds = float(reviewer_timeout_seconds)
         self.client = QwenClient.from_config(llm_config) if llm_config else None
+
+    async def _audit_pair_semantics(
+        self,
+        state: PipelineState,
+        hypothesis: Any,
+        plan: Any,
+    ) -> tuple[bool, str]:
+        """Audit the hypothesis-plan research object without sync thread joins."""
+
+        assert self.client is not None
+        contract = state.problem_card.task_contract if state.problem_card else None
+        primary_objects = [
+            {
+                "entity_id": entity.entity_id,
+                "name": entity.name,
+                "aliases": list(entity.aliases),
+            }
+            for entity in (contract.entities if contract is not None else [])
+            if entity.role == "primary_object" and entity.required
+        ]
+        if not primary_objects:
+            return True, "No required primary object needs semantic auditing."
+
+        prompt = (
+            "Judge whether BOTH the hypothesis and its research plan study the "
+            "same type of primary object required by the original task. Judge "
+            "meaning, not mere word overlap. Answer ONLY yes or no, followed "
+            "by one short reason.\n\nPrimary task objects:\n"
+            + json.dumps(primary_objects, ensure_ascii=False, indent=2)
+            + "\n\nHypothesis:\n"
+            + str(hypothesis.statement)
+            + "\n"
+            + str(hypothesis.mechanism)
+            + "\n\nPlan study subjects:\n"
+            + str(plan.study_subjects)
+        )
+        started_at = time.monotonic()
+        emit_event(
+            "tool_started",
+            module="m6",
+            tool="task_contract_auditor",
+            status="running",
+            message="M6 任务对象语义复核开始",
+            details={
+                "timeout_seconds": self.semantic_alignment_timeout_seconds,
+            },
+        )
+        try:
+            response = await asyncio.wait_for(
+                self.client.chat(
+                    user_prompt=prompt,
+                    max_tokens=512,
+                    temperature=0.0,
+                    disable_thinking=True,
+                ),
+                timeout=self.semantic_alignment_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            emit_event(
+                "tool_failed",
+                module="m6",
+                tool="task_contract_auditor",
+                status="failed",
+                message="M6 任务对象语义复核超时",
+                elapsed_seconds=time.monotonic() - started_at,
+            )
+            raise RuntimeError(
+                "M6 semantic task-contract audit timed out after "
+                f"{self.semantic_alignment_timeout_seconds:g} seconds"
+            ) from exc
+        answer = str(response or "").strip()
+        consistent = answer.casefold().startswith("yes")
+        emit_event(
+            "tool_completed",
+            module="m6",
+            tool="task_contract_auditor",
+            status="completed",
+            message=(
+                "M6 任务对象语义复核通过"
+                if consistent else "M6 任务对象语义复核未通过"
+            ),
+            elapsed_seconds=time.monotonic() - started_at,
+            details={"consistent": consistent},
+        )
+        return consistent, answer
 
     # ------------------------------------------------------------------
     # ModuleProtocol implementation
@@ -169,21 +267,27 @@ class M6ReviewIteration(ModuleProtocol):
             hypothesis.model_dump_json(exclude={"task_trace"}),
             subject_text="\n".join([hypothesis.statement, hypothesis.mechanism]),
             trace=hypothesis.task_trace,
-            semantic_client=self.client,
+            semantic_client=None,
         )
         plan_alignment = assess_task_alignment(
             state,
             plan.model_dump_json(exclude={"task_trace"}),
             subject_text=plan.study_subjects,
             trace=plan.task_trace,
-            semantic_client=self.client,
+            semantic_client=None,
+        )
+        semantic_alignment_passed, semantic_alignment_rationale = (
+            await self._audit_pair_semantics(state, hypothesis, plan)
         )
         deterministic_alignment_passed = (
-            hypothesis_alignment.passed and plan_alignment.passed
+            hypothesis_alignment.passed
+            and plan_alignment.passed
+            and semantic_alignment_passed
         )
         deterministic_alignment_rationale = " ".join(filter(None, [
             f"Hypothesis: {hypothesis_alignment.rationale}",
             f"Plan: {plan_alignment.rationale}",
+            f"Semantic pair audit: {semantic_alignment_rationale}",
         ]))
 
         # Task alignment is a deterministic, independent hard gate. It does
@@ -223,25 +327,35 @@ class M6ReviewIteration(ModuleProtocol):
                 message=f"评审 Agent 开始：{dim}",
                 details={"version": version},
             )
-            payload = await self.client.structured_chat(
-                system_prompt=system_prompt,
-                user_prompt=M6_USER_TEMPLATE.format(
-                    original_question=state.input_question,
-                    problem_card_json=(
-                        state.problem_card.model_dump_json(indent=2)
-                        if state.problem_card else "{}"
+            try:
+                payload = await asyncio.wait_for(
+                    self.client.structured_chat(
+                        system_prompt=system_prompt,
+                        user_prompt=M6_USER_TEMPLATE.format(
+                            original_question=state.input_question,
+                            problem_card_json=(
+                                state.problem_card.model_dump_json(indent=2)
+                                if state.problem_card else "{}"
+                            ),
+                            hypothesis_json=json.dumps(hypothesis.model_dump(mode="json"), ensure_ascii=False, indent=2),
+                            plan_json=json.dumps(plan.model_dump(mode="json"), ensure_ascii=False, indent=2),
+                            graph_context=rendered_graph_context,
+                            facts_count=len(graph.established_facts) if graph else 0,
+                            conflicts_count=len(graph.conflicts) if graph else 0,
+                            gaps_count=len(graph.knowledge_gaps) if graph else 0,
+                        ),
+                        output_schema=ReviewResult.model_json_schema(),
+                        max_tokens=8192,
+                        temperature=getattr(self.llm_config, "temperature", 0.1),
+                        disable_thinking=True,
                     ),
-                    hypothesis_json=json.dumps(hypothesis.model_dump(mode="json"), ensure_ascii=False, indent=2),
-                    plan_json=json.dumps(plan.model_dump(mode="json"), ensure_ascii=False, indent=2),
-                    graph_context=rendered_graph_context,
-                    facts_count=len(graph.established_facts) if graph else 0,
-                    conflicts_count=len(graph.conflicts) if graph else 0,
-                    gaps_count=len(graph.knowledge_gaps) if graph else 0,
-                ),
-                output_schema=ReviewResult.model_json_schema(),
-                max_tokens=8192,
-                temperature=getattr(self.llm_config, "temperature", 0.1),
-            )
+                    timeout=self.reviewer_timeout_seconds,
+                )
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"M6 reviewer {dim!r} timed out after "
+                    f"{self.reviewer_timeout_seconds:g} seconds"
+                ) from exc
             payload = dict(payload)
             payload["dimension"] = dim
             payload["version"] = version
@@ -405,23 +519,27 @@ class M6ReviewIteration(ModuleProtocol):
                 "procedures": plan.procedures[:5],
                 "measurement_metrics": plan.measurement_metrics[:5],
             }
-            payload = await self.client.structured_chat(
-                system_prompt=M6_EVIDENCE_VERDICT_SYSTEM,
-                user_prompt=M6_EVIDENCE_VERDICT_TEMPLATE.format(
-                    original_question=state.input_question,
-                    facts_count=len(graph.established_facts) if graph else 0,
-                    conflicts_count=len(graph.conflicts) if graph else 0,
-                    gaps_count=len(graph.knowledge_gaps) if graph else 0,
-                    graph_context=graph_context.render(),
-                    hypothesis_json=json.dumps(
-                        hypothesis.model_dump(mode="json"), ensure_ascii=False, indent=2
+            payload = await asyncio.wait_for(
+                self.client.structured_chat(
+                    system_prompt=M6_EVIDENCE_VERDICT_SYSTEM,
+                    user_prompt=M6_EVIDENCE_VERDICT_TEMPLATE.format(
+                        original_question=state.input_question,
+                        facts_count=len(graph.established_facts) if graph else 0,
+                        conflicts_count=len(graph.conflicts) if graph else 0,
+                        gaps_count=len(graph.knowledge_gaps) if graph else 0,
+                        graph_context=graph_context.render(),
+                        hypothesis_json=json.dumps(
+                            hypothesis.model_dump(mode="json"), ensure_ascii=False, indent=2
+                        ),
+                        plan_summary=json.dumps(plan_summary, ensure_ascii=False, indent=2),
+                        version=version,
                     ),
-                    plan_summary=json.dumps(plan_summary, ensure_ascii=False, indent=2),
-                    version=version,
+                    output_schema=EvidenceSufficiencyVerdict.model_json_schema(),
+                    max_tokens=4096,
+                    temperature=getattr(self.llm_config, "temperature", 0.1),
+                    disable_thinking=True,
                 ),
-                output_schema=EvidenceSufficiencyVerdict.model_json_schema(),
-                max_tokens=4096,
-                temperature=getattr(self.llm_config, "temperature", 0.1),
+                timeout=self.reviewer_timeout_seconds,
             )
             if not payload:
                 raise ValueError("empty evidence-sufficiency payload")

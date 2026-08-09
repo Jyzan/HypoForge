@@ -43,6 +43,7 @@ async def test_first_round_adds_every_missing_configured_source() -> None:
     assert {item.target_source for item in queries} == {
         "pubmed",
         "semantic_scholar",
+        "openalex",
         "arxiv",
     }
     added = [
@@ -50,12 +51,13 @@ async def test_first_round_adds_every_missing_configured_source() -> None:
     ]
     assert {item.target_source for item in added} == {
         "semantic_scholar",
+        "openalex",
         "arxiv",
     }
     assert all(
         item.text == "How does cancer immunotherapy work?" for item in added
     )
-    assert len({item.query_id for item in queries}) == 3
+    assert len({item.query_id for item in queries}) == 4
 
 
 @pytest.mark.asyncio
@@ -68,7 +70,7 @@ async def test_first_round_does_not_duplicate_model_selected_sources() -> None:
     queries = await planner.plan("question", state=SearchState())
 
     assert [item.target_source for item in queries].count("arxiv") == 1
-    assert len(queries) == 3
+    assert len(queries) == 4
 
 
 @pytest.mark.asyncio
@@ -91,9 +93,10 @@ async def test_first_round_coverage_precedes_repeated_source_queries() -> None:
 
     queries = await planner.plan("question", state=SearchState())
 
-    assert {item.target_source for item in queries[:3]} == {
+    assert {item.target_source for item in queries[:4]} == {
         "pubmed",
         "semantic_scholar",
+        "openalex",
         "arxiv",
     }
 
@@ -125,7 +128,11 @@ async def test_unavailable_source_is_not_reintroduced_on_first_round() -> None:
 
     queries = await planner.plan("question", state=state)
 
-    assert {item.target_source for item in queries} == {"pubmed", "arxiv"}
+    assert {item.target_source for item in queries} == {
+        "pubmed",
+        "openalex",
+        "arxiv",
+    }
 
 
 @pytest.mark.asyncio
@@ -145,7 +152,11 @@ async def test_fallback_does_not_reintroduce_unavailable_source() -> None:
 
     queries = await planner.plan("question", state=state)
 
-    assert {item.target_source for item in queries} == {"pubmed", "arxiv"}
+    assert {item.target_source for item in queries} == {
+        "pubmed",
+        "openalex",
+        "arxiv",
+    }
 
 
 @pytest.mark.asyncio

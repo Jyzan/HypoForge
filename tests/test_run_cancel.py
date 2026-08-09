@@ -2,8 +2,8 @@
 
 Covers task #24:
 
-1. The cancel flag stops the execution loop after the current module, and
-   the accumulated state (problem card / literature knowledge) is persisted.
+1. The cancel flag interrupts active async module work, and the accumulated
+   state (problem card / literature knowledge) is persisted.
 2. ``POST /api/runs/{run_id}/cancel`` status codes:
    202 cancelling / 409 finished / 404 unknown / 400 malformed id.
 3. A cancelled run keeps its knowledge artifacts and can serve as the parent
@@ -13,6 +13,7 @@ Covers task #24:
 
 from __future__ import annotations
 
+import asyncio
 import http.client
 import json
 import threading
@@ -136,6 +137,75 @@ async def test_cancel_flag_stops_after_current_module_and_persists_state(
         event for event in events if event["event_type"] == "run_cancelled"
     )
     assert cancelled_event["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_cancel_interrupts_a_module_that_is_currently_waiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A web stop request must cancel active async M4 work promptly."""
+    from hypoforge.registry import ModuleRegistry
+
+    started = asyncio.Event()
+    cancellation_observed = asyncio.Event()
+
+    class BlockingM4(ModuleProtocol):
+        module_name = "m4"
+        module_version = "test"
+        description = "blocking m4"
+
+        async def __call__(self, state, config=None):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_observed.set()
+                raise
+
+        @classmethod
+        def get_input_fields(cls):
+            return []
+
+        @classmethod
+        def get_output_fields(cls):
+            return ["top_hypotheses"]
+
+    problem_card = ProblemCard(
+        original_question="问题", sub_questions=["子问题 A"]
+    )
+    modules = {
+        "m1": _make_fake_module("m1", {"problem_card": problem_card}),
+        "m4": BlockingM4(),
+    }
+    cancel_event = threading.Event()
+    config = PipelineConfig(verbose=False, enabled_modules=["m1", "m4"])
+    config.output_dir = str(tmp_path)
+    recorder = RunEventRecorder(tmp_path, "run-active-cancel")
+    runner = PipelineRunner(
+        config, event_recorder=recorder, cancel_event=cancel_event
+    )
+    monkeypatch.setattr(
+        ModuleRegistry, "build_all", staticmethod(lambda cfg: modules)
+    )
+
+    run_task = asyncio.create_task(
+        runner.run("问题", run_id="run-active-cancel")
+    )
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    cancel_event.set()
+    state = await asyncio.wait_for(run_task, timeout=0.8)
+
+    assert cancellation_observed.is_set()
+    assert runner.cancelled is True
+    assert state.problem_card is not None
+    assert state.problem_card.sub_questions == ["子问题 A"]
+    assert state.top_hypotheses == []
+    cancelled = [
+        event for event in recorder.read_events()
+        if event["event_type"] == "module_cancelled"
+    ]
+    assert cancelled[-1]["module"] == "m4"
+    assert cancelled[-1]["details"]["during_module"] is True
 
 
 @pytest.mark.asyncio

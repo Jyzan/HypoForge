@@ -15,12 +15,13 @@ from typing import Any, Dict, List, Optional
 from hypoforge.literature.models import PaperRecord, SearchQuery
 from hypoforge.literature.sources.academic_source import AcademicSource
 from hypoforge.literature.sources.arxiv_source import ArxivSource
+from hypoforge.literature.sources.openalex_source import OpenAlexSource
 from hypoforge.literature.sources.pubmed_source import PubMedSource
 from hypoforge.tools.semantic_scholar import SemanticScholarTool
 
 
 class LiteratureSearchTool:
-    """Unified search across PubMed, Semantic Scholar/OpenAlex, and arXiv.
+    """Unified search across PubMed, Semantic Scholar, OpenAlex, and arXiv.
 
     Usage::
 
@@ -46,16 +47,26 @@ class LiteratureSearchTool:
         },
         {
             "name": "semantic_scholar",
-            "display_name": "Semantic Scholar / OpenAlex",
+            "display_name": "Semantic Scholar",
             "description": (
                 "Search academic literature across ALL disciplines via "
-                "Semantic Scholar or OpenAlex (auto-selected). "
+                "Semantic Scholar. "
                 "BEST for: computer science, engineering, physics, social "
                 "sciences, mathematics, and interdisciplinary research. "
                 "Also works for broad biomedical queries that may appear "
                 "in non-PubMed journals. "
                 "NOT ideal for: specialized biomedical/clinical queries "
                 "requiring MeSH terms (use PubMed instead)."
+            ),
+        },
+        {
+            "name": "openalex",
+            "display_name": "OpenAlex",
+            "description": (
+                "Search the OpenAlex scholarly catalog across ALL disciplines "
+                "with plain keyword queries. BEST for broad cross-disciplinary "
+                "recall, citation-rich metadata, and works missing from PubMed "
+                "or Semantic Scholar."
             ),
         },
         {
@@ -80,8 +91,11 @@ class LiteratureSearchTool:
         pubmed: Optional[PubMedSource] = None,
         academic: Optional[AcademicSource] = None,
         arxiv_source: Optional[ArxivSource] = None,
+        openalex_source: Optional[OpenAlexSource] = None,
         enabled_sources: Sequence[str] | None = None,
         semantic_scholar_api_key: str = "",
+        openalex_api_key: str = "",
+        openalex_mailto: str = "",
         zero_result_relaxation: bool = True,
     ):
         requested = {
@@ -109,6 +123,11 @@ class LiteratureSearchTool:
         self._arxiv_source = (
             arxiv_source if arxiv_source is not None else ArxivSource()
         )
+        self._openalex_source = (
+            openalex_source
+            if openalex_source is not None
+            else OpenAlexSource(api_key=openalex_api_key, mailto=openalex_mailto)
+        )
 
     @property
     def tool_definitions(self) -> List[Dict[str, Any]]:
@@ -129,6 +148,7 @@ class LiteratureSearchTool:
         source_map = {
             "pubmed": self._pubmed_source,
             "semantic_scholar": self._academic_source,
+            "openalex": self._openalex_source,
             "arxiv": self._arxiv_source,
         }
         return [
@@ -153,6 +173,8 @@ class LiteratureSearchTool:
             return await self._pubmed_source.search(query, limit=limit)
         if backend == "semantic_scholar":
             return await self._academic_source.search(query, limit=limit)
+        if backend == "openalex":
+            return await self._openalex_source.search(query, limit=limit)
         if backend == "arxiv":
             return await self._arxiv_source.search(query, limit=limit)
         raise ValueError(

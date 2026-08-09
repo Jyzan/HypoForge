@@ -408,6 +408,7 @@ async def test_biomedical_domains_move_pubmed_queries_first() -> None:
     assert queries[0].target_source == "pubmed"
     assert {item.target_source for item in queries} == {
         "pubmed", "semantic_scholar", "arxiv",
+        "openalex",
     }
 
 
@@ -446,9 +447,12 @@ async def test_non_biomedical_domains_keep_original_order() -> None:
         "question", domains=["computer science"], state=SearchState(),
     )
 
-    assert [item.target_source for item in queries[:3]] == [
-        "semantic_scholar", "arxiv", "pubmed",
+    assert [item.target_source for item in queries[:2]] == [
+        "semantic_scholar", "arxiv",
     ]
+    assert {item.target_source for item in queries} == {
+        "pubmed", "semantic_scholar", "openalex", "arxiv",
+    }
 
 
 # ---------------------------------------------------------------------------

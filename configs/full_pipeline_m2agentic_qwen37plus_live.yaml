@@ -37,7 +37,7 @@ qwen:
 
 search:
   implementation: agentic
-  tools: ["pubmed", "semantic_scholar", "arxiv"]
+  tools: ["pubmed", "semantic_scholar", "openalex", "arxiv"]
   papers_per_sub_question: 5
   max_papers_total: 20
   max_rounds: 1
@@ -77,14 +77,19 @@ module_overrides:
       top_k: 1
       mode: "multi_agent"
       llm_tier: "plus"
+      semantic_alignment_timeout_seconds: 60.0
   m5:
     kwargs:
       mode: "llm"
       llm_tier: "plus"
+      generation_timeout_seconds: 180.0
+      semantic_alignment_timeout_seconds: 60.0
   m6:
     kwargs:
       mode: "llm"
       llm_tier: "plus"
+      semantic_alignment_timeout_seconds: 60.0
+      reviewer_timeout_seconds: 180.0
       reviewers:
         - scientific_logic
         - evidence_consistency

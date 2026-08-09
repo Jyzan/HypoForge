@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
 
 from hypoforge.modules.m4_hypothesis_generation import M4HypothesisGeneration
 from hypoforge.modules.m5_research_plan import M5ResearchPlan
+from hypoforge.observability import RunEventRecorder, bind_recorder
 from hypoforge.prompts.m5_prompts import M5_USER_TEMPLATE
 from hypoforge.state import (
     FollowupRequest,
@@ -73,6 +75,105 @@ class _SequenceClient:
 
     async def structured_chat(self, **kwargs: Any) -> Any:
         return self.responses.pop(0)
+
+
+class _RecordingClient:
+    def __init__(self, response: Any) -> None:
+        self.response = response
+        self.calls: list[dict[str, Any]] = []
+
+    async def structured_chat(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return self.response
+
+
+class _BlockingClient:
+    async def structured_chat(self, **kwargs: Any) -> Any:
+        await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_semantic_contract_audit_batches_all_candidates_in_one_call() -> None:
+    client = _RecordingClient([
+        {"hypothesis_id": "H1", "consistent": True, "rationale": "same object"},
+        {"hypothesis_id": "H2", "consistent": True, "rationale": "same object"},
+        {"hypothesis_id": "H3", "consistent": True, "rationale": "same object"},
+    ])
+    module = M4HypothesisGeneration(semantic_alignment_timeout_seconds=0.5)
+    module.client = client
+    state = PipelineState(
+        input_question="如何训练视觉模型检测深度？",
+        problem_card=ProblemCard(
+            original_question="如何训练视觉模型检测深度？",
+            sub_questions=["如何训练视觉模型检测深度？"],
+            key_entities=["视觉模型"],
+            domain=["computer vision"],
+        ),
+    )
+    candidates = [
+        _card("H1", "视觉模型可通过单目深度监督学习距离。"),
+        _card("H2", "视觉模型可联合预测深度与不确定性。"),
+        _card("H3", "视觉模型可利用几何一致性学习相对距离。"),
+    ]
+
+    accepted, failures = await module._audit_context_contract_semantics(
+        state, candidates
+    )
+
+    assert [card.hypothesis_id for card in accepted] == ["H1", "H2", "H3"]
+    assert failures == []
+    assert len(client.calls) == 1
+    assert "H1" in client.calls[0]["user_prompt"]
+    assert "H2" in client.calls[0]["user_prompt"]
+    assert "H3" in client.calls[0]["user_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_semantic_contract_audit_has_a_hard_timeout() -> None:
+    module = M4HypothesisGeneration(semantic_alignment_timeout_seconds=0.03)
+    module.client = _BlockingClient()
+    state = PipelineState(
+        input_question="如何训练视觉模型检测深度？",
+        problem_card=ProblemCard(
+            original_question="如何训练视觉模型检测深度？",
+            sub_questions=["如何训练视觉模型检测深度？"],
+            key_entities=["视觉模型"],
+            domain=["computer vision"],
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="timed out after 0.03 seconds"):
+        await asyncio.wait_for(
+            module._audit_context_contract_semantics(
+                state,
+                [_card("H1", "视觉模型可通过单目深度监督学习距离。")],
+            ),
+            timeout=0.25,
+        )
+
+
+@pytest.mark.asyncio
+async def test_observed_m4_tool_cancellation_is_not_reported_as_failure(
+    tmp_path,
+) -> None:
+    recorder = RunEventRecorder(tmp_path, "m4-cancel")
+
+    async def blocked_operation() -> None:
+        await asyncio.Event().wait()
+
+    with bind_recorder(recorder):
+        task = asyncio.create_task(
+            M4HypothesisGeneration._observe_tool(
+                "hypothesis_contract_auditor", blocked_operation()
+            )
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    event_types = [event["event_type"] for event in recorder.read_events()]
+    assert event_types == ["tool_started", "tool_cancelled"]
 
 
 @pytest.mark.asyncio
@@ -150,6 +251,10 @@ async def test_multi_agent_round_preserves_generator_statements_end_to_end() -> 
     client = _SequenceClient([
         [h1.model_dump(), h2.model_dump()],
         [
+            {"hypothesis_id": "H1-rev", "consistent": True, "rationale": "same object"},
+            {"hypothesis_id": "H2-rev", "consistent": True, "rationale": "same object"},
+        ],
+        [
             {
                 "hypothesis_id": "H1-rev",
                 "pass": True,
@@ -185,7 +290,18 @@ async def test_multi_agent_round_preserves_generator_statements_end_to_end() -> 
     module.client = client
     module.ranker_client = client
 
-    result = await module._run_llm(PipelineState(input_question="q", problem_card=ProblemCard(original_question="q", sub_questions=["q"], key_entities=[], domain=[])), "revision")
+    result = await module._run_llm(
+        PipelineState(
+            input_question="q",
+            problem_card=ProblemCard(
+                original_question="q",
+                sub_questions=["q"],
+                key_entities=["PBK"],
+                domain=[],
+            ),
+        ),
+        "revision",
+    )
 
     assert [card.statement for card in result["candidate_hypotheses"]] == [
         h1.statement,

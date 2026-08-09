@@ -2,7 +2,9 @@
 
 > 挑战杯 2026 · 赛题A：科学假设生成与研究计划设计
 > 当前状态：**Track A/B/C + Web UI 已合并** · 具备完整的 agentic 搜索、全文 grounding、评估和仪表盘
-> 最后更新：2026-08-06
+> 最后更新：2026-08-09
+>
+> **当前集成基线实测缺陷：** 见 [`docs/M1-M6_FULL_PIPELINE_KNOWN_ISSUES_2026-08-09.md`](docs/M1-M6_FULL_PIPELINE_KNOWN_ISSUES_2026-08-09.md)。该文档记录了真实 M1-M6 运行中发现的 P0/P1/P2 问题及推荐修法，团队后续应优先按该清单认领。
 
 ---
 

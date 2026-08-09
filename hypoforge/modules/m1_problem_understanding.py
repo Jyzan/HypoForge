@@ -414,9 +414,6 @@ class M1ProblemUnderstanding(ModuleProtocol):
                 )
                 return questions
 
-            if round_index >= self.coverage_max_rounds:
-                break
-
             if audit.over_fragmented:
                 merged_payload = await self.client.structured_chat(
                     system_prompt=M1_COVERAGE_MERGE_SYSTEM_PROMPT,

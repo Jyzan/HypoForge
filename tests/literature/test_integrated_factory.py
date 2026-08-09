@@ -21,6 +21,7 @@ from hypoforge.literature.search import (
 from hypoforge.literature.search.search_tool import LiteratureSearchTool
 from hypoforge.literature.sources.academic_source import AcademicSource
 from hypoforge.literature.sources.arxiv_source import ArxivSource
+from hypoforge.literature.sources.openalex_source import OpenAlexSource
 from hypoforge.literature.sources.pubmed_source import PubMedSource
 from hypoforge.state import PipelineState
 
@@ -139,6 +140,7 @@ def make_search_tool() -> LiteratureSearchTool:
             )
         ),
         arxiv_source=ArxivSource(tool=FakeLegacyTool([])),
+        openalex_source=OpenAlexSource(backend=FakeLegacyTool([]).search),
     )
 
 
@@ -150,6 +152,7 @@ def test_factory_wires_all_literature_sources() -> None:
     assert set(adapter.search_agent.sources) == {
         "pubmed",
         "semantic_scholar",
+        "openalex",
         "arxiv",
     }
     assert type(adapter.search_agent.query_planner).__name__ == "QueryPlanner"
@@ -188,6 +191,38 @@ def test_search_tool_accepts_per_instance_semantic_scholar_key() -> None:
     [source] = tool.as_source_list()
     assert source.backend_name == "semantic_scholar"
     assert source._tool.api_key == "s2-memory-only"
+
+
+def test_factory_forwards_per_run_openalex_credentials(monkeypatch) -> None:
+    captured: dict[str, str] = {}
+
+    class CapturingOpenAlexSource:
+        source_name = "openalex"
+
+        def __init__(self, api_key: str = "", mailto: str = "") -> None:
+            captured["api_key"] = api_key
+            captured["mailto"] = mailto
+
+        async def search(self, query, limit: int = 20):
+            return []
+
+    monkeypatch.setattr(
+        "hypoforge.literature.search.search_tool.OpenAlexSource",
+        CapturingOpenAlexSource,
+    )
+
+    adapter = build_integrated_search_adapter(
+        client=FakeClient(),
+        enabled_sources=["openalex"],
+        openalex_api_key="oa-memory-only",
+        openalex_mailto="team@example.org",
+    )
+
+    assert set(adapter.search_agent.sources) == {"openalex"}
+    assert captured == {
+        "api_key": "oa-memory-only",
+        "mailto": "team@example.org",
+    }
 
 
 def test_factory_wires_real_paper_selection_tools() -> None:

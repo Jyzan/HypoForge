@@ -101,6 +101,47 @@ async def test_over_fragmented_questions_are_merged_and_rechecked() -> None:
 
 
 @pytest.mark.asyncio
+async def test_last_coverage_round_can_apply_its_merge_repair() -> None:
+    split_questions = [
+        "How can a model predict object position from one image?",
+        "How can a model predict object rotation from one image?",
+    ]
+    merged_question = (
+        "How can a model jointly predict object position and rotation from one image?"
+    )
+    over_fragmented = {
+        "sufficient": True,
+        "core_intent_covered": True,
+        "missing_aspects": [],
+        "over_fragmented": True,
+        "merge_instructions": ["Merge position and rotation into one question."],
+        "reason": "Parallel outputs of the same prediction task were split.",
+    }
+    module = module_with([
+        over_fragmented,
+        {"sub_questions": split_questions},  # First merge attempt is ineffective.
+        over_fragmented,
+        {"sub_questions": [merged_question]},
+        {
+            "sufficient": True,
+            "core_intent_covered": True,
+            "missing_aspects": [],
+            "over_fragmented": False,
+            "merge_instructions": [],
+            "reason": "The parallel outputs are now merged.",
+        },
+    ], rounds=2)
+
+    result = await module._check_subquestion_coverage(
+        "How can a model infer object position and rotation from one image?",
+        split_questions,
+    )
+
+    assert result == [merged_question]
+    assert len(module.client.calls) == 5
+
+
+@pytest.mark.asyncio
 async def test_core_intent_missing_after_budget_fails_closed() -> None:
     missing = {
         "sufficient": False,
@@ -114,6 +155,7 @@ async def test_core_intent_missing_after_budget_fails_closed() -> None:
         missing,
         {"sub_questions": ["新的背景问题是什么？"]},
         missing,
+        {"sub_questions": ["另一个背景问题是什么？"]},
         missing,
     ])
 

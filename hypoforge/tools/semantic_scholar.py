@@ -57,6 +57,7 @@ def _resolve_config() -> tuple[str, str]:
 
 _S2_API_KEY, _BACKEND = _resolve_config()
 _OPENALEX_API_KEY = os.environ.get("OPENALEX_API_KEY", "")
+_OPENALEX_MAILTO = os.environ.get("OPENALEX_MAILTO", "")
 
 # Module-level 429 circuit-breaker.  When S2 repeatedly rate-limits us,
 # subsequent calls in the same process skip S2 entirely and go directly
@@ -105,6 +106,7 @@ _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 # fit inside this window so the OpenAlex fallback always has room to run
 # within the agent's per-source timeout (default 30.0s).
 _S2_STAGE_DEADLINE_SECONDS = 15.0
+_OPENALEX_STAGE_DEADLINE_SECONDS = 15.0
 
 
 def _remaining_seconds(deadline: float) -> float:
@@ -261,28 +263,51 @@ def _s2_normalise(raw: dict) -> dict:
 _OA_BASE = "https://api.openalex.org"
 
 
+def _normalize_openalex_query(query: str) -> str:
+    """Convert backend-specific Boolean syntax to OpenAlex free text."""
+    text = re.sub(r"\[[^\]]+\]", " ", str(query or ""))
+    text = re.sub(r"\b(?:title|abstract|author):", " ", text, flags=re.I)
+    text = re.sub(r"\b(?:AND|OR|NOT)\b", " ", text, flags=re.I)
+    text = re.sub(r'''[(){}\[\]"'“”‘’]+''', " ", text)
+    return " ".join(text.split())
+
+
 def _oa_search(
-    query: str, limit: int, api_key: str = "", deadline: float | None = None
+    query: str,
+    limit: int,
+    api_key: str = "",
+    mailto: str = "",
+    deadline: float | None = None,
 ) -> List[dict]:
     """Search OpenAlex, return standardised paper dicts."""
+    clean_query = _normalize_openalex_query(query)
+    if not clean_query:
+        raise ValueError("OpenAlex query must not be blank")
     params = {
-        "search": query,
+        "search": clean_query,
         "per_page": str(min(limit, 200)),
         "sort": "relevance_score:desc",
     }
     if api_key:
         params["api_key"] = api_key
+    if mailto:
+        params["mailto"] = mailto
     url = f"{_OA_BASE}/works?{urllib.parse.urlencode(params)}"
     data = _http_get_json(url, deadline=deadline)
     papers = data.get("results", [])
     logger.info(
         "OpenAlex search: query=%r → total=%s returned=%d",
-        query, data.get("meta", {}).get("count", "?"), len(papers),
+        clean_query, data.get("meta", {}).get("count", "?"), len(papers),
     )
     return [_oa_normalise(p) for p in papers]
 
 
-def _oa_fetch(work_id: str, api_key: str = "", deadline: float | None = None) -> dict:
+def _oa_fetch(
+    work_id: str,
+    api_key: str = "",
+    mailto: str = "",
+    deadline: float | None = None,
+) -> dict:
     """Fetch a single work from OpenAlex by ID.
 
     The *work_id* can be a full OpenAlex URL
@@ -296,8 +321,13 @@ def _oa_fetch(work_id: str, api_key: str = "", deadline: float | None = None) ->
         work_id = work_id.rsplit("/", 1)[-1]
 
     url = f"{_OA_BASE}/works/{work_id}"
+    params: Dict[str, str] = {}
     if api_key:
-        url = f"{url}?{urllib.parse.urlencode({'api_key': api_key})}"
+        params["api_key"] = api_key
+    if mailto:
+        params["mailto"] = mailto
+    if params:
+        url = f"{url}?{urllib.parse.urlencode(params)}"
     return _oa_normalise(_http_get_json(url, deadline=deadline))
 
 
@@ -369,8 +399,9 @@ def _s2_with_oa_fallback(
 
     ``s2_error`` pre-populates the error from an earlier S2 attempt (e.g. from
     a circuit-breaker path that already failed).  When ``None`` a fresh S2
-    attempt is made first.  ``deadline`` bounds the whole S2+fallback stage
-    so the OpenAlex fallback always has room within the caller's budget.
+    attempt is made first. ``deadline`` bounds only the S2 stage; OpenAlex
+    receives a fresh bounded stage so an exhausted S2 deadline cannot cancel
+    the fallback before it starts.
     """
     if s2_error is None:
         try:
@@ -384,11 +415,10 @@ def _s2_with_oa_fallback(
                 "Semantic Scholar failed (%s); falling back to OpenAlex",
                 type(exc).__name__,
             )
-    oa_query = re.sub(r"\[[^\]]+\]", "", query)
-    oa_query = re.sub(r"\b(?:title|abstract|author):", "", oa_query, flags=re.I)
+    fallback_deadline = time.monotonic() + _OPENALEX_STAGE_DEADLINE_SECONDS
     try:
         return _oa_search(
-            " ".join(oa_query.split()), limit, oa_api_key, deadline=deadline
+            query, limit, oa_api_key, deadline=fallback_deadline
         )
     except Exception as oa_error:
         if s2_error is not None:
@@ -428,6 +458,7 @@ def _search(query: str, limit: int = 20) -> List[dict]:
                 logger.warning(
                     "Semantic Scholar returned zero results; falling back to OpenAlex"
                 )
+                s2_error = RuntimeError("Semantic Scholar returned zero results")
             except urllib.error.HTTPError as exc:
                 s2_error = exc
                 if exc.code == 429:
@@ -459,7 +490,10 @@ def _search(query: str, limit: int = 20) -> List[dict]:
             query, limit, _S2_API_KEY, _OPENALEX_API_KEY,
             s2_error=s2_error, deadline=deadline,
         )
-    return _oa_search(query, limit, _OPENALEX_API_KEY)
+    return _oa_search(
+        query, limit, _OPENALEX_API_KEY, _OPENALEX_MAILTO,
+        deadline=time.monotonic() + _OPENALEX_STAGE_DEADLINE_SECONDS,
+    )
 
 
 def _fetch(identifier: str) -> dict:
@@ -468,7 +502,7 @@ def _fetch(identifier: str) -> dict:
         deadline = time.monotonic() + _S2_STAGE_DEADLINE_SECONDS
         return _s2_fetch(identifier, _S2_API_KEY, deadline=deadline)
     else:
-        return _oa_fetch(identifier, _OPENALEX_API_KEY)
+        return _oa_fetch(identifier, _OPENALEX_API_KEY, _OPENALEX_MAILTO)
 
 
 # ============================================================================
@@ -594,6 +628,30 @@ class SemanticScholarTool(ToolProtocol):
 async def search_academic(query: str, limit: int = 20) -> List[dict]:
     """One-shot academic literature search via the active backend."""
     return await SemanticScholarTool().search(query, limit=limit)
+
+
+async def search_openalex_strict(
+    query: str,
+    limit: int = 20,
+    api_key: str = "",
+    mailto: str = "",
+) -> List[dict]:
+    """Search OpenAlex directly and propagate transport failures."""
+    clean_query = _normalize_openalex_query(query)
+    if not clean_query:
+        raise ValueError("query must not be blank")
+    bounded_limit = min(max(limit, 1), 200)
+    resolved_key = str(api_key or "").strip() or _OPENALEX_API_KEY
+    resolved_mailto = str(mailto or "").strip() or _OPENALEX_MAILTO
+    deadline = time.monotonic() + _OPENALEX_STAGE_DEADLINE_SECONDS
+    return await asyncio.to_thread(
+        _oa_search,
+        clean_query,
+        bounded_limit,
+        resolved_key,
+        resolved_mailto,
+        deadline,
+    )
 
 
 async def fetch_paper(identifier: str) -> dict:
