@@ -11,6 +11,7 @@ from hypoforge.state import (
     FollowupRequest,
     HypothesisCard,
     PipelineState,
+    ProblemCard,
     ReviewResult,
     ReviewerDimension,
 )
@@ -184,7 +185,7 @@ async def test_multi_agent_round_preserves_generator_statements_end_to_end() -> 
     module.client = client
     module.ranker_client = client
 
-    result = await module._run_llm(PipelineState(input_question="q"), "revision")
+    result = await module._run_llm(PipelineState(input_question="q", problem_card=ProblemCard(original_question="q", sub_questions=["q"], key_entities=[], domain=[])), "revision")
 
     assert [card.statement for card in result["candidate_hypotheses"]] == [
         h1.statement,

@@ -80,7 +80,7 @@ def test_all_yaml_configs_load():
 
 def test_config_guards():
     with pytest.raises(ValidationError):
-        PipelineConfig(grounding={"enabled": True}, search={"implementation": "legacy"})
+        PipelineConfig(grounding={"enabled": True}, search={"implementation": "automatic"})
     with pytest.raises(ValidationError):
         PipelineConfig(typo_field=True)
 
@@ -98,10 +98,12 @@ def test_custom_module_loader_validation():
 def test_agentic_selection_builds_track_a_module():
     from hypoforge import modules  # noqa: F401
     from hypoforge.literature.adapter import AgenticM2Module
+    from hypoforge.modules.m2_literature_search import M2LiteratureSearch
 
     config = PipelineConfig(search={"implementation": "agentic"})
     instances = ModuleRegistry.build_all(config)
 
+    assert ModuleRegistry.get("m2") is M2LiteratureSearch
     assert isinstance(instances["m2"], AgenticM2Module)
 
 

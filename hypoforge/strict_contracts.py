@@ -25,7 +25,8 @@ from .entity_normalization import (
     _stable_id,
     clean_entity_surface,
 )
-from .literature.adapter import AgenticM2Adapter, AgenticM2Module
+from .literature.adapter import AgenticM2Adapter
+from .modules.m2_literature_search import M2LiteratureSearch
 from .literature.export import build_m2_knowledge_export_run
 from .literature.models import (
     PaperRecord,
@@ -35,7 +36,6 @@ from .literature.models import (
     StopReason,
 )
 from .memory.paper_store import PaperStore, normalize_query_text, paper_key
-from .modules.m2_literature_search import M2LiteratureSearch, _merge_deduplicate
 from .modules.m3_evidence_graph import M3EvidenceGraph
 from .modules.m4_hypothesis_generation import M4HypothesisGeneration
 from .modules.m5_research_plan import M5ResearchPlan
@@ -479,15 +479,20 @@ class StrictEntityNormalizationService(EntityNormalizationService):
     ) -> dict[str, list[str]]:
         # Ensure the configured endpoint is valid before delegating.
         if self.embedding_backend is None and self.embedding_model:
-            base_url = self.embedding_base_url or os.getenv("ENTITY_EMBEDDING_BASE_URL", "")
+            base_url = (
+                self.embedding_base_url
+                or os.getenv("ENTITY_EMBEDDING_BASE_URL", "")
+                or os.getenv("OPENAI_BASE_URL", "")
+            )
             if not base_url:
                 raise RuntimeError(
                     "Entity embedding is configured but no shared embedding endpoint is set. "
-                    "Set ENTITY_EMBEDDING_BASE_URL (or entity_embedding_base_url in the config)."
+                    "Set ENTITY_EMBEDDING_BASE_URL or OPENAI_BASE_URL (or entity_embedding_base_url in the config)."
                 )
             key_env = self.embedding_key_env or ""
             credential = (
-                os.getenv(key_env) if key_env
+                (os.getenv(key_env, "") or os.getenv("OPENAI_API_KEY", ""))
+                if key_env
                 else os.getenv("ENTITY_EMBEDDING_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
             )
             if key_env and not credential:
@@ -496,10 +501,15 @@ class StrictEntityNormalizationService(EntityNormalizationService):
                     f"variable {key_env!r} is not set."
                 )
         else:
-            base_url = self.embedding_base_url or os.getenv("ENTITY_EMBEDDING_BASE_URL", "")
+            base_url = (
+                self.embedding_base_url
+                or os.getenv("ENTITY_EMBEDDING_BASE_URL", "")
+                or os.getenv("OPENAI_BASE_URL", "")
+            )
             key_env = self.embedding_key_env or ""
             credential = (
-                os.getenv(key_env) if key_env
+                (os.getenv(key_env, "") or os.getenv("OPENAI_API_KEY", ""))
+                if key_env
                 else os.getenv("ENTITY_EMBEDDING_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
             )
         # Pass resolved endpoint and key directly to _embed_raw so we never
@@ -673,362 +683,6 @@ class StrictEntityNormalizationService(EntityNormalizationService):
             result[original] = record
         self._save()
         return result
-
-
-class StrictM2LiteratureSearch(M2LiteratureSearch):
-    """Legacy M2 with explicit zero-result and supplement evidence contracts."""
-
-    def __init__(
-        self,
-        *args,
-        search_tools=None,
-        entity_embedding_base_url: str = "",
-        entity_embedding_key_env: str = "",
-        **kwargs,
-    ) -> None:
-        self.entity_embedding_base_url = str(entity_embedding_base_url or "").strip()
-        self.entity_embedding_key_env = str(entity_embedding_key_env or "").strip()
-        super().__init__(*args, search_tools=search_tools, **kwargs)
-        # The legacy base uses ``search_tools or defaults``. Preserve an
-        # explicitly supplied empty list so configuration cannot silently
-        # re-enable providers the caller disabled.
-        if search_tools is not None:
-            self.search_tools = list(search_tools)
-
-    async def __call__(self, state: PipelineState, config=None):
-        _set_entity_embedding_context(
-            self.entity_embedding_base_url,
-            self.entity_embedding_key_env,
-        )
-        return await super().__call__(state, config)
-
-    async def _run_real(
-        self,
-        sub_questions: list[str],
-        key_entities: list[str] | None = None,
-        entities_by_question: dict[str, list[str]] | None = None,
-    ) -> tuple[list[LiteratureResult], list[tuple]]:
-        """Run only configured legacy providers and fail on zero usable output."""
-        from .tools.pubmed_search import PubMedTool
-        from .tools.semantic_scholar import SemanticScholarTool
-
-        enabled_tools = {str(name).strip().casefold() for name in self.search_tools}
-        use_pubmed = "pubmed" in enabled_tools
-        use_academic = "semantic_scholar" in enabled_tools
-        if not use_pubmed and not use_academic:
-            raise RuntimeError(
-                "M2 has no supported search backend enabled. Configure at least "
-                "one of: pubmed, semantic_scholar."
-            )
-
-        pubmed = PubMedTool() if use_pubmed else None
-        academic = SemanticScholarTool() if use_academic else None
-        limit = self.max_papers_per_query
-        key_entities = key_entities or []
-        results: list[LiteratureResult] = []
-        collected: list[tuple] = []
-        self._last_queries_by_question = {}
-
-        for sub_question in sub_questions:
-            scoped_entities = (
-                (entities_by_question or {}).get(sub_question, key_entities) or []
-            )
-            queries = await self._generate_search_queries(
-                sub_question, scoped_entities
-            )
-            self._last_queries_by_question[sub_question] = list(queries)
-            if not queries:
-                raise RuntimeError(
-                    f"M2 generated no executable search queries for {sub_question!r}."
-                )
-
-            calls = []
-            for query in queries:
-                if pubmed is not None:
-                    calls.append(
-                        ("pubmed", pubmed.search_strict(query, limit=limit))
-                    )
-                if academic is not None:
-                    calls.append(
-                        ("academic", academic.search_strict(query, limit=limit))
-                    )
-            raw_results = await asyncio.gather(
-                *(call for _, call in calls),
-                return_exceptions=True,
-            )
-            successful_calls = 0
-            pubmed_papers: list[dict] = []
-            academic_papers: list[dict] = []
-            for (backend, _), response in zip(calls, raw_results):
-                if isinstance(response, Exception):
-                    logger.warning("%s search failed: %s", backend, response)
-                    continue
-                successful_calls += 1
-                if backend == "pubmed":
-                    pubmed_papers.extend(response)
-                else:
-                    academic_papers.extend(response)
-            if calls and successful_calls == 0:
-                raise RuntimeError(
-                    f"M2 search failed for every configured backend/query of "
-                    f"sub-question {sub_question!r}."
-                )
-
-            all_papers = _merge_deduplicate(pubmed_papers, academic_papers)
-            top_papers = all_papers[:limit]
-            if not top_papers:
-                raise RuntimeError(
-                    "M2 completed its configured searches but retained no usable "
-                    f"papers for required sub-question {sub_question!r}."
-                )
-
-            batches = [
-                top_papers[index:index + self.batch_size]
-                for index in range(0, len(top_papers), self.batch_size)
-            ]
-            semaphore = asyncio.Semaphore(3)
-
-            async def run_batch(batch):
-                async with semaphore:
-                    return await self._extract_batch(batch)
-
-            raw_entries = await asyncio.gather(
-                *(run_batch(batch) for batch in batches),
-                return_exceptions=True,
-            )
-            successful_batches = [
-                item for item in raw_entries if not isinstance(item, Exception)
-            ]
-            if batches and not successful_batches:
-                raise RuntimeError(
-                    f"M2 extraction failed for every batch of sub-question "
-                    f"{sub_question!r}."
-                )
-            entries = [entry for item in successful_batches for entry in item]
-            if not entries:
-                raise RuntimeError(
-                    f"M2 extraction produced no knowledge entries for "
-                    f"sub-question {sub_question!r}."
-                )
-
-            results.append(LiteratureResult(
-                sub_question=sub_question,
-                papers_retrieved=len(top_papers),
-                knowledge_entries=entries,
-            ))
-            collected.append((sub_question, queries, top_papers))
-
-        return results, collected
-
-    async def _run_supplement(
-        self,
-        state: PipelineState,
-        open_gaps: list[EvidenceGap],
-    ) -> dict[str, Any]:
-        from .tools.pubmed_search import PubMedTool
-        from .tools.semantic_scholar import SemanticScholarTool
-
-        store = open_paper_store(getattr(state, "memory_cache_dir", ""))
-        merged_results = [item.model_copy(deep=True) for item in state.literature_results]
-        existing_sub_questions = [item.sub_question for item in merged_results]
-        known_keys = set(state.search_ledger.paper_keys)
-        issued_norms = {
-            normalize_query_text(query) for query in state.search_ledger.queries_issued
-        }
-        new_query_texts: list[str] = []
-        new_paper_keys: list[str] = []
-        grounded_gap_ids: set[str] = set()
-        remaining_budget = self.supplement_paper_budget
-        pubmed = None
-        academic = None
-
-        async def extract_strict(papers: list[dict], *, gap_id: str) -> list[KnowledgeEntry]:
-            batches = [
-                papers[index:index + self.batch_size]
-                for index in range(0, len(papers), self.batch_size)
-            ]
-            semaphore = asyncio.Semaphore(3)
-
-            async def run_batch(batch):
-                async with semaphore:
-                    return await self._extract_batch(batch)
-
-            raw = await asyncio.gather(
-                *(run_batch(batch) for batch in batches),
-                return_exceptions=True,
-            )
-            succeeded = [item for item in raw if not isinstance(item, Exception)]
-            if batches and not succeeded:
-                raise RuntimeError(
-                    f"M2 supplement extraction failed for every batch of gap {gap_id}."
-                )
-            entries = [entry for item in succeeded for entry in item]
-            if papers and not entries:
-                raise RuntimeError(
-                    f"M2 supplement produced no knowledge entries for gap {gap_id}."
-                )
-            if entries and state.problem_card:
-                service = StrictEntityNormalizationService.from_task(
-                    state.problem_card.task_contract,
-                    domains=state.problem_card.domain,
-                    cache_dir=state.entity_cache_dir or state.memory_cache_dir,
-                    client=self.client,
-                    embedding_model=self.entity_embedding_model,
-                    embedding_base_url=self.entity_embedding_base_url,
-                    embedding_key_env=self.entity_embedding_key_env,
-                )
-                names = [entity for entry in entries for entity in entry.entities]
-                resolved = await service.resolve_batch(names)
-                entries = [
-                    entry.model_copy(update={
-                        "entities": list(dict.fromkeys(
-                            resolved[entity].canonical_name
-                            if entity in resolved else entity
-                            for entity in entry.entities
-                        )),
-                    })
-                    for entry in entries
-                ]
-            return entries
-
-        for gap in open_gaps:
-            sub_question = resolve_gap_sub_question(gap, existing_sub_questions)
-            candidates = gap_candidate_queries(gap)
-
-            if store is not None:
-                hit_keys: list[str] = []
-                seen: set[str] = set()
-                for query in candidates:
-                    for key in store.lookup_by_query(query):
-                        if key not in seen and key not in known_keys:
-                            seen.add(key)
-                            hit_keys.append(key)
-                cached = store.lookup_by_keys(hit_keys) if hit_keys else []
-                cached_with_text = [
-                    paper for paper in cached if str(paper.get("abstract") or "").strip()
-                ][:remaining_budget]
-                if cached_with_text:
-                    entries = await extract_strict(cached_with_text, gap_id=gap.gap_id)
-                    merge_literature_increment(
-                        merged_results,
-                        sub_question,
-                        len(cached_with_text),
-                        entries,
-                    )
-                    usable_keys = [paper_key(paper) for paper in cached_with_text]
-                    known_keys.update(usable_keys)
-                    new_paper_keys.extend(usable_keys)
-                    grounded_gap_ids.add(gap.gap_id)
-                    remaining_budget -= len(cached_with_text)
-                    for query in candidates:
-                        store.record_query(
-                            query,
-                            usable_keys,
-                            run_id=state.run_id,
-                            round=state.search_round,
-                        )
-                    emit_event(
-                        "memory_hit",
-                        module="m2",
-                        status="completed",
-                        message=f"Gap {gap.gap_id} reused {len(cached_with_text)} cached abstracts",
-                        details={"gap_id": gap.gap_id, "hits": len(cached_with_text)},
-                    )
-                    continue
-
-            fresh_queries = dedupe_queries(candidates, issued_norms)
-            if not fresh_queries or remaining_budget <= 0:
-                continue
-            if self.client is None:
-                raise RuntimeError("M2 supplement requires its configured language model.")
-            enabled_tools = {
-                str(name).strip().casefold() for name in self.search_tools
-            }
-            use_pubmed = "pubmed" in enabled_tools
-            use_academic = "semantic_scholar" in enabled_tools
-            if not use_pubmed and not use_academic:
-                raise RuntimeError(
-                    "M2 supplement has no supported search backend enabled. "
-                    "Configure at least one of: pubmed, semantic_scholar."
-                )
-            if use_pubmed and pubmed is None:
-                pubmed = PubMedTool()
-            if use_academic and academic is None:
-                academic = SemanticScholarTool()
-
-            calls = []
-            for query in fresh_queries:
-                if pubmed is not None:
-                    calls.append(
-                        ("pubmed", pubmed.search_strict(query, limit=remaining_budget))
-                    )
-                if academic is not None:
-                    calls.append(
-                        ("academic", academic.search_strict(query, limit=remaining_budget))
-                    )
-            raw_results = await asyncio.gather(
-                *(call for _, call in calls),
-                return_exceptions=True,
-            )
-            successful_calls = 0
-            pubmed_papers: list[dict] = []
-            academic_papers: list[dict] = []
-            for (backend, _), response in zip(calls, raw_results):
-                if isinstance(response, Exception):
-                    logger.warning("%s supplement search failed: %s", backend, response)
-                    continue
-                successful_calls += 1
-                (pubmed_papers if backend == "pubmed" else academic_papers).extend(response)
-            if calls and successful_calls == 0:
-                raise RuntimeError(
-                    f"M2 supplement search failed for every backend/query of gap {gap.gap_id}."
-                )
-
-            all_papers = _merge_deduplicate(pubmed_papers, academic_papers)
-            new_papers, fresh_keys = dedupe_papers_by_key(all_papers, known_keys)
-            new_papers = new_papers[:remaining_budget]
-            fresh_keys = fresh_keys[:remaining_budget]
-            new_query_texts.extend(fresh_queries)
-            if not new_papers:
-                continue
-
-            entries = await extract_strict(new_papers, gap_id=gap.gap_id)
-            merge_literature_increment(
-                merged_results, sub_question, len(new_papers), entries
-            )
-            grounded_gap_ids.add(gap.gap_id)
-            known_keys.update(fresh_keys)
-            new_paper_keys.extend(fresh_keys)
-            remaining_budget -= len(new_papers)
-            if store is not None:
-                store.upsert_papers(
-                    new_papers,
-                    run_id=state.run_id,
-                    round=state.search_round,
-                    source="legacy_m2",
-                )
-                for query in fresh_queries:
-                    store.record_query(
-                        query,
-                        fresh_keys,
-                        run_id=state.run_id,
-                        round=state.search_round,
-                    )
-
-        updated_gaps = [
-            gap.model_copy(update={"status": "pending_grounding"})
-            if gap.gap_id in grounded_gap_ids and gap.status == "open"
-            else gap.model_copy(deep=True)
-            for gap in state.evidence_gaps
-        ]
-        return {
-            "literature_results": merged_results,
-            "evidence_gaps": updated_gaps,
-            "search_ledger": SearchLedger(
-                queries_issued=[*state.search_ledger.queries_issued, *new_query_texts],
-                paper_keys=[*state.search_ledger.paper_keys, *new_paper_keys],
-            ),
-        }
 
 
 class StrictAgenticM2Adapter(AgenticM2Adapter):
@@ -1245,8 +899,8 @@ class StrictAgenticM2Adapter(AgenticM2Adapter):
         }
 
 
-class StrictAgenticM2Module(AgenticM2Module):
-    """Public agentic M2 wrapper using the strict supplement adapter."""
+class StrictM2LiteratureSearch(M2LiteratureSearch):
+    """Strict Pipeline facade using the strict Literature adapter."""
 
     def __init__(
         self,
@@ -1267,6 +921,10 @@ class StrictAgenticM2Module(AgenticM2Module):
             entity_embedding_base_url=entity_embedding_base_url,
             entity_embedding_key_env=entity_embedding_key_env,
         )
+
+
+# Backward-compatible name for callers that imported the pre-facade class.
+StrictAgenticM2Module = StrictM2LiteratureSearch
 
 
 class StrictM3EvidenceGraph(M3EvidenceGraph):
@@ -1741,11 +1399,9 @@ _ORIGINAL_GROUNDING_JUDGE_CANDIDATES = _GroundingWorkflow._judge_candidate_relat
 # global once when strict built-ins are loaded so every built-in M2/M3 path uses
 # the same pair-level identity contract.
 from .literature import adapter as _adapter_module
-from .modules import m2_literature_search as _legacy_m2_module
 from .modules import m3_evidence_graph as _m3_module
 
 _adapter_module.EntityNormalizationService = StrictEntityNormalizationService
-_legacy_m2_module.EntityNormalizationService = StrictEntityNormalizationService
 _m3_module.EntityNormalizationService = StrictEntityNormalizationService
 
 # ``assess_task_alignment`` resolves ``_call_chat`` from its defining module at

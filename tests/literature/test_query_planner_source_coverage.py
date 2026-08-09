@@ -146,3 +146,36 @@ async def test_fallback_does_not_reintroduce_unavailable_source() -> None:
     queries = await planner.plan("question", state=state)
 
     assert {item.target_source for item in queries} == {"pubmed", "arxiv"}
+
+
+@pytest.mark.asyncio
+async def test_missing_core_entity_is_added_as_grouped_conjunct() -> None:
+    planner = QueryPlanner(
+        FakeClient(response_for("arxiv", "method testing")),
+        LiteratureSearchTool.TOOL_DEFINITIONS,
+    )
+
+    queries = await planner.plan(
+        "How are robot arms tested?",
+        key_entities=["robot arm"],
+        state=SearchState(round_index=1),
+    )
+
+    assert queries[0].text == '"robot arm" AND (method testing)'
+    assert not queries[0].text.endswith("robot arm")
+
+
+@pytest.mark.asyncio
+async def test_core_entity_tokens_already_present_are_not_duplicated() -> None:
+    planner = QueryPlanner(
+        FakeClient(response_for("arxiv", "robot safety arm")),
+        LiteratureSearchTool.TOOL_DEFINITIONS,
+    )
+
+    queries = await planner.plan(
+        "How are robot arms tested?",
+        key_entities=["robot arm"],
+        state=SearchState(round_index=1),
+    )
+
+    assert queries[0].text == "robot safety arm"

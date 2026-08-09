@@ -18,7 +18,6 @@ from hypoforge.memory import (
     save_graph_round_snapshot,
     stable_entry_id,
 )
-from hypoforge.modules.m2_literature_search import _stable_entry_id
 from hypoforge.modules.m3_evidence_graph import M3EvidenceGraph
 from hypoforge.state import (
     EvidenceEdge,
@@ -216,9 +215,8 @@ async def test_m3_empty_entries_preserves_existing_graph():
 async def test_m3_empty_entries_and_no_graph_returns_empty():
     state = PipelineState(input_question="q", literature_results=[])
     module = M3EvidenceGraph(mode="rule")
-    result = await module(state)
-    assert len(result["evidence_graph"].nodes) == 0
-    assert len(result["evidence_graph"].edges) == 0
+    with pytest.raises(RuntimeError, match="no usable knowledge entries"):
+        await module(state)
 
 
 @pytest.mark.asyncio
@@ -529,9 +527,9 @@ async def test_no_pending_gaps_means_no_gap_patch():
 
 
 def test_stable_entry_id_is_content_based():
-    a = _stable_entry_id("Hsp70   folds proteins.", "PMID:1")
-    b = _stable_entry_id("hsp70 folds proteins.", "PMID:1")  # case/whitespace
-    c = _stable_entry_id("Hsp70 folds proteins.", "PMID:2")  # other paper
+    a = stable_entry_id("Hsp70   folds proteins.", "PMID:1")
+    b = stable_entry_id("hsp70 folds proteins.", "PMID:1")  # case/whitespace
+    c = stable_entry_id("Hsp70 folds proteins.", "PMID:2")  # other paper
     assert a == b
     assert a != c
     assert a.startswith("KE_")
@@ -541,7 +539,7 @@ def test_stable_entry_id_is_content_based():
 def test_stable_entry_id_matches_canonical_memory_helper():
     """M2's local helper and the canonical memory-layer helper must agree
     (same evidence → same id regardless of producer)."""
-    assert _stable_entry_id("  Hsp70 folds\tproteins. ", "PMID:7") == \
+    assert stable_entry_id("  Hsp70 folds\tproteins. ", "PMID:7") == \
         stable_entry_id("Hsp70 folds proteins.", "PMID:7")
 
 

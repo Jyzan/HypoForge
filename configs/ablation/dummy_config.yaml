@@ -3,7 +3,7 @@ output_dir: "./output"
 enabled_modules: ["m1"]
 max_iterations: 1
 search:
-  implementation: "legacy"
+  implementation: "agentic"
   max_papers_total: 2
   max_queries: 1
 grounding:

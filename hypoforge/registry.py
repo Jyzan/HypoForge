@@ -155,17 +155,13 @@ class ModuleRegistry:
             module_cls = cls._modules[name]
             if override is not None and override.class_name:
                 module_cls = cls._load_module_class(override.class_name, name)
-            elif name == "m2" and config.search.implementation == "agentic":
-                # Agentic M2 is an explicit pipeline configuration choice, as
-                # in the pre-strict registry behaviour.
-                module_cls = cls._load_module_class(
-                    "hypoforge.strict_contracts.StrictAgenticM2Module", "m2"
-                )
             elif (
                 name == "m2"
                 and module_cls.__module__ == "hypoforge.modules.m2_literature_search"
                 and module_cls.__name__ == "M2LiteratureSearch"
             ):
+                # Keep the Pipeline-facing M2 facade in the modules package;
+                # only swap its implementation for the strict contract wrapper.
                 module_cls = cls._load_module_class(
                     "hypoforge.strict_contracts.StrictM2LiteratureSearch", "m2"
                 )
@@ -210,18 +206,12 @@ class ModuleRegistry:
                 secondary_tier = getattr(config, "secondary_model_tier", "base")
                 kwargs.setdefault("query_llm_config", config.get_llm_for_tier(secondary_tier))
 
-                if config.search.implementation == "legacy":
-                    kwargs.setdefault("search_tools", config.search.tools)
-                    kwargs.setdefault(
-                        "max_papers_per_query", config.search.papers_per_sub_question
-                    )
-                else:
-                    # Agentic M2: per-round paper budget for gap-driven
-                    # supplement searches (cache-first incremental flow).
-                    kwargs.setdefault(
-                        "supplement_paper_budget",
-                        getattr(config, "supplement_paper_budget", 6),
-                    )
+                # Agentic M2: per-round paper budget for gap-driven
+                # supplement searches (cache-first incremental flow).
+                kwargs.setdefault(
+                    "supplement_paper_budget",
+                    getattr(config, "supplement_paper_budget", 6),
+                )
 
             if (
                 name in {"m2", "m3"}

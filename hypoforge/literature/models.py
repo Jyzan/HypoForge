@@ -83,6 +83,30 @@ class SearchQuery(LiteratureModel):
     purpose: NonEmptyStr
     target_gap: str = ""
     relation_to_question: NonEmptyStr
+    # Optional semantic weights supplied by the query planner.  They are used
+    # only by the deterministic zero-result fallback, where lower-importance
+    # modifiers are removed first.  Keeping this on the query makes the
+    # importance decision auditable instead of re-inferring it from position.
+    term_importance: Dict[str, float] = Field(default_factory=dict)
+
+    @field_validator("term_importance", mode="before")
+    @classmethod
+    def normalize_term_importance(cls, value: object) -> Dict[str, float]:
+        if not isinstance(value, dict):
+            return {}
+        output: Dict[str, float] = {}
+        for key, raw_score in value.items():
+            text = " ".join(str(key or "").split())
+            if not text:
+                continue
+            try:
+                score = float(raw_score)
+            except (TypeError, ValueError):
+                continue
+            if score != score or score in (float("inf"), float("-inf")):
+                continue
+            output[text] = max(0.0, min(1.0, score))
+        return output
 
 
 class PaperRecord(LiteratureModel):

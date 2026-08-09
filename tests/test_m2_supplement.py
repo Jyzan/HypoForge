@@ -30,7 +30,6 @@ from hypoforge.literature.models import (
 )
 from hypoforge.literature.search import IterativeSearchAgent
 from hypoforge.memory import PaperStore, paper_key
-from hypoforge.modules.m2_literature_search import M2LiteratureSearch
 from hypoforge.observability import RunEventRecorder, bind_recorder
 from hypoforge.state import (
     ConfidenceLevel,
@@ -218,14 +217,27 @@ async def test_first_round_runs_full_flow() -> None:
     )
     adapter = AgenticM2Adapter(
         search_agent=agent,
-        reading_workflow=FakeReadingWorkflow([PaperReadingResult(paper_id="p1")]),
+        reading_workflow=FakeReadingWorkflow([PaperReadingResult(
+            paper_id="p1",
+            evidence=[EvidenceChunk(
+                evidence_id="ev-p1", paper_id="p1", chunk_id="chunk-p1",
+                quote="Observed binding.", normalized_claim="Observed binding.", relevance_score=0.9,
+            )],
+            knowledge_entries=[EvidenceLinkedKnowledge(
+                entry_id="ke-p1",
+                entry_type=KnowledgeEntryType.MECHANISTIC_CONCLUSION,
+                content="Observed binding.",
+                confidence=ConfidenceLevel.HIGH,
+                evidence_ids=["ev-p1"],
+            )],
+        )]),
     )
     state = PipelineState(input_question="Q", problem_card=make_problem_card())
 
     output = await adapter(state)
 
     assert len(agent.calls) == 1
-    # fresh flow returns only the legacy two fields
+    # fresh flow returns the Agentic literature and grounded export fields
     assert set(output) == {"literature_results", "m2_knowledge_export"}
 
 
@@ -243,7 +255,20 @@ async def test_no_open_gap_runs_full_flow_even_on_later_round() -> None:
     )
     adapter = AgenticM2Adapter(
         search_agent=agent,
-        reading_workflow=FakeReadingWorkflow([PaperReadingResult(paper_id="p1")]),
+        reading_workflow=FakeReadingWorkflow([PaperReadingResult(
+            paper_id="p1",
+            evidence=[EvidenceChunk(
+                evidence_id="ev-p1", paper_id="p1", chunk_id="chunk-p1",
+                quote="Observed binding.", normalized_claim="Observed binding.", relevance_score=0.9,
+            )],
+            knowledge_entries=[EvidenceLinkedKnowledge(
+                entry_id="ke-p1",
+                entry_type=KnowledgeEntryType.MECHANISTIC_CONCLUSION,
+                content="Observed binding.",
+                confidence=ConfidenceLevel.HIGH,
+                evidence_ids=["ev-p1"],
+            )],
+        )]),
     )
     state = make_supplement_state(
         evidence_gaps=[make_gap(status="closed")],
@@ -289,7 +314,7 @@ async def test_supplement_cache_hit_rebuilds_paper_level_increment(
     # gap attempted → pending_grounding
     gaps = output["evidence_gaps"]
     assert len(gaps) == 1
-    assert gaps[0].status == "pending_grounding"
+    assert gaps[0].status == "open"
 
     # literature_results merged monotonically (old entry preserved)
     results = output["literature_results"]
@@ -304,7 +329,7 @@ async def test_supplement_cache_hit_rebuilds_paper_level_increment(
     assert new_run.sub_question == SUB_QUESTION
     assert [paper.paper_id for paper in new_run.papers] == ["cached-1"]
     assert new_run.evidence == []
-    assert new_run.knowledge_entries == []  # never fabricate entries
+    assert new_run.knowledge_entries == []  # metadata cache hits are not grounding
     assert new_run.search_provenance.stop_reason == "cache_hit"
     assert (
         new_run.search_provenance.queries[0].target_gap
@@ -382,7 +407,7 @@ async def test_supplement_dedups_queries_already_in_ledger() -> None:
     )
     agent, source = make_base_agent({"Hsp70 co-chaperone binding": [new_paper]})
     adapter = AgenticM2Adapter(
-        search_agent=agent, reading_workflow=EchoReadingWorkflow()
+        search_agent=agent, reading_workflow=EchoReadingWorkflow(with_evidence=True)
     )
     state = make_supplement_state(
         evidence_gaps=[make_gap()],
@@ -400,7 +425,7 @@ async def test_supplement_dedups_queries_already_in_ledger() -> None:
     assert output["search_ledger"].queries_issued == [
         "hsp70   co-chaperone binding!!"
     ]
-    assert output["evidence_gaps"][0].status == "pending_grounding"
+    assert output["evidence_gaps"][0].status == "open"
 
 
 @pytest.mark.asyncio
@@ -410,7 +435,7 @@ async def test_supplement_skips_papers_already_in_prior_export() -> None:
     )
     agent, source = make_base_agent({"Hsp70 co-chaperone binding": [duplicate]})
     adapter = AgenticM2Adapter(
-        search_agent=agent, reading_workflow=EchoReadingWorkflow()
+        search_agent=agent, reading_workflow=EchoReadingWorkflow(with_evidence=True)
     )
     state = make_supplement_state(evidence_gaps=[make_gap()])
 
@@ -420,7 +445,7 @@ async def test_supplement_skips_papers_already_in_prior_export() -> None:
     assert len(output["m2_knowledge_export"].runs) == 1  # duplicate discarded
     assert output["literature_results"][0].papers_retrieved == 1
     assert output["search_ledger"].paper_keys == ["doi:10.1000/old"]
-    assert output["evidence_gaps"][0].status == "pending_grounding"
+    assert output["evidence_gaps"][0].status == "open"
 
 
 @pytest.mark.asyncio
@@ -437,7 +462,7 @@ async def test_supplement_paper_budget_caps_new_papers() -> None:
     agent, source = make_base_agent({"Hsp70 co-chaperone binding": papers})
     adapter = AgenticM2Adapter(
         search_agent=agent,
-        reading_workflow=EchoReadingWorkflow(),
+        reading_workflow=EchoReadingWorkflow(with_evidence=True),
         supplement_paper_budget=1,
     )
     state = make_supplement_state(evidence_gaps=[make_gap()])
@@ -461,7 +486,7 @@ async def test_supplement_without_cache_dir_still_searches(tmp_path) -> None:
     )
     agent, source = make_base_agent({"Hsp70 co-chaperone binding": [new_paper]})
     adapter = AgenticM2Adapter(
-        search_agent=agent, reading_workflow=EchoReadingWorkflow()
+        search_agent=agent, reading_workflow=EchoReadingWorkflow(with_evidence=True)
     )
     # memory_cache_dir left empty → degraded but functional
     state = make_supplement_state(evidence_gaps=[make_gap()])
@@ -539,38 +564,3 @@ def test_paper_store_missing_files_are_graceful(tmp_path) -> None:
     store = PaperStore(tmp_path / "fresh-cache")
     assert store.lookup_query("anything") == []
     assert store.lookup_by_keys(["doi:10.1/x", "pmid:9"]) == []
-
-
-# ---------------------------------------------------------------------------
-# Legacy M2 short-circuit
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_legacy_m2_short_circuits_supplement_without_open_gaps() -> None:
-    module = M2LiteratureSearch()  # no llm_config — full flow would raise
-    prior = LiteratureResult(sub_question="SQ", papers_retrieved=1)
-    state = PipelineState(
-        input_question="Q",
-        search_round=1,
-        literature_results=[prior],
-        evidence_gaps=[make_gap(status="closed")],
-    )
-
-    output = await module(state)
-
-    assert output == {"literature_results": [prior]}
-
-
-@pytest.mark.asyncio
-async def test_legacy_m2_open_gap_still_runs_full_flow() -> None:
-    module = M2LiteratureSearch()
-    state = PipelineState(
-        input_question="Q",
-        search_round=1,
-        literature_results=[LiteratureResult(sub_question="SQ")],
-        evidence_gaps=[make_gap()],
-    )
-
-    with pytest.raises(RuntimeError, match="requires an LLM client"):
-        await module(state)

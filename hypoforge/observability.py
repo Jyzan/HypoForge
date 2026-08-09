@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, Protocol
 
 from pydantic import BaseModel
 
@@ -30,6 +30,13 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
+
+
+class EventSink(Protocol):
+    """Small protocol used by optional live terminal/web event consumers."""
+
+    def handle_event(self, event: Mapping[str, Any]) -> None:
+        ...
 
 
 class RunEventRecorder:
@@ -131,6 +138,10 @@ _CURRENT_RECORDER: ContextVar[RunEventRecorder | None] = ContextVar(
     "hypoforge_run_event_recorder",
     default=None,
 )
+_CURRENT_EVENT_SINK: ContextVar[EventSink | None] = ContextVar(
+    "hypoforge_event_sink",
+    default=None,
+)
 
 
 @contextmanager
@@ -142,6 +153,30 @@ def bind_recorder(recorder: RunEventRecorder | None) -> Iterator[None]:
         yield
     finally:
         _CURRENT_RECORDER.reset(token)
+
+
+@contextmanager
+def bind_event_sink(sink: EventSink | None) -> Iterator[None]:
+    """Bind an optional live event consumer for the current async context."""
+
+    token = _CURRENT_EVENT_SINK.set(sink)
+    try:
+        yield
+    finally:
+        _CURRENT_EVENT_SINK.reset(token)
+
+
+def notify_event(event: Mapping[str, Any]) -> None:
+    """Send an already-recorded event to the current live consumer."""
+
+    sink = _CURRENT_EVENT_SINK.get()
+    if sink is None:
+        return
+    try:
+        sink.handle_event(event)
+    except Exception:
+        # Terminal presentation must never break a scientific run.
+        return
 
 
 def emit_event(
@@ -157,14 +192,26 @@ def emit_event(
     """Emit to the current recorder, or do nothing in ordinary CLI runs."""
 
     recorder = _CURRENT_RECORDER.get()
-    if recorder is None:
-        return None
-    return recorder.emit(
-        event_type,
-        module=module,
-        tool=tool,
-        status=status,
-        message=message,
-        elapsed_seconds=elapsed_seconds,
-        details=details,
+    event = (
+        recorder.emit(
+            event_type,
+            module=module,
+            tool=tool,
+            status=status,
+            message=message,
+            elapsed_seconds=elapsed_seconds,
+            details=details,
+        )
+        if recorder is not None
+        else {
+            "event_type": event_type,
+            "module": module,
+            "tool": tool,
+            "status": status,
+            "message": message,
+            "elapsed_seconds": elapsed_seconds,
+            "details": dict(details or {}),
+        }
     )
+    notify_event(event)
+    return event if recorder is not None else None

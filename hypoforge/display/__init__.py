@@ -5,6 +5,8 @@ Heavily inspired by Flash-Searcher's ``AgentLogger`` and BioDSA's
 visual style is consistent and can be customised in one place.
 """
 
+import sys
+
 from rich.console import Console
 
 # ---------------------------------------------------------------------------
@@ -22,10 +24,24 @@ COLORS = {
     "muted":     "#6b7280",   # grey   — secondary text, metadata
 }
 
-# Single console instance — import this everywhere
-# force_terminal=True bypasses LegacyWindowsTerm (GBK-limited) and uses
-# ANSI escape codes directly, which all modern Windows terminals support.
-console = Console(force_terminal=True)
+# Single console instance; import this everywhere
+# Rich uses the stream encoding to decide whether Unicode box glyphs are safe.
+# Some Windows Anaconda environments expose ``gbk`` even though the terminal
+# itself supports UTF-8, which would silently downgrade rounded panels to ASCII.
+# Reconfigure the terminal streams when possible, then explicitly disable
+# Rich's legacy Windows renderer / safe-box substitution.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+console = Console(
+    force_terminal=True,
+    legacy_windows=False,
+    safe_box=False,
+)
 
 # Convenience re-exports so display callers don't need to import rich directly
 from rich.panel import Panel

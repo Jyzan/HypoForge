@@ -45,43 +45,171 @@ class IterativeSearchAgent:
         r"\b(\s*[=:]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s&]+)"
     )
 
+
+    @staticmethod
+    def _finite_float(value: object) -> bool:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return False
+        return number == number and number not in (float("inf"), float("-inf"))
+
     @staticmethod
     def _deterministic_relaxations(
         query: SearchQuery,
         key_entities: Sequence[str],
     ) -> list[SearchQuery]:
-        """Build a stable strict→unfielded→unquoted→keyword fallback chain."""
+        """Build a deterministic, semantic-importance-aware fallback ladder.
+
+        LLM-provided ``term_importance`` is the primary ordering signal.  The
+        local heuristic is only a conservative fallback for offline planners.
+        Anchors are protected by phrase match, and no missing anchor is ever
+        appended to the end of a query (which used to create broken syntax).
+        """
 
         original = " ".join(query.text.split())
         candidates: list[str] = []
-        unfielded = re.sub(r"\[[^\]]+\]", "", original)
-        unfielded = re.sub(
-            r"\b(?:title|abstract|author|keyword):", "", unfielded, flags=re.I
+        fieldless = re.sub(r"\[[^\]]+\]", "", original)
+        fieldless = re.sub(
+            r"\b(?:title|abstract|author|keyword):", "", fieldless, flags=re.I
         )
-        candidates.append(" ".join(unfielded.split()))
-        unquoted = re.sub(r'["“”]', "", unfielded)
+        fieldless = " ".join(fieldless.split())
+        candidates.append(fieldless)
+        unquoted = re.sub(r'["\u201c\u201d\u2018\u2019]', "", fieldless)
         candidates.append(" ".join(unquoted.split()))
 
-        anchors = [" ".join(str(value).split()) for value in key_entities if str(value).strip()]
-        anchor_words = {
-            token.casefold()
-            for anchor in anchors
-            for token in re.findall(r"[\w\-]+", anchor, flags=re.UNICODE)
-        }
-        terms = re.findall(r"[\w\-]+", unquoted, flags=re.UNICODE)
-        removable = [
-            index for index, term in enumerate(terms)
-            if term.casefold() not in anchor_words
+        anchors = [
+            " ".join(str(value).split()).casefold()
+            for value in key_entities
+            if str(value).strip()
         ]
-        for index in reversed(removable):
-            if len(terms) <= max(3, len(anchor_words)):
-                break
-            terms = terms[:index] + terms[index + 1:]
-            anchored = list(terms)
+        importance: dict[str, float] = {}
+        for key, value in getattr(query, "term_importance", {}).items():
+            if not str(key).strip() or not IterativeSearchAgent._finite_float(value):
+                continue
+            importance[" ".join(str(key).split()).casefold()] = max(
+                0.0, min(1.0, float(value))
+            )
+
+        stop_modifiers = {
+            "a", "an", "the", "role", "study", "using", "use", "used",
+            "novel", "new", "review", "analysis", "effect", "impact",
+            "association", "approach", "method", "methods", "evidence",
+            "investigation", "investigating", "based", "related",
+        }
+        boolean = {"and", "or", "not"}
+
+        def units(text: str) -> list[str]:
+            return re.findall(
+                r'"[^"\r\n]+"|\u201c[^\u201d\r\n]+\u201d|\(|\)|\bAND\b|\bOR\b|\bNOT\b|[\w][\w\-]*',
+                text,
+                flags=re.I | re.UNICODE,
+            )
+
+        def semantic_unit(token: str) -> str:
+            return re.sub(
+                r'^["\u201c\u201d\u2018\u2019]|["\u201c\u201d\u2018\u2019]$',
+                "",
+                token,
+            ).casefold().strip()
+
+        def clean(values: Sequence[str]) -> str:
+            kept = list(values)
+            # Drop unmatched parentheses and empty groups.
+            while True:
+                changed = False
+                depth = 0
+                filtered: list[str] = []
+                for token in kept:
+                    if token == "(":
+                        depth += 1
+                        filtered.append(token)
+                    elif token == ")":
+                        if depth:
+                            depth -= 1
+                            filtered.append(token)
+                        else:
+                            changed = True
+                    else:
+                        filtered.append(token)
+                if depth:
+                    filtered = [token for token in filtered if token != "("]
+                    changed = True
+                kept = filtered
+                for i in range(len(kept) - 1):
+                    if kept[i] == "(" and kept[i + 1] == ")":
+                        del kept[i:i + 2]
+                        changed = True
+                        break
+                if not changed:
+                    break
+            # Remove boolean operators that no longer have operands.
+            output: list[str] = []
+            for token in kept:
+                low = token.casefold()
+                previous = output[-1].casefold() if output else ""
+                if low in boolean and (not output or previous in boolean or previous == "("):
+                    continue
+                if low == ")" and (not output or previous in boolean or previous == "("):
+                    continue
+                output.append(token)
+            while output and output[-1].casefold() in boolean | {"("}:
+                output.pop()
+            while output and output[0] == ")":
+                output.pop(0)
+            return " ".join(output).strip()
+
+        token_units = units(unquoted)
+        if not token_units:
+            return []
+
+        def protected_indices(values: Sequence[str]) -> set[int]:
+            semantic = [semantic_unit(token) for token in values]
+            protected: set[int] = set()
             for anchor in anchors:
-                if anchor.casefold() not in " ".join(anchored).casefold():
-                    anchored.append(anchor)
-            candidates.append(" ".join(anchored))
+                parts = anchor.split()
+                if not parts:
+                    continue
+                for index, token in enumerate(semantic):
+                    if token == anchor:
+                        protected.add(index)
+                if len(parts) > 1:
+                    for index in range(len(semantic) - len(parts) + 1):
+                        if semantic[index:index + len(parts)] == parts:
+                            protected.update(range(index, index + len(parts)))
+            return protected
+
+        while True:
+            substantive = [
+                index for index, token in enumerate(token_units)
+                if semantic_unit(token) not in boolean | {"(", ")"}
+            ]
+            protected = protected_indices(token_units)
+            removable: list[tuple[float, int]] = []
+            for index in substantive:
+                if index in protected:
+                    continue
+                term = semantic_unit(token_units[index])
+                score = importance.get(term)
+                if score is None:
+                    words = term.split()
+                    known_scores = [importance[word] for word in words if word in importance]
+                    score = max(known_scores) if known_scores else (
+                        0.15 if term in stop_modifiers else 0.45
+                    )
+                removable.append((score, index))
+            if not removable:
+                break
+            # Lowest semantic importance first; rightmost wins ties only for
+            # deterministic output, not as the semantic decision itself.
+            _, remove_index = min(removable, key=lambda item: (item[0], -item[1]))
+            remaining_count = len(substantive) - 1
+            if remaining_count < max(2, len(protected)):
+                break
+            del token_units[remove_index]
+            text = clean(token_units)
+            if text:
+                candidates.append(text)
 
         output: list[SearchQuery] = []
         seen = {original.casefold()}
@@ -93,10 +221,10 @@ class IterativeSearchAgent:
             output.append(query.model_copy(update={
                 "query_id": f"{query.query_id}:relax{index}",
                 "text": text,
-                "purpose": f"deterministic fallback: {query.purpose}",
+                "purpose": f"deterministic fallback (importance-aware): {query.purpose}",
                 "relation_to_question": (
                     query.relation_to_question
-                    + " Deterministic relaxation with core entities preserved."
+                    + " Deterministic relaxation preserves semantic anchors and removes low-importance terms first."
                 ),
             }))
         return output
@@ -722,25 +850,77 @@ class IterativeSearchAgent:
             f"Key entities: {', '.join(key_entities) if key_entities else ''}\n\n"
             f"Candidates (title | year | relevance | directness | evidence_roles | current_decision):\n"
             f"{candidates_text}\n\n"
-            f"For each candidate above, output your retain/reject decision "
-            f"as JSON: {{\"paper_id\": \"...\", \"decision\": \"retain\"|\"reject\", "
-            f"\"rationale\": \"...\"}}.  Only re-judge boundary papers."
+            "Return one ruling for every candidate. Distinguish the portfolio "
+            "role of conventional/core evidence, methodological evidence, "
+            "contradicting evidence, and recent/time-sensitive evidence. "
+            "Retain a paper when it contributes a role or direct finding that "
+            "the current retained set would otherwise miss."
         )
         import json as _json
+        judge_system = (
+            "You are the final LLM retention judge for a scientific literature "
+            "search. Audit only the supplied boundary candidates. Use the title, "
+            "abstract-derived Scout signals, directness, and explicit portfolio "
+            "roles. Do not reward generic vocabulary or duplicate evidence. "
+            "Output JSON matching the supplied schema only."
+        )
+        output_schema = {
+            "type": "object",
+            "properties": {
+                "rulings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "paper_id": {"type": "string"},
+                            "decision": {"type": "string", "enum": ["retain", "reject"]},
+                            "roles": {"type": "array", "items": {"type": "string"}},
+                            "rationale": {"type": "string"},
+                        },
+                        "required": ["paper_id", "decision", "rationale"],
+                    },
+                },
+            },
+            "required": ["rulings"],
+        }
+        emit_event(
+            "tool_started",
+            module="m2",
+            tool="retention_judge",
+            status="running",
+            message="M2 ???? LLM ??/??????",
+            details={"candidates": len(boundary_papers), "window_size": window_size},
+        )
         try:
-            raw = await self.retention_judge_client.chat(
-                system_prompt=(
-                    "You audit a paper retention decision for a scientific "
-                    "literature search. Decide whether each boundary candidate "
-                    "should be retained or rejected based on its unique "
-                    "contribution, directness, methodological complement, and "
-                    "recency.  Output JSON only."
-                ),
-                user_prompt=prompt,
-            )
+            structured_chat = getattr(self.retention_judge_client, "structured_chat", None)
+            if callable(structured_chat):
+                raw = await structured_chat(
+                    system_prompt=judge_system,
+                    user_prompt=prompt,
+                    output_schema=output_schema,
+                    max_tokens=4096,
+                    temperature=0.0,
+                    disable_thinking=True,
+                )
+            else:
+                raw = await self.retention_judge_client.chat(
+                    system_prompt=judge_system,
+                    user_prompt=prompt,
+                    max_tokens=4096,
+                    temperature=0.0,
+                    disable_thinking=True,
+                )
         except Exception as exc:
+            emit_event(
+                "tool_failed",
+                module="m2",
+                tool="retention_judge",
+                status="failed",
+                message=f"LLM ??????: {type(exc).__name__}: {exc}",
+                details={"candidates": len(boundary_papers)},
+            )
             raise RuntimeError(
-                "Retention judge LLM call failed — the judge is enabled and "
+                "Retention judge LLM call failed ? the judge is enabled and "
                 "required. Check the retention judge client configuration."
             ) from exc
         try:
@@ -751,13 +931,15 @@ class IterativeSearchAgent:
                 "is required when the retention judge is enabled."
             ) from exc
         if isinstance(rulings, dict):
-            rulings = [rulings]
+            rulings = rulings.get("rulings", rulings.get("decisions", [rulings]))
         if not isinstance(rulings, list):
             raise RuntimeError(
                 "Retention judge returned unexpected output type "
                 f"{type(rulings).__name__}; expected a JSON array."
             )
         for ruling in rulings:
+            if not isinstance(ruling, dict):
+                continue
             pid = str(ruling.get("paper_id", ""))
             new_decision = str(ruling.get("decision", "")).lower()
             rationale = str(ruling.get("rationale", ""))
@@ -778,6 +960,18 @@ class IterativeSearchAgent:
             ranked[dec.rank_position - 1]
             for dec in decisions if dec.decision == "retain"
         ]
+        emit_event(
+            "tool_completed",
+            module="m2",
+            tool="retention_judge",
+            status="completed",
+            message="LLM ??????",
+            details={
+                "candidates": len(boundary_papers),
+                "retained": len(retained),
+                "overrides": sum(bool(dec.llm_override) for dec in decisions),
+            },
+        )
         return retained, decisions
 
     async def _search(self, query: SearchQuery) -> list[PaperRecord]:

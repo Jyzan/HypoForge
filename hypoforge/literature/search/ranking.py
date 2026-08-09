@@ -382,14 +382,6 @@ def _diversify_early_selection(
     selected_sources: set[str] = set()
     selected_kinds: Counter[str] = Counter()
     window = min(selection_limit or _DEFAULT_FINAL_SELECTION_WINDOW, len(ranked))
-    role_bonus = {
-        EvidenceBucket.CONTRADICTING.value: 0.08,
-        EvidenceBucket.SUPPORTING.value: 0.07,
-        "direct_primary": 0.08,
-        EvidenceBucket.REVIEW.value: 0.01,
-        EvidenceBucket.METHODOLOGICAL.value: 0.02,
-    }
-
     while remaining and len(selected) < window:
         credible = [
             paper
@@ -412,50 +404,47 @@ def _diversify_early_selection(
             if close_non_reviews:
                 candidates = close_non_reviews
 
-        choices: list[tuple[float, float, int, str, PaperRecord]] = []
+        # Role diversity is a lexicographic close-call policy, not a set of
+        # undocumented score patches.  The base rank remains the first-class
+        # signal; only candidates within the explicit close margin compete on
+        # portfolio coverage.  The retention LLM makes the final boundary
+        # retain/reject decision later in IterativeSearchAgent.
+        choices: list[tuple[tuple[object, ...], float, float, int, str, PaperRecord]] = []
         for index, paper in enumerate(candidates):
             note = notes.get(paper.paper_id)
             base = _safe_score(paper.rank_scores.get("post_scout_total"), 0.0)
             relevance = _note_relevance(note, base)
             roles = _evidence_roles(paper, note)
             kind = _selection_kind(paper, note)
-            adjustment = 0.0
-            if (
-                relevance >= _DIVERSITY_RELEVANCE_THRESHOLD
-                and base >= best_base - _CLOSE_EVIDENCE_MARGIN
-            ):
-                adjustment += sum(
-                    bonus
-                    for role, bonus in role_bonus.items()
-                    if role in roles and role not in covered_roles
-                )
-                if selected_sources and not (set(paper.sources) & selected_sources):
-                    adjustment += 0.02
-                kind_penalty = {
-                    "review": 0.045,
-                    "direct_primary": 0.015,
-                    "indirect_primary": 0.025,
-                    "context": 0.030,
-                }[kind]
-                adjustment -= kind_penalty * selected_kinds[kind]
-                # Diversity resolves close calls only. In particular, a paper
-                # with multiple metadata labels cannot leapfrog a materially
-                # stronger result just by collecting bonuses.
-                adjustment = max(-0.16, min(0.16, adjustment))
-            choices.append((base + adjustment, base, -index, paper.paper_id, paper))
+            is_close = relevance >= _DIVERSITY_RELEVANCE_THRESHOLD and (
+                base >= best_base - _CLOSE_EVIDENCE_MARGIN
+            )
+            uncovered_roles = roles - covered_roles
+            new_source = bool(
+                uncovered_roles
+                and selected_sources
+                and not (set(paper.sources) & selected_sources)
+            )
+            selection_key = (
+                int(is_close),
+                len(uncovered_roles) if is_close else 0,
+                int(new_source) if is_close else 0,
+                -selected_kinds[kind] if is_close else 0,
+                base,
+                -index,
+                paper.paper_id,
+            )
+            choices.append((selection_key, base, float(len(uncovered_roles)), -index, paper.paper_id, paper))
 
-        _, base, _, _, chosen = max(choices)
+        _, base, coverage_gain, _, _, chosen = max(choices)
         note = notes.get(chosen.paper_id)
         roles = _evidence_roles(chosen, note)
         kind = _selection_kind(chosen, note)
-        adjustment = next(
-            score - original
-            for score, original, _, _, item in choices
-            if item.paper_id == chosen.paper_id
-        )
         scores = dict(chosen.rank_scores)
-        scores["diversity_adjustment"] = adjustment
-        scores["diversity_selection_score"] = base + adjustment
+        # Diagnostic fields intentionally describe the lexicographic policy;
+        # no magic float is injected into the scientific relevance score.
+        scores["diversity_adjustment"] = coverage_gain
+        scores["diversity_selection_score"] = base
         selected.append(chosen.model_copy(update={"rank_scores": scores}))
         covered_roles.update(roles)
         selected_sources.update(chosen.sources)

@@ -6,8 +6,8 @@ Track A delivers two classes:
   pre-built ``search_agent``, ``reading_workflow`` and ``budget``.
   Used by ``integrated.py`` / ``minimal.py`` factories and scripts.
 
-* ``AgenticM2Module`` — config-driven public wrapper loaded by
-  ``ModuleRegistry`` when ``search.implementation == "agentic"``.
+* ``AgenticM2Module`` — Literature-layer configuration wrapper used by
+  the Pipeline-facing facade in ``hypoforge.modules.m2_literature_search``.
   Accepts ``llm_config`` + ``variant`` and builds the internal adapter
   via ``build_adapter_from_config()``.
 
@@ -277,6 +277,19 @@ class AgenticM2Adapter(ModuleProtocol):
                 sub_question,
                 search_result,
                 reading_results,
+            )
+            emit_event(
+                "tool_result",
+                module="m2",
+                tool="m2_export",
+                status="completed",
+                message="M2 to M3 evidence export completed",
+                details={
+                    "sub_question": sub_question,
+                    "papers": len(export_run.papers),
+                    "evidence": len(export_run.evidence),
+                    "knowledge_entries": len(export_run.knowledge_entries),
+                },
             )
             export_runs.append(export_run)
             literature_results.append(
@@ -793,16 +806,16 @@ class AgenticM2Adapter(ModuleProtocol):
 
 
 # ============================================================================
-# Public config-driven wrapper (loaded by ModuleRegistry)
+# Literature-layer config-driven wrapper
 # ============================================================================
 
 
 class AgenticM2Module(ModuleProtocol):
-    """Config-driven agentic M2 module.
+    """Literature-layer configuration wrapper.
 
-    Loaded by ``ModuleRegistry`` when ``search.implementation == "agentic"``.
-    Internally builds an ``AgenticM2Adapter`` via ``build_adapter_from_config()``
-    and delegates all calls to it.
+    The Pipeline-facing facade lives in
+    ``hypoforge.modules.m2_literature_search``. This class builds an
+    ``AgenticM2Adapter`` from configuration and delegates calls to it.
     """
 
     module_name = "m2"

@@ -14,7 +14,6 @@ from hypoforge.literature.models import (
     PaperRecord,
 )
 from hypoforge.memory import PaperStore
-from hypoforge.modules.m2_literature_search import M2LiteratureSearch
 from hypoforge.modules.m3_grounding.models import EvidenceRecord
 from hypoforge.state import (
     ConfidenceLevel,
@@ -37,8 +36,8 @@ from hypoforge.state import (
 )
 from hypoforge.strict_contracts import (
     StrictAgenticM2Adapter,
+    StrictAgenticM2Module,
     StrictEntityNormalizationService,
-    StrictM2LiteratureSearch,
     StrictM3EvidenceGraph,
     StrictM4HypothesisGeneration,
     StrictM5ResearchPlan,
@@ -385,41 +384,23 @@ async def test_agentic_cache_hit_is_read_before_pending_grounding(tmp_path) -> N
     assert result["m2_knowledge_export"].runs[0].knowledge_entries
 
 
-@pytest.mark.asyncio
-async def test_legacy_fresh_zero_papers_is_not_success(monkeypatch) -> None:
-    class ZeroPubMed:
-        async def search_strict(self, query, limit=10):
-            return []
-
-    class TestM2(StrictM2LiteratureSearch):
-        async def _generate_search_queries(self, sub_question, key_entities):
-            return ["zero-result-query"]
-
-    import hypoforge.tools.pubmed_search as pubmed_module
-    monkeypatch.setattr(pubmed_module, "PubMedTool", lambda: ZeroPubMed())
-    module = TestM2(search_tools=["pubmed"])
-
-    with pytest.raises(RuntimeError, match="retained no usable papers"):
-        await module._run_real(["SQ"])
-
-
 def test_registry_selects_strict_builtin_contracts() -> None:
     config = PipelineConfig(
-        search=SearchConfig(implementation="legacy"),
+        search=SearchConfig(implementation="agentic"),
         entity_embedding_model="text-embedding-v3",
     )
     instances = ModuleRegistry.build_all(config)
 
-    assert isinstance(instances["m2"], StrictM2LiteratureSearch)
+    assert isinstance(instances["m2"], StrictAgenticM2Module)
     assert isinstance(instances["m3"], StrictM3EvidenceGraph)
     assert isinstance(instances["m4"], StrictM4HypothesisGeneration)
     assert isinstance(instances["m5"], StrictM5ResearchPlan)
     assert isinstance(instances["m6"], StrictM6ReviewIteration)
-    assert instances["m2"].entity_embedding_model == "text-embedding-v3"
-    assert instances["m2"].entity_embedding_base_url == (
+    assert instances["m2"].adapter.entity_embedding_model == "text-embedding-v3"
+    assert instances["m2"].adapter.entity_embedding_base_url == (
         config.evaluation.embedding.base_url
     )
-    assert instances["m2"].entity_embedding_key_env == (
+    assert instances["m2"].adapter.entity_embedding_key_env == (
         config.evaluation.embedding.api_key_env_var
     )
     assert instances["m3"].entity_embedding_base_url == (
@@ -430,19 +411,19 @@ def test_registry_selects_strict_builtin_contracts() -> None:
     )
 
     # Default config (no entity_embedding_model) → empty string, no embedding.
-    config_nonembed = PipelineConfig(search=SearchConfig(implementation="legacy"))
+    config_nonembed = PipelineConfig(search=SearchConfig(implementation="agentic"))
     instances_nonembed = ModuleRegistry.build_all(config_nonembed)
-    assert instances_nonembed["m2"].entity_embedding_model == ""
+    assert instances_nonembed["m2"].adapter.entity_embedding_model == ""
 
 
 def test_registry_respects_explicit_empty_entity_embedding_model() -> None:
     config = PipelineConfig(
-        search=SearchConfig(implementation="legacy"),
+        search=SearchConfig(implementation="agentic"),
         entity_embedding_model="",
     )
     instances = ModuleRegistry.build_all(config)
 
-    assert instances["m2"].entity_embedding_model == ""
+    assert instances["m2"].adapter.entity_embedding_model == ""
     assert instances["m3"].entity_embedding_model == ""
 
 
@@ -500,7 +481,7 @@ def test_registry_preserves_custom_registered_m3() -> None:
     original = ModuleRegistry._modules.get("m3")
     ModuleRegistry._modules["m3"] = CustomM3
     try:
-        config = PipelineConfig(search=SearchConfig(implementation="legacy"))
+        config = PipelineConfig(search=SearchConfig(implementation="agentic"))
         instances = ModuleRegistry.build_all(config)
         assert isinstance(instances["m3"], CustomM3)
     finally:
@@ -529,18 +510,6 @@ def test_semantic_alignment_chat_uses_user_prompt_for_qwen_style_client() -> Non
     assert response.startswith("yes")
     assert client.system_prompt == ""
     assert client.user_prompt == "alignment question"
-
-
-def test_legacy_m2_preserves_explicit_empty_search_tools() -> None:
-    module = StrictM2LiteratureSearch(search_tools=[])
-    assert module.search_tools == []
-
-
-@pytest.mark.asyncio
-async def test_legacy_m2_with_no_supported_provider_fails_before_search() -> None:
-    module = StrictM2LiteratureSearch(search_tools=[])
-    with pytest.raises(RuntimeError, match="no supported search backend"):
-        await module._run_real(["SQ"])
 
 
 class FailingGroundingSynthesisClient:

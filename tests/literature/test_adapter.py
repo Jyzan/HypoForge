@@ -13,7 +13,6 @@ from hypoforge.literature.models import (
     SearchRunResult,
     StopReason,
 )
-from hypoforge.modules.m2_literature_search import M2LiteratureSearch
 from hypoforge.registry import ModuleRegistry
 from hypoforge.state import (
     ConfidenceLevel,
@@ -145,7 +144,21 @@ async def test_adapter_preserves_sub_question_order_in_knowledge_export() -> Non
             ]
         ),
         reading_workflow=FakeReadingWorkflow(
-            [PaperReadingResult(paper_id="paper-1")]
+            [PaperReadingResult(
+                paper_id="paper-1",
+                evidence=[EvidenceChunk(
+                    evidence_id="e-order", paper_id="paper-1", chunk_id="chunk-order",
+                    quote="The mechanism depends on ATP.",
+                    normalized_claim="The mechanism depends on ATP.", relevance_score=0.9,
+                )],
+                knowledge_entries=[EvidenceLinkedKnowledge(
+                    entry_id="ke-order",
+                    entry_type=KnowledgeEntryType.MECHANISTIC_CONCLUSION,
+                    content="The mechanism depends on ATP.",
+                    confidence=ConfidenceLevel.HIGH,
+                    evidence_ids=["e-order"],
+                )],
+            )]
         ),
     )
 
@@ -188,9 +201,6 @@ async def test_adapter_rejects_unrecoverable_search_error() -> None:
 # AgenticM2Module (config wrapper) tests
 # ---------------------------------------------------------------------------
 
-
-def test_importing_module_does_not_replace_registered_legacy_m2() -> None:
-    assert ModuleRegistry.get("m2") is M2LiteratureSearch
 
 
 def test_agentic_module_requires_llm_config_for_integrated_variant() -> None:

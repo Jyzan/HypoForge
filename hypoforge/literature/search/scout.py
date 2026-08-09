@@ -97,6 +97,39 @@ def _string_list(value: Any, *, limit: int = 20) -> list[str]:
     return output
 
 
+
+
+def _valid_entity(value: object) -> bool:
+    """Defensively accept only short noun-phrase-like entity surfaces."""
+
+    text = _clean_text(value)
+    if not text or len(text) > 100 or len(text.split()) > 8:
+        return False
+    if text.count("(") != text.count(")") or text.count("?") != text.count("?"):
+        return False
+    if text.endswith((".", "?", "!", "?", "?", "?", ":", "?", ";", "?")):
+        return False
+    if re.search(r"[.!????](?:\s|$)", text):
+        return False
+    if re.search(r"[,?;?:]", text):
+        return False
+    if re.match(
+        r"(?i)^(this|that|these|those|the|a|an|we|our|it|paper|study|本文|该研究|结果)",
+        text,
+    ) and len(text.split()) >= 4:
+        return False
+    return True
+
+
+def _validated_entities(value: Any, fallback: Sequence[str] = ()) -> list[str]:
+    """Filter LLM entities and fall back to the first valid candidate."""
+
+    candidates = _string_list(value, limit=20)
+    valid = [item for item in candidates if _valid_entity(item)]
+    if valid:
+        return valid
+    return [item for item in _string_list(list(fallback), limit=20) if _valid_entity(item)]
+
 def _sentences(text: str) -> list[str]:
     return [
         sentence.strip()
@@ -505,7 +538,7 @@ class ScoutReader(ScoutReaderProtocol):
                 paper_id=paper_id,
                 main_topic=paper.title,
                 key_terms=fallback.key_terms,
-                entities=_string_list(raw.get("entities")) or fallback.entities,
+                entities=_validated_entities(raw.get("entities"), fallback.entities),
                 mechanisms=_string_list(raw.get("mechanisms")),
                 important_authors=list(paper.authors[:3]),
                 controversies=list(contradicting),

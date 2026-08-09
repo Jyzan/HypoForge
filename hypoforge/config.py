@@ -114,7 +114,7 @@ class QwenModelsConfig(BaseModel):
 class SearchConfig(BaseModel):
     """Literature-search related settings."""
 
-    implementation: Literal["legacy", "agentic"] = "legacy"
+    implementation: Literal["agentic"] = "agentic"
     tools: List[str] = Field(default_factory=lambda: ["semantic_scholar", "pubmed"])
     papers_per_sub_question: int = Field(default=15, ge=0)
     max_papers_total: int = Field(default=80, ge=0)
@@ -128,8 +128,7 @@ class SearchConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_agentic_budget(self) -> "SearchConfig":
-        if self.implementation == "agentic" and self.max_papers_total <= 0:
-            raise ValueError("agentic search requires max_papers_total > 0")
+        # M2 applies the paper-budget gate only when it is enabled.
         return self
 
 
@@ -364,7 +363,7 @@ class PipelineConfig(BaseModel):
         override = self.module_overrides.get(module_name)
         kwargs = dict(override.kwargs) if override is not None else {}
         if module_name == "m2":
-            kwargs.setdefault("implementation", self.search.implementation)
+            kwargs["implementation"] = "agentic"
             if self.search.implementation == "agentic":
                 # Only the integrated variant's factory accepts search-budget
                 # wiring. The minimal (PubMed-only, rule-based) factory hard-

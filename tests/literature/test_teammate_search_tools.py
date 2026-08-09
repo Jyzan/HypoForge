@@ -36,10 +36,14 @@ def test_semantic_scholar_keyed_requests_stay_below_one_request_per_second(
     monkeypatch.setattr(semantic_scholar, "_last_request_time", 100.0)
     monkeypatch.setattr(semantic_scholar.time, "monotonic", lambda: 100.0)
     monkeypatch.setattr(semantic_scholar.time, "sleep", sleeps.append)
+
+    class FakeOpener:
+        @staticmethod
+        def open(request, timeout):
+            return FakeResponse()
+
     monkeypatch.setattr(
-        semantic_scholar.urllib.request,
-        "urlopen",
-        lambda request, timeout: FakeResponse(),
+        semantic_scholar, "_NO_PROXY_OPENER", FakeOpener()
     )
 
     semantic_scholar._http_get_json(
@@ -93,11 +97,13 @@ def test_semantic_scholar_rate_limit_serializes_concurrent_requests(
         time.monotonic(),
     )
     monkeypatch.setattr(semantic_scholar.time, "sleep", tracked_sleep)
-    monkeypatch.setattr(
-        semantic_scholar.urllib.request,
-        "urlopen",
-        lambda request, timeout: FakeResponse(),
-    )
+
+    class FakeOpener:
+        @staticmethod
+        def open(request, timeout):
+            return FakeResponse()
+
+    monkeypatch.setattr(semantic_scholar, "_NO_PROXY_OPENER", FakeOpener())
     workers = [threading.Thread(target=request) for _ in range(2)]
     for worker in workers:
         worker.start()
@@ -151,13 +157,13 @@ async def test_semantic_scholar_constructor_key_selects_instance_backend(
 ) -> None:
     calls = []
 
-    def search(query: str, limit: int, api_key: str):
+    def search(query: str, limit: int, api_key: str, deadline=None):
         calls.append((query, limit, api_key))
         return []
 
     fallback_calls = []
 
-    def openalex_search(query: str, limit: int, api_key: str):
+    def openalex_search(query: str, limit: int, api_key: str, deadline=None):
         fallback_calls.append((query, limit, api_key))
         return []
 

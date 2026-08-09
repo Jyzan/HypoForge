@@ -10,9 +10,6 @@ Covers:
 * ``PaperStore`` contract aliases (``lookup_by_query`` text/hash,
   ``papers_by_ids``) and ``source`` provenance;
 * ``paper_sources`` junction helpers;
-* legacy M2 cache-first supplement (hit path needs no LLM client; live path
-  merges without clearing, dedups via the ledger, moves gaps to
-  ``pending_grounding``);
 * pipeline supplement-round skip-suppression event.
 """
 
@@ -23,7 +20,6 @@ import pytest
 from hypoforge.config import PipelineConfig
 from hypoforge.memory import PaperStore
 from hypoforge.memory.paper_store import query_hash
-from hypoforge.modules.m2_literature_search import M2LiteratureSearch
 from hypoforge.modules.m6_review_iteration import M6ReviewIteration
 from hypoforge.observability import RunEventRecorder, bind_recorder
 from hypoforge.paper_sources import (
@@ -47,6 +43,7 @@ from hypoforge.state import (
     KnowledgeEntryType,
     LiteratureResult,
     PipelineState,
+    ProblemCard,
     ResearchPlan,
     RoutingDecision,
     SearchLedger,
@@ -91,6 +88,7 @@ def _review_payload() -> dict:
 def make_m6_state(**overrides) -> PipelineState:
     base = dict(
         input_question="Q",
+        problem_card=ProblemCard(original_question="Q", sub_questions=[SUB_QUESTION], key_entities=[], domain=[]),
         top_hypotheses=[HypothesisCard(hypothesis_id="h1", statement="s")],
         research_plans=[ResearchPlan(hypothesis_id="h1")],
     )
@@ -314,11 +312,11 @@ def test_paper_store_contract_aliases(tmp_path) -> None:
 
 def test_paper_store_source_provenance(tmp_path) -> None:
     store = PaperStore(tmp_path)
-    store.upsert_papers([{"doi": "10.1/x"}], source="legacy_m2")
+    store.upsert_papers([{"doi": "10.1/x"}], source="agentic_m2")
     store.upsert_papers([{"doi": "10.1/x"}], source="agentic_m2")
     store._ensure_loaded()
     record = store._papers["doi:10.1/x"]
-    assert record["sources_seen"] == ["legacy_m2", "agentic_m2"]
+    assert record["sources_seen"] == ["agentic_m2"]
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +335,7 @@ def test_persist_search_results_never_raises_and_records() -> None:
     with tempfile.TemporaryDirectory() as cache_dir:
         store = PaperStore(cache_dir)
         keys = persist_search_results(
-            store, [{"doi": "10.1/x"}], ["hsp70 query"], source="legacy_m2"
+            store, [{"doi": "10.1/x"}], ["hsp70 query"], source="agentic_m2"
         )
         assert keys == ["doi:10.1/x"]
         assert store.lookup_query("hsp70 query") == keys
@@ -424,194 +422,6 @@ def test_resolve_gap_sub_question() -> None:
 # ---------------------------------------------------------------------------
 # Legacy M2 supplement flow
 # ---------------------------------------------------------------------------
-
-
-def _make_legacy_state(tmp_path=None, **overrides) -> PipelineState:
-    base = dict(
-        input_question="Q",
-        search_round=1,
-        run_id="run-1",
-        literature_results=[
-            LiteratureResult(
-                sub_question=SUB_QUESTION,
-                papers_retrieved=1,
-                knowledge_entries=[
-                    KnowledgeEntry(
-                        id="KE_old",
-                        type=KnowledgeEntryType.ESTABLISHED_FACT,
-                        content="old fact",
-                        source_paper_id="old-1",
-                    )
-                ],
-            )
-        ],
-        search_ledger=SearchLedger(
-            queries_issued=["initial query"], paper_keys=["doi:10.1000/old"]
-        ),
-        evidence_gaps=[
-            EvidenceGap(
-                description="Missing Hsp70 co-chaperone data",
-                suggested_queries=["Hsp70 chaperone mechanism"],
-                target_sub_question=SUB_QUESTION,
-            )
-        ],
-    )
-    if tmp_path is not None:
-        base["memory_cache_dir"] = str(tmp_path)
-    base.update(overrides)
-    return PipelineState(**base)
-
-
-class FakeStructuredClient:
-    """structured_chat returns one empty entry list per call."""
-
-    def __init__(self):
-        self.calls = 0
-
-    async def structured_chat(self, **kwargs):
-        self.calls += 1
-        return []
-
-
-class FakePubMedTool:
-    def __init__(self, papers=None):
-        self.papers = papers or []
-        self.calls = []
-
-    async def search(self, query, limit=10):
-        self.calls.append((query, limit))
-        return [dict(paper) for paper in self.papers]
-
-
-class FakeSemanticScholarTool(FakePubMedTool):
-    pass
-
-
-@pytest.mark.asyncio
-async def test_legacy_m2_supplement_cache_hit_no_client_needed(
-    tmp_path, monkeypatch
-) -> None:
-    store = PaperStore(tmp_path)
-    keys = store.upsert_papers(
-        [{"doi": "10.1000/cached", "title": "Cached paper"}],
-        run_id="run-0", round=1,
-    )
-    store.record_query("Hsp70 chaperone mechanism", keys, run_id="run-0", round=1)
-
-    # Live search tools must never be touched on a cache hit.
-    def explode(*args, **kwargs):
-        raise AssertionError("live search must not run on a cache hit")
-
-    monkeypatch.setattr(
-        "hypoforge.tools.pubmed_search.PubMedTool", explode
-    )
-    monkeypatch.setattr(
-        "hypoforge.tools.semantic_scholar.SemanticScholarTool", explode
-    )
-
-    module = M2LiteratureSearch()  # no llm_config — proves no LLM is needed
-    state = _make_legacy_state(tmp_path)
-    recorder = RunEventRecorder(tmp_path / "run", "run-1")
-
-    with bind_recorder(recorder):
-        output = await module(state)
-
-    # gap moved to pending_grounding
-    assert output["evidence_gaps"][0].status == "pending_grounding"
-
-    # literature merged incrementally — old entry preserved
-    results = output["literature_results"]
-    assert len(results) == 1
-    assert results[0].papers_retrieved == 2
-    assert [e.id for e in results[0].knowledge_entries] == ["KE_old"]
-
-    # ledger gained the cached paper key, no new live query issued
-    ledger = output["search_ledger"]
-    assert ledger.queries_issued == ["initial query"]
-    assert "doi:10.1000/cached" in ledger.paper_keys
-
-    # memory_hit event fired with provenance
-    hits = [
-        e for e in recorder.read_events() if e["event_type"] == "memory_hit"
-    ]
-    assert len(hits) == 1
-    assert hits[0]["details"]["gap_id"] == output["evidence_gaps"][0].gap_id
-    assert hits[0]["details"]["hits"] == 1
-    assert hits[0]["details"]["source"] == "paper_store"
-
-
-@pytest.mark.asyncio
-async def test_legacy_m2_supplement_live_search_merges_and_ledger(
-    tmp_path, monkeypatch
-) -> None:
-    fake_pubmed = FakePubMedTool(
-        [{"doi": "10.1000/new", "title": "Fresh paper", "abstract": "a"}]
-    )
-    fake_s2 = FakeSemanticScholarTool([])
-    monkeypatch.setattr(
-        "hypoforge.tools.pubmed_search.PubMedTool", lambda: fake_pubmed
-    )
-    monkeypatch.setattr(
-        "hypoforge.tools.semantic_scholar.SemanticScholarTool", lambda: fake_s2
-    )
-
-    module = M2LiteratureSearch()
-    module.client = FakeStructuredClient()
-    state = _make_legacy_state(tmp_path)  # cache empty → live path
-
-    output = await module(state)
-
-    # suggested query reached the backend exactly once
-    assert [call[0] for call in fake_pubmed.calls] == ["Hsp70 chaperone mechanism"]
-
-    results = output["literature_results"]
-    assert results[0].papers_retrieved == 2
-    assert [e.id for e in results[0].knowledge_entries] == ["KE_old"]
-
-    ledger = output["search_ledger"]
-    assert ledger.queries_issued == ["initial query", "Hsp70 chaperone mechanism"]
-    assert "doi:10.1000/new" in ledger.paper_keys
-    assert output["evidence_gaps"][0].status == "pending_grounding"
-
-    # junction seeded the paper store for future cache hits
-    reloaded = PaperStore(tmp_path)
-    assert reloaded.lookup_query("Hsp70 chaperone mechanism") == [
-        "doi:10.1000/new"
-    ]
-
-
-@pytest.mark.asyncio
-async def test_legacy_m2_supplement_ledger_dedups_issued_queries(
-    tmp_path, monkeypatch
-) -> None:
-    fake_pubmed = FakePubMedTool([{"doi": "10.1000/new", "title": "T"}])
-    monkeypatch.setattr(
-        "hypoforge.tools.pubmed_search.PubMedTool", lambda: fake_pubmed
-    )
-    monkeypatch.setattr(
-        "hypoforge.tools.semantic_scholar.SemanticScholarTool",
-        lambda: FakeSemanticScholarTool([]),
-    )
-
-    module = M2LiteratureSearch()
-    module.client = FakeStructuredClient()
-    state = _make_legacy_state(
-        tmp_path,
-        search_ledger=SearchLedger(
-            queries_issued=["hsp70   chaperone, mechanism!!"],
-            paper_keys=["doi:10.1000/old"],
-        ),
-    )
-
-    output = await module(state)
-
-    assert fake_pubmed.calls == []  # duplicate query dropped before any search
-    assert output["literature_results"][0].papers_retrieved == 1
-    assert output["search_ledger"].queries_issued == [
-        "hsp70   chaperone, mechanism!!"
-    ]
-    # gap still attempted → pending_grounding
-    assert output["evidence_gaps"][0].status == "pending_grounding"
 
 
 # ---------------------------------------------------------------------------

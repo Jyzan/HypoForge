@@ -14,7 +14,10 @@ from hypoforge.literature.models import (
     SearchQuery,
     SearchRunResult,
     StopReason,
+    EvidenceChunk,
+    EvidenceLinkedKnowledge,
 )
+from hypoforge.state import ConfidenceLevel, KnowledgeEntryType
 from scripts import run_m2_integrated
 
 
@@ -61,6 +64,18 @@ def make_reading_result() -> PaperReadingResult:
         summary="YAP and TAZ connect Hippo signaling to organ size.",
         degraded_to_abstract=True,
         errors=["full text unavailable; used abstract"],
+        evidence=[EvidenceChunk(
+            evidence_id="ev-1", paper_id="PMID:1", chunk_id="chunk-1",
+            quote="YAP and TAZ regulate organ size.",
+            normalized_claim="YAP and TAZ regulate organ size.", relevance_score=0.9,
+        )],
+        knowledge_entries=[EvidenceLinkedKnowledge(
+            entry_id="ke-1",
+            entry_type=KnowledgeEntryType.ESTABLISHED_FACT,
+            content="YAP and TAZ regulate organ size.",
+            confidence=ConfidenceLevel.HIGH,
+            evidence_ids=["ev-1"],
+        )],
     )
 
 
@@ -138,7 +153,18 @@ async def test_run_uses_integrated_adapter_once_and_returns_complete_trace(
             {
                 "sub_question": QUESTION,
                 "papers_retrieved": 1,
-                "knowledge_entries": [],
+                "knowledge_entries": [
+                    {
+                        "id": reading_result.knowledge_entries[0].entry_id,
+                        "type": reading_result.knowledge_entries[0].entry_type.value,
+                        "content": reading_result.knowledge_entries[0].content,
+                        "confidence": reading_result.knowledge_entries[0].confidence.value,
+                        "source_paper_id": reading_result.paper_id,
+                        "source_paper_title": search_result.final_papers[0].title,
+                        "entities": reading_result.knowledge_entries[0].entities,
+                        "evidence_ids": reading_result.knowledge_entries[0].evidence_ids,
+                    }
+                ],
             }
         ],
     }

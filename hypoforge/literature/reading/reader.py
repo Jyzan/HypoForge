@@ -15,6 +15,7 @@ from ..models import (
     PaperRecord,
 )
 from ..protocols import PaperReaderProtocol
+from ..search.scout import _valid_entity
 
 _SYSTEM_PROMPT = """You are a cross-disciplinary scientific evidence extraction engine.
 Use only the supplied evidence passages. Extract zero or more concise knowledge
@@ -71,15 +72,6 @@ def _error(exc: BaseException) -> str:
     return " ".join(f"{type(exc).__name__}: {exc}".split())[:500]
 
 
-def _valid_entity(value: str) -> bool:
-    text = _clean(value, 200)
-    if not text or len(text.split()) > 8 or len(text) > 100:
-        return False
-    if text.count("(") != text.count(")") or text.count("（") != text.count("）"):
-        return False
-    return not text.endswith((".", "。", "!", "！", "?", "？", ":", "："))
-
-
 class QwenPaperReader(PaperReaderProtocol):
     def __init__(self, client: QwenClient) -> None:
         self.client = client
@@ -101,8 +93,10 @@ class QwenPaperReader(PaperReaderProtocol):
                 "\n".join(
                     [
                         label,
+                        f"Chunk ID: {item.chunk_id}",
                         f"Section: {item.section or 'unknown'}",
-                        item.quote,
+                        f"Page: {item.page if item.page is not None else 'unknown'}",
+                        f"Quote: {item.quote}",
                     ]
                 )
             )

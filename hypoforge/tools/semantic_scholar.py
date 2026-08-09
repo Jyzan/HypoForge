@@ -94,57 +94,93 @@ _OPENALEX_RATE_LIMIT = 0.12
 _last_request_time: float = 0.0
 _rate_limit_lock = threading.Lock()
 
+# Bypass the system proxy (e.g. Clash on 127.0.0.1:7897) for these APIs.
+# A shared proxy exit IP exhausts OpenAlex's daily free budget and trips
+# Semantic Scholar's per-IP limits; both endpoints are reachable directly
+# from CN networks, and a deterministic direct route keeps the OpenAlex
+# fallback within the caller's time budget.
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-def _rate_limit(min_interval: float) -> None:
+# Cap on the S2 stage of a search: rate-limit sleep + request + retries must
+# fit inside this window so the OpenAlex fallback always has room to run
+# within the agent's per-source timeout (default 30.0s).
+_S2_STAGE_DEADLINE_SECONDS = 15.0
+
+
+def _remaining_seconds(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Semantic Scholar request deadline exceeded")
+    return remaining
+
+
+def _sleep_with_deadline(seconds: float, deadline: float | None) -> None:
+    if seconds <= 0:
+        return
+    if deadline is not None and seconds >= _remaining_seconds(deadline):
+        raise TimeoutError("Semantic Scholar deadline would be exceeded")
+    time.sleep(seconds)
+
+
+def _rate_limit(min_interval: float, deadline: float | None = None) -> None:
     global _last_request_time
     with _rate_limit_lock:
         now = time.monotonic()
         gap = min_interval - (now - _last_request_time)
         if gap > 0:
-            time.sleep(gap)
+            _sleep_with_deadline(gap, deadline)
         _last_request_time = time.monotonic()
 
 
-def _http_get_json(url: str, *, s2_api_key: str = "") -> dict:
-    """GET *url*, parse JSON, with rate-limit + retry on transient errors."""
+def _http_get_json(
+    url: str, *, s2_api_key: str = "", deadline: float | None = None
+) -> dict:
+    """GET *url*, parse JSON, with rate-limit + retry on transient errors.
+
+    ``deadline`` (absolute ``time.monotonic()`` time) bounds the whole call:
+    rate-limit waits, backoff sleeps and the socket timeout all respect it.
+    HTTP 429 fails fast instead of retrying — a rate-limited key/IP will not
+    recover inside the caller's budget, and the S2 circuit-breaker +
+    OpenAlex fallback in ``_search`` is the designed recovery path.
+    """
+    is_s2 = bool(s2_api_key) and "semanticscholar.org" in url
+    if is_s2 and _s2_circuit_open():
+        # A concurrent worker already tripped the breaker; don't queue
+        # behind an 8s rate-limit sleep for a doomed request.
+        raise RuntimeError("Semantic Scholar circuit is open (rate-limited)")
+    request_interval = _S2_RATE_LIMIT if is_s2 else _OPENALEX_RATE_LIMIT
     last_exc = None
-    request_interval = (
-        _S2_RATE_LIMIT
-        if s2_api_key and "semanticscholar.org" in url
-        else _OPENALEX_RATE_LIMIT
-    )
     for attempt in range(4):
-        _rate_limit(request_interval)
+        _rate_limit(request_interval, deadline)
         req = urllib.request.Request(url)
         req.add_header("User-Agent", "HypoForge/0.1.0 (Academic Research)")
-        if s2_api_key and "semanticscholar.org" in url:
+        if is_s2:
             req.add_header("x-api-key", s2_api_key)
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+            with _NO_PROXY_OPENER.open(
+                req,
+                timeout=min(30.0, _remaining_seconds(deadline))
+                if deadline is not None else 30.0,
+            ) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                if deadline is not None:
+                    _remaining_seconds(deadline)
+                return data
         except urllib.error.HTTPError as e:
             last_exc = e
-            if e.code == 429 and attempt < 3:
-                retry_after = e.headers.get("Retry-After", "")
-                if retry_after:
-                    try:
-                        wait = float(retry_after)
-                    except (ValueError, TypeError):
-                        wait = 2.0
-                else:
-                    base = 2 ** attempt
-                    wait = base + random.uniform(0, base * 0.25)
-                logger.debug("429 rate-limited, retry in %.1fs", wait)
-                time.sleep(wait)
-            else:
-                raise
+            if e.code == 429:
+                logger.debug(
+                    "429 rate-limited (attempt %d); failing fast to the "
+                    "fallback backend", attempt,
+                )
+            raise
         except (urllib.error.URLError, OSError) as e:
             last_exc = e
             if attempt < 3:
                 base = 2 ** attempt
                 wait = base + random.uniform(0, base * 0.25)
                 logger.debug("Network error (%s), retry in %.1fs: %s", type(e).__name__, wait, e)
-                time.sleep(wait)
+                _sleep_with_deadline(wait, deadline)
             else:
                 raise
 
@@ -158,7 +194,9 @@ def _http_get_json(url: str, *, s2_api_key: str = "") -> dict:
 _S2_BASE = "https://api.semanticscholar.org/graph/v1"
 
 
-def _s2_search(query: str, limit: int, api_key: str = "") -> List[dict]:
+def _s2_search(
+    query: str, limit: int, api_key: str = "", deadline: float | None = None
+) -> List[dict]:
     """Search Semantic Scholar, return standardised paper dicts."""
     params: Dict[str, str] = {
         "query": query,
@@ -168,7 +206,7 @@ def _s2_search(query: str, limit: int, api_key: str = "") -> List[dict]:
     qs = urllib.parse.urlencode(params)
     url = f"{_S2_BASE}/paper/search?{qs}"
 
-    data = _http_get_json(url, s2_api_key=api_key)
+    data = _http_get_json(url, s2_api_key=api_key, deadline=deadline)
     papers = data.get("data", [])
     logger.info(
         "S2 search: query=%r → total=%s returned=%d",
@@ -178,11 +216,13 @@ def _s2_search(query: str, limit: int, api_key: str = "") -> List[dict]:
     return [_s2_normalise(p) for p in papers]
 
 
-def _s2_fetch(paper_id: str, api_key: str = "") -> dict:
+def _s2_fetch(paper_id: str, api_key: str = "", deadline: float | None = None) -> dict:
     """Fetch a single paper from Semantic Scholar by ID."""
     fields = "title,abstract,year,authors,journal,externalIds,citationCount,openAccessPdf,isOpenAccess"
     url = f"{_S2_BASE}/paper/{paper_id}?fields={fields}"
-    return _s2_normalise(_http_get_json(url, s2_api_key=api_key))
+    return _s2_normalise(
+        _http_get_json(url, s2_api_key=api_key, deadline=deadline)
+    )
 
 
 def _s2_normalise(raw: dict) -> dict:
@@ -221,7 +261,9 @@ def _s2_normalise(raw: dict) -> dict:
 _OA_BASE = "https://api.openalex.org"
 
 
-def _oa_search(query: str, limit: int, api_key: str = "") -> List[dict]:
+def _oa_search(
+    query: str, limit: int, api_key: str = "", deadline: float | None = None
+) -> List[dict]:
     """Search OpenAlex, return standardised paper dicts."""
     params = {
         "search": query,
@@ -231,7 +273,7 @@ def _oa_search(query: str, limit: int, api_key: str = "") -> List[dict]:
     if api_key:
         params["api_key"] = api_key
     url = f"{_OA_BASE}/works?{urllib.parse.urlencode(params)}"
-    data = _http_get_json(url)
+    data = _http_get_json(url, deadline=deadline)
     papers = data.get("results", [])
     logger.info(
         "OpenAlex search: query=%r → total=%s returned=%d",
@@ -240,7 +282,7 @@ def _oa_search(query: str, limit: int, api_key: str = "") -> List[dict]:
     return [_oa_normalise(p) for p in papers]
 
 
-def _oa_fetch(work_id: str, api_key: str = "") -> dict:
+def _oa_fetch(work_id: str, api_key: str = "", deadline: float | None = None) -> dict:
     """Fetch a single work from OpenAlex by ID.
 
     The *work_id* can be a full OpenAlex URL
@@ -256,7 +298,7 @@ def _oa_fetch(work_id: str, api_key: str = "") -> dict:
     url = f"{_OA_BASE}/works/{work_id}"
     if api_key:
         url = f"{url}?{urllib.parse.urlencode({'api_key': api_key})}"
-    return _oa_normalise(_http_get_json(url))
+    return _oa_normalise(_http_get_json(url, deadline=deadline))
 
 
 def _oa_normalise(raw: dict) -> dict:
@@ -321,16 +363,18 @@ def _s2_with_oa_fallback(
     s2_api_key: str,
     oa_api_key: str,
     s2_error: "Exception | None" = None,
+    deadline: float | None = None,
 ) -> List[dict]:
     """Try Semantic Scholar (unless *s2_error* is already set), then OpenAlex.
 
     ``s2_error`` pre-populates the error from an earlier S2 attempt (e.g. from
     a circuit-breaker path that already failed).  When ``None`` a fresh S2
-    attempt is made first.
+    attempt is made first.  ``deadline`` bounds the whole S2+fallback stage
+    so the OpenAlex fallback always has room within the caller's budget.
     """
     if s2_error is None:
         try:
-            rows = _s2_search(query, limit, s2_api_key)
+            rows = _s2_search(query, limit, s2_api_key, deadline=deadline)
             if rows:
                 return rows
             logger.warning("Semantic Scholar returned zero results; falling back to OpenAlex")
@@ -343,7 +387,9 @@ def _s2_with_oa_fallback(
     oa_query = re.sub(r"\[[^\]]+\]", "", query)
     oa_query = re.sub(r"\b(?:title|abstract|author):", "", oa_query, flags=re.I)
     try:
-        return _oa_search(" ".join(oa_query.split()), limit, oa_api_key)
+        return _oa_search(
+            " ".join(oa_query.split()), limit, oa_api_key, deadline=deadline
+        )
     except Exception as oa_error:
         if s2_error is not None:
             raise RuntimeError(
@@ -364,15 +410,19 @@ def _search(query: str, limit: int = 20) -> List[dict]:
     rate-limiting us (HTTP 429), a circuit-breaker opens and subsequent
     calls skip straight to OpenAlex for a cooldown period.  This avoids
     wasting 20+ seconds on doomed retries for every query in a batch.
+
+    The S2 stage is bounded by ``_S2_STAGE_DEADLINE_SECONDS`` so the OpenAlex
+    fallback always runs inside the agent's per-source timeout (30s default).
     """
     if _BACKEND == "semantic_scholar":
+        deadline = time.monotonic() + _S2_STAGE_DEADLINE_SECONDS
         s2_error: Exception | None = None
         if _s2_circuit_open():
             logger.info("S2 circuit is open (rate-limited); using OpenAlex directly")
             s2_error = RuntimeError("S2 circuit open")
         else:
             try:
-                rows = _s2_search(query, limit, _S2_API_KEY)
+                rows = _s2_search(query, limit, _S2_API_KEY, deadline=deadline)
                 if rows:
                     return rows
                 logger.warning(
@@ -393,12 +443,21 @@ def _search(query: str, limit: int = 20) -> List[dict]:
                     )
             except Exception as exc:
                 s2_error = exc
-                logger.warning(
-                    "Semantic Scholar failed (%s); falling back to OpenAlex",
-                    type(exc).__name__,
-                )
+                if isinstance(exc, TimeoutError):
+                    _s2_circuit_break()
+                    logger.warning(
+                        "Semantic Scholar stage deadline exceeded (%s); "
+                        "circuit-breaker open, falling back to OpenAlex",
+                        type(exc).__name__,
+                    )
+                else:
+                    logger.warning(
+                        "Semantic Scholar failed (%s); falling back to OpenAlex",
+                        type(exc).__name__,
+                    )
         return _s2_with_oa_fallback(
-            query, limit, _S2_API_KEY, _OPENALEX_API_KEY, s2_error=s2_error
+            query, limit, _S2_API_KEY, _OPENALEX_API_KEY,
+            s2_error=s2_error, deadline=deadline,
         )
     return _oa_search(query, limit, _OPENALEX_API_KEY)
 
@@ -406,7 +465,8 @@ def _search(query: str, limit: int = 20) -> List[dict]:
 def _fetch(identifier: str) -> dict:
     """Dispatch single-paper fetch to the active backend."""
     if _BACKEND == "semantic_scholar":
-        return _s2_fetch(identifier, _S2_API_KEY)
+        deadline = time.monotonic() + _S2_STAGE_DEADLINE_SECONDS
+        return _s2_fetch(identifier, _S2_API_KEY, deadline=deadline)
     else:
         return _oa_fetch(identifier, _OPENALEX_API_KEY)
 
@@ -458,15 +518,18 @@ class SemanticScholarTool(ToolProtocol):
             and self._backend == _BACKEND
         ):
             return _search(query, limit)
+        deadline = time.monotonic() + _S2_STAGE_DEADLINE_SECONDS
         if self._backend == "semantic_scholar":
             return _s2_with_oa_fallback(
-                query, limit, self.api_key, self.openalex_api_key
+                query, limit, self.api_key, self.openalex_api_key,
+                deadline=deadline,
             )
         return _oa_search(query, limit, self.openalex_api_key)
 
     def _fetch_instance(self, identifier: str) -> dict:
         if self._backend == "semantic_scholar":
-            return _s2_fetch(identifier, self.api_key)
+            deadline = time.monotonic() + _S2_STAGE_DEADLINE_SECONDS
+            return _s2_fetch(identifier, self.api_key, deadline=deadline)
         return _oa_fetch(identifier, self.openalex_api_key)
 
     async def search(self, query: str, limit: int = 20, **kwargs) -> List[dict]:

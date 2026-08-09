@@ -44,10 +44,7 @@ module_overrides:
       llm_tier: "base"
   m2:
     kwargs:
-      mode: "llm"
       llm_tier: "turbo"
-      max_papers_per_query: 15
-      batch_size: 5
   m3:
     kwargs:
       mode: "llm"

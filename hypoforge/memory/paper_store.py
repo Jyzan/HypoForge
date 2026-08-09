@@ -175,7 +175,7 @@ class PaperStore:
         """Append/upsert papers; returns their keys in input order.
 
         ``source`` is optional provenance: the name of the search backend /
-        junction that produced the records (e.g. ``"legacy_m2"``).  Every
+        junction that produced the records (e.g. ``"agentic_m2"``).  Every
         distinct source that ever touches a paper is kept in the record's
         ``sources_seen`` list.
         """

@@ -1,8 +1,7 @@
 """Shared paper-source junction helpers for supplement ("gap-filling") search.
 
-The agentic M2 adapter keeps its supplement flow self-contained; the legacy
-M2 module (``modules/m2_literature_search.py``) reuses the helpers here so
-both implementations share ONE set of semantics for:
+The Agentic M2 adapter uses these helpers for its cache-first supplement
+flow. They centralise ONE set of semantics for:
 
 * opening the persistent :class:`~hypoforge.memory.paper_store.PaperStore`
   (gracefully degrading to ``None`` when the cache dir is unavailable);

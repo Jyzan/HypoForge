@@ -45,7 +45,7 @@ def test_default_config_loads():
     config = PipelineConfig.from_defaults()
     assert config.enabled_modules == ["m1", "m2", "m3", "m4", "m5", "m6"]
     assert config.max_iterations == 3
-    assert config.search.implementation == "legacy"
+    assert config.search.implementation == "agentic"
     assert config.evaluation.embedding.model_name == "text-embedding-v3"
     assert config.evaluation.consistency.similarity_threshold == 0.5
 
@@ -102,13 +102,13 @@ def test_agentic_search_config_is_forwarded_to_integrated_adapter() -> None:
     }
 
 
-def test_module_override_can_explicitly_override_search_implementation() -> None:
+def test_module_override_cannot_reintroduce_removed_legacy_implementation() -> None:
     config = PipelineConfig(
         search={"implementation": "agentic"},
-        module_overrides={"m2": {"kwargs": {"implementation": "legacy"}}},
+        module_overrides={"m2": {"kwargs": {"implementation": "agentic"}}},
     )
 
-    assert config.get_module_kwargs("m2")["implementation"] == "legacy"
+    assert config.get_module_kwargs("m2")["implementation"] == "agentic"
 
 
 def test_unknown_search_implementation_is_rejected() -> None:

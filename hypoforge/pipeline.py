@@ -15,7 +15,7 @@ from langgraph.graph import END, StateGraph
 
 from .config import PipelineConfig
 from .display.panels import render_module_result, render_phase_done, render_phase_header
-from .observability import RunEventRecorder, bind_recorder
+from .observability import RunEventRecorder, bind_recorder, notify_event, bind_event_sink
 from .protocol import ModuleProtocol
 from .registry import ModuleRegistry, SkillRegistry
 from .state import FollowupRequest, PipelineState, RoutingDecision, SearchLedger
@@ -274,7 +274,10 @@ class PipelineRunner:
 
     def _record_event(self, event_type: str, **kwargs: Any) -> None:
         if self.event_recorder is not None:
-            self.event_recorder.emit(event_type, **kwargs)
+            event = self.event_recorder.emit(event_type, **kwargs)
+        else:
+            event = {"event_type": event_type, **kwargs}
+        notify_event(event)
 
     @staticmethod
     def _summarize_result(name: str, result: Dict[str, Any]) -> Dict[str, Any]:
@@ -607,7 +610,9 @@ class PipelineRunner:
                 state_before_hooks_dict.update(pre_header_patch)
                 state_before_hooks = PipelineState(**state_before_hooks_dict)
 
-                if self.config.verbose:
+                if self.config.verbose and name != "m2":
+                    # Agentic M2 owns a richer live progress panel; avoid
+                    # printing a second generic phase header before it.
                     render_phase_header(name, mod.description)
 
                 # --- before hooks ---
@@ -708,7 +713,8 @@ class PipelineRunner:
 
                 if self.config.verbose:
                     render_module_result(name, state, final)
-                    render_phase_done(name)
+                    if name != "m2":
+                        render_phase_done(name)
                 # --- checkpoint: save state after each successful module ---
                 self._save_checkpoint(name, state, final)
                 elapsed = time.perf_counter() - module_started_at
@@ -1236,7 +1242,12 @@ class PipelineRunner:
             # The run lock covers every checkpoint mutation. Cancellation is
             # cooperative: a running module finishes and the next one stops.
             final_state_dict = None
-            with bind_recorder(self.event_recorder):
+            from .display.m2_progress import M2ProgressReporter
+            progress_sink = M2ProgressReporter(
+                enabled=bool(self.config.verbose),
+                run_id=run_id,
+            )
+            with bind_event_sink(progress_sink), bind_recorder(self.event_recorder):
                 try:
                     async for chunk in graph.astream(
                         initial_state,

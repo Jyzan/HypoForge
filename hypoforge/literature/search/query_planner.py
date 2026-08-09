@@ -7,6 +7,7 @@ that include backend selection and coverage intent.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Any, Dict, List, Optional, Sequence
@@ -24,6 +25,43 @@ def _sanitize_query(text: str, backend: str) -> str:
     if backend != "pubmed":
         text = _FIELD_TAG_PATTERN.sub("", text)
     return " ".join(text.split())
+
+
+def _query_tokens(text: str) -> list[str]:
+    """Return backend-agnostic lexical tokens for anchor checks."""
+    return re.findall(r"[\w\u3400-\u9fff]+", text.casefold())
+
+
+def _contains_core_entity(query: str, entity: str) -> bool:
+    """Whether *query* already contains the entity as a phrase or token set.
+
+    LLMs sometimes insert operators or field tags between words of a
+    multi-word entity. Treating the entity as present when all of its tokens
+    occur avoids adding a duplicated anchor merely because the phrase is not
+    contiguous.
+    """
+    query_tokens = _query_tokens(query)
+    entity_tokens = _query_tokens(entity)
+    if not entity_tokens:
+        return True
+    if " ".join(entity_tokens) in " ".join(query_tokens):
+        return True
+    return all(token in query_tokens for token in entity_tokens)
+
+
+def _anchor_query(text: str, core_entity: str, backend: str) -> str:
+    """Add a missing core entity without destroying the LLM query structure.
+
+    The anchor is deliberately placed as a grouped conjunct rather than
+    appended as loose trailing words (``query entity``), which can alter the
+    parser's precedence and produce malformed backend queries.
+    """
+    entity = " ".join(str(core_entity or "").split()).strip()
+    query = _sanitize_query(text, backend).strip()
+    if not entity or not query or _contains_core_entity(query, entity):
+        return query
+    quoted_entity = json.dumps(entity, ensure_ascii=False)
+    return _sanitize_query(f"{quoted_entity} AND ({query})", backend)
 
 # ---------------------------------------------------------------------------
 # Prompts (mirrored from m2_branch for standalone use)
@@ -95,8 +133,13 @@ In later rounds, target only the gaps identified by the coverage evaluator.
 1. Generate **4-6** queries in the first round (fewer in later rounds, targeting gaps).
 2. Keep each concept/term short (1-3 words).
 3. Assign each query to the most appropriate tool based on domain.
-4. Never repeat a query that has already been used.
-5. Never select a search tool listed as unavailable.
+4. For every query, provide ``term_importance`` scores for substantive terms.
+   Score the central entities and the requested relation/method highest; score
+   generic modifiers such as "role", "study", "using", "novel", or "effect"
+   lower. These scores drive deterministic zero-result relaxation, so they
+   must reflect semantic importance rather than the term's position.
+5. Never repeat a query that has already been used.
+6. Never select a search tool listed as unavailable.
 
 Return valid JSON only — no markdown fences, no extra text."""
 
@@ -330,6 +373,17 @@ class QueryPlanner(QueryPlannerProtocol):
                             },
                             "purpose": {"type": "string"},
                             "reasoning": {"type": "string"},
+                            "term_importance": {
+                                "type": "object",
+                                "additionalProperties": {
+                                    "type": "number", "minimum": 0, "maximum": 1
+                                },
+                                "description": (
+                                    "Semantic importance of each substantive query "
+                                    "term; 1 is indispensable and 0 is a removable "
+                                    "modifier. Preserve key entities and relation terms."
+                                ),
+                            },
                         },
                         "required": ["text", "tool", "purpose"],
                     },
@@ -382,24 +436,20 @@ class QueryPlanner(QueryPlannerProtocol):
             text = _sanitize_query(raw.get("text", "").strip(), backend)
             if not text:
                 continue
-            # M1's first key entity is the canonical task object. The planner
-            # may simplify modifiers, but it must never silently drop this
-            # hard anchor from an LLM-generated query.
+            # M1's first key entity is the canonical task object. Keep it as
+            # a structured conjunct when the LLM omitted it; never append loose
+            # words to the tail of the query.
             if entities:
-                core_entity = " ".join(str(entities[0]).split())
-                normalized_query = re.sub(r'[^\w\u3400-\u9fff]+', ' ', text.casefold())
-                normalized_entity = re.sub(
-                    r'[^\w\u3400-\u9fff]+', ' ', core_entity.casefold()
-                ).strip()
-                if normalized_entity and normalized_entity not in normalized_query:
-                    text = _sanitize_query(
-                        f'{text} "{core_entity}"', backend
-                    )
+                text = _anchor_query(text, entities[0], backend)
 
             purpose = raw.get("purpose", "").strip()
             intent = _purpose_to_intent(purpose)
             reasoning = str(raw.get("reasoning") or "").strip()
             relation = reasoning or f"Targets the {purpose or 'search'} dimension."
+            raw_importance = raw.get("term_importance")
+            term_importance = (
+                raw_importance if isinstance(raw_importance, dict) else {}
+            )
 
             queries.append(SearchQuery(
                 query_id=f"q-{round_num}-{i + 1}",
@@ -409,6 +459,7 @@ class QueryPlanner(QueryPlannerProtocol):
                 purpose=purpose or "search",
                 target_gap="",
                 relation_to_question=relation,
+                term_importance=term_importance,
             ))
 
         if not queries:
