@@ -34,7 +34,7 @@ M3 消费 M2 导出的证据，不负责重复下载论文。严格契约模式�
 
 ```powershell
 conda activate biodsa
-D:/Programming/Anaconda/envs/biodsa/python.exe -m pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 如果环境尚未创建，可以使用：
@@ -80,14 +80,14 @@ API key:           ENTITY_EMBEDDING_API_KEY -> OPENAI_API_KEY
 完整 M1-M6 Pipeline（默认配置，无需 `-c`）：
 
 ```powershell
-D:/Programming/Anaconda/envs/biodsa/python.exe run_hypoforge.py `
+python run_hypoforge.py `
   -q "蛋白质如何折叠以及错误折叠导致疾病的机制是什么？"
 ```
 
 只运行 M1 + M2（复用默认配置，裁剪模块）：
 
 ```powershell
-D:/Programming/Anaconda/envs/biodsa/python.exe run_hypoforge.py `
+python run_hypoforge.py `
   -q "强化学习相比于 Pass@K 是否真的有性能上的改进？" `
   --modules m1,m2
 ```
@@ -95,7 +95,7 @@ D:/Programming/Anaconda/envs/biodsa/python.exe run_hypoforge.py `
 断点续跑：
 
 ```powershell
-D:/Programming/Anaconda/envs/biodsa/python.exe run_hypoforge.py `
+python run_hypoforge.py `
   -q "原始问题" `
   --run-id hypoforge-xxxxxxxx `
   --resume
@@ -104,7 +104,7 @@ D:/Programming/Anaconda/envs/biodsa/python.exe run_hypoforge.py `
 静默运行：
 
 ```powershell
-D:/Programming/Anaconda/envs/biodsa/python.exe run_hypoforge.py `
+python run_hypoforge.py `
   -q "原始问题" `
   --quiet
 ```
@@ -182,13 +182,13 @@ output/
 启动实时 Pipeline 进度界面：
 
 ```powershell
-D:/Programming/Anaconda/envs/biodsa/python.exe scripts/run_pipeline_ui.py
+python run_hypoforge_ui.py
 ```
 
 指定端口：
 
 ```powershell
-D:/Programming/Anaconda/envs/biodsa/python.exe scripts/run_pipeline_ui.py `
+python run_hypoforge_ui.py `
   --port 8080
 ```
 
@@ -197,23 +197,20 @@ D:/Programming/Anaconda/envs/biodsa/python.exe scripts/run_pipeline_ui.py `
 运行完整测试集：
 
 ```powershell
-D:/Programming/Anaconda/envs/biodsa/python.exe -m pytest -q tests
+python -m pytest -q scripts/test_pipeline.py
 ```
 
-当前完整测试结果：
+当前完整测试结果（整合测试集，覆盖 M1-M6 各流程与完整管线）：
 
 ```text
-637 passed
+324 passed
 ```
 
-常用聚焦测试：
+按模块聚焦（M1/M2/M3/M4/M6/路由/webapp 等分段在文件内以 `====` 注释分隔）：
 
 ```powershell
-D:/Programming/Anaconda/envs/biodsa/python.exe -m pytest -q `
-  tests/test_pipeline.py `
-  tests/test_phase0_contracts.py `
-  tests/test_strict_contracts.py `
-  tests/test_m2_progress.py
+python -m pytest -q scripts/test_pipeline.py -k m1
+python -m pytest -q scripts/test_pipeline.py -k m2
 ```
 
 ## 项目结构
@@ -249,5 +246,5 @@ hypoforge/
 - 修改完成后至少运行完整测试集：
 
 ```powershell
-D:/Programming/Anaconda/envs/biodsa/python.exe -m pytest -q tests
+python -m pytest -q scripts/test_pipeline.py
 ```
