@@ -127,14 +127,6 @@ class AcademicSource(LiteratureSourceProtocol):
                 f"{self.backend_name} backend failed: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
-        if (
-            not raw
-            and self.backend_name == "openalex"
-            and not str(getattr(self._tool, "openalex_api_key", "") or "").strip()
-        ):
-            raise AcademicBackendError(
-                "openalex returned zero results and OPENALEX_API_KEY is not configured"
-            )
         records = []
         for row in raw:
             if not any(

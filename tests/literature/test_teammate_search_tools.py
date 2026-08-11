@@ -161,11 +161,8 @@ async def test_semantic_scholar_constructor_key_selects_instance_backend(
         calls.append((query, limit, api_key))
         return []
 
-    fallback_calls = []
-
     def openalex_search(query: str, limit: int, api_key: str, deadline=None):
-        fallback_calls.append((query, limit, api_key))
-        return []
+        raise AssertionError("Semantic Scholar must not fall back to OpenAlex")
 
     monkeypatch.setattr(semantic_scholar, "_s2_search", search)
     monkeypatch.setattr(semantic_scholar, "_oa_search", openalex_search)
@@ -178,25 +175,27 @@ async def test_semantic_scholar_constructor_key_selects_instance_backend(
 
     assert tool.backend_name == "semantic_scholar"
     assert calls == [("Hippo", 3, "instance-key")]
-    assert fallback_calls == [("Hippo", 3, "")]
+    assert tool.api_key == "instance-key"
 
 
 @pytest.mark.asyncio
-async def test_openalex_instance_key_is_forwarded(monkeypatch) -> None:
+async def test_openalex_instance_key_does_not_switch_semantic_source(monkeypatch) -> None:
     calls = []
 
-    def search(query: str, limit: int, api_key: str):
+    def search(query: str, limit: int, api_key: str = "", deadline=None):
         calls.append((query, limit, api_key))
         return []
 
-    monkeypatch.setattr(semantic_scholar, "_S2_API_KEY", "")
-    monkeypatch.setattr(semantic_scholar, "_oa_search", search)
-    tool = SemanticScholarTool(openalex_api_key="openalex-key")
+    monkeypatch.setattr(semantic_scholar, "_s2_search", search)
+    tool = SemanticScholarTool(
+        api_key="instance-key",
+        openalex_api_key="openalex-key",
+    )
 
     await tool.search_strict("Hippo", limit=4)
 
-    assert tool.backend_name == "openalex"
-    assert calls == [("Hippo", 4, "openalex-key")]
+    assert tool.backend_name == "semantic_scholar"
+    assert calls == [("Hippo", 4, "instance-key")]
 
 
 @pytest.mark.asyncio

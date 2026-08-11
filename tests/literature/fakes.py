@@ -32,6 +32,8 @@ class FakePlanner(QueryPlannerProtocol):
         self.plans = [list(plan) for plan in plans]
         self.error = error
         self.states: list[SearchState] = []
+        self.supplement_calls: list[list[str]] = []
+        self.focus_calls: list[list[str]] = []
 
     async def plan(
         self,
@@ -40,10 +42,14 @@ class FakePlanner(QueryPlannerProtocol):
         domains: Sequence[str] = (),
         question_type: str = "",
         state: SearchState | None = None,
+        supplement_entities: Sequence[str] = (),
+        focus_entities: Sequence[str] = (),
     ) -> list[SearchQuery]:
         if self.error:
             raise self.error
         self.states.append((state or SearchState()).model_copy(deep=True))
+        self.supplement_calls.append(list(supplement_entities))
+        self.focus_calls.append(list(focus_entities))
         index = min(len(self.states) - 1, len(self.plans) - 1)
         return [query.model_copy(deep=True) for query in self.plans[index]]
 

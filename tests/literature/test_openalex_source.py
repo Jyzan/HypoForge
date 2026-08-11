@@ -163,40 +163,12 @@ async def test_openalex_strict_search_forwards_explicit_credentials(
     assert captured["mailto"] == "run@example.org"
 
 
-def test_s2_fallback_gives_openalex_a_fresh_deadline(monkeypatch) -> None:
-    captured: dict[str, object] = {}
-    monkeypatch.setattr(ss.time, "monotonic", lambda: 100.0)
-
-    def fake_openalex(
-        query: str,
-        limit: int,
-        api_key: str = "",
-        mailto: str = "",
-        deadline=None,
-    ):
-        captured["deadline"] = deadline
-        return []
-
-    monkeypatch.setattr(ss, "_oa_search", fake_openalex)
-
-    ss._s2_with_oa_fallback(
-        "robot grasping",
-        3,
-        "s2-key",
-        "oa-key",
-        s2_error=TimeoutError("S2 expired"),
-        deadline=99.0,
-    )
-
-    assert float(captured["deadline"]) > 100.0
-
-
-def test_zero_result_s2_is_not_repeated_before_openalex(monkeypatch) -> None:
+def test_s2_failure_does_not_call_openalex(monkeypatch) -> None:
     calls = {"s2": 0, "openalex": 0}
 
     def fake_s2(query: str, limit: int, api_key: str = "", deadline=None):
         calls["s2"] += 1
-        return []
+        raise TimeoutError("S2 unavailable")
 
     def fake_openalex(
         query: str,
@@ -211,9 +183,11 @@ def test_zero_result_s2_is_not_repeated_before_openalex(monkeypatch) -> None:
     monkeypatch.setattr(ss, "_BACKEND", "semantic_scholar")
     monkeypatch.setattr(ss, "_S2_API_KEY", "s2-key")
     monkeypatch.setattr(ss, "_s2_circuit_open", lambda: False)
+    monkeypatch.setattr(ss, "_s2_circuit_break", lambda: None)
     monkeypatch.setattr(ss, "_s2_search", fake_s2)
     monkeypatch.setattr(ss, "_oa_search", fake_openalex)
 
-    ss._search("robot grasping", 3)
+    with pytest.raises(TimeoutError, match="S2 unavailable"):
+        ss._search("robot grasping", 3)
 
-    assert calls == {"s2": 1, "openalex": 1}
+    assert calls == {"s2": 1, "openalex": 0}

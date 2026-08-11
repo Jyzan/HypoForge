@@ -53,8 +53,16 @@ Use exactly one relation:
 - contradicts: the abstract directly provides evidence against it;
 - mixed: separate abstract sentences provide evidence in both directions;
 - insufficient: the paper is relevant but the abstract cannot establish a
-  direction, including when it says a relation was not tested;
-- not_applicable: the paper does not address the sub-question.
+  direction, including when it addresses only one component of a broader
+  question, provides a useful method, review, background, or adjacent result,
+  or says that the exact relation was not tested;
+- not_applicable: the paper concerns a clearly different research object or
+  scientific domain and cannot contribute even background or methodological
+  evidence to the sub-question.
+
+Scientific questions are often novel, so a useful paper is not required to
+answer the whole sub-question. Low directness alone is never sufficient for
+`not_applicable`; use `insufficient` for relevant partial or contextual work.
 
 Every supports/contradicts judgment must cite the corresponding supplied
 sentence IDs. Never invent or rewrite sentence IDs. Return one result per
@@ -71,8 +79,10 @@ Score anchors:
   component (for example environmental noise) cannot be scored as a complete
   method for a broader task (for example sim-to-real transfer).
 
-Any "Required task entities/domains" in the sub-question are hard constraints.
-A paper about a different object is not_applicable even if it shares generic
+Required task entities/domains anchor relevance, but a paper may still be
+useful when it studies a named component, method family, measurement, or
+closely adjacent object needed to solve the question. A paper about a clearly
+different object and domain is not_applicable even if it shares only generic
 terms such as adaptation, transfer, stress, or simulation."""
 
 

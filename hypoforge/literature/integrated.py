@@ -55,6 +55,7 @@ def build_integrated_search_adapter(
     reader_timeout_seconds: float = 120.0,
     reading_workflow_timeout_seconds: float = 600.0,
     entity_embedding_model: str = "",
+    round_strategy: str = "entity_group",
 ) -> AgenticM2Adapter:
     if final_k <= 0:
         raise ValueError("final_k must be positive")
@@ -104,6 +105,10 @@ def build_integrated_search_adapter(
         per_query_limit=per_query_limit or final_k,
         source_timeout_seconds=source_timeout_seconds,
         retention_judge_client=client,
+        # Must/unmust entity classification for the entity-group round
+        # strategy (reuses the shared Qwen client; failures degrade to a
+        # deterministic fallback inside the search agent).
+        entity_classifier=client,
     )
     store = InMemoryChunkStore()
     pmc_resolver = PMCFulltextResolver(
@@ -140,4 +145,6 @@ def build_integrated_search_adapter(
         budget=resolved_budget,
         entity_judge_client=client,
         entity_embedding_model=entity_embedding_model,
+        subquestion_entity_client=client,
+        round_strategy=round_strategy,
     )

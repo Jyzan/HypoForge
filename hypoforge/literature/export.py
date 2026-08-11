@@ -121,6 +121,15 @@ def _paper_export(
         resolved_status = FulltextStatus.UNAVAILABLE.value
     else:
         resolved_status = _enum_value(paper.fulltext_status)
+    failure_category = reading.fulltext_failure_category
+    failure_detail = reading.fulltext_failure_detail
+    if resolved_status == FulltextStatus.DOWNLOADED.value:
+        # Successful full-text retrieval carries no failure attribution.
+        failure_category = ""
+        failure_detail = ""
+    sanitized_failure_detail = (
+        _sanitize_error_messages([failure_detail])[0] if failure_detail else ""
+    )
     return M2PaperExport(
         paper_id=paper.paper_id,
         title=paper.title,
@@ -146,6 +155,8 @@ def _paper_export(
         document_source_uri=reading.document_source_uri,
         document_license=reading.document_license,
         degraded_to_abstract=reading.degraded_to_abstract,
+        fulltext_failure_category=failure_category,
+        fulltext_failure_detail=sanitized_failure_detail,
         chunks_parsed=reading.chunks_parsed,
         chunks_retrieved=reading.chunks_retrieved,
         stage_elapsed_seconds=dict(reading.stage_elapsed_seconds),

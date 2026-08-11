@@ -58,11 +58,15 @@ from ..state import (
     PipelineState,
     SearchLedger,
 )
-from ..task_alignment import search_entities_for_sub_question
+from ..task_alignment import (
+    search_entities_for_sub_question,
+    sub_question_entity_terms,
+)
 from .export import build_m2_knowledge_export_run
 from .models import QueryIntent, SearchBudget, SearchQuery, StopReason
 from .protocols import QueryPlannerProtocol, ReadingExtractionWorkflowProtocol
 from .search import IterativeSearchAgent
+from .subquestion_entities import generate_subquestion_entities
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +94,8 @@ class _GapQueryPlanner(QueryPlannerProtocol):
         domains: Sequence[str] = (),
         question_type: str = "",
         state=None,
+        supplement_entities: Sequence[str] = (),
+        focus_entities: Sequence[str] = (),
     ) -> List[SearchQuery]:
         if self._served:
             return []
@@ -126,6 +132,8 @@ class AgenticM2Adapter(ModuleProtocol):
         supplement_paper_budget: int = _DEFAULT_SUPPLEMENT_PAPER_BUDGET,
         entity_judge_client: Any = None,
         entity_embedding_model: str = "",
+        subquestion_entity_client: Any = None,
+        round_strategy: str = "entity_group",
     ) -> None:
         self.search_agent = search_agent
         self.reading_workflow = reading_workflow
@@ -133,6 +141,14 @@ class AgenticM2Adapter(ModuleProtocol):
         self.supplement_paper_budget = max(1, int(supplement_paper_budget))
         self.entity_judge_client = entity_judge_client
         self.entity_embedding_model = entity_embedding_model
+        # M2-local supplementary entity generation (search-only scope; the
+        # results never leave the M2 search data flow).
+        self.subquestion_entity_client = subquestion_entity_client
+        # Round organisation for the primary search flow.  "entity_group"
+        # uses the must/unmust grouping strategy + zero-result rescue;
+        # "coverage" keeps the legacy coverage-driven iteration.  The
+        # supplement (gap) path always stays on the legacy one-shot flow.
+        self.round_strategy = round_strategy
 
     async def _normalise_reading_entities(
         self,
@@ -148,6 +164,9 @@ class AgenticM2Adapter(ModuleProtocol):
             cache_dir=state.entity_cache_dir or state.memory_cache_dir,
             client=self.entity_judge_client,
             embedding_model=self.entity_embedding_model,
+            # Per-run cache isolation: one stable stamp (the pipeline run_id,
+            # fixed at run start) shared by every construction in this run.
+            run_stamp=state.run_id,
         )
         names = [
             entity
@@ -180,16 +199,13 @@ class AgenticM2Adapter(ModuleProtocol):
         """Ensure the reading workflow produced at least one usable evidence item.
 
         Partial failures (some papers fail, others succeed) are acceptable.
-        Total failure (all papers produce no citable evidence, no knowledge
-        entries, or zero papers were retained) means the evidence contract
-        for this sub-question is broken.
+        Total reading failure after papers were retained remains an error.
+        Zero retained papers is represented as an explicit evidence gap rather
+        than crashing all other sub-questions in M2.
         """
         retained_count = len(search_result.final_papers)
         if retained_count == 0:
-            raise RuntimeError(
-                f"M2 retained zero papers for sub-question {sub_question!r}.  "
-                f"The search completed but no papers met the retention criteria."
-            )
+            return
         citable_count = sum(
             1 for r in reading_results
             if getattr(r, "evidence", None)
@@ -246,11 +262,26 @@ class AgenticM2Adapter(ModuleProtocol):
         executed_queries: dict[str, list[str]] = {}
         for sub_question in sub_questions:
             key_entities = search_entities_for_sub_question(state, sub_question)
+            # M2-local entity generation: the LLM sees this sub-question's
+            # M1 entities and may add uncovered search concepts.  Results
+            # are search-scoped only — never written back to the problem
+            # card / task contract.
+            supplement_entities = await generate_subquestion_entities(
+                self.subquestion_entity_client,
+                sub_question,
+                existing_terms=[
+                    *sub_question_entity_terms(state, sub_question),
+                    *key_entities,
+                ],
+                domains=domains,
+            )
             search_result = await self.search_agent.run(
                 sub_question,
                 key_entities=key_entities,
                 domains=domains,
                 budget=self.budget,
+                supplement_entities=supplement_entities,
+                round_strategy=self.round_strategy,
             )
             if search_result.stop_reason is StopReason.ERROR:
                 detail = "; ".join(search_result.errors) or "unrecoverable search error"
@@ -258,6 +289,24 @@ class AgenticM2Adapter(ModuleProtocol):
             executed_queries[sub_question] = [
                 query.text for query in search_result.queries
             ]
+
+            if not search_result.final_papers:
+                emit_event(
+                    "tool_result",
+                    module="m2",
+                    tool="evidence_gap",
+                    status="warning",
+                    message="本子问题未保留论文，记录证据缺口并继续其他子问题",
+                    details={
+                        "sub_question": sub_question,
+                        "papers_found": search_result.papers_found,
+                        "stop_reason": (
+                            search_result.stop_reason.value
+                            if search_result.stop_reason is not None else None
+                        ),
+                        "errors": list(search_result.errors),
+                    },
+                )
 
             reading_results = await self.reading_workflow.run(
                 sub_question,

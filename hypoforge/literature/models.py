@@ -64,6 +64,7 @@ class EvidenceBucket(str, Enum):
 
 class StopReason(str, Enum):
     COVERAGE_SATISFIED = "coverage_satisfied"
+    PLAN_COMPLETE = "plan_complete"
     MAX_ROUNDS = "max_rounds"
     QUERY_BUDGET = "query_budget"
     PAPER_BUDGET = "paper_budget"
@@ -259,6 +260,10 @@ class DocumentRecord(LiteratureModel):
     local_path: str = ""
     license: str = ""
     retrieval_error: str = ""
+    # Structured full-text failure attribution (see reading/attribution.py);
+    # both stay empty when full text was retrieved successfully.
+    retrieval_failure_category: str = ""
+    retrieval_failure_detail: str = ""
 
 
 class DocumentChunk(LiteratureModel):
@@ -308,4 +313,8 @@ class PaperReadingResult(LiteratureModel):
     chunks_retrieved: int = Field(default=0, ge=0)
     stage_elapsed_seconds: Dict[str, float] = Field(default_factory=dict)
     degraded_to_abstract: bool = False
+    # Structured full-text failure attribution (see reading/attribution.py);
+    # both stay empty when full text was retrieved successfully.
+    fulltext_failure_category: str = ""
+    fulltext_failure_detail: str = ""
     errors: List[str] = Field(default_factory=list)

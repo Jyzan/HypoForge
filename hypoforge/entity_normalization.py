@@ -9,17 +9,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import re
+import time
 import unicodedata
+import uuid
+from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from pydantic import BaseModel, Field
 
+from .observability import emit_event
 from .state import TaskContract
+
+
+logger = logging.getLogger(__name__)
 
 
 class NormalizedEntity(BaseModel):
@@ -35,6 +43,10 @@ class EntityPairDecision(BaseModel):
     same_concept: bool
     rationale: str = ""
     source: str = "llm"
+
+
+class EntityEmbeddingTransportError(RuntimeError):
+    """Both environment-aware and direct embedding transports failed."""
 
 
 def clean_entity_surface(value: str) -> str:
@@ -63,6 +75,25 @@ def _stable_id(namespace: str, canonical_name: str) -> str:
         f"{namespace}|{clean_entity_surface(canonical_name)}".encode("utf-8")
     ).hexdigest()[:20]
     return f"ENT_{digest}"
+
+
+def default_run_stamp() -> str:
+    """Generate a fresh per-construction run stamp from the current time.
+
+    Microseconds are included plus a short uuid suffix, because Windows
+    clock resolution can return identical timestamps for constructions a
+    few milliseconds apart (e.g. parallel test cases).
+    """
+    return (
+        datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        + "-"
+        + uuid.uuid4().hex[:6]
+    )
+
+
+def _sanitize_run_stamp(stamp: str) -> str:
+    """Make *stamp* safe to embed in a cache file name."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", str(stamp or "").strip()).strip(".")
 
 
 def _cosine(left: list[float], right: list[float]) -> float:
@@ -111,19 +142,40 @@ async def _embed_raw(
     # MaaS limit: 10 inputs per request (see Algo.InvalidParameter errors).
     batch_size = 10
     all_embeddings: list[list[float]] = []
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        for i in range(0, len(inputs), batch_size):
-            batch = inputs[i : i + batch_size]
-            resp = await client.post(
-                endpoint,
-                headers={"Authorization": f"Bearer {resolved_key}"},
-                json={"model": model, "input": batch},
-            )
-            resp.raise_for_status()
-            data = resp.json()
+    prefer_direct = False
+    for i in range(0, len(inputs), batch_size):
+        batch = inputs[i : i + batch_size]
+        trust_modes = (False,) if prefer_direct else (True, False)
+        for trust_env in trust_modes:
+            try:
+                async with httpx.AsyncClient(
+                    timeout=60.0,
+                    trust_env=trust_env,
+                ) as client:
+                    resp = await client.post(
+                        endpoint,
+                        headers={"Authorization": f"Bearer {resolved_key}"},
+                        json={"model": model, "input": batch},
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+            except httpx.TransportError as exc:
+                if trust_env:
+                    prefer_direct = True
+                    logger.warning(
+                        "Entity embedding transport failed through the machine "
+                        "network environment; retrying without environment proxies: %s",
+                        type(exc).__name__,
+                    )
+                    continue
+                raise EntityEmbeddingTransportError(
+                    "Entity embedding transport failed through both the machine "
+                    f"network environment and a direct connection: {type(exc).__name__}"
+                ) from exc
             all_embeddings.extend(
                 item["embedding"] for item in data["data"]
             )
+            break
     return all_embeddings
 
 
@@ -141,6 +193,7 @@ class EntityNormalizationService:
         embedding_backend: Any = None,
         embedding_model: str = "",
         similarity_threshold: float = 0.82,
+        run_stamp: str = "",
     ) -> None:
         self.namespace = clean_entity_surface(namespace) or "global"
         self.client = client
@@ -155,11 +208,17 @@ class EntityNormalizationService:
         self.records: dict[str, NormalizedEntity] = {}
         self.alias_to_id: dict[str, str] = {}
         self.pair_decisions: dict[str, EntityPairDecision] = {}
+        # Per-run isolation: the cache file name embeds *run_stamp* so two
+        # pipeline runs over the same namespace never share a cache file.
+        # Callers that construct several services within one run must pass
+        # the same explicit stamp (e.g. the pipeline run_id); when omitted,
+        # a fresh current-time stamp is generated per construction.
+        self.run_stamp = _sanitize_run_stamp(run_stamp) or default_run_stamp()
         self.cache_path: Optional[Path] = None
         if cache_dir:
             root = Path(cache_dir) / "entity_normalization"
             digest = hashlib.sha256(self.namespace.encode("utf-8")).hexdigest()[:16]
-            self.cache_path = root / f"{digest}.json"
+            self.cache_path = root / f"{digest}-{self.run_stamp}.json"
         self._load()
 
     @classmethod
@@ -172,6 +231,7 @@ class EntityNormalizationService:
         client: Any = None,
         embedding_backend: Any = None,
         embedding_model: str = "",
+        run_stamp: str = "",
     ) -> "EntityNormalizationService":
         namespace = "|".join(sorted(
             clean_entity_surface(domain) for domain in domains
@@ -183,6 +243,7 @@ class EntityNormalizationService:
             client=client,
             embedding_backend=embedding_backend,
             embedding_model=embedding_model,
+            run_stamp=run_stamp,
         )
         service.register_task_contract(contract)
         return service
@@ -235,7 +296,17 @@ class EntityNormalizationService:
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        temporary.replace(self.cache_path)
+        for attempt in range(5):
+            try:
+                temporary.replace(self.cache_path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                # Antivirus/indexing processes can briefly hold a freshly
+                # written file on Windows. Keep the retry local and bounded;
+                # persistent permission problems still fail explicitly.
+                time.sleep(0.02 * (attempt + 1))
 
     @staticmethod
     def _pair_key(left: str, right: str) -> str:
@@ -299,20 +370,13 @@ class EntityNormalizationService:
         self._save()
         return record
 
-    async def _embedding_candidates_scored(
+    async def _embedding_candidates(
         self,
         surfaces: list[str],
         canonical_names: list[str],
         _base_url: str = "",
         _api_key: str = "",
-    ) -> dict[str, list[tuple[float, str]]]:
-        """Top-5 embedding neighbors with their cosine scores, unthresholded.
-
-        Thresholding is the caller's responsibility so that one recall can
-        feed both the regular judge pass (high-confidence candidates) and a
-        low-score supplemental pass (candidates that may still be identical
-        but fall below ``similarity_threshold``).
-        """
+    ) -> dict[str, list[str]]:
         if (
             not self.embedding_backend and not self.embedding_model
         ) or not surfaces or not canonical_names:
@@ -341,6 +405,27 @@ class EntityNormalizationService:
                     f"canonical names — expected "
                     f"{len(surfaces) + len(canonical_names)}."
                 )
+        except EntityEmbeddingTransportError as exc:
+            logger.warning(
+                "Entity embedding is unavailable through both network routes; "
+                "continuing with lexical candidate recall: %s",
+                exc,
+            )
+            emit_event(
+                "entity_embedding_degraded",
+                tool="entity_embedding",
+                status="warning",
+                message=(
+                    "实体 embedding 网络不可用，已降级为字符串匹配与 LLM 实体判断"
+                ),
+                details={
+                    "model": self.embedding_model,
+                    "attempted_routes": ["environment", "direct"],
+                    "fallback": "lexical_and_llm_identity_judge",
+                    "error_type": type(exc).__name__,
+                },
+            )
+            return {}
         except Exception as exc:
             if self._embedding_configured:
                 raise RuntimeError(
@@ -352,9 +437,9 @@ class EntityNormalizationService:
             return {}
         surface_vectors = vectors[:len(surfaces)]
         canonical_vectors = vectors[len(surfaces):]
-        output: dict[str, list[tuple[float, str]]] = {}
+        output: dict[str, list[str]] = {}
         for surface, vector in zip(surfaces, surface_vectors):
-            output[surface] = sorted(
+            scored = sorted(
                 (
                     (_cosine(vector, candidate_vector), canonical)
                     for canonical, candidate_vector in zip(
@@ -362,48 +447,24 @@ class EntityNormalizationService:
                     )
                 ),
                 reverse=True,
-            )[:5]
-        return output
-
-    async def _embedding_candidates(
-        self,
-        surfaces: list[str],
-        canonical_names: list[str],
-        _base_url: str = "",
-        _api_key: str = "",
-    ) -> dict[str, list[str]]:
-        scored = await self._embedding_candidates_scored(
-            surfaces, canonical_names, _base_url=_base_url, _api_key=_api_key
-        )
-        return {
-            surface: [
-                candidate for score, candidate in pairs
+            )
+            output[surface] = [
+                canonical for score, canonical in scored[:5]
                 if score >= self.similarity_threshold
             ]
-            for surface, pairs in scored.items()
-        }
-
-    def _lexical_candidates_scored(
-        self,
-        surface: str,
-        canonical_names: list[str],
-    ) -> list[tuple[float, str]]:
-        return sorted(
-            (
-                (SequenceMatcher(None, surface, candidate).ratio(), candidate)
-                for candidate in canonical_names
-            ),
-            reverse=True,
-        )[:5]
+        return output
 
     def _lexical_candidates(
         self,
         surface: str,
         canonical_names: list[str],
     ) -> list[str]:
+        scored = [
+            (SequenceMatcher(None, surface, candidate).ratio(), candidate)
+            for candidate in canonical_names
+        ]
         return [
-            candidate for score, candidate
-            in self._lexical_candidates_scored(surface, canonical_names)
+            candidate for score, candidate in sorted(scored, reverse=True)[:5]
             if score >= self.similarity_threshold
         ]
 

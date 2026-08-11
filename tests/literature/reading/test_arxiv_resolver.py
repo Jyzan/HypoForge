@@ -4,6 +4,8 @@ import asyncio
 import json
 import socket
 import time
+import urllib.error
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -18,7 +20,15 @@ from hypoforge.literature.models import (
 from hypoforge.literature.reading.arxiv_resolver import (
     ArxivDownloadTimeoutError,
     ArxivPDFResolver,
+    _default_fetch,
     _read_bounded_response,
+    _safe_request_url,
+)
+from hypoforge.literature.reading.attribution import (
+    INVALID_PDF_LINK,
+    NO_FULLTEXT_AVAILABLE,
+    OTHER,
+    PUBLISHER_BLOCKED,
 )
 from hypoforge.literature.reading.routing import RoutingFulltextResolver
 
@@ -371,3 +381,129 @@ async def test_routing_resolver_chooses_arxiv_by_source_or_external_id() -> None
     pubmed_fallback = await resolver.resolve_abstract(pubmed)
     assert pubmed_fallback.document_id == "doc:pmc:abstract"
     assert pmc.calls[-1] == "abstract:PMID:1"
+
+
+CHINESE_OA_URL = (
+    "https://www.cjig.cn/rc-pub/front/front-article/download/55707659/"
+    "lowqualitypdf/基于深度学习的图像三维重建研究综述.pdf"
+)
+
+
+def test_safe_request_url_percent_encodes_chinese_path() -> None:
+    encoded = _safe_request_url(CHINESE_OA_URL)
+
+    assert encoded.isascii()
+    assert encoded.startswith(
+        "https://www.cjig.cn/rc-pub/front/front-article/download/55707659/"
+        "lowqualitypdf/"
+    )
+    assert urllib.parse.unquote(encoded).endswith(
+        "基于深度学习的图像三维重建研究综述.pdf"
+    )
+
+
+def test_safe_request_url_keeps_ascii_urls_byte_for_byte() -> None:
+    url = "https://arxiv.org/pdf/2401.12345v2?download=1&format=pdf#page=2"
+
+    assert _safe_request_url(url) == url
+
+
+def test_safe_request_url_does_not_double_encode_existing_sequences() -> None:
+    encoded = _safe_request_url("https://example.cn/files/a%20b/中文报告.pdf")
+
+    assert "%2520" not in encoded
+    assert "%20" in encoded
+    assert encoded.isascii()
+
+
+def test_safe_request_url_encodes_non_ascii_query() -> None:
+    encoded = _safe_request_url("https://example.cn/get?file=论文.pdf&kind=oa")
+
+    assert encoded.isascii()
+    parsed = urllib.parse.urlsplit(encoded)
+    query = urllib.parse.parse_qs(parsed.query)
+    assert query["file"] == ["论文.pdf"]
+    assert query["kind"] == ["oa"]
+
+
+@pytest.mark.asyncio
+async def test_default_fetch_encodes_non_ascii_url_before_request(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_urlopen(request, timeout):  # noqa: ANN001
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return FakeResponse([b"%PDF-1.4\nchinese-ok"])
+
+    monkeypatch.setattr(resolver_module.urllib.request, "urlopen", fake_urlopen)
+
+    payload = await _default_fetch(
+        CHINESE_OA_URL, timeout=2.0, max_bytes=100_000, download_timeout_seconds=10.0
+    )
+
+    assert payload.startswith(b"%PDF-")
+    request = captured["request"]
+    assert request.full_url.isascii()
+    assert urllib.parse.unquote(request.full_url) == CHINESE_OA_URL
+
+
+@pytest.mark.asyncio
+async def test_arxiv_resolver_attributes_publisher_block(tmp_path: Path) -> None:
+    async def fetch(url: str, timeout: float) -> bytes:
+        raise urllib.error.HTTPError(url, 403, "Forbidden", None, None)
+
+    document = await ArxivPDFResolver(tmp_path, backend=fetch).resolve(arxiv_paper())
+
+    assert document.content_level is ContentLevel.ABSTRACT
+    assert document.retrieval_failure_category == PUBLISHER_BLOCKED
+    assert "403" in document.retrieval_failure_detail
+
+
+@pytest.mark.asyncio
+async def test_arxiv_resolver_attributes_non_blocked_http_error(
+    tmp_path: Path,
+) -> None:
+    async def fetch(url: str, timeout: float) -> bytes:
+        raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
+
+    document = await ArxivPDFResolver(tmp_path, backend=fetch).resolve(arxiv_paper())
+
+    assert document.retrieval_failure_category == OTHER
+    assert "404" in document.retrieval_failure_detail
+
+
+@pytest.mark.asyncio
+async def test_arxiv_resolver_attributes_invalid_pdf_link(tmp_path: Path) -> None:
+    async def fetch(url: str, timeout: float) -> bytes:
+        return b"<html>landing page</html>"
+
+    document = await ArxivPDFResolver(tmp_path, backend=fetch).resolve(arxiv_paper())
+
+    assert document.retrieval_failure_category == INVALID_PDF_LINK
+    assert "arxiv.org/pdf/2401.12345v2" in document.retrieval_failure_detail
+
+
+@pytest.mark.asyncio
+async def test_arxiv_resolver_attributes_missing_identifier(
+    tmp_path: Path,
+) -> None:
+    document = await ArxivPDFResolver(tmp_path).resolve(
+        arxiv_paper(paper_id="DOI:10.1000/no-fulltext", arxiv_id="")
+    )
+
+    assert document.retrieval_failure_category == NO_FULLTEXT_AVAILABLE
+    assert document.retrieval_failure_detail
+
+
+@pytest.mark.asyncio
+async def test_arxiv_resolver_success_keeps_empty_attribution(tmp_path: Path) -> None:
+    async def fetch(url: str, timeout: float) -> bytes:
+        return b"%PDF-1.4\nvalid"
+
+    document = await ArxivPDFResolver(tmp_path, backend=fetch).resolve(arxiv_paper())
+
+    assert document.content_level is ContentLevel.PDF
+    assert document.retrieval_failure_category == ""
+    assert document.retrieval_failure_detail == ""

@@ -40,8 +40,8 @@ search:
   tools: ["pubmed", "semantic_scholar", "openalex", "arxiv"]
   papers_per_sub_question: 5
   max_papers_total: 20
-  max_rounds: 1
-  max_queries: 4
+  max_rounds: 2
+  max_queries: 8
   max_papers: 20
   max_tokens: 30000
   max_seconds: 600
@@ -71,6 +71,8 @@ module_overrides:
     kwargs:
       mode: "llm"
       llm_tier: "plus"
+      entity_merge_enabled: true
+      entity_merge_similarity_threshold: 0.92
   m4:
     kwargs:
       num_candidates: 3

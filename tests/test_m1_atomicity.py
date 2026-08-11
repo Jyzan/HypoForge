@@ -36,14 +36,14 @@ async def test_missing_core_intent_is_supplemented_and_rechecked() -> None:
         {
             "sufficient": False,
             "core_intent_covered": False,
-            "missing_aspects": ["离线强化学习如何用于迁移"],
+            "missing_aspects": ["use of offline reinforcement learning for transfer"],
             "over_fragmented": False,
             "merge_instructions": [],
             "reason": "核心方法缺失",
         },
         {
             "sub_questions": [
-                "离线强化学习如何实现机械臂从仿真到现实的策略迁移？"
+                "How can offline reinforcement learning transfer a robot arm policy from simulation to reality?"
             ]
         },
         {
@@ -58,12 +58,12 @@ async def test_missing_core_intent_is_supplemented_and_rechecked() -> None:
 
     result = await module._check_subquestion_coverage(
         "如何使用离线强化学习实现机械臂从仿真到现实的迁移？",
-        ["仿真环境与现实环境存在哪些差异？"],
+        ["How do simulation and real-world environments differ?"],
     )
 
     assert result == [
-        "仿真环境与现实环境存在哪些差异？",
-        "离线强化学习如何实现机械臂从仿真到现实的策略迁移？",
+        "How do simulation and real-world environments differ?",
+        "How can offline reinforcement learning transfer a robot arm policy from simulation to reality?",
     ]
     assert len(module.client.calls) == 3
 
@@ -76,11 +76,11 @@ async def test_over_fragmented_questions_are_merged_and_rechecked() -> None:
             "core_intent_covered": True,
             "missing_aspects": [],
             "over_fragmented": True,
-            "merge_instructions": ["合并两个环境差异问题"],
+            "merge_instructions": ["Merge the two environment-difference questions."],
             "reason": "同一关系被拆碎",
         },
         {
-            "sub_questions": ["仿真与现实环境通过哪些差异影响机械臂策略迁移？"]
+            "sub_questions": ["How do simulation-to-reality environment differences affect robot arm policy transfer?"]
         },
         {
             "sufficient": True,
@@ -94,10 +94,15 @@ async def test_over_fragmented_questions_are_merged_and_rechecked() -> None:
 
     result = await module._check_subquestion_coverage(
         "如何解决机械臂从仿真到现实的策略迁移？",
-        ["摩擦力差异有什么影响？", "传感器噪声差异有什么影响？"],
+        [
+            "How do friction differences affect robot arm policy transfer?",
+            "How do sensor-noise differences affect robot arm policy transfer?",
+        ],
     )
 
-    assert result == ["仿真与现实环境通过哪些差异影响机械臂策略迁移？"]
+    assert result == [
+        "How do simulation-to-reality environment differences affect robot arm policy transfer?"
+    ]
 
 
 @pytest.mark.asyncio
@@ -146,23 +151,23 @@ async def test_core_intent_missing_after_budget_fails_closed() -> None:
     missing = {
         "sufficient": False,
         "core_intent_covered": False,
-        "missing_aspects": ["核心实现方法"],
+        "missing_aspects": ["the core implementation method"],
         "over_fragmented": False,
         "merge_instructions": [],
         "reason": "仍未回答如何实现",
     }
     module = module_with([
         missing,
-        {"sub_questions": ["新的背景问题是什么？"]},
+        {"sub_questions": ["What is the new background question?"]},
         missing,
-        {"sub_questions": ["另一个背景问题是什么？"]},
+        {"sub_questions": ["What is another background question?"]},
         missing,
     ])
 
     with pytest.raises(ValueError, match="core user intent"):
         await module._check_subquestion_coverage(
             "如何实现机械臂策略迁移？",
-            ["仿真环境是什么？"],
+            ["What is the simulation environment?"],
         )
 
 
@@ -241,9 +246,9 @@ async def test_initial_decomposition_call_cannot_generate_entities_or_contract()
         {
             "domain": ["robotics", "reinforcement learning"],
             "sub_questions": [
-                "离线强化学习如何实现机械臂从仿真到现实的策略迁移？",
-                "如何评估机械臂策略迁移的现实性能？",
-                "仿真与现实环境差异如何影响策略迁移？",
+                "How can offline reinforcement learning transfer a robot arm policy from simulation to reality?",
+                "How should real-world robot arm transfer performance be evaluated?",
+                "How do simulation-to-reality environment differences affect policy transfer?",
             ],
         },
         {
@@ -257,7 +262,7 @@ async def test_initial_decomposition_call_cannot_generate_entities_or_contract()
         {
             "entities": [
                 {
-                    "name": "机械臂",
+                    "name": "robot arm",
                     "source_mention": "机械臂",
                     "aliases": [],
                     "role": "primary_object",
@@ -265,9 +270,9 @@ async def test_initial_decomposition_call_cannot_generate_entities_or_contract()
                     "extraction_reason": "literal source mention",
                 },
                 {
-                    "name": "离线强化学习",
+                    "name": "offline reinforcement learning",
                     "source_mention": "离线强化学习",
-                    "aliases": ["offline reinforcement learning"],
+                    "aliases": ["offline RL"],
                     "role": "method",
                     "required": True,
                     "extraction_reason": "literal source mention",
@@ -277,13 +282,13 @@ async def test_initial_decomposition_call_cannot_generate_entities_or_contract()
         {
             "items": [
                 {
-                    "candidate_name": "机械臂",
+                    "candidate_name": "robot arm",
                     "accepted": True,
                     "source_mention": "机械臂",
                     "reason": "literal source mention",
                 },
                 {
-                    "candidate_name": "离线强化学习",
+                    "candidate_name": "offline reinforcement learning",
                     "accepted": True,
                     "source_mention": "离线强化学习",
                     "reason": "literal source mention",
@@ -303,9 +308,9 @@ async def test_initial_decomposition_call_cannot_generate_entities_or_contract()
                     "required": True,
                 }
                 for index, question in enumerate([
-                    "离线强化学习如何实现机械臂从仿真到现实的策略迁移？",
-                    "如何评估机械臂策略迁移的现实性能？",
-                    "仿真与现实环境差异如何影响策略迁移？",
+                    "How can offline reinforcement learning transfer a robot arm policy from simulation to reality?",
+                    "How should real-world robot arm transfer performance be evaluated?",
+                    "How do simulation-to-reality environment differences affect policy transfer?",
                 ], start=1)
             ]
         },
@@ -317,48 +322,16 @@ async def test_initial_decomposition_call_cannot_generate_entities_or_contract()
 
     schema_properties = module.client.calls[0]["output_schema"]["properties"]
     assert set(schema_properties) == {"domain", "sub_questions"}
-    assert card.key_entities == ["机械臂", "离线强化学习"]
+    assert card.key_entities == ["robot arm", "offline reinforcement learning"]
     assert [entity.name for entity in card.task_contract.entities] == [
-        "机械臂",
-        "离线强化学习",
+        "robot arm",
+        "offline reinforcement learning",
     ]
 
 
-@pytest.mark.asyncio
-async def test_entity_extraction_requests_bilingual_aliases() -> None:
-    """M1 extraction must request bilingual aliases so downstream literal
-    alignment gates (M4-M6) can match contract entities in either language."""
-    question = "肠道微生物组如何影响人体免疫系统？"
-    module = module_with([
-        {
-            "entities": [{
-                "name": "肠道微生物组",
-                "source_mention": "肠道微生物组",
-                "aliases": ["gut microbiome", "肠道菌群", "gut microbiota"],
-                "role": "primary_object",
-                "required": True,
-                "extraction_reason": "directly studied research object",
-            }],
-        },
-        {
-            "items": [{
-                "candidate_name": "肠道微生物组",
-                "accepted": True,
-                "source_mention": "肠道微生物组",
-                "reason": "literal term in the question",
-            }],
-            "missing_explicit_entities": [],
-            "complete": True,
-        },
+def test_sub_question_validator_rejects_non_english_output() -> None:
+    violations = M1ProblemUnderstanding._sub_question_violations([
+        "如何训练旋转目标检测模型？",
     ])
 
-    entities = await module._extract_and_audit_entities(question)
-
-    extraction_prompt = module.client.calls[0]["system_prompt"]
-    assert "BOTH languages" in extraction_prompt
-    assert "must be a real name someone would quote" in extraction_prompt
-    assert len(entities) == 1
-    # 双语 aliases 保留进契约，供 M4 的字面匹配使用。
-    assert set(entities[0].aliases) == {
-        "gut microbiome", "肠道菌群", "gut microbiota",
-    }
+    assert any("entirely in English" in item for item in violations)

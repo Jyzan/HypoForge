@@ -55,7 +55,8 @@ def _latin_terms(text: str, limit: int = 8) -> list[str]:
 class RuleBasedQueryPlanner(QueryPlannerProtocol):
     async def plan(self, sub_question: str, key_entities: Sequence[str] = (),
                    domains: Sequence[str] = (), question_type: str = "",
-                   state: SearchState | None = None) -> list[SearchQuery]:
+                   state: SearchState | None = None,
+                   supplement_entities: Sequence[str] = ()) -> list[SearchQuery]:
         if state and state.queries_used:
             return []
         terms = _latin_terms(" ".join([*key_entities, sub_question]), limit=6)

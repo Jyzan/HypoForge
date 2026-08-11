@@ -94,14 +94,21 @@ class _SubQuestionSupplement(BaseModel):
 
 
 class _CandidateEntity(BaseModel):
-    name: str
-    source_mention: str
+    name: str = Field(
+        description="Canonical scientific English entity name",
+    )
+    source_mention: str = Field(
+        description="Exact verbatim mention from the original user question",
+    )
     aliases: List[str] = Field(default_factory=list)
     role: Literal[
         "primary_object", "intervention", "outcome", "method",
         "context", "constraint", "other",
     ] = "other"
-    required: bool = False
+    required: bool = Field(
+        default=False,
+        description="True for task-defining entities that the answer must address",
+    )
     extraction_reason: str = ""
 
 
@@ -129,9 +136,31 @@ class _RequirementList(BaseModel):
 @ModuleRegistry.register
 class M1ProblemUnderstanding(ModuleProtocol):
     module_name = "m1"
-    module_version = "0.3.0"
+    module_version = "0.4.0"
     description = "Problem decomposition: sub-questions, domain tagging, entity extraction"
     MAX_SUB_QUESTIONS = 5
+
+    @staticmethod
+    def _is_english_output(value: str) -> bool:
+        """Require English/Latin output while allowing scientific punctuation.
+
+        M1 accepts questions in any language, but its retrieval-facing fields
+        must be English.  Requiring at least one ASCII letter prevents a model
+        from satisfying the gate with punctuation or numbers alone.  Any
+        alphabetic character from a non-Latin script is rejected; prompts ask
+        the model to spell Greek-letter names out (for example, ``alpha``).
+        """
+
+        text = str(value or "").strip()
+        if not re.search(r"[A-Za-z]", text):
+            return False
+        for char in text:
+            if not char.isalpha():
+                continue
+            unicode_name = unicodedata.name(char, "")
+            if "LATIN" not in unicode_name:
+                return False
+        return True
 
     @staticmethod
     def _sub_question_violations(sub_questions: List[str]) -> List[str]:
@@ -152,6 +181,8 @@ class M1ProblemUnderstanding(ModuleProtocol):
                 reasons.append("contains a semicolon/parallel clause")
             if re.search(r"[（(][^）)]*[,，、;/；][^）)]*[）)]", text):
                 reasons.append("contains a parenthesized enumeration")
+            if not M1ProblemUnderstanding._is_english_output(text):
+                reasons.append("must be written entirely in English")
             if reasons:
                 violations.append(f"sub_question[{index}]: {', '.join(reasons)}")
         return violations
@@ -551,9 +582,11 @@ class M1ProblemUnderstanding(ModuleProtocol):
     async def _extract_and_audit_entities(self, question: str) -> List[TaskEntity]:
         """Extract entities from the original question and independently audit them.
 
-        The LLM audit is intentionally followed by a deterministic literal-source
-        gate.  Therefore even an overly agreeable auditor cannot legitimize a term
-        introduced by a generated sub-question or by model background knowledge.
+        The LLM audit is intentionally followed by two deterministic gates:
+        ``source_mention`` must occur in the original question, and the canonical
+        entity ``name`` must be English.  The independent LLM audit verifies that
+        the English name faithfully represents that source mention.  Therefore a
+        generated sub-question still cannot introduce a new task entity.
         """
 
         source = self._normalize_source_text(question)
@@ -607,9 +640,10 @@ class M1ProblemUnderstanding(ModuleProtocol):
                 )
                 literal_source_valid = bool(
                     name
-                    and name == mention
-                    and name in source
-                    and audited_mention == name
+                    and self._is_english_output(candidate.name)
+                    and mention
+                    and mention in source
+                    and audited_mention == mention
                 )
                 if (
                     audited is None

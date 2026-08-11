@@ -31,13 +31,14 @@ def entity_module(payloads: list[dict[str, Any]]) -> M1ProblemUnderstanding:
 def candidate(
     name: str,
     *,
+    source_mention: str | None = None,
     role: str = "other",
     required: bool = False,
     aliases: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
         "name": name,
-        "source_mention": name,
+        "source_mention": source_mention or name,
         "aliases": aliases or [],
         "role": role,
         "required": required,
@@ -45,11 +46,16 @@ def candidate(
     }
 
 
-def audit_item(name: str, accepted: bool = True) -> dict[str, Any]:
+def audit_item(
+    name: str,
+    accepted: bool = True,
+    *,
+    source_mention: str | None = None,
+) -> dict[str, Any]:
     return {
         "candidate_name": name,
         "accepted": accepted,
-        "source_mention": name,
+        "source_mention": source_mention or name,
         "reason": "可在用户原文定位" if accepted else "原文没有该实体",
     }
 
@@ -108,11 +114,19 @@ async def test_entity_gate_rejects_llm_accepted_term_absent_from_user_text() -> 
 
     module = entity_module([
         {"entities": [
-            candidate("机械臂", role="primary_object", required=True),
-            candidate("域随机化", role="method"),
+            candidate(
+                "robot arm", source_mention="机械臂",
+                role="primary_object", required=True,
+            ),
+            candidate(
+                "domain randomization", source_mention="域随机化", role="method",
+            ),
         ]},
         {
-            "items": [audit_item("机械臂"), audit_item("域随机化")],
+            "items": [
+                audit_item("robot arm", source_mention="机械臂"),
+                audit_item("domain randomization", source_mention="域随机化"),
+            ],
             "missing_explicit_entities": [],
             "complete": True,
         },
@@ -122,30 +136,44 @@ async def test_entity_gate_rejects_llm_accepted_term_absent_from_user_text() -> 
         "如何改进机械臂从仿真到现实的迁移？"
     )
 
-    assert [entity.name for entity in entities] == ["机械臂"]
+    assert [entity.name for entity in entities] == ["robot arm"]
+    assert entities[0].source_mention == "机械臂"
     assert entities[0].entity_id == "E1"
 
 
 @pytest.mark.asyncio
 async def test_entity_audit_missing_term_triggers_one_repair_and_reaudit() -> None:
     module = entity_module([
-        {"entities": [candidate("机械臂", role="primary_object", required=True)]},
+        {"entities": [candidate(
+            "robot arm", source_mention="机械臂",
+            role="primary_object", required=True,
+        )]},
         {
-            "items": [audit_item("机械臂")],
+            "items": [audit_item("robot arm", source_mention="机械臂")],
             "missing_explicit_entities": ["离线强化学习"],
             "complete": False,
         },
         {"entities": [
-            candidate("机械臂", role="primary_object", required=True),
             candidate(
-                "离线强化学习",
+                "robot arm", source_mention="机械臂",
+                role="primary_object", required=True,
+            ),
+            candidate(
+                "offline reinforcement learning",
+                source_mention="离线强化学习",
                 role="method",
                 required=True,
-                aliases=["offline reinforcement learning"],
+                aliases=["offline RL"],
             ),
         ]},
         {
-            "items": [audit_item("机械臂"), audit_item("离线强化学习")],
+            "items": [
+                audit_item("robot arm", source_mention="机械臂"),
+                audit_item(
+                    "offline reinforcement learning",
+                    source_mention="离线强化学习",
+                ),
+            ],
             "missing_explicit_entities": [],
             "complete": True,
         },
@@ -155,17 +183,22 @@ async def test_entity_audit_missing_term_triggers_one_repair_and_reaudit() -> No
         "如何使用离线强化学习控制机械臂？"
     )
 
-    assert [entity.name for entity in entities] == ["机械臂", "离线强化学习"]
-    assert entities[1].aliases == ["offline reinforcement learning"]
+    assert [entity.name for entity in entities] == [
+        "robot arm", "offline reinforcement learning",
+    ]
+    assert entities[1].aliases == ["offline RL"]
     assert len(module.client.calls) == 4
 
 
 @pytest.mark.asyncio
 async def test_entity_prompts_never_receive_generated_subquestions() -> None:
     module = entity_module([
-        {"entities": [candidate("机械臂", role="primary_object", required=True)]},
+        {"entities": [candidate(
+            "robot arm", source_mention="机械臂",
+            role="primary_object", required=True,
+        )]},
         {
-            "items": [audit_item("机械臂")],
+            "items": [audit_item("robot arm", source_mention="机械臂")],
             "missing_explicit_entities": [],
             "complete": True,
         },
@@ -269,9 +302,13 @@ async def test_requirement_builder_repairs_unknown_entity_without_changing_entit
 
 @pytest.mark.asyncio
 async def test_missing_primary_object_after_repair_fails_closed() -> None:
-    invalid_round = {"entities": [candidate("域随机化", role="method")]}
+    invalid_round = {"entities": [candidate(
+        "domain randomization", source_mention="域随机化", role="method",
+    )]}
     invalid_audit = {
-        "items": [audit_item("域随机化")],
+        "items": [audit_item(
+            "domain randomization", source_mention="域随机化",
+        )],
         "missing_explicit_entities": [],
         "complete": True,
     }

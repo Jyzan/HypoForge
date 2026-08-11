@@ -609,3 +609,72 @@ async def test_workflow_propagates_global_timeout_and_cancellation() -> None:
     )
     with pytest.raises(asyncio.CancelledError):
         await cancelled.run("question", [paper("p1")])
+
+
+@pytest.mark.asyncio
+async def test_workflow_propagates_resolver_failure_attribution() -> None:
+    class BlockedResolver:
+        async def resolve(self, item: PaperRecord) -> DocumentRecord:
+            return DocumentRecord(
+                document_id=f"doc:{item.paper_id}",
+                paper_id=item.paper_id,
+                content_level=ContentLevel.ABSTRACT,
+                local_path="abstract.json",
+                retrieval_error="HTTP Error 403: Forbidden",
+                retrieval_failure_category="publisher_blocked",
+                retrieval_failure_detail="HTTP 403：出版商反爬拦截",
+            )
+
+        async def resolve_abstract(self, item: PaperRecord) -> DocumentRecord:
+            raise AssertionError("abstract fallback should not be needed")
+
+    workflow = FullTextReadingWorkflow(
+        resolver=BlockedResolver(),
+        parser=FakeParser(),
+        retriever=FakeRetriever(),
+        reader=FakeReader(),
+        store=InMemoryChunkStore(),
+    )
+
+    result = (await workflow.run("question", [paper("p1")]))[0]
+
+    assert result.degraded_to_abstract is True
+    assert result.fulltext_failure_category == "publisher_blocked"
+    assert result.fulltext_failure_detail == "HTTP 403：出版商反爬拦截"
+
+
+@pytest.mark.asyncio
+async def test_workflow_attributes_raised_resolver_errors() -> None:
+    class RaisingResolver:
+        async def resolve(self, item: PaperRecord) -> DocumentRecord:
+            raise ValueError("HTTP Error 418: I'm a teapot")
+
+    workflow = FullTextReadingWorkflow(
+        resolver=RaisingResolver(),
+        parser=FakeParser(),
+        retriever=FakeRetriever(),
+        reader=FakeReader(),
+        store=InMemoryChunkStore(),
+    )
+
+    result = (await workflow.run("question", [paper("p1")]))[0]
+
+    assert result.fulltext_failure_category == "publisher_blocked"
+    assert result.fulltext_failure_detail
+    assert result.errors
+
+
+@pytest.mark.asyncio
+async def test_workflow_success_keeps_empty_attribution() -> None:
+    workflow = FullTextReadingWorkflow(
+        resolver=FakeResolver({"p1": ContentLevel.STRUCTURED_FULLTEXT}),
+        parser=FakeParser(),
+        retriever=FakeRetriever(),
+        reader=FakeReader(),
+        store=InMemoryChunkStore(),
+    )
+
+    result = (await workflow.run("question", [paper("p1")]))[0]
+
+    assert result.fulltext_failure_category == ""
+    assert result.fulltext_failure_detail == ""

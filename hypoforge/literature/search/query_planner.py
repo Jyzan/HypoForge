@@ -140,6 +140,14 @@ In later rounds, target only the gaps identified by the coverage evaluator.
    must reflect semantic importance rather than the term's position.
 5. Never repeat a query that has already been used.
 6. Never select a search tool listed as unavailable.
+7. When the request lists ``Round Focus Entities``, every query of this \
+round MUST be built around those concepts: each query must contain all of \
+them (combine with AND / field tags appropriate to the tool). They are the \
+round's mandatory concepts, not optional decoration.
+8. When the request lists ``Supplementary Search Concepts``, treat them as \
+optional extra concepts added by M2 for retrieval: you MAY weave them \
+into queries when they improve recall, but they never replace the key \
+entities or the round focus entities.
 
 Return valid JSON only — no markdown fences, no extra text."""
 
@@ -150,7 +158,7 @@ _QUERY_PLANNING_USER_FIRST = """\
 ## Domain & Context
 - Domains: {domains}
 - Key Entities: {entities}
-
+{supplements}
 ## Current Search State
 - Round: 1/{max_rounds}
 - Papers found so far: 0
@@ -176,7 +184,7 @@ _QUERY_PLANNING_USER_RETRY = """\
 ## Domain & Context
 - Domains: {domains}
 - Key Entities: {entities}
-
+{supplements}
 ## Current Search State
 - Round: {round}/{max_rounds}
 - Papers found so far: {paper_count}
@@ -237,6 +245,8 @@ class QueryPlanner(QueryPlannerProtocol):
         domains: Sequence[str] = (),
         question_type: str = "",
         state: SearchState | None = None,
+        supplement_entities: Sequence[str] = (),
+        focus_entities: Sequence[str] = (),
     ) -> List[SearchQuery]:
         """Generate source-aware search queries.
 
@@ -244,6 +254,10 @@ class QueryPlanner(QueryPlannerProtocol):
         covering multiple evidence dimensions.  When ``state`` carries
         round/gap information from a prior iteration, the planner
         produces targeted follow-up queries.
+
+        ``focus_entities`` are the round's mandatory concepts assigned by
+        the entity-group round strategy: every generated query is built
+        around them (and deterministically anchored to them).
         """
         # ``question_type`` is accepted only for historical caller
         # compatibility; planning is derived from the atomic sub-question.
@@ -273,6 +287,8 @@ class QueryPlanner(QueryPlannerProtocol):
             queries_used=queries_used,
             gaps=gaps,
             unavailable_sources=unavailable_sources,
+            supplements=list(supplement_entities),
+            focus=list(focus_entities),
         )
 
     # ------------------------------------------------------------------
@@ -319,6 +335,8 @@ class QueryPlanner(QueryPlannerProtocol):
         queries_used: List[str],
         gaps: List[str],
         unavailable_sources: List[str],
+        supplements: Optional[List[str]] = None,
+        focus: Optional[List[str]] = None,
     ) -> List[SearchQuery]:
         """Core planning logic — shared by plan() and plan_next()."""
         tool_descriptions = "\n\n".join(
@@ -328,11 +346,26 @@ class QueryPlanner(QueryPlannerProtocol):
 
         system = _QUERY_PLANNING_SYSTEM.format(tool_descriptions=tool_descriptions)
 
+        supplement_line = (
+            "- Supplementary Search Concepts (added by M2 for this "
+            "sub-question's retrieval only; optional to use): "
+            + ", ".join(supplements) + "\n\n"
+            if supplements else "\n"
+        )
+        focus_list = [str(term).strip() for term in (focus or []) if str(term).strip()]
+        focus_line = (
+            "- Round Focus Entities (MANDATORY concepts for this round; every "
+            "query must be built around ALL of them): "
+            + ", ".join(focus_list) + "\n\n"
+            if focus_list else ""
+        )
+
         if round_num <= 1 and not queries_used:
             user = _QUERY_PLANNING_USER_FIRST.format(
                 sub_question=sub_question,
                 domains=", ".join(domains) if domains else "unknown",
                 entities=", ".join(entities) if entities else "unknown",
+                supplements=focus_line + supplement_line,
                 max_rounds=self._max_rounds,
                 unavailable_sources=(
                     ", ".join(unavailable_sources) if unavailable_sources else "(none)"
@@ -343,6 +376,7 @@ class QueryPlanner(QueryPlannerProtocol):
                 sub_question=sub_question,
                 domains=", ".join(domains) if domains else "unknown",
                 entities=", ".join(entities) if entities else "unknown",
+                supplements=focus_line + supplement_line,
                 round=round_num,
                 max_rounds=self._max_rounds,
                 paper_count=paper_count,
@@ -431,9 +465,12 @@ class QueryPlanner(QueryPlannerProtocol):
             text = _sanitize_query(raw.get("text", "").strip(), backend)
             if not text:
                 continue
-            # M1's first key entity is the canonical task object. Keep it as
-            # a structured conjunct when the LLM omitted it; never append loose
-            # words to the tail of the query.
+            # The round's focus entities are mandatory concepts: anchor every
+            # one the LLM omitted.  Then keep M1's first key entity as a
+            # structured conjunct as well; never append loose words to the
+            # tail of the query.
+            for focus_entity in focus_list:
+                text = _anchor_query(text, focus_entity, backend)
             if entities:
                 text = _anchor_query(text, entities[0], backend)
 

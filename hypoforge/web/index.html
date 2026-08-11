@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>HypoForge · 科研假设流水线</title>
+<script src="https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
 <style>
   :root{
     --bg:#f4f6fb; --card:#ffffff; --ink:#0f172a; --ink2:#475569; --ink3:#94a3b8;
@@ -428,6 +429,7 @@
     transition:transform .3s cubic-bezier(.32,.72,.28,1);display:flex;flex-direction:column;
   }
   .drawer.open{transform:none}
+  .drawer.wide{width:min(780px,96vw)}
   .drawer-head{padding:18px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px}
   .drawer-head .node-icon{width:38px;height:38px}
   .drawer-head h3{font-size:15px;font-weight:700}
@@ -460,6 +462,87 @@
   .src-row .src-papers li{counter-increment:paper;font-size:12px;color:var(--ink2);padding:5px 0;border-top:1px dashed var(--line);line-height:1.5;overflow-wrap:anywhere;word-break:break-word}
   .src-row .src-papers li::before{content:counter(paper) ".";color:var(--accent);font-weight:700;margin-right:8px;font-variant-numeric:tabular-nums}
   .src-row .src-papers-empty{font-size:11.5px;color:var(--ink3);margin-top:6px;font-style:italic}
+  .detail-lead{padding:12px 14px;border:1px solid #c7d2fe;background:var(--accent-soft);border-radius:12px;color:var(--ink2);font-size:12.5px;line-height:1.7}
+  .detail-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin:10px 0}
+  .detail-metric{padding:11px 12px;border:1px solid var(--line);border-radius:12px;background:var(--bg)}
+  .detail-metric b{display:block;font-size:19px;color:var(--accent);font-variant-numeric:tabular-nums}
+  .detail-metric span{font-size:11px;color:var(--ink3)}
+  .detail-list{display:flex;flex-direction:column;gap:8px}
+  .detail-card{border:1px solid var(--line);border-radius:12px;background:#fbfcfe;overflow:hidden}
+  .detail-card>summary{list-style:none;cursor:pointer;padding:11px 13px;display:flex;align-items:flex-start;gap:9px;font-size:12.8px;font-weight:600;color:var(--ink)}
+  .detail-card>summary::-webkit-details-marker{display:none}
+  .detail-card>summary::before{content:"›";color:var(--accent);font-size:18px;line-height:1;transition:transform .15s}
+  .detail-card[open]>summary::before{transform:rotate(90deg)}
+  .detail-card-body{padding:0 14px 13px;color:var(--ink2);font-size:12.5px}
+  .detail-card-body p{margin:6px 0;overflow-wrap:anywhere}
+  .detail-card-body ul{padding-left:19px}
+  .detail-card-body li{margin:5px 0}
+  .detail-chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}
+  .detail-chip{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:999px;background:var(--accent-soft);color:var(--accent);font-size:11px;font-weight:600;max-width:100%;overflow-wrap:anywhere}
+  .detail-chip.neutral{background:var(--bg);color:var(--ink2);border:1px solid var(--line)}
+  .detail-chip.good{background:var(--green-soft);color:var(--green)}
+  .detail-chip.warn{background:var(--amber-soft);color:var(--amber)}
+    .fulltext-failure{display:flex;align-items:flex-start;gap:8px;margin:6px 0;padding:7px 10px;border-radius:9px;background:var(--bg);border-left:3px solid var(--amber)}
+    .fulltext-failure .detail-chip{flex:none}
+    .fulltext-failure .paper-meta{flex:1;overflow-wrap:anywhere}
+  .transfer-row{border-left:3px solid var(--accent);padding:10px 12px;background:var(--bg);border-radius:0 10px 10px 0;margin-bottom:8px}
+  .transfer-row .idx{font:700 11px/1 ui-monospace,Consolas,monospace;color:var(--accent);margin-bottom:6px}
+  .entity-row{display:grid;grid-template-columns:minmax(130px,.8fr) minmax(130px,.8fr) minmax(90px,.45fr) minmax(160px,1fr);gap:8px;padding:9px 10px;border-bottom:1px solid var(--line);align-items:start;font-size:12px}
+  .entity-row:last-child{border-bottom:0}
+  .entity-row.head{font-size:10.5px;font-weight:700;color:var(--ink3);letter-spacing:.04em;background:var(--bg)}
+  .entity-box{border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  .paper-title{line-height:1.5;flex:1}
+  .paper-meta{color:var(--ink3);font-size:11.5px;line-height:1.6}
+  .knowledge-item{padding:10px 12px;margin-top:7px;border-radius:10px;background:#fff;border:1px solid var(--line)}
+  .knowledge-item .content{font-size:12.8px;color:var(--ink);line-height:1.65}
+  .knowledge-item .source{font-size:11px;color:var(--ink3);margin-top:5px;overflow-wrap:anywhere}
+  .source-table{border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  .source-line{display:grid;grid-template-columns:minmax(150px,1fr) 90px 90px;gap:8px;padding:9px 12px;border-bottom:1px solid var(--line);font-size:12px;align-items:center}
+  .source-line:last-child{border-bottom:0}
+  .source-line.head{background:var(--bg);font-size:10.5px;color:var(--ink3);font-weight:700}
+  .source-line b{color:var(--accent);font-variant-numeric:tabular-nums}
+
+  /* ---------- M3 全屏证据图谱 ---------- */
+  .graph-overlay{position:fixed;inset:0;z-index:220;background:#0e1116;color:#e8edf4;display:none;flex-direction:column;overflow:hidden}
+  .graph-overlay.open{display:flex}
+  .graph-head{flex:none;padding:13px 20px 11px;border-bottom:1px solid #293241;background:#151a22;display:flex;align-items:center;gap:14px}
+  .graph-head-copy{min-width:0;flex:1}
+  .graph-eyebrow{font-size:10.5px;letter-spacing:.2em;color:#e0a458;font-weight:750}
+  .graph-head h2{font-size:18px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .graph-question{font-size:12px;color:#8b96a8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .graph-close{border:1px solid #344052;background:#1b212c;color:#cbd5e1;width:38px;height:38px;border-radius:10px;cursor:pointer;font-size:22px;flex:none}
+  .graph-close:hover{border-color:#e0a458;color:#fff}
+  .graph-stats{flex:none;display:flex;background:#1b212c;border-bottom:1px solid #293241;overflow-x:auto}
+  .graph-stat{padding:7px 18px;border-right:1px solid #293241;display:flex;align-items:baseline;gap:7px;white-space:nowrap}
+  .graph-stat b{font-size:18px;color:#e0a458}.graph-stat span{font-size:11px;color:#8b96a8}
+  .graph-main{flex:1;display:flex;min-height:0;position:relative}
+  .graph-stage{flex:1;display:flex;flex-direction:column;min-width:0}
+  .graph-controls{flex:none;display:flex;align-items:center;gap:7px;flex-wrap:wrap;padding:8px 13px;border-bottom:1px solid #293241;background:#151a22}
+  .graph-controls input,.graph-controls select{background:#1b212c;border:1px solid #344052;color:#e8edf4;border-radius:8px;padding:6px 10px;font-size:12px;outline:none}
+  .graph-controls input{width:235px}.graph-controls input:focus,.graph-controls select:focus{border-color:#e0a458}
+  .graph-toggles{display:flex;gap:4px;flex-wrap:wrap}
+  .graph-toggle,.graph-reset{border:1px solid #344052;background:#1b212c;color:#cbd5e1;border-radius:999px;padding:5px 10px;font-size:11.5px;cursor:pointer}
+  .graph-reset{border-radius:8px}.graph-toggle.off{opacity:.38}.graph-toggle i{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px}
+  .graph-canvas{flex:1;min-height:0;background:radial-gradient(circle at 50% 45%,rgba(255,255,255,.025),transparent 58%),#0e1116}
+  .graph-fallback{display:none;flex:1;overflow:auto;padding:20px;color:#aab4c3}
+  .graph-legend{flex:none;display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding:6px 13px;border-top:1px solid #293241;background:#151a22;font-size:11px;color:#8b96a8}
+  .graph-legend-item{display:flex;align-items:center;gap:5px}.graph-dot{width:8px;height:8px;border-radius:50%}.graph-line{width:15px;border-top:2px solid}
+  .graph-tip{margin-left:auto;color:#5f6b7d}
+  .graph-side{width:390px;flex:none;border-left:1px solid #293241;border-right:0;background:#151a22;display:flex;flex-direction:column;min-height:0}
+  .graph-side-head{padding:11px 15px;border-bottom:1px solid #293241;font-size:13px;font-weight:650}
+  .graph-side-body{padding:14px 16px;overflow-y:auto;flex:1;font-size:12.5px;line-height:1.75;color:#aab4c3}
+  .graph-guide{margin-bottom:13px}.graph-guide b{color:#e8edf4}
+  .graph-section{font-size:10px;letter-spacing:.15em;color:#5f6b7d;font-weight:750;margin:17px 0 7px;text-transform:uppercase}
+  .graph-section:first-child{margin-top:0}
+  .graph-item{background:#1b212c;border:1px solid #293241;border-left:3px solid #43b7a0;border-radius:9px;padding:9px 11px;margin-bottom:7px;cursor:pointer}
+  .graph-item.source{border-left-color:#e0a458}.graph-item:hover{border-color:#43b7a0}
+  .graph-item .meta{font-size:10.5px;color:#657185;margin-top:5px}
+  .graph-badge{display:inline-block;color:#0e1116;font-size:10.5px;font-weight:750;border-radius:999px;padding:2px 9px;margin-bottom:8px}
+  .graph-detail-title{font-size:15px;color:#e8edf4;line-height:1.55;margin-bottom:12px}
+  .graph-kv{margin:10px 0}.graph-kv .k{font-size:10px;letter-spacing:.1em;color:#5f6b7d}.graph-kv .v{color:#cbd5e1;overflow-wrap:anywhere}
+  .graph-related{padding:6px 8px;border-radius:7px;background:#1b212c;margin:5px 0;cursor:pointer;color:#aab4c3}
+  .graph-related:hover{color:#fff}
+  .graph-raw{white-space:pre-wrap;overflow-wrap:anywhere;background:#0e1116;padding:9px;border-radius:8px;max-height:180px;overflow:auto;font:10px/1.5 ui-monospace,Consolas,monospace;color:#8b96a8}
   /* ---------- 响应式 ---------- */
   @media (max-width:960px){
     .row-nodes{grid-template-columns:repeat(2,1fr)}
@@ -472,6 +555,10 @@
     .main-inner{padding:20px 16px 12px}
     .input-bar{padding:12px 14px calc(12px + env(safe-area-inset-bottom))}
     .row-nodes{grid-template-columns:1fr;gap:10px}
+    .detail-grid{grid-template-columns:repeat(2,1fr)}
+    .entity-row{grid-template-columns:1fr 1fr}
+    .graph-side{position:absolute;left:auto;right:0;top:0;bottom:0;width:min(390px,90vw);z-index:3;box-shadow:-10px 0 30px rgba(0,0,0,.35);transform:none;transition:none}
+    .graph-controls input{width:160px}
   }
   /* 桌面端侧栏折叠：整体水平滑出（宽度不变，内容不重排），主区占满 */
   @media (min-width:861px){
@@ -692,6 +779,37 @@
   <div class="drawer-body" id="drawerBody"></div>
 </div>
 
+<!-- M3 全屏交互式证据图谱 -->
+<section class="graph-overlay" id="graphOverlay" aria-hidden="true">
+  <div class="graph-head">
+    <div class="graph-head-copy">
+      <div class="graph-eyebrow">HYPOFORGE · M3 EVIDENCE GRAPH</div>
+      <h2 id="graphTitle">M3 证据图谱</h2>
+      <div class="graph-question" id="graphQuestion"></div>
+    </div>
+    <button class="graph-close" id="graphClose" type="button" aria-label="关闭知识图谱">×</button>
+  </div>
+  <div class="graph-stats" id="graphStats"></div>
+  <div class="graph-main">
+    <div class="graph-stage">
+      <div class="graph-controls">
+        <input id="graphSearch" type="text" placeholder="搜索节点、实体、论文或证据…">
+        <select id="graphPaperFilter"><option value="">全部论文</option></select>
+        <div class="graph-toggles" id="graphTypeToggles"></div>
+        <button class="graph-reset" id="graphReset" type="button">重置视图</button>
+        <span id="graphFilterInfo" style="font-size:11px;color:#e0a458"></span>
+      </div>
+      <div class="graph-canvas" id="graphCanvas"></div>
+      <div class="graph-fallback" id="graphFallback"></div>
+      <div class="graph-legend" id="graphLegend"></div>
+    </div>
+    <aside class="graph-side">
+      <div class="graph-side-head" id="graphSideTitle">图谱导读</div>
+      <div class="graph-side-body" id="graphSideBody"></div>
+    </aside>
+  </div>
+</section>
+
 <script>
 /* ============================================================
  * HypoForge 观测前端 — 数据全部来自本地 REST 端点：
@@ -719,7 +837,8 @@ const PATH_LABELS = { "full":"全量检索", "revise":"修订", "supplement":"�
 // routing_history 的 to_module（decision）→ 时间线徽标类型。
 const DECISION_TO_PATH = { "supplement_m2":"supplement", "revise_m4":"revise", "direct_m4":"skip-search", "search_m2":"full", "end":"end" };
 const GAP_LABELS = { "open":"待补检索", "pending_grounding":"待 Grounding", "closed":"已闭合", "unimprovable":"无法改进", "unknown":"未知" };
-const DIM_LABELS = { "scientific_logic":"科学逻辑", "evidence_consistency":"证据一致性", "method_feasibility":"方法可行性", "overall":"综合评分" };
+const DIM_LABELS = { "task_alignment":"任务对齐", "scientific_logic":"科学逻辑", "evidence_consistency":"证据一致性", "method_feasibility":"方法可行性", "overall":"综合评分" };
+const STRUCTURED_DRAWER_MODULES = new Set(["m1","m2","m4","m5","m6"]);
 
 let currentRun = null, runRecord = null, lastSequence = 0, timer = null;
 let allEvents = [], collapsedCount = 0, renderedEventCount = 0;
@@ -735,6 +854,7 @@ let segments = [];
 let pendingSeg = null;
 // Authoritative iteration state（来自 result/state 端点），运行中用事件估算兑底。
 let stateData = null;
+let graphCy = null, graphData = null, graphPapersById = {};
 // Sequences of event <details> currently expanded — preserved across rebuilds.
 let openSequences = new Set();
 // Root run ids of expanded followup chains in the history sidebar — preserved across loadHistory rebuilds.
@@ -1157,6 +1277,550 @@ function moduleSnapshotHtml(moduleId, r){
   }[moduleId];
   return data ? `<div class="d-sec-title">最终只读快照</div><div class="output-box"><details><summary>查看完整字段与证据 ID</summary><pre>${pretty(data)}</pre></details></div>` : "";
 }
+
+async function fetchLatestState(){
+  if(!currentRun) return stateData || resultData;
+  try{
+    const response = await fetch(`/api/runs/${encodeURIComponent(currentRun)}/state`);
+    if(response.status === 200){
+      const payload = await response.json();
+      if(payload.state){ stateData = payload.state; return payload.state; }
+    }
+  }catch(err){ console.warn("latest state", err); }
+  return stateData || resultData;
+}
+
+function m1DetailsHtml(r){
+  const card = r?.problem_card;
+  if(!card) return `<div class="output-box" style="color:var(--ink3)">M1 尚未生成可读取的问题卡。</div>`;
+  const contract = card.task_contract || {};
+  const entities = contract.entities || [];
+  const entityById = Object.fromEntries(entities.map(e => [e.entity_id, e]));
+  const requirements = contract.requirements || [];
+  const subQuestions = card.sub_questions || [];
+  const entityRows = entities.length ? entities.map(e => `
+    <div class="entity-row">
+      <div><b>${esc(e.name || "—")}</b><div class="paper-meta">${esc(e.entity_id || "")}</div></div>
+      <div>${esc(e.source_mention || "—")}</div>
+      <div><span class="detail-chip ${e.required === false ? "neutral" : "good"}">${esc(e.role || "entity")}</span></div>
+      <div>${(e.aliases || []).length ? (e.aliases || []).map(a => `<span class="detail-chip neutral">${esc(a)}</span>`).join(" ") : "—"}</div>
+    </div>`).join("") : (card.key_entities || []).map((name, i) => `
+      <div class="entity-row"><div><b>${esc(name)}</b></div><div>—</div><div><span class="detail-chip good">key entity</span></div><div>—</div></div>`).join("");
+  const requirementRows = requirements.map(req => {
+    const primary = entityById[req.primary_entity_id];
+    const related = (req.related_entity_ids || []).map(id => entityById[id]?.name || id);
+    return `<div class="transfer-row">
+      <div class="idx">${esc(req.requirement_id || "REQUIREMENT")}</div>
+      <b>${esc(req.sub_question || "")}</b>
+      <div class="detail-chips">
+        ${primary ? `<span class="detail-chip">主实体：${esc(primary.name)}</span>` : ""}
+        ${related.map(name => `<span class="detail-chip neutral">关联：${esc(name)}</span>`).join("")}
+      </div>
+      ${req.relation ? `<div class="paper-meta" style="margin-top:7px">任务关系：${esc(req.relation)}</div>` : ""}
+    </div>`;
+  }).join("");
+  return `
+    <div class="detail-lead">这里展示的是 M1 实际交给下游的结构化问题卡，而不是执行数量摘要。M2 的检索任务主要由这些子问题和关键实体驱动。</div>
+    <div class="detail-grid">
+      <div class="detail-metric"><b>${subQuestions.length}</b><span>子问题</span></div>
+      <div class="detail-metric"><b>${entities.length || (card.key_entities || []).length}</b><span>关键实体</span></div>
+      <div class="detail-metric"><b>${requirements.length}</b><span>任务要求</span></div>
+      <div class="detail-metric"><b>${(card.domain || []).length}</b><span>领域标签</span></div>
+    </div>
+    <div class="d-sec-title">传递给 M2 的子问题</div>
+    <div class="detail-list">${subQuestions.length ? subQuestions.map((q, i) => `
+      <div class="transfer-row"><div class="idx">SUB QUESTION ${i + 1}</div><div>${esc(q)}</div></div>`).join("") : `<div class="output-box">暂无子问题</div>`}</div>
+    <div class="d-sec-title">关键实体与原问题来源</div>
+    <div class="entity-box">
+      <div class="entity-row head"><div>规范名称</div><div>原问题表述</div><div>角色</div><div>别名</div></div>
+      ${entityRows || `<div class="entity-row"><div>暂无实体</div></div>`}
+    </div>
+    ${requirements.length ? `<div class="d-sec-title">子问题—实体任务契约</div>${requirementRows}` : ""}
+    ${(card.domain || []).length ? `<div class="d-sec-title">领域</div><div class="detail-chips">${card.domain.map(x => `<span class="detail-chip neutral">${esc(x)}</span>`).join("")}</div>` : ""}`;
+}
+
+const SOURCE_LABELS = {
+  pubmed:"PubMed", semantic_scholar:"Semantic Scholar", openalex:"OpenAlex",
+  arxiv:"arXiv"
+};
+// M2 全文获取失败归因（后端 fulltext_failure_category 的中文标签映射）。
+const FULLTEXT_FAILURE_LABELS = {
+  publisher_blocked:"出版商拦截",
+  invalid_pdf_link:"PDF 链接无效",
+  no_fulltext_available:"该论文客观上无全文",
+  other:"其他"
+};
+function m2Runs(r){ return r?.m2_knowledge_export?.runs || []; }
+function uniqueM2Papers(runs){
+  const byId = new Map();
+  runs.forEach(run => (run.papers || []).forEach(p => { if(p.paper_id && !byId.has(p.paper_id)) byId.set(p.paper_id, p); }));
+  return [...byId.values()];
+}
+function m2SourceRows(runs, papers){
+  const hits = {}, retained = {};
+  runs.forEach(run => Object.entries(run.search_provenance?.source_result_counts || {}).forEach(([name, count]) => {
+    hits[name] = (hits[name] || 0) + Number(count || 0);
+  }));
+  papers.forEach(p => (p.sources || []).forEach(name => {
+    if(!retained[name]) retained[name] = new Set();
+    retained[name].add(p.paper_id);
+  }));
+  const names = [...new Set([...Object.keys(hits), ...Object.keys(retained)])];
+  return names.map(name => ({ name, found:hits[name] || 0, retained:retained[name]?.size || 0 }));
+}
+function m2PaperHtml(p, decision){
+  const isFull = ["pdf","structured_fulltext","xml"].includes(String(p.content_level || "").toLowerCase()) || p.fulltext_status === "downloaded";
+  const status = isFull ? "全文" : "摘要";
+  const reason = decision?.reason || "已进入 M2→M3 导出集合";
+  // 旧运行没有归因字段时优雅降级：不渲染失败原因行。
+  const failCategory = String(p.fulltext_failure_category || "");
+  const failRow = (!isFull && failCategory) ? `
+      <p class="fulltext-failure"><span class="detail-chip warn">${esc(FULLTEXT_FAILURE_LABELS[failCategory] || failCategory)}</span><span class="paper-meta">${esc(p.fulltext_failure_detail || "无更多明细")}</span></p>` : "";
+  return `<details class="detail-card">
+    <summary><span class="paper-title">${esc(p.title || p.paper_id || "未命名论文")}</span><span class="detail-chip ${isFull ? "good" : "warn"}">${status}</span></summary>
+    <div class="detail-card-body">
+      <div class="paper-meta">${esc(p.paper_id || "")} · ${esc((p.sources || []).map(x => SOURCE_LABELS[x] || x).join(" / ") || "来源未知")} · ${esc(p.year || "年份未知")} · ${esc(p.journal || "期刊未知")}</div>
+      <p><b>获取情况：</b>${esc(p.fulltext_status || "unknown")} / ${esc(p.content_level || "unknown")}${p.degraded_to_abstract ? "（全文失败，已降级为摘要）" : ""}</p>
+      ${failRow}
+      <p><b>采纳理由：</b>${esc(reason)}</p>
+      ${p.reading_summary ? `<p><b>阅读摘要：</b>${esc(p.reading_summary)}</p>` : ""}
+      ${p.abstract ? `<details><summary>查看论文摘要</summary><p>${esc(p.abstract)}</p></details>` : ""}
+      ${(p.errors || []).length ? `<p style="color:var(--amber)"><b>获取/阅读提示：</b>${esc(p.errors.join("；"))}</p>` : ""}
+    </div>
+  </details>`;
+}
+function m2KnowledgeHtml(entry){
+  return `<div class="knowledge-item">
+    <div class="detail-chips">
+      <span class="detail-chip">${esc(entry.type || "knowledge")}</span>
+      ${entry.confidence ? `<span class="detail-chip ${entry.confidence === "high" ? "good" : "warn"}">${esc(entry.confidence)}</span>` : ""}
+    </div>
+    <div class="content">${esc(entry.content || "")}</div>
+    <div class="source">来源：${esc(entry.source_paper_title || entry.source_paper_id || "未知论文")}</div>
+    ${(entry.entities || []).length ? `<div class="detail-chips">${entry.entities.map(x => `<span class="detail-chip neutral">${esc(x)}</span>`).join("")}</div>` : ""}
+    ${(entry.evidence_ids || []).length ? `<details><summary>Evidence IDs（${entry.evidence_ids.length}）</summary><div class="paper-meta">${entry.evidence_ids.map(esc).join("<br>")}</div></details>` : ""}
+  </div>`;
+}
+function m2DetailsHtml(r){
+  const runs = m2Runs(r);
+  if(!runs.length) return `<div class="output-box" style="color:var(--ink3)">M2 尚未生成可读取的论文与知识导出。</div>`;
+  const papers = uniqueM2Papers(runs);
+  const knowledgeCount = runs.reduce((n, run) => n + (run.knowledge_entries || []).length, 0);
+  const fullCount = papers.filter(p => ["pdf","structured_fulltext","xml"].includes(String(p.content_level || "").toLowerCase()) || p.fulltext_status === "downloaded").length;
+  const sourceRows = m2SourceRows(runs, papers);
+  const sourceTable = sourceRows.map(row => `<div class="source-line"><div>${esc(SOURCE_LABELS[row.name] || row.name)}</div><b>${row.found}</b><b>${row.retained}</b></div>`).join("");
+  const runBlocks = runs.map((run, idx) => {
+    const decisions = Object.fromEntries((run.search_provenance?.retention_decisions || []).map(d => [d.paper_id, d]));
+    const papersHtml = (run.papers || []).map(p => m2PaperHtml(p, decisions[p.paper_id])).join("");
+    const knowledgeHtml = (run.knowledge_entries || []).map(m2KnowledgeHtml).join("");
+    return `<details class="detail-card" ${idx === 0 ? "open" : ""}>
+      <summary><span class="paper-title">子问题 ${idx + 1}：${esc(run.sub_question || "")}</span><span class="detail-chip good">${(run.papers || []).length} 篇采纳</span></summary>
+      <div class="detail-card-body">
+        <div class="paper-meta">停止原因：${esc(run.search_provenance?.stop_reason || "—")} · 查询 ${(run.search_provenance?.queries || []).length} 条</div>
+        <div class="d-sec-title">输出给 M3 的论文</div>
+        <div class="detail-list">${papersHtml || `<div class="output-box">本子问题没有采纳论文</div>`}</div>
+        <div class="d-sec-title">从这些论文提取的知识（${(run.knowledge_entries || []).length} 条）</div>
+        ${knowledgeHtml || `<div class="output-box">没有导出知识条目</div>`}
+      </div>
+    </details>`;
+  }).join("");
+  return `
+    <div class="detail-lead">“检索命中”按各子问题、各检索源累加，可能包含跨查询重复；“最终采纳”按导出给 M3 的唯一论文计算。下面列出的论文和知识就是 M2→M3 的实际接口内容。</div>
+    <div class="detail-grid">
+      <div class="detail-metric"><b>${runs.length}</b><span>检索子问题</span></div>
+      <div class="detail-metric"><b>${papers.length}</b><span>最终唯一论文</span></div>
+      <div class="detail-metric"><b>${fullCount}/${papers.length}</b><span>全文 / 全部</span></div>
+      <div class="detail-metric"><b>${knowledgeCount}</b><span>输出知识条目</span></div>
+    </div>
+    <div class="d-sec-title">各检索网站：搜到多少 / 最终采纳多少</div>
+    <div class="source-table">
+      <div class="source-line head"><div>检索源</div><div>检索命中</div><div>最终采纳</div></div>
+      ${sourceTable || `<div class="source-line"><div>暂无来源统计</div><div>0</div><div>0</div></div>`}
+    </div>
+    <div class="d-sec-title">按子问题查看论文与知识</div>
+    <div class="detail-list">${runBlocks}</div>`;
+}
+
+function detailBulletList(items, emptyText="暂无"){
+  const values = Array.isArray(items) ? items.filter(x => String(x || "").trim()) : [];
+  return values.length
+    ? `<ul>${values.map(item => `<li>${esc(item)}</li>`).join("")}</ul>`
+    : `<p class="paper-meta">${esc(emptyText)}</p>`;
+}
+function detailIdChips(items, tone="neutral"){
+  const values = Array.isArray(items) ? items.filter(Boolean) : [];
+  return values.length
+    ? `<div class="detail-chips">${values.map(id => `<span class="detail-chip ${tone}">${esc(id)}</span>`).join("")}</div>`
+    : `<div class="paper-meta">暂无可追溯 ID</div>`;
+}
+function hypothesisScoreHtml(scores){
+  const entries = Object.entries(scores || {});
+  return entries.length ? `<div class="score-row">${entries.map(([name, value]) => {
+    const score = Number(value);
+    return `<div class="score-chip"><div class="v">${Number.isFinite(score) ? score.toFixed(2) : esc(value)}</div><div class="k">${esc(name)}</div></div>`;
+  }).join("")}</div>` : `<div class="paper-meta">本候选暂无排序分数</div>`;
+}
+function m4DetailsHtml(r){
+  const candidates = Array.isArray(r?.candidate_hypotheses) ? r.candidate_hypotheses : [];
+  const selected = Array.isArray(r?.top_hypotheses) && r.top_hypotheses.length
+    ? r.top_hypotheses : (Array.isArray(r?.best_hypotheses) ? r.best_hypotheses : []);
+  const gaps = Array.isArray(r?.evidence_gap_requests) ? r.evidence_gap_requests : [];
+  const selectedIds = new Set(selected.map(h => h.hypothesis_id).filter(Boolean));
+  const allById = new Map();
+  [...candidates, ...selected].forEach((h, index) => {
+    const key = h.hypothesis_id || `hypothesis-${index}`;
+    if(!allById.has(key)) allById.set(key, h);
+  });
+  const hypotheses = [...allById.values()];
+  if(!hypotheses.length) return `<div class="output-box" style="color:var(--ink3)">M4 尚未生成可读取的候选假设。</div>`;
+  const cards = hypotheses.map((h, index) => {
+    const isSelected = selectedIds.has(h.hypothesis_id) || (!candidates.length && selected.includes(h));
+    return `<details class="detail-card" ${isSelected || index === 0 ? "open" : ""}>
+      <summary>
+        <span class="paper-title">${esc(h.hypothesis_id || `H${index + 1}`)} · ${esc(h.statement || h.title || "未命名假设")}</span>
+        <span class="detail-chip ${isSelected ? "good" : "neutral"}">${isSelected ? "已入选" : "候选"}</span>
+      </summary>
+      <div class="detail-card-body">
+        ${h.mechanism ? `<div class="d-sec-title">作用机制</div><p>${esc(h.mechanism)}</p>` : ""}
+        <div class="d-sec-title">排序分数</div>${hypothesisScoreHtml(h.scores)}
+        ${h.ranking_rationale ? `<div class="d-sec-title">入选 / 排序理由</div><p>${esc(h.ranking_rationale)}</p>` : ""}
+        <div class="d-sec-title">可观察预测</div>${detailBulletList(h.observable_predictions, "暂无可观察预测")}
+        <div class="d-sec-title">可证伪条件</div>${detailBulletList(h.falsification_conditions, "暂无可证伪条件")}
+        <div class="d-sec-title">支持证据 ID</div>${detailIdChips(h.supporting_evidence)}
+        <div class="d-sec-title">来源论文 ID</div>${detailIdChips(h.source_paper_ids)}
+        ${h.task_trace && Object.keys(h.task_trace).length ? `<details><summary>查看任务契约追踪</summary><pre>${pretty(h.task_trace)}</pre></details>` : ""}
+      </div>
+    </details>`;
+  }).join("");
+  const gapBlocks = gaps.map(g => `<div class="transfer-row">
+    <div class="idx">${esc(g.gap_id || "EVIDENCE GAP")}</div>
+    <b>${esc(g.sub_question || g.rationale || "未描述的证据缺口")}</b>
+    <div class="detail-chips"><span class="detail-chip warn">${esc(g.status || "pending")}</span>${g.hypothesis_id ? `<span class="detail-chip neutral">${esc(g.hypothesis_id)}</span>` : ""}</div>
+    ${(g.suggested_queries || []).length ? `<div class="paper-meta" style="margin-top:7px">建议补搜：${esc(g.suggested_queries.join("；"))}</div>` : ""}
+  </div>`).join("");
+  return `
+    <div class="detail-lead">这里展示 M4 实际生成、排序并交给 M5 的假设。绿色标签表示进入后续研究计划设计的 Top 假设。</div>
+    <div class="detail-grid">
+      <div class="detail-metric"><b>${candidates.length}</b><span>候选假设</span></div>
+      <div class="detail-metric"><b>${selected.length}</b><span>最终入选</span></div>
+      <div class="detail-metric"><b>${gaps.length}</b><span>证据缺口请求</span></div>
+      <div class="detail-metric"><b>${Number(r?.iteration_count || 0)}</b><span>当前迭代轮次</span></div>
+    </div>
+    <div class="d-sec-title">候选与入选假设</div>
+    <div class="detail-list">${cards}</div>
+    ${gaps.length ? `<div class="d-sec-title">待补充证据</div><div class="detail-list">${gapBlocks}</div>` : ""}`;
+}
+
+function planSection(title, content, emptyText="暂无"){
+  const hasContent = Array.isArray(content) ? content.length : String(content || "").trim();
+  if(!hasContent) return `<div class="d-sec-title">${esc(title)}</div><p class="paper-meta">${esc(emptyText)}</p>`;
+  return `<div class="d-sec-title">${esc(title)}</div>${Array.isArray(content) ? detailBulletList(content, emptyText) : `<p>${esc(content)}</p>`}`;
+}
+function m5PlanHtml(plan, index){
+  const links = Array.isArray(plan.evidence_links) ? plan.evidence_links : [];
+  const linkRows = links.map(link => `<div class="transfer-row">
+    <div class="idx">${esc(link.support_status || "unknown")}</div>
+    <b>${esc(link.plan_element || "计划环节")}</b>
+    ${link.claim ? `<div style="margin-top:6px">${esc(link.claim)}</div>` : ""}
+    <div class="paper-meta" style="margin-top:7px">Evidence：${esc((link.supporting_evidence_ids || []).join(", ") || "暂无")}<br>Paper：${esc((link.source_paper_ids || []).join(", ") || "暂无")}</div>
+  </div>`).join("");
+  return `<details class="detail-card" ${index === 0 ? "open" : ""}>
+    <summary><span class="paper-title">方案 ${index + 1} · ${esc(plan.hypothesis_id || "未绑定假设")}</span><span class="detail-chip good">研究计划</span></summary>
+    <div class="detail-card-body">
+      ${planSection("研究对象", plan.study_subjects)}
+      ${planSection("实验步骤", plan.procedures, "暂无实验步骤")}
+      <div class="d-sec-title">变量与对照</div>
+      <div class="detail-grid">
+        <div class="output-box"><b>自变量</b>${detailBulletList(plan.independent_variables)}</div>
+        <div class="output-box"><b>因变量</b>${detailBulletList(plan.dependent_variables)}</div>
+        <div class="output-box"><b>对照组</b>${detailBulletList(plan.control_groups)}</div>
+        <div class="output-box"><b>测量指标</b>${detailBulletList(plan.measurement_metrics)}</div>
+      </div>
+      ${planSection("分析方法", plan.analysis_methods, "暂无分析方法")}
+      ${planSection("假设成立时的预期结果", plan.expected_results_if_supported)}
+      ${planSection("假设不成立时的预期结果", plan.expected_results_if_refuted)}
+      ${planSection("时间安排", plan.timeline)}
+      ${planSection("风险与替代方案", plan.risks_and_alternatives)}
+      <div class="d-sec-title">方案级证据</div>${detailIdChips(plan.supporting_evidence_ids)}
+      <div class="d-sec-title">来源论文</div>${detailIdChips(plan.source_paper_ids)}
+      ${links.length ? `<div class="d-sec-title">计划环节—证据映射</div><div class="detail-list">${linkRows}</div>` : ""}
+      ${plan.task_trace && Object.keys(plan.task_trace).length ? `<details><summary>查看任务契约追踪</summary><pre>${pretty(plan.task_trace)}</pre></details>` : ""}
+    </div>
+  </details>`;
+}
+function m5DetailsHtml(r){
+  const plans = Array.isArray(r?.research_plans) ? r.research_plans : [];
+  const history = Array.isArray(r?.research_plan_history) ? r.research_plan_history : [];
+  if(!plans.length) return `<div class="output-box" style="color:var(--ink3)">M5 尚未生成可读取的研究方案。</div>`;
+  const supportedLinks = plans.reduce((sum, plan) => sum + (plan.evidence_links || []).filter(link => link.support_status === "supported").length, 0);
+  const allLinks = plans.reduce((sum, plan) => sum + (plan.evidence_links || []).length, 0);
+  return `
+    <div class="detail-lead">这里展示 M5 实际交给 M6 评审的研究计划，包括实验步骤、变量、对照、测量、分析方法和证据映射。</div>
+    <div class="detail-grid">
+      <div class="detail-metric"><b>${plans.length}</b><span>当前研究方案</span></div>
+      <div class="detail-metric"><b>${new Set(plans.map(p => p.hypothesis_id).filter(Boolean)).size}</b><span>覆盖假设</span></div>
+      <div class="detail-metric"><b>${supportedLinks}/${allLinks}</b><span>已支持证据映射</span></div>
+      <div class="detail-metric"><b>${history.length}</b><span>历史方案快照</span></div>
+    </div>
+    <div class="d-sec-title">具体研究方案</div>
+    <div class="detail-list">${plans.map(m5PlanHtml).join("")}</div>
+    ${history.length ? `<details class="detail-card"><summary>查看研究方案历史（${history.length} 条）</summary><div class="detail-card-body"><pre>${pretty(history)}</pre></div></details>` : ""}`;
+}
+
+function groupReviewsByVersion(reviews){
+  const groups = new Map();
+  (Array.isArray(reviews) ? reviews : []).forEach(review => {
+    const version = Number(review.version || 1);
+    if(!groups.has(version)) groups.set(version, []);
+    groups.get(version).push(review);
+  });
+  return [...groups.entries()].sort((a, b) => a[0] - b[0]);
+}
+function reviewScoreClass(review){
+  if(review.hard_gate_passed === false || Number(review.score) < 3) return "warn";
+  return Number(review.score) >= 4 ? "good" : "neutral";
+}
+function m6ReviewHtml(review){
+  const label = DIM_LABELS[review.dimension] || review.dimension || "未命名维度";
+  const score = Number(review.score);
+  return `<details class="detail-card" ${review.dimension === "overall" ? "open" : ""}>
+    <summary>
+      <span class="paper-title">${esc(label)}</span>
+      <span class="detail-chip ${reviewScoreClass(review)}">${Number.isFinite(score) ? score.toFixed(1) : "—"} / 5</span>
+      ${review.hard_gate_passed == null ? "" : `<span class="detail-chip ${review.hard_gate_passed ? "good" : "warn"}">${review.hard_gate_passed ? "硬门通过" : "硬门未通过"}</span>`}
+    </summary>
+    <div class="detail-card-body">
+      ${review.reasoning ? `<div class="d-sec-title">评分理由</div><p>${esc(review.reasoning)}</p>` : ""}
+      ${review.comments ? `<div class="d-sec-title">评审意见</div><p>${esc(review.comments)}</p>` : ""}
+      ${review.suggestions ? `<div class="d-sec-title">改进建议</div><p>${esc(review.suggestions)}</p>` : ""}
+      <div class="d-sec-title">引用证据 ID</div>${detailIdChips(review.evidence_ids)}
+      ${(review.graph_correction_requests || []).length ? `<div class="d-sec-title">图谱纠错请求</div><pre>${pretty(review.graph_correction_requests)}</pre>` : ""}
+    </div>
+  </details>`;
+}
+function m6DetailsHtml(r){
+  const reviews = Array.isArray(r?.reviews) ? r.reviews : [];
+  const versions = groupReviewsByVersion(reviews);
+  const gaps = Array.isArray(r?.evidence_gaps) ? r.evidence_gaps : [];
+  const routing = Array.isArray(r?.routing_history) ? r.routing_history : [];
+  if(!reviews.length) return `<div class="output-box" style="color:var(--ink3)">M6 尚未生成可读取的评审结果。</div>`;
+  const latest = versions[versions.length - 1] || [1, []];
+  const latestOverall = latest[1].find(review => review.dimension === "overall");
+  const latestPassed = latest[1].filter(review => review.hard_gate_passed === true).length;
+  const latestGated = latest[1].filter(review => review.hard_gate_passed != null).length;
+  const versionBlocks = versions.map(([version, versionReviews], index) => {
+    const overall = versionReviews.find(review => review.dimension === "overall");
+    return `<details class="detail-card" ${index === versions.length - 1 ? "open" : ""}>
+      <summary><span class="paper-title">第 ${version} 版评审</span><span class="detail-chip ${overall ? reviewScoreClass(overall) : "neutral"}">总体 ${overall ? Number(overall.score).toFixed(1) : "—"} / 5</span></summary>
+      <div class="detail-card-body">
+        <div class="score-row">${versionReviews.map(review => `<div class="score-chip"><div class="v">${Number(review.score).toFixed(1)}</div><div class="k">${esc(DIM_LABELS[review.dimension] || review.dimension)}</div></div>`).join("")}</div>
+        <div class="detail-list">${versionReviews.map(m6ReviewHtml).join("")}</div>
+      </div>
+    </details>`;
+  }).join("");
+  const independentScores = r?.scores?.aggregate && Object.keys(r.scores.aggregate).length
+    ? `<div class="d-sec-title">流程外独立评分</div>${scoreRowsHtml(r.scores.aggregate)}<details><summary>查看完整独立评分</summary><pre>${pretty(r.scores)}</pre></details>` : "";
+  return `
+    <div class="detail-lead">这里按版本展示 M6 的各维度评分。每个分数都可展开查看评分理由、意见、建议、硬门结果和引用证据。</div>
+    <div class="detail-grid">
+      <div class="detail-metric"><b>${versions.length}</b><span>评审版本</span></div>
+      <div class="detail-metric"><b>${latestOverall ? Number(latestOverall.score).toFixed(1) : "—"}</b><span>最新版总体 / 5</span></div>
+      <div class="detail-metric"><b>${latestPassed}/${latestGated}</b><span>最新版硬门通过</span></div>
+      <div class="detail-metric"><b>${gaps.filter(g => !["closed","resolved"].includes(g.status)).length}</b><span>未闭合证据缺口</span></div>
+    </div>
+    <div class="d-sec-title">逐轮评审与具体评分</div>
+    <div class="detail-list">${versionBlocks}</div>
+    ${independentScores}
+    ${routing.length ? `<details class="detail-card"><summary>查看评审后的迭代路由（${routing.length} 条）</summary><div class="detail-card-body"><pre>${pretty(routing)}</pre></div></details>` : ""}`;
+}
+
+const GRAPH_TYPE_META = {
+  source:{zh:"论文",color:"#e0a458"}, evidence:{zh:"证据",color:"#43b7a0"},
+  entity:{zh:"实体",color:"#8ea0bd"}, claim:{zh:"论断",color:"#c9a84c"}
+};
+const GRAPH_REL_META = {
+  involves:{zh:"涉及",color:"#77808f",dash:false}, supports:{zh:"支持",color:"#6fbf8b",dash:false},
+  contradicts:{zh:"反驳",color:"#e05c5c",dash:true}, extends:{zh:"扩展",color:"#c9a84c",dash:false},
+  same_as:{zh:"等同",color:"#5fb3d9",dash:true}, refines:{zh:"细化",color:"#a583d6",dash:true},
+  limits:{zh:"限定",color:"#e0a458",dash:true}
+};
+function graphShort(value, n=46){ const s=String(value || ""); return s.length > n ? `${s.slice(0,n)}…` : s; }
+function graphPaperIds(node){
+  const ids = [...(node.paper_ids || [])];
+  const fromMeta = node.metadata?.source_paper_id;
+  if(fromMeta) ids.push(fromMeta);
+  if(node.type === "source" && String(node.id || "").startsWith("SRC_")) ids.push(String(node.id).slice(4));
+  return [...new Set(ids.filter(Boolean))];
+}
+function graphPaperList(r){ return uniqueM2Papers(m2Runs(r)); }
+function allGraphPapers(r, graph){
+  const byId = new Map(graphPaperList(r).map(p => [p.paper_id,{...p}]));
+  (graph?.nodes || []).forEach(node => {
+    const ids = graphPaperIds(node);
+    ids.forEach(id => {
+      const title = node.type === "source" ? node.label : node.metadata?.source_paper_title;
+      if(!byId.has(id)) byId.set(id,{paper_id:id,title:title || id,sources:[]});
+      else if(title && !byId.get(id).title) byId.get(id).title = title;
+    });
+  });
+  return [...byId.values()];
+}
+function setGraphSide(title, html){ $("graphSideTitle").textContent = title; $("graphSideBody").innerHTML = html; }
+function entityMergeAuditHtml(graph){
+  const records = graph?.entity_merge_log || [];
+  if(!records.length){
+    return `<div class="graph-section">实体合并记录</div><div class="graph-guide">本轮未发生实体合并。</div>`;
+  }
+  return `<div class="graph-section">实体合并记录（${records.length} 组）</div>` + records.map(record => {
+    const members = record.members || [];
+    const memberRows = members.map(member => {
+      const score = Number(member.similarity_to_canonical);
+      const scoreText = Number.isFinite(score) ? score.toFixed(3) : "—";
+      return `<div class="graph-kv"><div class="k">合并前 · ${esc(member.node_id || "")}</div><div class="v">${esc(member.name || "未命名实体")} · 相似度 ${scoreText}</div></div>`;
+    }).join("");
+    return `<div class="graph-item" style="cursor:default;border-left-color:#8b5cf6">
+      <div><b>合并后：${esc(record.canonical_name || record.canonical_node_id || "未命名实体")}</b></div>
+      <div class="meta">${esc(record.canonical_node_id || "")} · ${esc(record.method || "unknown")} · 阈值 ${esc(record.threshold ?? "—")}</div>
+      ${memberRows}
+      <div class="meta">继承/重定向边 ${esc(record.redirected_edge_count ?? 0)} · 重复边合并 ${esc(record.deduplicated_edge_count ?? 0)} · 自环删除 ${esc(record.removed_self_loop_count ?? 0)}</div>
+    </div>`;
+  }).join("");
+}
+function graphGuideHtml(graph, papers){
+  const evidence = (graph.nodes || []).filter(n => n.type === "evidence");
+  const entities = (graph.nodes || []).filter(n => n.type === "entity");
+  const sources = (graph.nodes || []).filter(n => n.type === "source");
+  return `<div class="graph-guide">这张图是 M3 实际生成的证据结构：<b>${sources.length} 个论文节点</b>、<b>${evidence.length} 个证据节点</b>、<b>${entities.length} 个实体节点</b>和 <b>${(graph.edges || []).length} 条关系</b>。点击节点或边查看完整内容。</div>
+    <div class="graph-section">核心证据</div>
+    ${evidence.map(n => `<div class="graph-item" data-graph-node="${esc(n.id)}"><div>${esc(n.label || n.id)}</div><div class="meta">${esc(n.metadata?.entry_type || "evidence")} · ${esc(n.metadata?.confidence || "置信度未标注")}</div></div>`).join("") || `<div class="graph-guide">暂无证据节点</div>`}
+    <div class="graph-section">论文来源</div>
+    ${papers.map(p => { const nodeId = (graph.nodes || []).find(n => n.type === "source" && graphPaperIds(n).includes(p.paper_id))?.id || ""; return `<div class="graph-item source" ${nodeId ? `data-graph-node="${esc(nodeId)}"` : ""}><div>${esc(p.title || p.paper_id)}</div><div class="meta">${esc(p.year || "")} · ${esc((p.sources || []).map(x => SOURCE_LABELS[x] || x).join(" / "))}</div></div>`; }).join("")}
+    <div class="graph-section">图谱桶</div>
+    <div class="graph-guide">已证实事实：<b>${(graph.established_facts || []).length}</b><br>冲突：<b>${(graph.conflicts || []).length}</b><br>知识缺口：<b>${(graph.knowledge_gaps || []).length}</b></div>
+    ${entityMergeAuditHtml(graph)}`;
+}
+function graphNodeDetails(node){
+  const meta = node.metadata || {};
+  const type = GRAPH_TYPE_META[node.type] || {zh:node.type || "节点",color:"#8ea0bd"};
+  const related = (graphData?.edges || []).filter(e => e.source === node.id || e.target === node.id);
+  const paperIds = graphPaperIds(node);
+  const papers = paperIds.map(id => graphPapersById[id]).filter(Boolean);
+  return `<span class="graph-badge" style="background:${type.color}">${esc(type.zh)}</span>
+    <div class="graph-detail-title">${esc(node.label || node.id)}</div>
+    ${meta.entry_type ? `<div class="graph-kv"><div class="k">知识类型</div><div class="v">${esc(meta.entry_type)}</div></div>` : ""}
+    ${meta.confidence ? `<div class="graph-kv"><div class="k">置信度</div><div class="v">${esc(meta.confidence)}</div></div>` : ""}
+    ${(meta.entities || []).length ? `<div class="graph-kv"><div class="k">关联实体</div><div class="v">${meta.entities.map(esc).join("、")}</div></div>` : ""}
+    ${(meta.evidence_ids || []).length ? `<div class="graph-kv"><div class="k">Evidence IDs</div><div class="v">${meta.evidence_ids.map(esc).join("<br>")}</div></div>` : ""}
+    ${papers.map(p => `<div class="graph-kv"><div class="k">来源论文</div><div class="v">${esc(p.title || p.paper_id)}</div>${p.abstract ? `<details><summary>查看摘要</summary><div class="v" style="margin-top:5px">${esc(p.abstract)}</div></details>` : ""}</div>`).join("")}
+    ${!papers.length && (meta.source_paper_title || meta.source_paper_id) ? `<div class="graph-kv"><div class="k">来源论文</div><div class="v">${esc(meta.source_paper_title || meta.source_paper_id)}</div></div>` : ""}
+    ${related.length ? `<div class="graph-kv"><div class="k">关联关系（${related.length}）</div>${related.map(edge => { const otherId = edge.source === node.id ? edge.target : edge.source; const other = (graphData.nodes || []).find(n => n.id === otherId); const rel = GRAPH_REL_META[edge.relation] || {zh:edge.relation}; return `<div class="graph-related" data-graph-node="${esc(otherId)}">${esc(rel.zh)} → ${esc(graphShort(other?.label || otherId,55))}</div>`; }).join("")}</div>` : ""}
+    <details><summary>原始节点数据</summary><pre class="graph-raw">${pretty(node)}</pre></details>`;
+}
+function graphEdgeDetails(edge){
+  const rel = GRAPH_REL_META[edge.relation] || {zh:edge.relation,color:"#77808f"};
+  const source = (graphData?.nodes || []).find(n => n.id === edge.source);
+  const target = (graphData?.nodes || []).find(n => n.id === edge.target);
+  return `<span class="graph-badge" style="background:${rel.color}">${esc(rel.zh || edge.relation)}</span>
+    <div class="graph-detail-title">${esc(source?.label || edge.source)}<br><span style="color:${rel.color}">↓ ${esc(rel.zh || edge.relation)}</span><br>${esc(target?.label || edge.target)}</div>
+    ${edge.rationale ? `<div class="graph-kv"><div class="k">关系理由</div><div class="v">${esc(edge.rationale)}</div></div>` : ""}
+    ${edge.confidence != null ? `<div class="graph-kv"><div class="k">置信度</div><div class="v">${esc(edge.confidence)}</div></div>` : ""}
+    ${(edge.evidence_ids || []).length ? `<div class="graph-kv"><div class="k">Evidence IDs</div><div class="v">${edge.evidence_ids.map(esc).join("<br>")}</div></div>` : ""}
+    <details><summary>原始关系数据</summary><pre class="graph-raw">${pretty(edge)}</pre></details>`;
+}
+function closeGraphView(){
+  if(graphCy){ graphCy.destroy(); graphCy = null; }
+  $("graphOverlay").classList.remove("open");
+  $("graphOverlay").setAttribute("aria-hidden","true");
+  document.body.style.overflow = "";
+}
+function focusGraphNode(id){
+  if(!graphCy) return;
+  const node = graphCy.getElementById(id);
+  if(!node || node.empty()) return;
+  graphCy.elements().removeClass("graph-hl graph-fade");
+  const hood = node.closedNeighborhood();
+  graphCy.elements().not(hood).addClass("graph-fade");
+  node.addClass("graph-hl");
+  graphCy.animate({center:{eles:node},zoom:Math.max(graphCy.zoom(),1.05)},{duration:300});
+}
+function renderGraphView(r){
+  const graph = r?.evidence_graph;
+  graphData = graph || {nodes:[],edges:[]};
+  const m2Papers = graphPaperList(r);
+  const papers = allGraphPapers(r, graphData);
+  graphPapersById = Object.fromEntries(papers.map(p => [p.paper_id,p]));
+  $("graphTitle").textContent = `M3 证据图谱 · v${graph?.version || 1}`;
+  $("graphQuestion").textContent = r?.question || r?.problem_card?.original_question || "";
+  const nodes = graphData.nodes || [], edges = graphData.edges || [];
+  const typeCounts = {}; nodes.forEach(n => typeCounts[n.type] = (typeCounts[n.type] || 0) + 1);
+  $("graphStats").innerHTML = [
+    [m2Papers.length,"篇 M2 导出论文"],[typeCounts.source || 0,"个图谱论文节点"],[nodes.length,"个节点"],[edges.length,"条关系"],
+    [typeCounts.evidence || 0,"条证据"],[typeCounts.entity || 0,"个实体"],[(graphData.knowledge_gaps || []).length,"个知识缺口"]
+  ].map(([v,k]) => `<div class="graph-stat"><b>${v}</b><span>${k}</span></div>`).join("");
+  const presentTypes = Object.keys(GRAPH_TYPE_META).filter(t => nodes.some(n => n.type === t));
+  $("graphLegend").innerHTML = presentTypes.map(t => `<span class="graph-legend-item"><i class="graph-dot" style="background:${GRAPH_TYPE_META[t].color}"></i>${GRAPH_TYPE_META[t].zh}</span>`).join("") +
+    Object.entries(GRAPH_REL_META).filter(([rel]) => edges.some(e => e.relation === rel)).map(([rel,m]) => `<span class="graph-legend-item"><i class="graph-line" style="border-color:${m.color};${m.dash ? "border-top-style:dashed" : ""}"></i>${m.zh}</span>`).join("") +
+    `<span class="graph-tip">单击查看详情 · 滚轮缩放 · 拖拽平移</span>`;
+  const filter = $("graphPaperFilter");
+  filter.innerHTML = `<option value="">全部论文</option>` + papers.map(p => `<option value="${esc(p.paper_id)}">${esc(graphShort(p.title || p.paper_id,48))}</option>`).join("");
+  $("graphTypeToggles").innerHTML = presentTypes.map(t => `<button class="graph-toggle" type="button" data-graph-type="${t}"><i style="background:${GRAPH_TYPE_META[t].color}"></i>${GRAPH_TYPE_META[t].zh}</button>`).join("");
+  setGraphSide("图谱导读", graphGuideHtml(graphData,papers));
+  if(!nodes.length){
+    $("graphCanvas").style.display="none"; $("graphFallback").style.display="block";
+    $("graphFallback").innerHTML="M3 尚未生成知识图谱，或当前最新快照还停留在 M2。"; return;
+  }
+  if(typeof cytoscape === "undefined"){
+    $("graphCanvas").style.display="none"; $("graphFallback").style.display="block";
+    $("graphFallback").innerHTML=`图谱库加载失败，先以列表展示：<br><br>${nodes.map(n => `<b>${esc(n.type)}</b> · ${esc(n.label || n.id)}<br>`).join("")}`; return;
+  }
+  $("graphFallback").style.display="none"; $("graphCanvas").style.display="block";
+  const degree = {}; edges.forEach(e => { degree[e.source]=(degree[e.source]||0)+1; degree[e.target]=(degree[e.target]||0)+1; });
+  const elements = [
+    ...nodes.map(n => ({data:{...n,nodeType:n.type,paperIds:graphPaperIds(n),color:(GRAPH_TYPE_META[n.type]||{color:"#8ea0bd"}).color,size:(n.type === "source" ? 34 : n.type === "evidence" ? 22 : 13) + Math.min(18,(degree[n.id]||0)*1.4),shortLabel:n.type === "source" ? graphShort(n.label,34) : n.type === "evidence" ? graphShort(n.label,48) : graphShort(n.label,30)}})),
+    ...edges.map((e,i) => { const m=GRAPH_REL_META[e.relation]||{zh:e.relation,color:"#77808f",dash:false}; return {data:{id:`graph-edge-${i}`,...e,relLabel:m.zh,color:m.color},classes:m.dash?"graph-dashed":""}; })
+  ];
+  if(graphCy) graphCy.destroy();
+  graphCy = cytoscape({container:$("graphCanvas"),elements,wheelSensitivity:.25,style:[
+    {selector:"node",style:{"background-color":"data(color)","border-width":2,"border-color":"#0e1116","label":"data(shortLabel)","color":"#c6cedb","font-size":10,"font-family":"PingFang SC, Microsoft YaHei, sans-serif","text-wrap":"wrap","text-max-width":"120px","text-valign":"bottom","text-margin-y":6,"text-outline-color":"#0e1116","text-outline-width":1.4,"width":"data(size)","height":"data(size)"}},
+    {selector:'node[nodeType = "source"]',style:{"shape":"round-rectangle","text-valign":"center","text-halign":"right","font-size":10.5,"font-weight":"bold","text-max-width":"180px"}},
+    {selector:"edge",style:{"line-color":"data(color)","target-arrow-color":"data(color)","target-arrow-shape":"triangle","curve-style":"bezier","width":1.5,"arrow-scale":1,"label":"data(relLabel)","font-size":8.5,"color":"#77839a","text-background-color":"#0e1116","text-background-opacity":.7,"text-background-padding":2,"text-rotation":"autorotate"}},
+    {selector:"edge.graph-dashed",style:{"line-style":"dashed"}},
+    {selector:".graph-hl",style:{"border-color":"#e0a458","border-width":3.5}},
+    {selector:".graph-fade",style:{"opacity":.12}},{selector:"edge.graph-fade",style:{"opacity":.05}}
+  ]});
+  const layoutOptions={name:"cose",animate:false,nodeRepulsion:500000,idealEdgeLength:95,edgeElasticity:220,gravity:.23,padding:50,randomize:true};
+  graphCy.layout(layoutOptions).run();
+  setTimeout(() => { if(graphCy){ graphCy.resize(); graphCy.fit(undefined,55); } },80);
+  graphCy.on("tap","node",ev => { const n=ev.target.data(); focusGraphNode(n.id); setGraphSide(`${GRAPH_TYPE_META[n.nodeType]?.zh || "节点"}详情`,graphNodeDetails(n)); });
+  graphCy.on("tap","edge",ev => { const edge=ev.target.data(); graphCy.elements().removeClass("graph-hl graph-fade"); ev.target.addClass("graph-hl"); setGraphSide("关系详情",graphEdgeDetails(edge)); });
+  graphCy.on("tap",ev => { if(ev.target === graphCy){ graphCy.elements().removeClass("graph-hl graph-fade"); setGraphSide("图谱导读",graphGuideHtml(graphData,papers)); } });
+  const hiddenTypes = new Set();
+  function applyGraphFilter(){
+    if(!graphCy) return;
+    const keyword=$("graphSearch").value.trim().toLowerCase(), paperId=$("graphPaperFilter").value;
+    graphCy.elements().removeClass("graph-hl graph-fade");
+    graphCy.nodes().forEach(n => n.style("display", hiddenTypes.has(n.data("nodeType")) ? "none" : "element"));
+    if(!keyword && !paperId){ $("graphFilterInfo").textContent=""; return; }
+    const hits=graphCy.nodes().filter(n => !hiddenTypes.has(n.data("nodeType")) && (!keyword || String(n.data("label")||"").toLowerCase().includes(keyword) || String(n.id()).toLowerCase().includes(keyword) || JSON.stringify(n.data("metadata")||{}).toLowerCase().includes(keyword)) && (!paperId || (n.data("paperIds")||[]).includes(paperId)));
+    graphCy.elements().addClass("graph-fade"); hits.removeClass("graph-fade").addClass("graph-hl"); hits.connectedEdges().removeClass("graph-fade"); hits.connectedEdges().connectedNodes().removeClass("graph-fade");
+    $("graphFilterInfo").textContent=`高亮 ${hits.length} 个节点`;
+  }
+  $("graphSearch").value=""; $("graphSearch").oninput=applyGraphFilter; filter.onchange=applyGraphFilter;
+  $("graphTypeToggles").querySelectorAll("button").forEach(button => button.onclick=()=>{ const t=button.dataset.graphType; button.classList.toggle("off"); if(button.classList.contains("off")) hiddenTypes.add(t); else hiddenTypes.delete(t); applyGraphFilter(); });
+  $("graphReset").onclick=()=>{ $("graphSearch").value=""; filter.value=""; hiddenTypes.clear(); $("graphTypeToggles").querySelectorAll("button").forEach(b=>b.classList.remove("off")); graphCy.elements().style("display","element").removeClass("graph-hl graph-fade"); graphCy.layout(layoutOptions).run(); graphCy.fit(undefined,55); $("graphFilterInfo").textContent=""; setGraphSide("图谱导读",graphGuideHtml(graphData,papers)); };
+  $("graphSideBody").onclick=ev=>{ const target=ev.target.closest("[data-graph-node]"); if(!target) return; const id=target.dataset.graphNode; const node=(graphData.nodes||[]).find(n=>n.id===id); if(node){ focusGraphNode(id); setGraphSide(`${GRAPH_TYPE_META[node.type]?.zh || "节点"}详情`,graphNodeDetails(node)); } };
+}
+async function openGraphView(){
+  closeDrawer();
+  $("graphOverlay").classList.add("open");
+  $("graphOverlay").setAttribute("aria-hidden","false");
+  document.body.style.overflow="hidden";
+  $("graphStats").innerHTML=`<div class="graph-stat"><span>正在读取最新 M3 快照…</span></div>`;
+  $("graphCanvas").innerHTML="";
+  setGraphSide("图谱导读","正在读取证据图谱…");
+  const latest = await fetchLatestState();
+  renderGraphView(latest);
+}
 function renderPlanBody(v, label){
   const body = $("planBody");
   const isFinal = resultData && versionsData.length > 0 && v === versionsData[versionsData.length - 1];
@@ -1399,17 +2063,27 @@ async function finishRun(){
 }
 
 /* ---------- 抽屉 ---------- */
-function openDrawer(segIdx, mId){
+async function openDrawer(segIdx, mId){
   if(!currentRun) return;
+  if(mId === "m3"){
+    await openGraphView();
+    return;
+  }
   drawerSeg = Number.isInteger(segIdx) ? segIdx : 0;
   drawerModule = mId;
+  $("drawer").classList.toggle("wide", STRUCTURED_DRAWER_MODULES.has(mId));
   renderDrawer();
   $("drawer").classList.add("open");
   $("drawerMask").classList.add("open");
+  if(STRUCTURED_DRAWER_MODULES.has(mId)){
+    await fetchLatestState();
+    if(drawerModule === mId) renderDrawer();
+  }
 }
 function closeDrawer(){
   drawerModule = null;
   $("drawer").classList.remove("open");
+  $("drawer").classList.remove("wide");
   $("drawerMask").classList.remove("open");
 }
 function renderDrawer(){
@@ -1475,8 +2149,24 @@ function renderDrawer(){
   const outputHtml = completed
     ? `<div class="output-box"><details open><summary>输出摘要</summary><pre>${pretty(completed.details)}</pre></details></div>`
     : `<div class="output-box" style="color:var(--ink3)">${st.status === "running" ? "模块运行中，输出将在完成后生成…" : "模块尚未完成，暂无历史输出"}</div>`;
+  const latest = resultData ? {...(stateData || {}), ...resultData} : stateData;
+  if(STRUCTURED_DRAWER_MODULES.has(drawerModule)){
+    const structuredRenderers = {
+      m1:m1DetailsHtml,
+      m2:m2DetailsHtml,
+      m4:m4DetailsHtml,
+      m5:m5DetailsHtml,
+      m6:m6DetailsHtml,
+    };
+    const structured = structuredRenderers[drawerModule](latest);
+    $("drawerBody").innerHTML = `
+      ${structured}
+      <div class="d-sec-title">执行记录</div>
+      <details class="detail-card"><summary>查看当前执行段日志（${logs.length} 条）</summary><div class="detail-card-body"><div class="log-box" id="drawerLogs">${logsHtml}</div></div></details>
+      ${moduleSnapshotHtml(drawerModule, latest)}`;
+    return;
+  }
   $("drawerBody").innerHTML = `
-    ${sourceStatsHtml}
     <div class="d-sec-title">实时日志（${logs.length} 条）</div>
     <div class="log-box" id="drawerLogs">${logsHtml}</div>
     <div class="d-sec-title">历史输出</div>
@@ -2127,16 +2817,19 @@ document.addEventListener("click", ev => {
   if(menu.contains(ev.target) || ev.target.closest(".h-menu-btn")) return;
   closeItemMenu();
 });
-document.addEventListener("keydown", ev => {
-  if(ev.key === "Escape") closeItemMenu();
-});
+$("graphClose").addEventListener("click", closeGraphView);
 // 管线格子点击（事件委托）：按 data-seg + data-module 打开对应段的详情抽屉。
 $("pipelineGrid").addEventListener("click", ev => {
   const node = ev.target.closest(".node");
   if(!node || !node.dataset.module) return;
   openDrawer(Number(node.dataset.seg || 0), node.dataset.module);
 });
-document.addEventListener("keydown", e => { if(e.key === "Escape") closeDrawer(); });
+document.addEventListener("keydown", e => {
+  if(e.key !== "Escape") return;
+  closeItemMenu();
+  if($("graphOverlay").classList.contains("open")) closeGraphView();
+  else closeDrawer();
+});
 // 侧栏展开/收起：桌面折叠（宽度 0）+ 窄屏滑出，状态持久化。
 try{
   if(localStorage.getItem("hypoforge_sidebar") === "collapsed" && window.innerWidth > 860){

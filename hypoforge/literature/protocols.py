@@ -30,8 +30,20 @@ class QueryPlannerProtocol(ABC):
         domains: Sequence[str] = (),
         question_type: str = "",
         state: SearchState | None = None,
+        supplement_entities: Sequence[str] = (),
+        focus_entities: Sequence[str] = (),
     ) -> List[SearchQuery]:
-        """Create source-aware queries with explicit search intents."""
+        """Create source-aware queries with explicit search intents.
+
+        ``supplement_entities`` carries optional M2-local search concepts
+        generated for this sub-question; they must only influence query
+        construction and never leave the M2 search data flow.
+
+        ``focus_entities`` carries the current round's mandatory concepts
+        assigned by the entity-group round strategy; queries for this round
+        must be built around all of them.  Planners that predate this
+        parameter may ignore it.
+        """
         ...
 
 

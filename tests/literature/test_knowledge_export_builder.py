@@ -143,6 +143,8 @@ def test_builder_exports_papers_evidence_knowledge_and_search_provenance() -> No
         "document_source_uri": "https://example.test/fulltext/1",
         "document_license": "CC BY 4.0",
         "degraded_to_abstract": False,
+        "fulltext_failure_category": "",
+        "fulltext_failure_detail": "",
         "chunks_parsed": 8,
         "chunks_retrieved": 1,
         "stage_elapsed_seconds": {"parse": 0.1},
@@ -424,3 +426,62 @@ def test_builder_rejects_reading_evidence_from_a_different_paper() -> None:
         match="reading result for paper ID: PMID:1 contains evidence.*PMID:2",
     ):
         build_m2_knowledge_export_run("question", search, [reading])
+
+
+def test_builder_exports_fulltext_failure_attribution() -> None:
+    search = SearchRunResult(
+        sub_question="question",
+        final_papers=[make_paper("PMID:9", "Blocked paper")],
+    )
+    reading = PaperReadingResult(
+        paper_id="PMID:9",
+        content_level=ContentLevel.ABSTRACT,
+        degraded_to_abstract=True,
+        fulltext_failure_category="publisher_blocked",
+        fulltext_failure_detail="HTTP 403：出版商反爬拦截，拒绝下载 https://mdpi.test/a.pdf",
+        errors=["HTTP Error 403: Forbidden"],
+    )
+
+    run = build_m2_knowledge_export_run("question", search, [reading])
+
+    exported = run.papers[0]
+    assert exported.fulltext_status == "abstract_only"
+    assert exported.fulltext_failure_category == "publisher_blocked"
+    assert "HTTP 403" in exported.fulltext_failure_detail
+    assert "mdpi.test" in exported.fulltext_failure_detail
+
+
+def test_builder_clears_failure_attribution_for_downloaded_fulltext() -> None:
+    search = SearchRunResult(
+        sub_question="question",
+        final_papers=[make_paper("PMID:10", "Full text paper")],
+    )
+    reading = PaperReadingResult(
+        paper_id="PMID:10",
+        content_level=ContentLevel.STRUCTURED_FULLTEXT,
+        # Stale attribution must never survive a successful retrieval.
+        fulltext_failure_category="other",
+        fulltext_failure_detail="stale",
+    )
+
+    run = build_m2_knowledge_export_run("question", search, [reading])
+
+    exported = run.papers[0]
+    assert exported.fulltext_status == "downloaded"
+    assert exported.fulltext_failure_category == ""
+    assert exported.fulltext_failure_detail == ""
+
+
+def test_builder_defaults_failure_attribution_to_empty_strings() -> None:
+    search = SearchRunResult(
+        sub_question="question",
+        final_papers=[make_paper("PMID:11", "Legacy compatible")],
+    )
+
+    run = build_m2_knowledge_export_run(
+        "question", search, [make_reading("PMID:11")]
+    )
+
+    exported = run.papers[0]
+    assert exported.fulltext_failure_category == ""
+    assert exported.fulltext_failure_detail == ""

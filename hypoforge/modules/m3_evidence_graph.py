@@ -38,8 +38,10 @@ from ..memory.hypoforge_types import GapGain, stable_entry_id
 from ..protocol import ModuleProtocol
 from ..entity_normalization import (
     EntityNormalizationService,
+    _embed_raw,
     clean_entity_surface,
 )
+from ..entity_graph_merge import EmbedTexts, EntityGraphMerger
 from ..observability import emit_event
 from ..prompts.m3_prompts import (
     M3_BATCH_RELATION_SYSTEM_PROMPT,
@@ -243,6 +245,9 @@ class M3EvidenceGraph(ModuleProtocol):
         enable_cross_batch: bool = True,
         bridge_batch_size: int = 10,
         entity_embedding_model: str = "",
+        entity_merge_enabled: bool = True,
+        entity_merge_similarity_threshold: float = 0.92,
+        entity_merge_embedding_backend: Optional[EmbedTexts] = None,
         # ---- grounding settings ----
         grounding_enabled: bool = False,
         grounding_mode: str = "rule",
@@ -281,6 +286,11 @@ class M3EvidenceGraph(ModuleProtocol):
         self.entity_embedding_model = (
             entity_embedding_model or grounding_embedding_model
         )
+        self.entity_merge_enabled = bool(entity_merge_enabled)
+        self.entity_merge_similarity_threshold = float(
+            entity_merge_similarity_threshold
+        )
+        self.entity_merge_embedding_backend = entity_merge_embedding_backend
 
         # Gap confirmation: how many no-improvement rounds before a
         # pending_grounding gap is declared unimprovable.
@@ -349,6 +359,9 @@ class M3EvidenceGraph(ModuleProtocol):
             namespace=namespace,
             client=self.client,
             embedding_model=self.entity_embedding_model,
+            # Per-run cache isolation: share the run_id stamp fixed at run
+            # start so M2/M3 within one run use the same cache file.
+            run_stamp=state.run_id,
         )
         # Compatibility vocabularies are explicit inputs to the public service;
         # the current task contract is registered last and is authoritative.
@@ -397,22 +410,10 @@ class M3EvidenceGraph(ModuleProtocol):
                     "are available.  M2 must produce at least one "
                     "knowledge entry before M3 can proceed."
                 )
-            correction_updates = [
-                request.model_copy(deep=True)
-                for request in state.graph_correction_requests
-            ]
-            if any(request.status == "pending" for request in correction_updates):
-                graph, correction_updates = self._apply_graph_corrections(
-                    graph,
-                    correction_updates,
-                    iteration=state.iteration_count,
-                )
-            result: Dict[str, Any] = {"evidence_graph": graph}
-            if indexed_gap_requests != state.evidence_gap_requests:
-                result["evidence_gap_requests"] = indexed_gap_requests
-            if correction_updates != state.graph_correction_requests:
-                result["graph_correction_requests"] = correction_updates
-            return result
+            # Continue through the shared correction → grounding → gap
+            # confirmation → entity merge → persistence path below.  A
+            # checkpoint-resume round can have no new KnowledgeEntry objects
+            # while still carrying new M2 evidence that must be grounded.
 
         # --- Step 1: rule-based graph construction (with incremental update) ---
         rule_started_at = time.monotonic()
@@ -589,6 +590,10 @@ class M3EvidenceGraph(ModuleProtocol):
         if state.evidence_gaps:
             result["metrics"] = {**state.metrics, "m3_gap_gain": gap_gain}
 
+        # --- Step 6: final-graph entity similarity merge ---
+        graph = await self._merge_final_entities(graph, state)
+        result["evidence_graph"] = graph
+
         # --- persist to disk (merge semantics) + lossless round snapshot ---
         if getattr(state, "memory_cache_dir", ""):
             self._persist_graph(graph, state.memory_cache_dir)
@@ -600,6 +605,105 @@ class M3EvidenceGraph(ModuleProtocol):
             result["evidence_gap_requests"] = indexed_gap_requests
 
         return result
+
+    async def _merge_final_entities(
+        self,
+        graph: EvidenceGraph,
+        state: PipelineState,
+    ) -> EvidenceGraph:
+        """Apply the auditable final-graph entity merge without failing M3."""
+        if not self.entity_merge_enabled:
+            return graph
+
+        entity_count = sum(
+            1 for node in graph.nodes if node.type == EvidenceNodeType.ENTITY
+        )
+        started_at = time.monotonic()
+        emit_event(
+            "entity_merge_started",
+            module="m3",
+            tool="entity_similarity_merger",
+            status="running",
+            message=(
+                f"开始检查 {entity_count} 个实体节点，"
+                f"合并阈值 {self.entity_merge_similarity_threshold:.2f}"
+            ),
+            details={
+                "entity_count": entity_count,
+                "threshold": self.entity_merge_similarity_threshold,
+                "embedding_model": self.entity_embedding_model,
+            },
+        )
+        task_entity_names: list[str] = []
+        if state.problem_card:
+            task_entity_names = [
+                entity.name
+                for entity in state.problem_card.task_contract.entities
+                if entity.name.strip()
+            ]
+            if not task_entity_names:
+                task_entity_names = list(state.problem_card.key_entities)
+
+        embedding_backend = (
+            self.entity_merge_embedding_backend or self._embed_final_entity_names
+        )
+        outcome = await EntityGraphMerger(
+            threshold=self.entity_merge_similarity_threshold,
+            embedding_model=self.entity_embedding_model,
+            embed_texts=embedding_backend,
+        ).merge(
+            graph,
+            task_entity_names=task_entity_names,
+            round_index=state.iteration_count,
+        )
+        elapsed = time.monotonic() - started_at
+        if outcome.degraded_reason:
+            emit_event(
+                "entity_merge_degraded",
+                module="m3",
+                tool="entity_similarity_merger",
+                status="degraded",
+                message=(
+                    "实体 embedding 不可用，已仅执行完全同名合并："
+                    f"{outcome.degraded_reason}"
+                ),
+                elapsed_seconds=elapsed,
+                details={"reason": outcome.degraded_reason},
+            )
+        emit_event(
+            "entity_merge_completed",
+            module="m3",
+            tool="entity_similarity_merger",
+            status="completed",
+            message=(
+                f"实体合并完成：{outcome.entity_count_before} → "
+                f"{outcome.entity_count_after}，共 {outcome.merge_count} 组"
+            ),
+            elapsed_seconds=elapsed,
+            details={
+                "merge_count": outcome.merge_count,
+                "entity_count_before": outcome.entity_count_before,
+                "entity_count_after": outcome.entity_count_after,
+                "redirected_edge_count": outcome.redirected_edge_count,
+                "deduplicated_edge_count": outcome.deduplicated_edge_count,
+                "removed_self_loop_count": outcome.removed_self_loop_count,
+                "degraded": bool(outcome.degraded_reason),
+            },
+        )
+        return outcome.graph
+
+    async def _embed_final_entity_names(
+        self,
+        texts: list[str],
+        model: str,
+    ) -> list[list[float]]:
+        """Reuse the configured Qwen-compatible embedding transport."""
+        return await _embed_raw(
+            model=model,
+            inputs=texts,
+            base_url=self.client.api_base if self.client else "",
+            api_key=self.client.api_key if self.client else "",
+        )
 
     # ------------------------------------------------------------------
     # Incremental update helpers
@@ -625,7 +729,18 @@ class M3EvidenceGraph(ModuleProtocol):
             entry_id = (node.metadata or {}).get("entry_id", "")
             if entry_id:
                 existing_entry_ids.add(entry_id)
-        return [e for e in all_entries if e.id not in existing_entry_ids]
+            entry_ids = (node.metadata or {}).get("entry_ids", [])
+            if isinstance(entry_ids, str):
+                entry_ids = [entry_ids]
+            existing_entry_ids.update(
+                str(item) for item in entry_ids if str(item or "").strip()
+            )
+        return [
+            entry
+            for entry in all_entries
+            if (entry.id or stable_entry_id(entry.content, entry.source_paper_id))
+            not in existing_entry_ids
+        ]
 
     @staticmethod
     def _merge_graphs(base: EvidenceGraph, additions: EvidenceGraph) -> EvidenceGraph:

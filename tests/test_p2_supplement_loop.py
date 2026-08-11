@@ -45,6 +45,7 @@ from hypoforge.state import (
     PipelineState,
     ProblemCard,
     ResearchPlan,
+    ReviewResult,
     RoutingDecision,
     SearchLedger,
     make_gap_id,
@@ -52,6 +53,32 @@ from hypoforge.state import (
 
 
 SUB_QUESTION = "What is the Hsp70 mechanism?"
+
+
+def test_review_result_accepts_multiple_suggestion_strings() -> None:
+    review = ReviewResult.model_validate({
+        "dimension": "scientific_logic",
+        "score": 3.0,
+        "suggestions": ["Clarify the strategy.", "Add an error analysis."],
+    })
+
+    assert review.suggestions == "Clarify the strategy.\nAdd an error analysis."
+
+
+def test_review_result_accepts_multiple_reasoning_strings() -> None:
+    review = ReviewResult.model_validate({
+        "dimension": "scientific_logic",
+        "score": 4.0,
+        "reasoning": [
+            "- **Task fit**: The hypothesis addresses the stated object.",
+            "- **Testability**: The proposed claims can be measured.",
+        ],
+    })
+
+    assert review.reasoning == (
+        "- **Task fit**: The hypothesis addresses the stated object.\n"
+        "- **Testability**: The proposed claims can be measured."
+    )
 
 
 # ---------------------------------------------------------------------------

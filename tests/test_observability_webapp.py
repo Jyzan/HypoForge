@@ -76,6 +76,38 @@ def test_run_manager_reads_persisted_result_and_artifacts(tmp_path: Path) -> Non
     assert f"{run_id}_scores.json" in names
 
 
+def test_latest_state_falls_back_to_checkpoint_for_failed_run(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("enabled_modules: [m1]\n", encoding="utf-8")
+    manager = RunManager(config_path=config_path, output_root=tmp_path / "runs")
+    run_id = "ui-partial"
+    run_dir = tmp_path / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "manifest.json").write_text(
+        json.dumps({"run_id": run_id, "status": "failed"}), encoding="utf-8"
+    )
+    (run_dir / f"{run_id}_checkpoint.json").write_text(
+        json.dumps(
+            {
+                "input_question": "q",
+                "problem_card": {"sub_questions": ["sq1"]},
+                "evidence_graph": {"nodes": [{"id": "n1"}], "edges": []},
+                "_last_module": "m3",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert manager.result(run_id) is None
+    state = manager.latest_state(run_id)
+    assert state is not None
+    assert state["problem_card"]["sub_questions"] == ["sq1"]
+    assert state["evidence_graph"]["nodes"] == [{"id": "n1"}]
+    assert state["last_module"] == "m3"
+    assert state["is_final"] is False
+    assert state["snapshot_source"] == f"{run_id}_checkpoint.json"
+
+
 def test_run_credentials_are_memory_only_and_applied_per_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -190,6 +222,11 @@ def test_web_ui_preserves_open_event_details_and_has_ephemeral_key_fields() -> N
     assert 'id="openalexApiKey" type="password"' in html
     assert "openSequences" in html
     assert "data-event-sequence" in html
+    assert 'id="graphOverlay"' in html
+    assert "m1DetailsHtml" in html
+    assert "m2DetailsHtml" in html
+    assert "openGraphView" in html
+    assert "/state`" in html
 
 
 class DeferredThread:
@@ -804,6 +841,13 @@ def test_http_endpoints_rounds_versions_and_followup_error(
         assert set(rounds_payload) == {"routing_history", "search_round"}
         assert len(rounds_payload["routing_history"]) == 3
         assert rounds_payload["search_round"] == 1
+
+        conn.request("GET", "/api/runs/ui-http/state")
+        response = conn.getresponse()
+        assert response.status == 200
+        state_payload = json.loads(response.read())["state"]
+        assert state_payload["question"] == "q"
+        assert state_payload["is_final"] is True
 
         conn.request("GET", "/api/runs/ui-http/versions")
         response = conn.getresponse()

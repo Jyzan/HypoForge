@@ -216,7 +216,43 @@ async def test_agent_returns_complete_result_when_first_round_is_sufficient() ->
 
 
 @pytest.mark.asyncio
+async def test_agent_drops_paper_when_scout_returns_no_note_for_it() -> None:
+    class PartialScout(FakeScoutReader):
+        async def read(self, sub_question, papers):
+            self.calls.append([item.paper_id for item in papers])
+            first = papers[0]
+            return [ScoutNote(
+                paper_id=first.paper_id,
+                key_terms=["usable"],
+                relevance_to_question=0.8,
+            )]
+
+    planner = FakePlanner([[query("q-1", "query one", "pubmed")]])
+    source = FakeSource("pubmed", {
+        "query one": [paper("paper-kept", "pubmed"), paper("paper-skipped", "pubmed")],
+    })
+    agent = IterativeSearchAgent(
+        query_planner=planner,
+        sources=[source],
+        deduplicator=FakeDeduplicator(),
+        ranker=FakeRanker(),
+        scout_reader=PartialScout(),
+        coverage_evaluator=FakeCoverageEvaluator([
+            CoverageReport(sufficient=True, rationale="usable paper remains")
+        ]),
+        final_k=2,
+    )
+
+    result = await agent.run("Does the mechanism hold?")
+
+    assert [item.paper_id for item in result.candidates] == ["paper-kept"]
+    assert [item.paper_id for item in result.final_papers] == ["paper-kept"]
+
+
+@pytest.mark.asyncio
 async def test_agent_uses_coverage_gap_to_plan_a_second_round() -> None:
+    """Legacy ``coverage`` strategy: coverage gaps drive a second round."""
+
     planner = FakePlanner(
         [
             [query("q-1", "core query", "pubmed")],
@@ -251,6 +287,7 @@ async def test_agent_uses_coverage_gap_to_plan_a_second_round() -> None:
     result = await agent.run(
         "Does the mechanism hold?",
         budget=SearchBudget(max_rounds=3),
+        round_strategy="coverage",
     )
 
     assert len(planner.states) == 2
@@ -259,6 +296,55 @@ async def test_agent_uses_coverage_gap_to_plan_a_second_round() -> None:
     assert [item.paper_id for item in result.candidates] == ["paper-1", "paper-2"]
     assert result.iterations == 2
     assert result.stop_reason is StopReason.COVERAGE_SATISFIED
+
+
+@pytest.mark.asyncio
+async def test_entity_group_strategy_never_lets_coverage_drive_rounds() -> None:
+    """Under ``entity_group`` an insufficient coverage report must not add
+    rounds: with no entities the plan is a single round even when the
+    (unused) coverage evaluator reports gaps."""
+
+    planner = FakePlanner(
+        [
+            [query("q-1", "core query", "pubmed")],
+            [query("q-2", "negative evidence", "pubmed")],
+        ]
+    )
+    source = FakeSource(
+        "pubmed",
+        {
+            "core query": [
+                paper(f"paper-{index}", "pubmed") for index in range(4)
+            ],
+            "negative evidence": [paper("paper-x", "pubmed")],
+        },
+    )
+    agent = IterativeSearchAgent(
+        query_planner=planner,
+        sources=[source],
+        deduplicator=FakeDeduplicator(),
+        ranker=FakeRanker(),
+        scout_reader=FakeScoutReader(),
+        coverage_evaluator=FakeCoverageEvaluator(
+            [CoverageReport(sufficient=False, missing_topics=["negative evidence"])]
+        ),
+    )
+
+    result = await agent.run(
+        "Does the mechanism hold?",
+        budget=SearchBudget(max_rounds=3),
+        round_strategy="entity_group",
+    )
+
+    assert result.iterations == 1
+    assert len(planner.states) == 1
+    assert [item.paper_id for item in result.candidates] == [
+        "paper-0",
+        "paper-1",
+        "paper-2",
+        "paper-3",
+    ]
+    assert result.stop_reason is not StopReason.COVERAGE_SATISFIED
 
 
 @pytest.mark.asyncio
@@ -379,6 +465,65 @@ async def test_agent_excludes_not_applicable_papers_from_final_k_when_possible()
     assert [item.paper_id for item in result.final_papers] == ["relevant"]
 
 
+@pytest.mark.asyncio
+async def test_agent_retains_best_context_when_no_direct_paper_exists() -> None:
+    class ContextScout(FakeScoutReader):
+        async def read(self, sub_question, papers):
+            return [
+                ScoutNote(
+                    paper_id=item.paper_id,
+                    relevance_to_question=0.1,
+                    directness_to_question=0.1,
+                )
+                for item in papers
+            ]
+
+    class RejectingJudge:
+        async def structured_chat(self, **kwargs):
+            return {
+                "rulings": [
+                    {
+                        "paper_id": "context-best",
+                        "decision": "reject",
+                        "rationale": "does not answer the complete novel question",
+                    }
+                ]
+            }
+
+    best = paper("context-best", "arxiv").model_copy(
+        update={"rank_scores": {"total": 0.9}}
+    )
+    weaker = paper("context-weaker", "openalex").model_copy(
+        update={"rank_scores": {"total": 0.2}}
+    )
+    agent = IterativeSearchAgent(
+        query_planner=FakePlanner([[query("q-1", "core", "arxiv")]]),
+        sources=[FakeSource("arxiv", {"core": [best, weaker]})],
+        deduplicator=FakeDeduplicator(),
+        ranker=FakeRanker(),
+        scout_reader=ContextScout(),
+        coverage_evaluator=FakeCoverageEvaluator(
+            [CoverageReport(sufficient=False)]
+        ),
+        retention_judge_client=RejectingJudge(),
+        final_k=1,
+    )
+
+    result = await agent.run(
+        "How can a novel model combine position and rotation prediction?",
+        budget=SearchBudget(max_rounds=1, max_queries=1),
+    )
+
+    assert [item.paper_id for item in result.final_papers] == ["context-best"]
+    retained = next(
+        item for item in result.retention_decisions
+        if item.paper_id == "context-best"
+    )
+    assert retained.decision == "retain"
+    assert "context_evidence" in retained.roles
+    assert "contextual fallback" in retained.reason
+
+
 def build_agent(
     *,
     planner: FakePlanner | None = None,
@@ -426,6 +571,9 @@ async def test_one_source_failure_keeps_other_source_results() -> None:
 
 @pytest.mark.asyncio
 async def test_failed_source_circuit_opens_for_later_rounds() -> None:
+    """Entity-group strategy keeps the failed-source circuit breaker: the
+    second planned round must not re-dispatch the broken source."""
+
     planner = FakePlanner(
         [
             [
@@ -448,24 +596,36 @@ async def test_failed_source_circuit_opens_for_later_rounds() -> None:
     pubmed = FakeSource(
         "pubmed",
         {
-            "good one": [paper("paper-1", "pubmed")],
-            "good two": [paper("paper-2", "pubmed")],
+            "good one": [paper(f"paper-{index}", "pubmed") for index in range(4)],
+            "good two": [paper(f"paper-{index + 4}", "pubmed") for index in range(3)],
         },
     )
+
+    class ScriptedClassifier:
+        async def structured_chat(self, **kwargs):
+            return {
+                "must_entities": ["alpha"],
+                "unmapped_entities": ["beta", "gamma", "delta", "epsilon"],
+            }
+
     agent = build_agent(
         planner=planner,
         sources=[academic, pubmed],
-        coverage=FakeCoverageEvaluator(
-            [CoverageReport(sufficient=False), CoverageReport(sufficient=True)]
-        ),
+        coverage=FakeCoverageEvaluator([CoverageReport(sufficient=False)]),
+        entity_classifier=ScriptedClassifier(),
     )
 
-    result = await agent.run("question")
+    result = await agent.run(
+        "question",
+        key_entities=["alpha", "beta", "gamma", "delta", "epsilon"],
+        round_strategy="entity_group",
+    )
 
     assert [call.text for call in academic.calls] == ["bad one"]
     assert [call.text for call in pubmed.calls] == ["good one", "good two"]
     assert planner.states[1].unavailable_sources == {"semantic_scholar"}
     assert result.failed_sources == ["semantic_scholar"]
+    assert result.iterations == 2
 
 
 @pytest.mark.asyncio

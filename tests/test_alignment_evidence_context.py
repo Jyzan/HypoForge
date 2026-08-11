@@ -627,8 +627,8 @@ async def test_m4_repair_does_not_admit_a_second_invalid_result() -> None:
 
 def test_m1_atomic_validator_flags_parallel_questions() -> None:
     violations = M1ProblemUnderstanding._sub_question_violations([
-        "机制是什么；环境应激又如何影响它？？",
-        "域随机化如何影响机械臂迁移成功率？",
+        "What is the mechanism; how does environmental stress affect it??",
+        "How does domain randomization affect robot arm transfer success?",
     ])
 
     assert len(violations) == 1

@@ -173,8 +173,11 @@ async def test_factory_returns_empty_result_when_pubmed_returns_none() -> None:
 
     module = build_minimal_pubmed_adapter(backend=backend)
 
-    with pytest.raises(RuntimeError, match="retained zero papers"):
-        await module(PipelineState(input_question="no matching topic"))
+    output = await module(PipelineState(input_question="no matching topic"))
+
+    assert output["literature_results"][0].papers_retrieved == 0
+    assert output["literature_results"][0].knowledge_entries == []
+    assert output["m2_knowledge_export"].runs[0].papers == []
 
 
 @pytest.mark.asyncio

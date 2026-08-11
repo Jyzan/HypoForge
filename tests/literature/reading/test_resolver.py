@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import urllib.error
 from pathlib import Path
 
 import pytest
 
 from hypoforge.literature.models import ContentLevel, PaperRecord
+from hypoforge.literature.reading.attribution import (
+    NO_FULLTEXT_AVAILABLE,
+    OTHER,
+    PUBLISHER_BLOCKED,
+)
 from hypoforge.literature.reading.resolver import PMCFulltextResolver
 
 
@@ -83,6 +89,73 @@ async def test_resolver_uses_pmid_when_pmcid_is_missing(tmp_path: Path) -> None:
 
     assert result.content_level is ContentLevel.STRUCTURED_FULLTEXT
     assert urls[0].endswith("/123/unicode")
+
+
+@pytest.mark.asyncio
+async def test_resolver_success_keeps_empty_attribution(tmp_path: Path) -> None:
+    async def backend(url: str, timeout: float) -> bytes:
+        return json.dumps(BIOC_PAYLOAD).encode()
+
+    result = await PMCFulltextResolver(tmp_path, backend=backend).resolve(paper())
+
+    assert result.retrieval_failure_category == ""
+    assert result.retrieval_failure_detail == ""
+
+
+@pytest.mark.asyncio
+async def test_resolver_attributes_missing_identifier(tmp_path: Path) -> None:
+    result = await PMCFulltextResolver(tmp_path).resolve(paper(pmid="", pmcid=""))
+
+    assert result.content_level is ContentLevel.ABSTRACT
+    assert result.retrieval_failure_category == NO_FULLTEXT_AVAILABLE
+    assert "PMID/PMCID" in result.retrieval_failure_detail
+
+
+@pytest.mark.asyncio
+async def test_resolver_attributes_pmc_without_oa_copy(tmp_path: Path) -> None:
+    async def backend(url: str, timeout: float) -> bytes:
+        return b"[Error] : No result can be found."
+
+    result = await PMCFulltextResolver(tmp_path, backend=backend).resolve(paper())
+
+    assert result.retrieval_failure_category == NO_FULLTEXT_AVAILABLE
+    assert "OA" in result.retrieval_failure_detail
+
+
+@pytest.mark.asyncio
+async def test_resolver_attributes_empty_passages(tmp_path: Path) -> None:
+    async def backend(url: str, timeout: float) -> bytes:
+        return b'{"documents": [{"passages": [{"text": ""}]}]}'
+
+    result = await PMCFulltextResolver(tmp_path, backend=backend).resolve(paper())
+
+    assert result.retrieval_failure_category == NO_FULLTEXT_AVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_resolver_attributes_generic_network_failure(
+    tmp_path: Path,
+) -> None:
+    async def backend(url: str, timeout: float) -> bytes:
+        raise OSError("network down")
+
+    result = await PMCFulltextResolver(tmp_path, backend=backend).resolve(paper())
+
+    assert result.retrieval_failure_category == OTHER
+    assert "network down" in result.retrieval_failure_detail
+
+
+@pytest.mark.asyncio
+async def test_resolver_attributes_publisher_block_status(
+    tmp_path: Path,
+) -> None:
+    async def backend(url: str, timeout: float) -> bytes:
+        raise urllib.error.HTTPError(url, 429, "Too Many Requests", None, None)
+
+    result = await PMCFulltextResolver(tmp_path, backend=backend).resolve(paper())
+
+    assert result.retrieval_failure_category == PUBLISHER_BLOCKED
+    assert "429" in result.retrieval_failure_detail
 
 
 @pytest.mark.asyncio

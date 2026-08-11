@@ -12,6 +12,7 @@ from pathlib import Path
 
 from ..models import ContentLevel, DocumentRecord, PaperRecord
 from ..protocols import FulltextResolverProtocol
+from .attribution import NO_FULLTEXT_AVAILABLE, attribute_error_text
 
 FetchBackend = Callable[[str, float], Awaitable[bytes]]
 
@@ -102,15 +103,26 @@ class PMCFulltextResolver(FulltextResolverProtocol):
         temporary.write_bytes(payload)
         temporary.replace(path)
 
-    def _abstract_document(self, paper: PaperRecord, error: str) -> DocumentRecord:
+    def _abstract_document(
+        self,
+        paper: PaperRecord,
+        error: str,
+        *,
+        category: str = "",
+        detail: str = "",
+    ) -> DocumentRecord:
         abstract = " ".join(paper.abstract.split())
         if not abstract:
-            detail = f"{error}; no readable content" if error else "no readable content"
+            detail_message = (
+                f"{error}; no readable content" if error else "no readable content"
+            )
             return DocumentRecord(
                 document_id=self._document_id(paper, "metadata"),
                 paper_id=paper.paper_id,
                 content_level=ContentLevel.METADATA,
-                retrieval_error=detail,
+                retrieval_error=detail_message,
+                retrieval_failure_category=category,
+                retrieval_failure_detail=detail or detail_message,
             )
 
         path = self._paper_dir(paper) / "abstract.json"
@@ -125,12 +137,19 @@ class PMCFulltextResolver(FulltextResolverProtocol):
             content_level=ContentLevel.ABSTRACT,
             local_path=str(path.resolve()),
             retrieval_error=error,
+            retrieval_failure_category=category,
+            retrieval_failure_detail=detail or error,
         )
 
     async def resolve(self, paper: PaperRecord) -> DocumentRecord:
         identifier = self._identifier(paper)
         if not identifier:
-            return self._abstract_document(paper, "PMC identifier unavailable")
+            return self._abstract_document(
+                paper,
+                "PMC identifier unavailable",
+                category=NO_FULLTEXT_AVAILABLE,
+                detail="无 PMID/PMCID，无法查询 PMC OA 副本",
+            )
 
         path = self._paper_dir(paper) / "bioc.json"
         source_uri = f"{self.API_ROOT}/{identifier}/unicode"
@@ -154,10 +173,21 @@ class PMCFulltextResolver(FulltextResolverProtocol):
             decoded = raw.decode("utf-8")
             if decoded.lstrip().casefold().startswith("[error]"):
                 detail = " ".join(decoded.split())[:300]
-                raise ValueError(f"PMC Open Access full text unavailable: {detail}")
+                message = f"PMC Open Access full text unavailable: {detail}"
+                return self._abstract_document(
+                    paper,
+                    message,
+                    category=NO_FULLTEXT_AVAILABLE,
+                    detail=f"PMC 无 OA 副本：{detail}",
+                )
             payload = json.loads(decoded)
             if not _has_nonempty_passage(payload):
-                raise ValueError("PMC BioC response has no non-empty passages")
+                return self._abstract_document(
+                    paper,
+                    "PMC BioC response has no non-empty passages",
+                    category=NO_FULLTEXT_AVAILABLE,
+                    detail="PMC BioC 响应没有正文段落（无 OA 副本）",
+                )
             normalized = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self._write_atomic(path, normalized)
             return DocumentRecord(
@@ -171,12 +201,21 @@ class PMCFulltextResolver(FulltextResolverProtocol):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return self._abstract_document(paper, _safe_error(exc))
+            message = _safe_error(exc)
+            return self._abstract_document(
+                paper,
+                message,
+                category=attribute_error_text(message),
+                detail=message,
+            )
 
     async def resolve_abstract(self, paper: PaperRecord) -> DocumentRecord:
         """Materialize the paper's real abstract without another network request."""
 
+        message = "full text retrieval unavailable; used abstract"
         return self._abstract_document(
             paper,
-            "full text retrieval unavailable; used abstract",
+            message,
+            category=NO_FULLTEXT_AVAILABLE,
+            detail=message,
         )

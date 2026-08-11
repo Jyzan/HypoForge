@@ -653,6 +653,42 @@ class M4HypothesisGeneration(ModuleProtocol):
             cards.append(card)
         return cards
 
+    @staticmethod
+    def _merge_generation_candidates(
+        existing: List[HypothesisCard],
+        incoming: List[HypothesisCard],
+    ) -> List[HypothesisCard]:
+        """Merge one generator retry without losing distinct hypotheses.
+
+        Models commonly restart IDs at ``H1`` on every call.  IDs are therefore
+        made unique here, while repeated statements are discarded so a retry
+        cannot inflate the candidate count with duplicates.
+        """
+
+        merged = list(existing)
+        seen_statements = {
+            " ".join(card.statement.casefold().split())
+            for card in merged
+        }
+        used_ids = {card.hypothesis_id for card in merged}
+        for card in incoming:
+            statement_key = " ".join(card.statement.casefold().split())
+            if not statement_key or statement_key in seen_statements:
+                continue
+            candidate = card
+            base_id = str(candidate.hypothesis_id or "H")
+            unique_id = base_id
+            suffix = 2
+            while unique_id in used_ids:
+                unique_id = f"{base_id}-retry{suffix}"
+                suffix += 1
+            if unique_id != candidate.hypothesis_id:
+                candidate = candidate.model_copy(update={"hypothesis_id": unique_id})
+            merged.append(candidate)
+            used_ids.add(unique_id)
+            seen_statements.add(statement_key)
+        return merged
+
     def _rank_top(self, cards: List[HypothesisCard]) -> List[HypothesisCard]:
         return sorted(
             cards,
@@ -898,27 +934,28 @@ class M4HypothesisGeneration(ModuleProtocol):
 
         return list(existing.values())
 
-    async def _run_llm(self, state: PipelineState, feedback_context: str = "") -> Dict[str, Any]:
-        assert self.client is not None
-        question = state.problem_card.original_question if state.problem_card else state.input_question
-        rubric_block = hypothesis_rubric_block()
-        graph_context = build_graph_context(state)
-        rendered_graph_context = graph_context.render()
+    async def _generate_hypothesis_batch(
+        self,
+        state: PipelineState,
+        *,
+        question: str,
+        graph_context: GraphContext,
+        feedback_context: str,
+        tool_name: str,
+        attempt: int,
+    ) -> tuple[Any, List[HypothesisCard], List[Dict[str, Any]]]:
+        """Run one generator pass and apply the normal context gates."""
 
-        # ── Step 1: Generator ──────────────────────────────────────────
-        generator_schema = {
-            "type": "array",
-            "items": HypothesisCard.model_json_schema(),
-        }
+        assert self.client is not None
         generated = await self._observe_tool(
-            "hypothesis_generator",
+            tool_name,
             self.client.structured_chat(
                 system_prompt=M4_GENERATOR_SYSTEM_PROMPT.format(
                     num_candidates=self.num_candidates,
-                    rubric_block=rubric_block,
+                    rubric_block=hypothesis_rubric_block(),
                 ),
                 user_prompt=M4_GENERATOR_USER_TEMPLATE.format(
-                    graph_context=rendered_graph_context,
+                    graph_context=graph_context.render(),
                     knowledge_gaps=self._graph_bucket_text(state, "knowledge_gaps"),
                     established_facts=self._graph_bucket_text(state, "established_facts"),
                     conflicts=self._graph_bucket_text(state, "conflicts"),
@@ -927,13 +964,17 @@ class M4HypothesisGeneration(ModuleProtocol):
                     feedback_context=feedback_context,
                     task_contract_block=self._render_task_contract_block(state),
                 ),
-                output_schema=generator_schema,
+                output_schema={
+                    "type": "array",
+                    "items": HypothesisCard.model_json_schema(),
+                },
                 max_tokens=16384,
                 temperature=max(getattr(self.llm_config, "temperature", 0.1), 0.4),
             ),
             details={
                 "requested_candidates": self.num_candidates,
                 "iteration": state.iteration_count + 1,
+                "attempt": attempt,
             },
         )
         candidates = self._canonicalize_task_traces(
@@ -946,15 +987,76 @@ class M4HypothesisGeneration(ModuleProtocol):
             state, candidates
         )
         contract_failures.extend(semantic_failures)
+        return generated, candidates, contract_failures
+
+    async def _run_llm(self, state: PipelineState, feedback_context: str = "") -> Dict[str, Any]:
+        assert self.client is not None
+        question = state.problem_card.original_question if state.problem_card else state.input_question
+        graph_context = build_graph_context(state)
+        rendered_graph_context = graph_context.render()
+
+        # ── Step 1: Generator ──────────────────────────────────────────
+        generated, candidates, contract_failures = await self._generate_hypothesis_batch(
+            state,
+            question=question,
+            graph_context=graph_context,
+            feedback_context=feedback_context,
+            tool_name="hypothesis_generator",
+            attempt=1,
+        )
+        all_generated = list(self._normalise_hypotheses(generated))
+
+        # A short generator response is recoverable.  Give the model exactly
+        # one additional pass, then accept the smaller set if the problem
+        # genuinely does not yield the requested number of hypotheses.
+        # An empty set means contract validation failed, which already has a
+        # dedicated deterministic repair path below.  The extra generator pass
+        # is reserved for the recoverable case where at least one valid
+        # hypothesis exists but the batch is shorter than requested.
+        generation_shortfall = bool(candidates) and len(candidates) < self.num_candidates
+        if generation_shortfall:
+            retry_feedback = (
+                f"The previous pass produced only {len(candidates)} valid hypotheses, "
+                f"but {self.num_candidates} were requested. Generate additional "
+                "distinct scientific hypotheses if the evidence supports them. "
+                "Do not invent unsupported claims; returning fewer is acceptable "
+                "if no further defensible hypothesis exists."
+            )
+            retry_generated, retry_candidates, retry_failures = (
+                await self._generate_hypothesis_batch(
+                    state,
+                    question=question,
+                    graph_context=graph_context,
+                    feedback_context="\n".join(
+                        item for item in [feedback_context, retry_feedback] if item
+                    ),
+                    tool_name="hypothesis_generator_retry",
+                    attempt=2,
+                )
+            )
+            all_generated.extend(self._normalise_hypotheses(retry_generated))
+            candidates = self._merge_generation_candidates(candidates, retry_candidates)
+            contract_failures.extend(retry_failures)
+            generation_shortfall = len(candidates) < self.num_candidates
+
         if not candidates:
             candidates, contract_failures = await self._repair_context_contract(
                 state=state,
                 context=graph_context,
-                candidates=self._normalise_hypotheses(generated),
+                candidates=all_generated,
                 failures=contract_failures,
                 feedback_context=feedback_context,
             )
         if not candidates:
+            if generation_shortfall:
+                logger.warning(
+                    "M4 produced no task-contract-compliant hypotheses after "
+                    "one retry; continuing with an empty candidate set."
+                )
+                return {
+                    "candidate_hypotheses": [],
+                    "top_hypotheses": [],
+                }
             diagnostics = "; ".join(
                 str(item.get("rationale") or "contract validation failed")
                 for item in contract_failures[:3]
@@ -972,10 +1074,26 @@ class M4HypothesisGeneration(ModuleProtocol):
             }
 
         # ── Step 2: Critic ─────────────────────────────────────────────
-        candidates = await self._run_critic(state, candidates)
+        try:
+            candidates = await self._run_critic(state, candidates)
+        except Exception:
+            if not generation_shortfall:
+                raise
+            logger.warning(
+                "M4 Critic failed after the one retry still left too few "
+                "hypotheses; continuing with the generated candidates."
+            )
 
         # ── Step 3: Falsifiability Checker ─────────────────────────────
-        candidates = await self._run_falsifiability(state, candidates)
+        try:
+            candidates = await self._run_falsifiability(state, candidates)
+        except Exception:
+            if not generation_shortfall:
+                raise
+            logger.warning(
+                "M4 Falsifiability Checker failed after the one retry still "
+                "left too few hypotheses; continuing with the current candidates."
+            )
 
         # ── Step 4: Ranker (separate model tier) ───────────────────────
         ranker_client = self.ranker_client or self.client
@@ -996,30 +1114,48 @@ class M4HypothesisGeneration(ModuleProtocol):
             "required": ["hypothesis_id", "ranking_rationale", "scores"],
         }
         ranker_schema = {"type": "array", "items": ranker_item_schema}
-        ranked = await self._observe_tool(
-            "hypothesis_ranker",
-            ranker_client.structured_chat(
-                system_prompt=M4_RANKER_SYSTEM_PROMPT.format(
-                    top_k=self.top_k,
-                    weights_formula=weights_summary(self.weights),
-                    rubric_block=hypothesis_rubric_block(),
-                ),
-                user_prompt=M4_RANKER_USER_TEMPLATE.format(
-                    graph_context=rendered_graph_context,
-                    hypotheses_json=json.dumps(
-                        [h.model_dump(mode="json") for h in candidates],
-                        ensure_ascii=False,
-                        indent=2,
+        try:
+            ranked = await self._observe_tool(
+                "hypothesis_ranker",
+                ranker_client.structured_chat(
+                    system_prompt=M4_RANKER_SYSTEM_PROMPT.format(
+                        top_k=self.top_k,
+                        weights_formula=weights_summary(self.weights),
+                        rubric_block=hypothesis_rubric_block(),
                     ),
-                    top_k=self.top_k,
+                    user_prompt=M4_RANKER_USER_TEMPLATE.format(
+                        graph_context=rendered_graph_context,
+                        hypotheses_json=json.dumps(
+                            [h.model_dump(mode="json") for h in candidates],
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                        top_k=self.top_k,
+                    ),
+                    output_schema=ranker_schema,
+                    max_tokens=8192,
+                    temperature=getattr(self.llm_config, "temperature", 0.1),
                 ),
-                output_schema=ranker_schema,
-                max_tokens=8192,
-                temperature=getattr(self.llm_config, "temperature", 0.1),
-            ),
-            details={"candidates": len(candidates), "top_k": self.top_k},
-        )
-        top = self._attach_rankings(candidates, ranked, graph_context)
+                details={"candidates": len(candidates), "top_k": self.top_k},
+            )
+        except Exception:
+            if not generation_shortfall:
+                raise
+            logger.warning(
+                "M4 Ranker failed after the one retry still left too few "
+                "hypotheses; continuing with deterministic ranking."
+            )
+            ranked = []
+        try:
+            top = self._attach_rankings(candidates, ranked, graph_context)
+        except Exception:
+            if not generation_shortfall:
+                raise
+            logger.warning(
+                "M4 Ranker returned an incomplete result after the one retry "
+                "still left too few hypotheses; using deterministic ranking."
+            )
+            top = self._rank_top(candidates)
         if not top:
             logger.warning("M4 ranker returned incomplete scores; ranking generated candidates instead")
             top = self._rank_top(candidates)

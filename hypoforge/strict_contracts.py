@@ -367,7 +367,7 @@ async def _strict_search_agent_run(self, *args, **kwargs):
 
 
 async def _strict_scout_read(self, sub_question, papers):
-    """Use fallback notes only when Scout LLM is intentionally unconfigured."""
+    """Retry malformed semantic notes once, then omit only failed papers."""
     paper_list = list(papers)
     if not paper_list:
         return []
@@ -382,24 +382,90 @@ async def _strict_scout_read(self, sub_question, papers):
 
     async def run_batch(batch):
         async with semaphore:
-            return await self._read_batch(sub_question, batch)
+            try:
+                initial_notes = await self._read_batch(sub_question, batch)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Scout batch failed; retrying each paper once (%s: %s)",
+                    type(exc).__name__,
+                    exc,
+                )
+                initial_notes = []
+
+            valid_by_id = {
+                note.paper_id: note
+                for note in initial_notes
+                if note.paper_id in {paper.paper_id for paper in batch}
+                and note.study_design
+            }
+            retry_papers = [
+                paper for paper in batch if paper.paper_id not in valid_by_id
+            ]
+            for paper in retry_papers:
+                emit_event(
+                    "tool_started",
+                    module="m2",
+                    tool="scout_reader_retry",
+                    status="running",
+                    message=f"快速阅读结果不完整，单篇重试：{paper.title}",
+                    details={"paper_id": paper.paper_id},
+                )
+                retry_error = ""
+                try:
+                    retry_notes = await self._read_batch(sub_question, [paper])
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    retry_notes = []
+                    retry_error = f"{type(exc).__name__}: {exc}"
+                retry_note = next(
+                    (
+                        note for note in retry_notes
+                        if note.paper_id == paper.paper_id and note.study_design
+                    ),
+                    None,
+                )
+                if retry_note is not None:
+                    valid_by_id[paper.paper_id] = retry_note
+                    emit_event(
+                        "tool_completed",
+                        module="m2",
+                        tool="scout_reader_retry",
+                        status="completed",
+                        message=f"单篇快速阅读重试成功：{paper.title}",
+                        details={"paper_id": paper.paper_id},
+                    )
+                    continue
+
+                logger.warning(
+                    "Scout single-paper retry failed; skipping %s%s",
+                    paper.paper_id,
+                    f" ({retry_error})" if retry_error else "",
+                )
+                emit_event(
+                    "tool_result",
+                    module="m2",
+                    tool="scout_reader_retry",
+                    status="warning",
+                    message=f"单篇快速阅读重试仍失败，跳过论文：{paper.title}",
+                    details={
+                        "paper_id": paper.paper_id,
+                        "error": retry_error,
+                    },
+                )
+
+            return [
+                valid_by_id[paper.paper_id]
+                for paper in batch
+                if paper.paper_id in valid_by_id
+            ]
 
     batch_results = await asyncio.gather(
         *(run_batch(batch) for batch in batches)
     )
     notes = [note for batch in batch_results for note in batch]
-    expected_ids = [paper.paper_id for paper in paper_list]
-    actual_ids = [note.paper_id for note in notes]
-    if actual_ids != expected_ids:
-        raise RuntimeError(
-            "Configured ScoutReader did not return exactly one ordered note per paper."
-        )
-    fallback_ids = [note.paper_id for note in notes if not note.study_design]
-    if fallback_ids:
-        raise RuntimeError(
-            "Configured ScoutReader produced conservative fallback notes for paper IDs: "
-            f"{fallback_ids}. Semantic screening must succeed explicitly."
-        )
     return notes
 
 
@@ -418,11 +484,6 @@ def _set_entity_embedding_context(base_url: str, key_env: str) -> None:
 
 class StrictEntityNormalizationService(EntityNormalizationService):
     """Use independent three-state decisions for each surface/candidate pair."""
-
-    # Near-synonyms that miss the similarity gate still get one judge pass
-    # before a brand-new canonical is minted (see resolve_batch), so the
-    # canonical table stops accumulating split synonyms over runs.
-    _low_similarity_threshold = 0.5
 
     def __init__(
         self,
@@ -453,6 +514,7 @@ class StrictEntityNormalizationService(EntityNormalizationService):
         embedding_model: str = "",
         embedding_base_url: str = "",
         embedding_key_env: str = "",
+        run_stamp: str = "",
     ) -> "StrictEntityNormalizationService":
         """Create a service for *contract*, optionally with explicit embedding config.
 
@@ -473,6 +535,7 @@ class StrictEntityNormalizationService(EntityNormalizationService):
             embedding_model=embedding_model,
             embedding_base_url=embedding_base_url,
             embedding_key_env=embedding_key_env,
+            run_stamp=run_stamp,
         )
         service.register_task_contract(contract)
         return service
@@ -481,12 +544,7 @@ class StrictEntityNormalizationService(EntityNormalizationService):
         self,
         surfaces: list[str],
         canonical_names: list[str],
-    ) -> dict[str, list[tuple[float, str]]]:
-        """Scored top-5 embedding neighbors, unthresholded (see base).
-
-        The strict resolve_batch applies ``similarity_threshold`` itself so a
-        single recall can also feed the low-score supplemental judge pass.
-        """
+    ) -> dict[str, list[str]]:
         # Ensure the configured endpoint is valid before delegating.
         if self.embedding_backend is None and self.embedding_model:
             base_url = (
@@ -524,7 +582,7 @@ class StrictEntityNormalizationService(EntityNormalizationService):
             )
         # Pass resolved endpoint and key directly to _embed_raw so we never
         # mutate the process environment with os.environ.setdefault.
-        return await super()._embedding_candidates_scored(
+        return await super()._embedding_candidates(
             surfaces, canonical_names,
             _base_url=base_url,
             _api_key=credential,
@@ -619,23 +677,9 @@ class StrictEntityNormalizationService(EntityNormalizationService):
         embedded = await self._embedding_candidates(unresolved, canonical_names)
         candidate_map: dict[str, list[str]] = {}
         for surface in unresolved:
-            scored = embedded.get(surface) or self._lexical_candidates_scored(
+            candidates = embedded.get(surface) or self._lexical_candidates(
                 surface, canonical_names
             )
-            candidates = [
-                candidate for score, candidate in scored
-                if score >= self.similarity_threshold
-            ]
-            if not candidates and self.client is not None:
-                # Low-score neighbors are still judged before a brand-new
-                # canonical is minted: abbreviations and word-order/spelling
-                # variants rarely pass a 0.82 embedding gate yet denote the
-                # same concept, and minting them as independent canonicals is
-                # how the table accumulates split synonyms across runs.
-                candidates = [
-                    candidate for score, candidate in scored
-                    if score >= self._low_similarity_threshold
-                ][:2]
             undecided: list[str] = []
             resolved_from_cache = False
             for candidate in candidates:
@@ -669,14 +713,10 @@ class StrictEntityNormalizationService(EntityNormalizationService):
                 if decision.same_concept:
                     positive.append(candidate)
             if len(positive) > 1:
-                positive = await self._merge_ambiguous_canonicals(positive)
-                if len(positive) > 1:
-                    raise RuntimeError(
-                        f"Entity judge returned multiple identity matches for "
-                        f"{surface!r}: {positive}. Refusing an ambiguous merge. "
-                        "The matching canonical concepts were judged distinct "
-                        "from each other."
-                    )
+                raise RuntimeError(
+                    f"Entity judge returned multiple identity matches for {surface!r}: "
+                    f"{positive}. Refusing an ambiguous merge."
+                )
             for candidate, decision in explicit:
                 self.pair_decisions[self._pair_key(surface, candidate)] = decision
             if len(positive) == 1:
@@ -711,103 +751,6 @@ class StrictEntityNormalizationService(EntityNormalizationService):
             result[original] = record
         self._save()
         return result
-
-    def _merge_records(self, keep_id: str, drop_id: str) -> None:
-        """Fold record ``drop_id`` into ``keep_id``; both must exist.
-
-        The surviving record keeps its canonical id/name and absorbs the
-        dropped record's aliases, so every historical surface keeps resolving
-        to the same canonical id.  Used when the judge confirms two canonical
-        records denote the same concept.
-        """
-        keep = self.records[keep_id]
-        drop = self.records[drop_id]
-        merged_aliases = list(dict.fromkeys([
-            *keep.aliases,
-            drop.canonical_name,
-            *drop.aliases,
-        ]))
-        self.records[keep_id] = keep.model_copy(update={
-            "aliases": merged_aliases,
-            "decision_source": "canonical_merge",
-        })
-        del self.records[drop_id]
-        for surface in merged_aliases:
-            self.alias_to_id[surface] = keep_id
-
-    async def _merge_ambiguous_canonicals(
-        self,
-        positive: list[str],
-    ) -> list[str]:
-        """Collapse >1 positive candidates via judge-confirmed transitivity.
-
-        A surface that maps to several candidates can only be merged safely
-        when those candidates are themselves identical (identity is
-        transitive), so the judge is consulted on every unordered canonical
-        pair.  Judge-identical pairs form connected components; each
-        component is merged into one canonical record and its surviving
-        canonical name is returned.  Pair decisions are persisted so later
-        runs resolve from cache.  When more than one component survives, the
-        caller keeps the fail-closed contract and raises.
-        """
-        pairs = [
-            (left, right)
-            for index, left in enumerate(positive)
-            for right in positive[index + 1:]
-        ]
-        judged = await self._judge([
-            {"surface": left, "candidates": [right]} for left, right in pairs
-        ])
-        adjacent: dict[str, set[str]] = {name: set() for name in positive}
-        for left, right in pairs:
-            decision = judged.get(
-                (clean_entity_surface(left), clean_entity_surface(right))
-            )
-            if decision is None:
-                continue
-            self.pair_decisions[self._pair_key(left, right)] = decision
-            if decision.same_concept:
-                adjacent[left].add(right)
-                adjacent[right].add(left)
-        # Connected components of the judge-identical graph.
-        components: list[list[str]] = []
-        visited: set[str] = set()
-        for start in positive:
-            if start in visited:
-                continue
-            component: list[str] = []
-            stack = [start]
-            while stack:
-                name = stack.pop()
-                if name in visited:
-                    continue
-                visited.add(name)
-                component.append(name)
-                stack.extend(adjacent[name] - visited)
-            components.append(component)
-        survivors: list[str] = []
-        for component in components:
-            if len(component) < 2:
-                survivors.append(component[0])
-                continue
-            # The representative keeps the richest alias history.
-            keep = max(
-                component,
-                key=lambda name: (
-                    len(self.records[
-                        self.alias_to_id[clean_entity_surface(name)]
-                    ].aliases),
-                    name.casefold(),
-                ),
-            )
-            keep_id = self.alias_to_id[clean_entity_surface(keep)]
-            for name in component:
-                if name == keep:
-                    continue
-                drop_id = self.alias_to_id[clean_entity_surface(name)]
-                self._merge_records(keep_id, drop_id)
-            survivors.append(keep)
-        return survivors
 
 
 class StrictAgenticM2Adapter(AgenticM2Adapter):
@@ -1240,43 +1183,25 @@ class StrictM3EvidenceGraph(M3EvidenceGraph):
 
         graph = self._dedupe_graph(result["evidence_graph"])
         if requested_grounding:
-            # With knowledge entries present, the base M3 call reached its
-            # configured grounding stage; any failure there would already have
-            # propagated. A no-entry resume path returns early in base M3 and
-            # therefore needs one explicit grounding pass here.
+            # Base M3 now routes both new-entry and checkpoint-resume calls
+            # through the same grounding stage.  Strict mode only validates
+            # and fingerprints that result; it must not run grounding twice.
             if suppress_base_grounding:
                 graph = self._mark_grounding_fingerprint(graph, fingerprint)
-            elif has_entries:
+            else:
                 grounded_now = self._grounded_evidence_ids(graph) & current_evidence_ids
                 if not grounded_now:
+                    if not has_entries:
+                        raise RuntimeError(
+                            "M3 grounding failed while grounding a resumed historical "
+                            "graph: no grounded provenance was produced for the current "
+                            "M2 evidence set."
+                        )
                     raise RuntimeError(
                         "M3 grounding returned successfully but produced no grounded "
                         "provenance for the current M2 evidence set."
                     )
                 graph = self._mark_grounding_fingerprint(graph, fingerprint)
-            else:
-                try:
-                    grounded = await self._grounder.run(state)
-                    graph = self._merge_grounding(
-                        graph,
-                        grounded.get("evidence_records", []),
-                        grounded.get("claims", []),
-                        grounded.get("relations", []),
-                        grounded.get("report"),
-                        entity_normalizer=self._normalise_task_entity,
-                    )
-                    graph = self._dedupe_graph(graph)
-                    grounded_now = self._grounded_evidence_ids(graph) & current_evidence_ids
-                    if not grounded_now:
-                        raise RuntimeError(
-                            "M3 grounding completed on resume but produced no grounded "
-                            "provenance for the current M2 evidence set."
-                        )
-                    graph = self._mark_grounding_fingerprint(graph, fingerprint)
-                except Exception as exc:
-                    raise RuntimeError(
-                        "M3 grounding failed while grounding a resumed historical graph."
-                    ) from exc
         result["evidence_graph"] = graph
         return result
 
