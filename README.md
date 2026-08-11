@@ -1,47 +1,29 @@
-﻿# HypoForge
+# HypoForge
 
-> 基于 LangGraph StateGraph 的六模块闭环 AI Scientist Pipeline，用于科学问题分解、文献检索、证据图谱构建、假设生成、研究计划设计与评审迭代。
+> 基于 LangGraph StateGraph 的六模块闭环 AI Scientist Pipeline：从科学问题出发，自动完成问题理解、文献检索、证据图谱构建、假设生成、研究计划设计与评审迭代。
 
-## 当前架构
-
-HypoForge 当前采用 **Agentic-only M2** 架构。M2 的 Pipeline 入口和 Literature 实现分层如下：
+## 核心流程
 
 ```text
-Pipeline
-  -> ModuleRegistry
-  -> hypoforge.modules.m2_literature_search.M2LiteratureSearch
-  -> hypoforge.literature.adapter.AgenticM2Module
-  -> AgenticM2Adapter
-  -> plan -> search -> screen -> read evidence -> export to M3
+M1 问题理解        Problem Understanding      -> ProblemCard + TaskContract
+M2 文献检索        Agentic Literature Search  -> 论文、知识条目与可溯源证据
+M3 证据图谱        Evidence Graph / Grounding -> EvidenceGraph + GroundingReport
+M4 假设生成        Hypothesis Generation      -> 排序后的候选假设
+M5 研究计划        Research Plan              -> 结构化实验/计算方案
+M6 评审迭代        Review & Iteration         -> 评分与迭代修订
 ```
 
-`M2LiteratureSearch` 是 Pipeline-facing facade，只负责统一模块边界和 Registry 注册；实际的搜索、筛选、全文/摘要阅读、知识抽取和证据导出由 `hypoforge.literature` 提供。
-
-M2 导出的结果包括：
-
-- `literature_results`
-- `m2_knowledge_export`
-- 带有 `evidence_ids` 的知识条目
-- 带有 `quote`、`chunk_id`、`page`、`paper_id` 等溯源信息的证据条目
-
-M3 消费 M2 导出的证据，不负责重复下载论文。严格契约模式下，M2 仍然使用 `StrictM2LiteratureSearch` 和 `StrictAgenticM2Adapter`。
+- 每个模块的输出都带**可审计的溯源**（证据 ID、引用、任务契约追踪）
+- 模块间通过统一的 observability 事件流同步到终端显示与 Web UI
+- 支持断点续传（checkpoint）、失败重试（从断点继续）、追问链（基于上一轮结果迭代）
 
 ## 快速开始
 
 ### 1. 创建环境
 
-推荐使用项目当前验证过的 Anaconda 环境：
-
 ```powershell
 conda activate biodsa
 python -m pip install -r requirements.txt
-```
-
-如果环境尚未创建，可以使用：
-
-```powershell
-conda env create -f environment.yml
-conda activate biodsa
 ```
 
 ### 2. 配置环境变量
@@ -59,110 +41,54 @@ OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 OPENAI_API_KEY=your_api_key_here
 ```
 
-如果启用了实体规范化 embedding，建议显式配置独立 endpoint：
+启用实体规范化 embedding 时，建议显式配置独立 endpoint：
 
 ```env
 ENTITY_EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 ENTITY_EMBEDDING_API_KEY=your_api_key_here
 ```
 
-当前代码也支持以下 fallback：
-
-```text
-embedding endpoint: entity_embedding_base_url -> ENTITY_EMBEDDING_BASE_URL -> OPENAI_BASE_URL
-API key:           ENTITY_EMBEDDING_API_KEY -> OPENAI_API_KEY
-```
+Endpoint 与 Key 的 fallback 链：`entity_embedding_base_url` → `ENTITY_EMBEDDING_BASE_URL` → `OPENAI_BASE_URL`；`ENTITY_EMBEDDING_API_KEY` → `OPENAI_API_KEY`。
 
 本地 `.env` 已被 `.gitignore` 忽略，不要将真实 API Key 提交到 Git。
 
-### 3. 运行 Pipeline
-
-完整 M1-M6 Pipeline（默认配置，无需 `-c`）：
+### 3. 运行完整 Pipeline
 
 ```powershell
-python run_hypoforge.py `
-  -q "蛋白质如何折叠以及错误折叠导致疾病的机制是什么？"
+python run_hypoforge.py -q "蛋白质如何折叠以及错误折叠导致疾病的机制是什么？"
 ```
 
-只运行 M1 + M2（复用默认配置，裁剪模块）：
+常用参数：
 
 ```powershell
-python run_hypoforge.py `
-  -q "强化学习相比于 Pass@K 是否真的有性能上的改进？" `
-  --modules m1,m2
+# 只运行部分模块（复用默认配置，裁剪流程）
+python run_hypoforge.py -q "..." --modules m1,m2
+
+# 断点续跑（同一 --run-id）
+python run_hypoforge.py -q "..." --run-id hypoforge-xxxxxxxx --resume
+
+# 静默运行（关闭 Rich 终端输出）
+python run_hypoforge.py -q "..." --quiet
 ```
 
-断点续跑：
+### 4. 启动 Web UI
 
 ```powershell
-python run_hypoforge.py `
-  -q "原始问题" `
-  --run-id hypoforge-xxxxxxxx `
-  --resume
+python run_hypoforge_ui.py            # 默认 http://127.0.0.1:7860
+python run_hypoforge_ui.py --port 8080
 ```
 
-静默运行：
-
-```powershell
-python run_hypoforge.py `
-  -q "原始问题" `
-  --quiet
-```
-
-M2 运行时会通过 Rich 输出紫色圆角进度框，并展示 Query planning、Source search、Screening、Reading、Evidence export 等阶段。
-
-## 六模块 Pipeline
-
-```text
-M1 Problem Understanding
-    -> ProblemCard
-M2 Agentic Literature Search
-    -> LiteratureResult + M2KnowledgeExport
-M3 Evidence Graph / Grounding
-    -> EvidenceGraph + GroundingReport
-M4 Hypothesis Generation
-    -> ranked hypotheses
-M5 Research Plan
-    -> structured research plan
-M6 Review & Iteration
-    -> review scores and optional feedback loop
-```
-
-### M2 Agentic 流程
-
-```text
-Query Planner
-    -> multi-source search (PubMed / Semantic Scholar)
-    -> deduplication
-    -> ranking
-    -> Scout screening
-    -> coverage evaluation
-    -> full-text / abstract reading
-    -> evidence retrieval and knowledge extraction
-    -> M2 -> M3 evidence export
-```
-
-M2 默认优先使用缓存和已有 Paper Store 数据，并在需要时执行增量补搜。每个阶段都会通过统一 observability event 同步到终端显示和 Web UI。
+UI 提供实时事件流、模块级详情抽屉（检索源统计、证据、评审意见等）、历史运行管理与断点重试。
 
 ## 配置文件
 
 | 文件 | 用途 |
 |---|---|
-| `configs/default.yaml` | 默认完整 M1-M6 Pipeline（CLI 无 `-c` 时使用；配合 `--modules m1,m2` 可裁剪模块） |
-| `configs/web_ui.yaml` | Web UI 运行配置（Agentic M2 + 实时 API 参数） |
-| `configs/evaluation.yaml` | 评估与消融矩阵配置 |
+| `configs/default.yaml` | 默认完整 M1-M6 Pipeline（CLI 无 `-c` 时使用；配合 `--modules` 可裁剪模块） |
+| `configs/web_ui.yaml` | Web UI 运行配置 |
+| `configs/evaluation.yaml` | 评估配置 |
 
-Embedding 模型通过 Pipeline 配置中的以下字段启用：
-
-```yaml
-entity_embedding_model: "text-embedding-v3"
-```
-
-设置为空字符串表示仅使用 lexical-only entity normalization：
-
-```yaml
-entity_embedding_model: ""
-```
+实体规范化 embedding 通过 `entity_embedding_model` 字段启用（设为空字符串表示仅使用 lexical-only 匹配）。
 
 ## 输出文件
 
@@ -170,80 +96,59 @@ entity_embedding_model: ""
 
 ```text
 output/
-├── <run_id>.json
-├── <run_id>_checkpoint.json
-└── <run_id>_scores.json
+├── <run_id>.json            # 最终状态
+├── <run_id>_checkpoint.json # 模块级断点（续传/重试的依据）
+├── <run_id>_scores.json     # 独立评分
+└── snapshots/               # 每轮迭代快照
 ```
 
-如果配置了 `memory_cache_dir`，Paper Store 和实体规范化缓存会写入对应目录。
-
-## Web UI
-
-启动实时 Pipeline 进度界面：
-
-```powershell
-python run_hypoforge_ui.py
-```
-
-指定端口：
-
-```powershell
-python run_hypoforge_ui.py `
-  --port 8080
-```
+如果配置了 `memory_cache_dir`，Paper Store 与实体规范化缓存会写入对应目录。
 
 ## 测试与验证
 
-运行完整测试集：
+整合测试集（单文件，覆盖 M1-M6 各流程与完整管线）：
 
 ```powershell
 python -m pytest -q scripts/test_pipeline.py
 ```
 
-当前完整测试结果（整合测试集，覆盖 M1-M6 各流程与完整管线）：
-
-```text
-324 passed
-```
-
-按模块聚焦（M1/M2/M3/M4/M6/路由/webapp 等分段在文件内以 `====` 注释分隔）：
+按模块聚焦（文件内以 `====` 注释分段）：
 
 ```powershell
-python -m pytest -q scripts/test_pipeline.py -k m1
 python -m pytest -q scripts/test_pipeline.py -k m2
+python -m pytest -q scripts/test_pipeline.py -k m4
+```
+
+冒烟验证（真实 LLM，端到端最小流程）：
+
+```powershell
+python scripts/smoke_pipeline.py
 ```
 
 ## 项目结构
 
 ```text
 hypoforge/
-├── modules/
-│   ├── m1_problem_understanding.py
-│   ├── m2_literature_search.py       # Pipeline-facing M2 facade
-│   ├── m3_evidence_graph.py
-│   ├── m4_hypothesis_generation.py
-│   ├── m5_research_plan.py
-│   └── m6_review_iteration.py
-├── literature/
-│   ├── adapter.py                    # Literature adapter and config wrapper
-│   ├── search/                       # Query planning and multi-source retrieval
-│   ├── reading/                      # Screening, reading and evidence extraction
-│   └── export.py                     # M2 -> M3 evidence export
-├── strict_contracts.py               # Strict module and evidence contracts
-├── registry.py                       # Module registration and construction
-├── pipeline.py                       # LangGraph pipeline orchestration
-└── display/
-    ├── __init__.py                   # Rich console and color palette
-    └── m2_progress.py                # Agentic M2 terminal reporter
+├── modules/                 # M1-M6 各模块（Pipeline-facing facade）
+├── literature/              # M2 检索：规划、多源检索、阅读、证据导出
+├── entity_graph_merge.py    # M3 最终图实体合并（带审计）
+├── strict_contracts.py      # 严格契约（fail-closed 包装）
+├── registry.py              # 模块注册与装配
+├── pipeline.py              # LangGraph 管线编排（checkpoint/续传/取消）
+├── observability.py         # 统一事件流
+├── webapp.py                # 本地 Web UI 后端
+└── display/                 # 终端渲染（Rich）
+
+scripts/
+├── test_pipeline.py         # 整合测试集
+└── smoke_pipeline.py        # 冒烟验证脚本
 ```
 
 ## 开发约定
 
-- M2 的 Pipeline 入口统一使用 `hypoforge.modules.m2_literature_search.M2LiteratureSearch`。
-- Literature 层负责检索和证据生产，但不直接向 `ModuleRegistry` 注册 Pipeline 模块。
-- 新增输出字段时，应同步更新状态模型、严格契约和对应测试。
-- 不要提交 `.env`、API Key、运行输出、缓存或临时测试目录。
-- 修改完成后至少运行完整测试集：
+- 新增输出字段时，同步更新状态模型、严格契约与测试。
+- 不要提交 `.env`、API Key、运行输出、缓存或临时目录。
+- 修改完成后运行完整测试集：
 
 ```powershell
 python -m pytest -q scripts/test_pipeline.py
