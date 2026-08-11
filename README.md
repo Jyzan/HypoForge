@@ -77,20 +77,19 @@ API key:           ENTITY_EMBEDDING_API_KEY -> OPENAI_API_KEY
 
 ### 3. 运行 Pipeline
 
-完整 M1-M6 Pipeline：
+完整 M1-M6 Pipeline（默认配置，无需 `-c`）：
 
 ```powershell
 D:/Programming/Anaconda/envs/biodsa/python.exe run_hypoforge.py `
-  -q "蛋白质如何折叠以及错误折叠导致疾病的机制是什么？" `
-  -c configs/full_pipeline.yaml
+  -q "蛋白质如何折叠以及错误折叠导致疾病的机制是什么？"
 ```
 
-只运行 M1 + Agentic M2：
+只运行 M1 + M2（复用默认配置，裁剪模块）：
 
 ```powershell
 D:/Programming/Anaconda/envs/biodsa/python.exe run_hypoforge.py `
   -q "强化学习相比于 Pass@K 是否真的有性能上的改进？" `
-  -c configs/m2_agentic.yaml
+  --modules m1,m2
 ```
 
 断点续跑：
@@ -98,7 +97,6 @@ D:/Programming/Anaconda/envs/biodsa/python.exe run_hypoforge.py `
 ```powershell
 D:/Programming/Anaconda/envs/biodsa/python.exe run_hypoforge.py `
   -q "原始问题" `
-  -c configs/full_pipeline.yaml `
   --run-id hypoforge-xxxxxxxx `
   --resume
 ```
@@ -108,7 +106,6 @@ D:/Programming/Anaconda/envs/biodsa/python.exe run_hypoforge.py `
 ```powershell
 D:/Programming/Anaconda/envs/biodsa/python.exe run_hypoforge.py `
   -q "原始问题" `
-  -c configs/m2_agentic.yaml `
   --quiet
 ```
 
@@ -151,14 +148,8 @@ M2 默认优先使用缓存和已有 Paper Store 数据，并在需要时执行�
 
 | 文件 | 用途 |
 |---|---|
-| `configs/default.yaml` | 默认完整 Pipeline 配置 |
-| `configs/full_pipeline.yaml` | M1-M6 完整 Pipeline 与迭代 |
-| `configs/m2_agentic.yaml` | M1 + Agentic M2，适合单独验证文献检索 |
-| `configs/full_pipeline_m2agentic.yaml` | Agentic M2 完整 Pipeline 变体 |
-| `configs/m2_minimal_pubmed.yaml` | 轻量 PubMed 检索配置 |
-| `configs/m3_grounding.yaml` | M3 Direct Grounding |
-| `configs/m3_evidence_gams.yaml` | M3 GAMS 实验配置 |
-| `configs/baseline_b0.yaml` - `configs/baseline_b3.yaml` | 基线实验配置 |
+| `configs/default.yaml` | 默认完整 M1-M6 Pipeline（CLI 无 `-c` 时使用；配合 `--modules m1,m2` 可裁剪模块） |
+| `configs/web_ui.yaml` | Web UI 运行配置（Agentic M2 + 实时 API 参数） |
 | `configs/evaluation.yaml` | 评估与消融矩阵配置 |
 
 Embedding 模型通过 Pipeline 配置中的以下字段启用：
@@ -194,12 +185,11 @@ output/
 D:/Programming/Anaconda/envs/biodsa/python.exe scripts/run_pipeline_ui.py
 ```
 
-指定端口和配置：
+指定端口：
 
 ```powershell
 D:/Programming/Anaconda/envs/biodsa/python.exe scripts/run_pipeline_ui.py `
-  --port 8080 `
-  --config configs/m2_agentic.yaml
+  --port 8080
 ```
 
 ## 测试与验证

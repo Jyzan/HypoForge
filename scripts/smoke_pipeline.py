@@ -23,7 +23,7 @@ Usage::
 
     python scripts/smoke_pipeline.py
     python scripts/smoke_pipeline.py -q "衰老的生物学基础是什么？"
-    python scripts/smoke_pipeline.py --m4-mode multi_agent   # also exercise the ranker
+    python scripts/smoke_pipeline.py --m4-mode direct   # generator only, fastest
     python scripts/smoke_pipeline.py --no-feedback-round     # shortest single pass
 """
 
@@ -43,7 +43,7 @@ from hypoforge.pipeline import PipelineRunner
 
 def build_fast_config(
     base_config: str,
-    m4_mode: str = "direct",
+    m4_mode: str = "multi_agent",
     feedback_round: bool = True,
 ) -> PipelineConfig:
     """Load *base_config* and apply the fast-smoke simplification knobs.
@@ -93,8 +93,9 @@ async def _main() -> int:
     parser.add_argument("-q", "--question", default="蛋白质如何折叠及错误折叠导致疾病的机制？")
     parser.add_argument("-c", "--config", default="configs/default.yaml")
     parser.add_argument("--run-id", default="smoke")
-    parser.add_argument("--m4-mode", default="direct", choices=["direct", "multi_agent"],
-                        help="'direct' = generator only (fastest); 'multi_agent' also runs the ranker.")
+    parser.add_argument("--m4-mode", default="multi_agent", choices=["direct", "multi_agent"],
+                        help="'direct' = generator only (fastest); 'multi_agent' (default) also runs critic, "
+                             "falsifiability checker, and the ranker.")
     parser.add_argument(
         "--no-feedback-round",
         action="store_true",

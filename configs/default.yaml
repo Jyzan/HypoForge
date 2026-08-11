@@ -1,5 +1,5 @@
 # HypoForge — Default Pipeline Configuration
-# Used when no --config flag is given.
+# Full M1-M6 pipeline with iteration; used when no --config flag is given.
 
 run_name: hypoforge-default
 output_dir: ./output
@@ -16,25 +16,25 @@ pipeline:
 qwen:
   base:
     model: qwen3.7-max
-    max_tokens: 16384
+    max_tokens: 8192
     temperature: 0.1
   max:
     model: qwen3.7-max
-    max_tokens: 16384
+    max_tokens: 8192
     temperature: 0.1
   plus:
     model: qwen3.7-plus
-    max_tokens: 8192
+    max_tokens: 4096
     temperature: 0.1
   turbo:
     model: qwen3.6-flash
-    max_tokens: 8192
+    max_tokens: 4096
     temperature: 0.3
 
 search:
   tools: ["semantic_scholar", "pubmed"]
-  papers_per_sub_question: 15
-  max_papers_total: 80
+  papers_per_sub_question: 20
+  max_papers_total: 100
 
 # Entity normalization embedding (set model name to enable; empty = lexical-only).
 # Endpoint read from ENTITY_EMBEDDING_BASE_URL / ENTITY_EMBEDDING_API_KEY env vars.
@@ -54,9 +54,9 @@ module_overrides:
       llm_tier: "plus"
   m4:
     kwargs:
-      mode: "direct"
+      mode: "multi_agent"
       llm_tier: "base"
-      num_candidates: 5
+      num_candidates: 7
       top_k: 3
   m5:
     kwargs:
@@ -66,6 +66,7 @@ module_overrides:
     kwargs:
       mode: "llm"
       llm_tier: "plus"
+      reviewers: ["scientific_logic", "evidence_consistency", "method_feasibility", "overall"]
 
 enabled_skills: []
 

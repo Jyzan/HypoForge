@@ -6,20 +6,18 @@ Usage::
 
     # Fresh run
     python run_hypoforge.py \\
-        --question "蛋白质如何折叠及错误折叠导致疾病的机制？" \\
-        --config configs/full_pipeline.yaml
+        --question "蛋白质如何折叠及错误折叠导致疾病的机制？"
 
     # Resume from checkpoint (same --run-id as the interrupted run)
     python run_hypoforge.py \\
         --question "蛋白质如何折叠及错误折叠导致疾病的机制？" \\
-        --config configs/full_pipeline.yaml \\
         --run-id hypoforge-abc12345 \\
         --resume
 
     python run_hypoforge.py \\
         --question "衰老的生物学基础是什么？" \\
-        --config configs/baseline_b0.yaml \\
-        --output-dir output/baseline_b0
+        --modules m1,m2 \\
+        --output-dir output/m1_m2
 """
 
 from __future__ import annotations
@@ -47,6 +45,14 @@ def main():
         type=str,
         default="configs/default.yaml",
         help="Path to YAML configuration file.",
+    )
+    parser.add_argument(
+        "--modules",
+        type=str,
+        default="",
+        help="Comma-separated subset of enabled modules, e.g. 'm1,m2' to run "
+             "only problem understanding and literature search (reuses the "
+             "same config without extra YAML files).",
     )
     parser.add_argument(
         "--output-dir", "-o",
@@ -111,6 +117,18 @@ def main():
     except Exception as exc:
         print(f"Error loading config: {exc}")
         sys.exit(1)
+
+    # ---- override enabled modules (subset reuse) ----
+    if args.modules:
+        selected = [
+            name.strip()
+            for name in args.modules.split(",")
+            if name.strip()
+        ]
+        if not selected:
+            print("Error: --modules must name at least one module, e.g. 'm1,m2'")
+            sys.exit(1)
+        config.enabled_modules = selected
 
     # ---- override output dir ----
     config.output_dir = args.output_dir

@@ -1111,10 +1111,9 @@ cp .env_template .env   # 编辑填入 API key
 pip install -r requirements.txt  # Agentic M2、Gradio 或测试依赖按当前 Track 按需启用
 
 # 运行
-python run_hypoforge.py -q "蛋白质如何折叠及错误折叠导致疾病的机制？" -c configs/full_pipeline.yaml
-python run_hypoforge.py -q "..." -c configs/baseline_b0.yaml   # 消融
-python run_hypoforge.py -q "..." -c configs/m2_agentic.yaml    # Agentic M2
-python run_hypoforge.py -q "..." -c configs/m3_grounding.yaml  # M3 Grounding
+python run_hypoforge.py -q "蛋白质如何折叠及错误折叠导致疾病的机制？"   # 默认 configs/default.yaml（完整 M1-M6）
+python run_hypoforge.py -q "..." --modules m1,m2                      # 只跑 M1+M2（复用默认配置）
+python scripts/run_pipeline_ui.py                                     # Web UI（默认 configs/web_ui.yaml）
 
 # 测试
 python -m pytest tests -q
