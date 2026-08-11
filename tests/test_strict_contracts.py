@@ -128,6 +128,168 @@ async def test_unresolved_entity_is_not_persisted_as_confirmed_new_entity(tmp_pa
     assert resolved["RCM"].canonical_name == "Regional Climate Model"
 
 
+class ProgrammableIdentityClient:
+    """Judge with explicit per-pair rules; unknown pairs are negative."""
+
+    def __init__(self, rules: dict[tuple[str, str], bool]) -> None:
+        # Identity is symmetric, so rules are keyed by the sorted pair.
+        self.rules = {
+            tuple(sorted((left.casefold().strip(), right.casefold().strip()))): same
+            for (left, right), same in rules.items()
+        }
+        self.calls = 0
+
+    async def structured_chat(self, **kwargs):
+        self.calls += 1
+        requests = json.loads(kwargs["user_prompt"])
+        decisions = []
+        for request in requests:
+            surface = request["surface"].casefold().strip()
+            for candidate in request["candidates"]:
+                key = tuple(sorted((surface, candidate.casefold().strip())))
+                decisions.append({
+                    "surface": request["surface"],
+                    "canonical_name": candidate,
+                    "same_concept": self.rules.get(key, False),
+                    "rationale": "programmable test decision",
+                })
+        return {"decisions": decisions}
+
+
+class LowSimilarityEmbeddings:
+    async def aembed_documents(self, texts):
+        # surface [0.6, 0.8] vs canonical [1.0, 0.0] → cosine 0.6:
+        # below the 0.82 similarity gate but above the 0.5 low-score gate.
+        return [[0.6, 0.8]] + [[1.0, 0.0] for _ in texts[1:]]
+
+
+@pytest.mark.asyncio
+async def test_multiple_positive_candidates_collapse_via_transitive_closure(
+    tmp_path,
+) -> None:
+    """surface→A and surface→B both positive, A→B also positive:
+    the canonical records merge and the surface joins the survivor."""
+    client = ProgrammableIdentityClient({
+        ("amyloid fibrils", "amyloid fibrillar structures"): True,
+        ("amyloid fibrils", "insoluble amyloid fibrils"): True,
+        ("amyloid fibrillar structures", "insoluble amyloid fibrils"): True,
+    })
+    service = StrictEntityNormalizationService(
+        cache_dir=tmp_path,
+        client=client,
+        embedding_backend=EqualEmbeddings(),
+    )
+    service.register_alias_group("Amyloid Fibrillar Structures", [])
+    service.register_alias_group("Insoluble Amyloid Fibrils", [])
+
+    result = await service.resolve_batch(["amyloid fibrils"])
+
+    assert result["amyloid fibrils"].canonical_name in {
+        "Amyloid Fibrillar Structures",
+        "Insoluble Amyloid Fibrils",
+    }
+    assert len(service.records) == 1
+    assert "amyloid fibrils" in service.alias_to_id
+    assert service.alias_to_id["amyloid fibrils"] == (
+        result["amyloid fibrils"].canonical_id
+    )
+    # surface pairs + one canonical pair were judged.
+    assert client.calls == 2
+    # Canonical-pair decision is cached for future runs.
+    assert service.pair_decisions[
+        service._pair_key(
+            "Amyloid Fibrillar Structures", "Insoluble Amyloid Fibrils"
+        )
+    ].same_concept is True
+
+
+@pytest.mark.asyncio
+async def test_multiple_positive_candidates_judged_distinct_stay_fail_closed(
+    tmp_path,
+) -> None:
+    """surface→A and surface→B positive but A→B negative: the identity graph
+    has two components, so the ambiguous merge stays fail-closed."""
+    client = ProgrammableIdentityClient({
+        ("amyloid fibrils", "amyloid fibrillar structures"): True,
+        ("amyloid fibrils", "insoluble amyloid fibrils"): True,
+        ("amyloid fibrillar structures", "insoluble amyloid fibrils"): False,
+    })
+    service = StrictEntityNormalizationService(
+        cache_dir=tmp_path,
+        client=client,
+        embedding_backend=EqualEmbeddings(),
+    )
+    service.register_alias_group("Amyloid Fibrillar Structures", [])
+    service.register_alias_group("Insoluble Amyloid Fibrils", [])
+
+    with pytest.raises(RuntimeError, match="multiple identity matches"):
+        await service.resolve_batch(["amyloid fibrils"])
+
+    # The table is untouched, but the negative canonical-pair decision is kept.
+    assert len(service.records) == 2
+    assert service.pair_decisions[
+        service._pair_key(
+            "Amyloid Fibrillar Structures", "Insoluble Amyloid Fibrils"
+        )
+    ].same_concept is False
+
+
+@pytest.mark.asyncio
+async def test_low_similarity_neighbor_is_judged_before_new_entity(tmp_path) -> None:
+    """A near-synonym below the similarity gate is still judged; a positive
+    verdict merges instead of minting a split canonical."""
+    client = ProgrammableIdentityClient({
+        ("rcm", "regional climate model"): True,
+    })
+    service = StrictEntityNormalizationService(
+        cache_dir=tmp_path,
+        client=client,
+        embedding_backend=LowSimilarityEmbeddings(),
+    )
+    service.register_alias_group("Regional Climate Model", [])
+
+    result = await service.resolve_batch(["RCM"])
+
+    assert result["RCM"].canonical_name == "Regional Climate Model"
+    assert "rcm" in service.alias_to_id
+    assert service.alias_to_id["rcm"] == result["RCM"].canonical_id
+    assert len(service.records) == 1
+
+
+@pytest.mark.asyncio
+async def test_low_similarity_negative_verdict_still_mints_new_entity(
+    tmp_path,
+) -> None:
+    """A negative low-score verdict explicitly allows a brand-new canonical."""
+    service = StrictEntityNormalizationService(
+        cache_dir=tmp_path,
+        client=ProgrammableIdentityClient({}),
+        embedding_backend=LowSimilarityEmbeddings(),
+    )
+    service.register_alias_group("Regional Climate Model", [])
+
+    result = await service.resolve_batch(["RCM"])
+
+    # new_entity surfaces keep the cleaned surface as canonical name.
+    assert result["RCM"].canonical_name == "rcm"
+    assert result["RCM"].decision_source == "new_entity"
+
+
+@pytest.mark.asyncio
+async def test_low_similarity_gate_is_skipped_without_judge_client(tmp_path) -> None:
+    """Without a judge client the low-score pass is skipped and the surface
+    becomes a new entity directly (no unresolved deferral on judge-less runs)."""
+    service = StrictEntityNormalizationService(
+        cache_dir=tmp_path,
+        embedding_backend=LowSimilarityEmbeddings(),
+    )
+    service.register_alias_group("Regional Climate Model", [])
+
+    result = await service.resolve_batch(["RCM"])
+
+    assert result["RCM"].decision_source == "new_entity"
+
+
 class FailingRelationClient:
     async def structured_chat(self, **kwargs):
         raise ConnectionError("relation extractor unavailable")

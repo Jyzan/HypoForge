@@ -299,13 +299,20 @@ class EntityNormalizationService:
         self._save()
         return record
 
-    async def _embedding_candidates(
+    async def _embedding_candidates_scored(
         self,
         surfaces: list[str],
         canonical_names: list[str],
         _base_url: str = "",
         _api_key: str = "",
-    ) -> dict[str, list[str]]:
+    ) -> dict[str, list[tuple[float, str]]]:
+        """Top-5 embedding neighbors with their cosine scores, unthresholded.
+
+        Thresholding is the caller's responsibility so that one recall can
+        feed both the regular judge pass (high-confidence candidates) and a
+        low-score supplemental pass (candidates that may still be identical
+        but fall below ``similarity_threshold``).
+        """
         if (
             not self.embedding_backend and not self.embedding_model
         ) or not surfaces or not canonical_names:
@@ -345,9 +352,9 @@ class EntityNormalizationService:
             return {}
         surface_vectors = vectors[:len(surfaces)]
         canonical_vectors = vectors[len(surfaces):]
-        output: dict[str, list[str]] = {}
+        output: dict[str, list[tuple[float, str]]] = {}
         for surface, vector in zip(surfaces, surface_vectors):
-            scored = sorted(
+            output[surface] = sorted(
                 (
                     (_cosine(vector, candidate_vector), canonical)
                     for canonical, candidate_vector in zip(
@@ -355,24 +362,48 @@ class EntityNormalizationService:
                     )
                 ),
                 reverse=True,
-            )
-            output[surface] = [
-                canonical for score, canonical in scored[:5]
+            )[:5]
+        return output
+
+    async def _embedding_candidates(
+        self,
+        surfaces: list[str],
+        canonical_names: list[str],
+        _base_url: str = "",
+        _api_key: str = "",
+    ) -> dict[str, list[str]]:
+        scored = await self._embedding_candidates_scored(
+            surfaces, canonical_names, _base_url=_base_url, _api_key=_api_key
+        )
+        return {
+            surface: [
+                candidate for score, candidate in pairs
                 if score >= self.similarity_threshold
             ]
-        return output
+            for surface, pairs in scored.items()
+        }
+
+    def _lexical_candidates_scored(
+        self,
+        surface: str,
+        canonical_names: list[str],
+    ) -> list[tuple[float, str]]:
+        return sorted(
+            (
+                (SequenceMatcher(None, surface, candidate).ratio(), candidate)
+                for candidate in canonical_names
+            ),
+            reverse=True,
+        )[:5]
 
     def _lexical_candidates(
         self,
         surface: str,
         canonical_names: list[str],
     ) -> list[str]:
-        scored = [
-            (SequenceMatcher(None, surface, candidate).ratio(), candidate)
-            for candidate in canonical_names
-        ]
         return [
-            candidate for score, candidate in sorted(scored, reverse=True)[:5]
+            candidate for score, candidate
+            in self._lexical_candidates_scored(surface, canonical_names)
             if score >= self.similarity_threshold
         ]
 

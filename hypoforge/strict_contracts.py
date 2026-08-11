@@ -419,6 +419,11 @@ def _set_entity_embedding_context(base_url: str, key_env: str) -> None:
 class StrictEntityNormalizationService(EntityNormalizationService):
     """Use independent three-state decisions for each surface/candidate pair."""
 
+    # Near-synonyms that miss the similarity gate still get one judge pass
+    # before a brand-new canonical is minted (see resolve_batch), so the
+    # canonical table stops accumulating split synonyms over runs.
+    _low_similarity_threshold = 0.5
+
     def __init__(
         self,
         *,
@@ -476,7 +481,12 @@ class StrictEntityNormalizationService(EntityNormalizationService):
         self,
         surfaces: list[str],
         canonical_names: list[str],
-    ) -> dict[str, list[str]]:
+    ) -> dict[str, list[tuple[float, str]]]:
+        """Scored top-5 embedding neighbors, unthresholded (see base).
+
+        The strict resolve_batch applies ``similarity_threshold`` itself so a
+        single recall can also feed the low-score supplemental judge pass.
+        """
         # Ensure the configured endpoint is valid before delegating.
         if self.embedding_backend is None and self.embedding_model:
             base_url = (
@@ -514,7 +524,7 @@ class StrictEntityNormalizationService(EntityNormalizationService):
             )
         # Pass resolved endpoint and key directly to _embed_raw so we never
         # mutate the process environment with os.environ.setdefault.
-        return await super()._embedding_candidates(
+        return await super()._embedding_candidates_scored(
             surfaces, canonical_names,
             _base_url=base_url,
             _api_key=credential,
@@ -609,9 +619,23 @@ class StrictEntityNormalizationService(EntityNormalizationService):
         embedded = await self._embedding_candidates(unresolved, canonical_names)
         candidate_map: dict[str, list[str]] = {}
         for surface in unresolved:
-            candidates = embedded.get(surface) or self._lexical_candidates(
+            scored = embedded.get(surface) or self._lexical_candidates_scored(
                 surface, canonical_names
             )
+            candidates = [
+                candidate for score, candidate in scored
+                if score >= self.similarity_threshold
+            ]
+            if not candidates and self.client is not None:
+                # Low-score neighbors are still judged before a brand-new
+                # canonical is minted: abbreviations and word-order/spelling
+                # variants rarely pass a 0.82 embedding gate yet denote the
+                # same concept, and minting them as independent canonicals is
+                # how the table accumulates split synonyms across runs.
+                candidates = [
+                    candidate for score, candidate in scored
+                    if score >= self._low_similarity_threshold
+                ][:2]
             undecided: list[str] = []
             resolved_from_cache = False
             for candidate in candidates:
@@ -645,10 +669,14 @@ class StrictEntityNormalizationService(EntityNormalizationService):
                 if decision.same_concept:
                     positive.append(candidate)
             if len(positive) > 1:
-                raise RuntimeError(
-                    f"Entity judge returned multiple identity matches for {surface!r}: "
-                    f"{positive}. Refusing an ambiguous merge."
-                )
+                positive = await self._merge_ambiguous_canonicals(positive)
+                if len(positive) > 1:
+                    raise RuntimeError(
+                        f"Entity judge returned multiple identity matches for "
+                        f"{surface!r}: {positive}. Refusing an ambiguous merge. "
+                        "The matching canonical concepts were judged distinct "
+                        "from each other."
+                    )
             for candidate, decision in explicit:
                 self.pair_decisions[self._pair_key(surface, candidate)] = decision
             if len(positive) == 1:
@@ -683,6 +711,103 @@ class StrictEntityNormalizationService(EntityNormalizationService):
             result[original] = record
         self._save()
         return result
+
+    def _merge_records(self, keep_id: str, drop_id: str) -> None:
+        """Fold record ``drop_id`` into ``keep_id``; both must exist.
+
+        The surviving record keeps its canonical id/name and absorbs the
+        dropped record's aliases, so every historical surface keeps resolving
+        to the same canonical id.  Used when the judge confirms two canonical
+        records denote the same concept.
+        """
+        keep = self.records[keep_id]
+        drop = self.records[drop_id]
+        merged_aliases = list(dict.fromkeys([
+            *keep.aliases,
+            drop.canonical_name,
+            *drop.aliases,
+        ]))
+        self.records[keep_id] = keep.model_copy(update={
+            "aliases": merged_aliases,
+            "decision_source": "canonical_merge",
+        })
+        del self.records[drop_id]
+        for surface in merged_aliases:
+            self.alias_to_id[surface] = keep_id
+
+    async def _merge_ambiguous_canonicals(
+        self,
+        positive: list[str],
+    ) -> list[str]:
+        """Collapse >1 positive candidates via judge-confirmed transitivity.
+
+        A surface that maps to several candidates can only be merged safely
+        when those candidates are themselves identical (identity is
+        transitive), so the judge is consulted on every unordered canonical
+        pair.  Judge-identical pairs form connected components; each
+        component is merged into one canonical record and its surviving
+        canonical name is returned.  Pair decisions are persisted so later
+        runs resolve from cache.  When more than one component survives, the
+        caller keeps the fail-closed contract and raises.
+        """
+        pairs = [
+            (left, right)
+            for index, left in enumerate(positive)
+            for right in positive[index + 1:]
+        ]
+        judged = await self._judge([
+            {"surface": left, "candidates": [right]} for left, right in pairs
+        ])
+        adjacent: dict[str, set[str]] = {name: set() for name in positive}
+        for left, right in pairs:
+            decision = judged.get(
+                (clean_entity_surface(left), clean_entity_surface(right))
+            )
+            if decision is None:
+                continue
+            self.pair_decisions[self._pair_key(left, right)] = decision
+            if decision.same_concept:
+                adjacent[left].add(right)
+                adjacent[right].add(left)
+        # Connected components of the judge-identical graph.
+        components: list[list[str]] = []
+        visited: set[str] = set()
+        for start in positive:
+            if start in visited:
+                continue
+            component: list[str] = []
+            stack = [start]
+            while stack:
+                name = stack.pop()
+                if name in visited:
+                    continue
+                visited.add(name)
+                component.append(name)
+                stack.extend(adjacent[name] - visited)
+            components.append(component)
+        survivors: list[str] = []
+        for component in components:
+            if len(component) < 2:
+                survivors.append(component[0])
+                continue
+            # The representative keeps the richest alias history.
+            keep = max(
+                component,
+                key=lambda name: (
+                    len(self.records[
+                        self.alias_to_id[clean_entity_surface(name)]
+                    ].aliases),
+                    name.casefold(),
+                ),
+            )
+            keep_id = self.alias_to_id[clean_entity_surface(keep)]
+            for name in component:
+                if name == keep:
+                    continue
+                drop_id = self.alias_to_id[clean_entity_surface(name)]
+                self._merge_records(keep_id, drop_id)
+            survivors.append(keep)
+        return survivors
 
 
 class StrictAgenticM2Adapter(AgenticM2Adapter):
