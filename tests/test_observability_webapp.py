@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import threading
 from pathlib import Path
 
@@ -174,7 +175,18 @@ def test_web_ui_preserves_open_event_details_and_has_ephemeral_key_fields() -> N
     assert 'id="openalexApiKey"' in html
     assert 'id="openalexMailto"' in html
     # Ephemeral keys: never echoed back, persisted, or sent in plaintext.
-    assert "localStorage" not in html
+    # localStorage is allowed only for non-sensitive UI state (history order);
+    # credential fields must never appear in any storage read/write path.
+    storage_keys = re.findall(
+        r'localStorage\.(?:setItem|getItem|removeItem)\(\s*["\']([^"\']+)["\']',
+        html,
+    )
+    credential_ids = {
+        "modelName", "qwenApiKey", "semanticApiKey",
+        "openalexApiKey", "openalexMailto",
+    }
+    assert not (set(storage_keys) & credential_ids)
+    assert "hypoforge_order" in storage_keys  # the only non-sensitive persistence
     assert 'id="openalexApiKey" type="password"' in html
     assert "openSequences" in html
     assert "data-event-sequence" in html
@@ -319,6 +331,129 @@ def test_followup_passes_seed_state_and_marks_manifest(
     )
     assert manifest["parent_run_id"] == "ui-parent"
     assert manifest["followup"] == "请细化对照组设计"
+
+
+def test_resume_reads_parent_checkpoint_without_followup_semantics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = RunManager(
+        config_path=_write_config(tmp_path), output_root=tmp_path / "runs"
+    )
+    parent_dir = tmp_path / "runs" / "ui-parent"
+    parent_dir.mkdir(parents=True)
+    (parent_dir / "ui-parent_checkpoint.json").write_text(
+        json.dumps({
+            "run_id": "ui-parent",
+            "input_question": "蛋白质错误折叠如何导致神经退行性疾病？",
+            "_last_module": "m1",
+        }),
+        encoding="utf-8",
+    )
+    captured: dict = {}
+
+    class FakeRunner:
+        def __init__(self, config, event_recorder=None):
+            pass
+
+        async def run(self, question: str, run_id: str, **kwargs):
+            captured["kwargs"] = kwargs
+            return PipelineState(input_question=question, run_id=run_id)
+
+    monkeypatch.setattr(threading, "Thread", DeferredThread)
+    monkeypatch.setattr("hypoforge.webapp.PipelineRunner", FakeRunner)
+    run = manager.start("ignored question", resume_of="ui-parent")
+    assert run["resume_of"] == "ui-parent"
+    # 问题文本以后端 checkpoint 为准，调用方无法漂移。
+    assert run["question"] == "蛋白质错误折叠如何导致神经退行性疾病？"
+    manager._run_pipeline(run["run_id"], run["question"])
+    kwargs = captured["kwargs"]
+    # 纯续传：无 followup_text，不触发 followup 路由/预算重置。
+    assert "followup_text" not in kwargs
+    assert kwargs["seed_state"]["_last_module"] == "m1"
+    assert kwargs["seed_state"]["input_question"] == (
+        "蛋白质错误折叠如何导致神经退行性疾病？"
+    )
+    manifest = json.loads(
+        (tmp_path / "runs" / run["run_id"] / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["resume_of"] == "ui-parent"
+    assert "parent_run_id" not in manifest
+
+
+def test_resume_rejects_running_parent(tmp_path: Path) -> None:
+    manager = RunManager(
+        config_path=_write_config(tmp_path), output_root=tmp_path / "runs"
+    )
+    manager._runs["ui-live"] = {"run_id": "ui-live", "status": "running"}
+    with pytest.raises(ValueError, match="仍在运行"):
+        manager.start("q", resume_of="ui-live")
+
+
+def test_resume_missing_checkpoint_returns_error(tmp_path: Path) -> None:
+    manager = RunManager(
+        config_path=_write_config(tmp_path), output_root=tmp_path / "runs"
+    )
+    (tmp_path / "runs" / "ui-ghost").mkdir(parents=True)
+    with pytest.raises(ValueError, match="没有可用的断点"):
+        manager.start("q", resume_of="ui-ghost")
+
+
+def test_resume_rejects_illegal_parent_id_and_followup_conflict(
+    tmp_path: Path,
+) -> None:
+    manager = RunManager(
+        config_path=_write_config(tmp_path), output_root=tmp_path / "runs"
+    )
+    with pytest.raises(ValueError, match="非法字符"):
+        manager.start("q", resume_of="../escape")
+    with pytest.raises(ValueError, match="不能与"):
+        manager.start(
+            "q",
+            parent_run_id="ui-parent",
+            followup="x",
+            resume_of="ui-parent",
+        )
+
+
+def test_rename_run_writes_display_name_and_keeps_question(
+    tmp_path: Path,
+) -> None:
+    manager = RunManager(
+        config_path=_write_config(tmp_path), output_root=tmp_path / "runs"
+    )
+    run_dir = tmp_path / "runs" / "ui-rename"
+    run_dir.mkdir(parents=True)
+    manifest = {"run_id": "ui-rename", "question": "原始问题", "status": "completed"}
+    (run_dir / "manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+
+    updated = manager.rename("ui-rename", "  我的标注名称  ")
+
+    assert updated["display_name"] == "我的标注名称"
+    assert updated["question"] == "原始问题"
+    assert json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))[
+        "display_name"
+    ] == "我的标注名称"
+    # 侧栏列表直接带出 display_name。
+    listed = next(r for r in manager.list_runs() if r["run_id"] == "ui-rename")
+    assert listed["display_name"] == "我的标注名称"
+
+
+def test_rename_run_validations(tmp_path: Path) -> None:
+    manager = RunManager(
+        config_path=_write_config(tmp_path), output_root=tmp_path / "runs"
+    )
+    with pytest.raises(ValueError, match="非法字符"):
+        manager.rename("../escape", "x")
+    with pytest.raises(ValueError, match="不能为空"):
+        manager.rename("ui-x", "   ")
+    with pytest.raises(ValueError, match="过长"):
+        manager.rename("ui-x", "长" * 201)
+    with pytest.raises(LookupError, match="不存在"):
+        manager.rename("ui-ghost", "新名字")
 
 
 def test_single_run_mutex_error_message_mentions_waiting(

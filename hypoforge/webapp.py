@@ -62,6 +62,10 @@ class RunManager:
         self._runs: dict[str, dict[str, Any]] = {}
         self._run_credentials: dict[str, dict[str, str]] = {}
         self._run_followups: dict[str, dict[str, Any]] = {}
+        # Pure-resume seeds: checkpoint JSON of a failed run, consumed once by
+        # the worker.  Kept separate from followups because a resume carries
+        # no followup semantics (no M1 triage, no fresh iteration budget).
+        self._run_resumes: dict[str, dict[str, Any]] = {}
         # One cancellation flag per live run: set by ``request_cancel`` and
         # polled by the pipeline both during and between async modules.
         self._cancel_events: dict[str, threading.Event] = {}
@@ -77,6 +81,7 @@ class RunManager:
         openalex_mailto: str = "",
         parent_run_id: str = "",
         followup: str = "",
+        resume_of: str = "",
     ) -> dict[str, Any]:
         question = " ".join(str(question or "").split())
         model_name = " ".join(str(model_name or "").split())
@@ -86,6 +91,9 @@ class RunManager:
         openalex_mailto = " ".join(str(openalex_mailto or "").split())
         parent_run_id = " ".join(str(parent_run_id or "").split())
         followup = " ".join(str(followup or "").split())
+        resume_of = " ".join(str(resume_of or "").split())
+        if resume_of and (parent_run_id or followup):
+            raise ValueError("resume_of 不能与 parent_run_id/followup 同时提供")
         if not question:
             raise ValueError("问题不能为空")
         if len(question) > 4000:
@@ -107,6 +115,11 @@ class RunManager:
             if not parent_run_id or not followup:
                 raise ValueError("追问运行需要同时提供 parent_run_id 与 followup")
             seed_state = self._load_parent_state(parent_run_id)
+        elif resume_of:
+            # Pure resume: the parent's checkpoint is authoritative for the
+            # question text, so the caller cannot drift from the failed run.
+            seed_state = self._load_checkpoint_state(resume_of)
+            question = str(seed_state.get("input_question") or question)
         with self._lock:
             if any(item.get("status") == "running" for item in self._runs.values()):
                 raise RuntimeError("已有一条流程正在运行，当前运行结束后才能提交")
@@ -129,6 +142,8 @@ class RunManager:
             }
             if parent_run_id:
                 record["parent_run_id"] = parent_run_id
+            if resume_of:
+                record["resume_of"] = resume_of
             self._runs[run_id] = record
             self._cancel_events[run_id] = threading.Event()
             # Credentials are intentionally kept outside the public run record.
@@ -142,11 +157,17 @@ class RunManager:
             }
             if seed_state is not None:
                 # Memory-only, consumed once by the worker (like credentials).
-                self._run_followups[run_id] = {
-                    "parent_run_id": parent_run_id,
-                    "followup": followup,
-                    "seed_state": seed_state,
-                }
+                if resume_of:
+                    self._run_resumes[run_id] = {
+                        "resume_of": resume_of,
+                        "seed_state": seed_state,
+                    }
+                else:
+                    self._run_followups[run_id] = {
+                        "parent_run_id": parent_run_id,
+                        "followup": followup,
+                        "seed_state": seed_state,
+                    }
         thread = threading.Thread(
             target=self._run_pipeline,
             args=(run_id, question),
@@ -221,6 +242,30 @@ class RunManager:
             raise ValueError(f"父运行 {parent_run_id} 的 state 格式无效")
         return data
 
+    def _load_checkpoint_state(self, run_id: str) -> dict[str, Any]:
+        """Load and validate a run's checkpoint for a pure resume."""
+
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", run_id):
+            raise ValueError("resume_of 含非法字符")
+        record = self._runs.get(run_id)
+        if record and record.get("status") == "running":
+            raise ValueError("父运行仍在运行中，无法从断点重试")
+        ckpt_path = self.output_root / run_id / f"{run_id}_checkpoint.json"
+        if not ckpt_path.exists():
+            raise ValueError(
+                f"父运行 {run_id} 没有可用的断点（checkpoint）——"
+                "运行可能在第一个模块完成前失败，请重新发起运行"
+            )
+        try:
+            data = json.loads(ckpt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"父运行 {run_id} 的断点文件损坏，无法续传：{exc}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise ValueError(f"父运行 {run_id} 的断点格式无效")
+        return data
+
     def _read_final_state(self, run_id: str) -> dict[str, Any] | None:
         state_path = self.output_root / run_id / f"{run_id}.json"
         if not state_path.exists():
@@ -237,6 +282,7 @@ class RunManager:
         with self._lock:
             credentials = self._run_credentials.pop(run_id, {})
             followup_info = self._run_followups.pop(run_id, {})
+            resume_info = self._run_resumes.pop(run_id, {})
         try:
             config = PipelineConfig.from_yaml(self.config_path)
             config.output_dir = str(run_dir)
@@ -297,6 +343,8 @@ class RunManager:
             if followup_info:
                 manifest["parent_run_id"] = followup_info.get("parent_run_id", "")
                 manifest["followup"] = followup_info.get("followup", "")
+            if resume_info:
+                manifest["resume_of"] = resume_info.get("resume_of", "")
             recorder.write_manifest(manifest)
             run_kwargs: dict[str, Any] = {}
             if followup_info:
@@ -304,6 +352,10 @@ class RunManager:
                     "followup_text": followup_info.get("followup", ""),
                     "seed_state": followup_info.get("seed_state"),
                 }
+            elif resume_info:
+                # Pure resume: checkpoint seed without followup_text, so the
+                # pipeline skips completed modules and re-runs the failed one.
+                run_kwargs = {"seed_state": resume_info.get("seed_state")}
             runner = PipelineRunner(config, event_recorder=recorder)
             # Active cancellation flag (set by request_cancel).
             runner.cancel_event = self._cancel_events.get(run_id)
@@ -402,6 +454,33 @@ class RunManager:
             key=lambda item: str(item.get("started_at", "")),
             reverse=True,
         )
+
+    def rename(self, run_id: str, display_name: str) -> dict[str, Any]:
+        """Set a display name for a run (sidebar only; question untouched)."""
+
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", run_id):
+            raise ValueError("run_id 含非法字符")
+        display_name = " ".join(str(display_name or "").split())
+        if not display_name:
+            raise ValueError("名称不能为空")
+        if len(display_name) > 200:
+            raise ValueError("名称过长，请控制在 200 字以内")
+        manifest_path = self.output_root / run_id / "manifest.json"
+        if not manifest_path.exists():
+            raise LookupError(f"运行 {run_id} 不存在")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"运行 {run_id} 的 manifest 损坏，无法重命名：{exc}") from exc
+        manifest["display_name"] = display_name
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        with self._lock:
+            if run_id in self._runs:
+                self._runs[run_id]["display_name"] = display_name
+        return manifest
 
     def delete(self, run_id: str) -> list[str]:
         """Delete a run directory together with its whole followup chain.
@@ -830,6 +909,26 @@ class HypoForgeRequestHandler(BaseHTTPRequestHandler):
                 return
             self._json(info, HTTPStatus.ACCEPTED)
             return
+        if route is not None and route[1] == "rename":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length > 4096:
+                    raise ValueError("请求内容过大")
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                info = self.server.manager.rename(
+                    route[0], payload.get("name", "")
+                )
+            except ValueError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            except LookupError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+                return
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self._json({"error": "请求 JSON 无效"}, HTTPStatus.BAD_REQUEST)
+                return
+            self._json({"run": info}, HTTPStatus.OK)
+            return
         if parsed.path != "/api/runs":
             self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             return
@@ -849,6 +948,7 @@ class HypoForgeRequestHandler(BaseHTTPRequestHandler):
                 openalex_mailto=payload.get("openalex_mailto", ""),
                 parent_run_id=payload.get("parent_run_id", ""),
                 followup=payload.get("followup", ""),
+                resume_of=payload.get("resume_of", ""),
             )
         except ValueError as exc:
             self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)

@@ -376,6 +376,39 @@ def test_checkpoint_is_atomically_published_without_temp_residue(tmp_path) -> No
     assert list(tmp_path.glob("*.tmp")) == []
 
 
+@pytest.mark.asyncio
+async def test_pure_resume_seed_skips_completed_modules(tmp_path) -> None:
+    """seed_state without followup_text is a pure resume: the completed
+    module is skipped (checkpoint semantics) and run_id is rebound."""
+    config = PipelineConfig(
+        verbose=False,
+        output_dir=str(tmp_path),
+        enabled_modules=["m1"],
+    )
+    seed = {
+        "run_id": "parent-run",
+        "input_question": "蛋白质错误折叠如何导致神经退行性疾病？",
+        "problem_card": {
+            "original_question": "蛋白质错误折叠如何导致神经退行性疾病？",
+        },
+        "_last_module": "m1",
+    }
+    runner = PipelineRunner(config)
+    final = await runner.run(
+        question="ignored",
+        run_id="child-run",
+        seed_state=seed,
+    )
+
+    assert final.run_id == "child-run"
+    # 问题卡来自断点，未被 followup 重置；M1 因输出齐全而跳过。
+    assert final.input_question == "蛋白质错误折叠如何导致神经退行性疾病？"
+    assert final.problem_card.original_question == (
+        "蛋白质错误折叠如何导致神经退行性疾病？"
+    )
+    assert runner._resume_last_module is None  # 光标已消费（M1 跳过后清空）
+
+
 def test_run_lock_rejects_a_second_writer_for_the_same_run(tmp_path) -> None:
     runner = PipelineRunner(PipelineConfig(verbose=False, output_dir=str(tmp_path)))
     runner._current_run_id = "single-writer"

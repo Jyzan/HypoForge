@@ -1200,10 +1200,14 @@ class PipelineRunner:
             *seed_state*; it overrides *question* as the input question
             (falls back to *question* when empty).
         seed_state : dict | None
-            Final state (dict / loaded output JSON) of a previous run.  When
-            provided, this run is a **follow-up run**: whitelisted M2/M3
+            State (dict / loaded checkpoint JSON) of a previous run.  With
+            *followup_text* this is a **follow-up run**: whitelisted M2/M3
             knowledge artifacts are inherited, everything else resets, and a
-            fresh iteration budget is granted (see :func:`build_followup_seed`).
+            fresh iteration budget is granted (see
+            :func:`build_followup_seed`).  Without *followup_text* this is a
+            **pure resume**: the seed is treated as a checkpoint, completed
+            modules are skipped, and the failed module re-runs with the same
+            iteration budget.
 
         Returns
         -------
@@ -1232,9 +1236,31 @@ class PipelineRunner:
         try:
             graph = self._build_graph()
 
-            # ---- initial state: followup run > checkpoint resume > fresh ----
+            # ---- initial state: pure resume > followup run > checkpoint resume > fresh ----
             checkpoint = self._load_checkpoint() if resume else None
-            if seed_state is not None:
+            if seed_state is not None and not followup_text:
+                # Pure resume (no followup semantics): the seed is a previous
+                # run's checkpoint, so modules whose outputs already exist are
+                # skipped and the failed module re-runs with the same
+                # iteration budget.
+                seed = dict(seed_state)
+                last_module = seed.pop("_last_module", "")
+                self._resume_last_module = (
+                    last_module
+                    if last_module in self.config.enabled_modules else None
+                )
+                initial_state = PipelineState(**seed)
+                initial_state.run_id = run_id
+                if self.config.verbose:
+                    from .display import console, COLORS
+                    console.print()
+                    console.print(
+                        f"  [{COLORS['success']}][RESUME] Continuing from checkpoint"
+                        f"{' after ' + last_module.upper() if last_module else ''} — "
+                        f"completed modules will be skipped"
+                        f"[/{COLORS['success']}]"
+                    )
+            elif seed_state is not None:
                 self._resume_last_module = None
                 initial_state = build_followup_seed(
                     seed_state=seed_state,

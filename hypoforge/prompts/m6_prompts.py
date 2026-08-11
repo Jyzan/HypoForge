@@ -76,6 +76,16 @@ M6_REASON_FIRST = (
 )
 
 
+M6_FORMAT_NOTE = (
+    "Formatting requirements:\n"
+    "- `reasoning`: use short bullet points, one `- ` line per finding, with the "
+    "key term wrapped in `**bold**`; keep each point to one or two sentences.\n"
+    "- `suggestions`: a numbered list (`1. `, `2. `…), one concrete action per item.\n"
+    "- Do not use tables, nested lists, or section headings; bold is the only "
+    "inline emphasis you need."
+)
+
+
 M6_USER_TEMPLATE = """\
 Original question: {original_question}
 

@@ -24,6 +24,7 @@ from ..protocol import ModuleProtocol
 from ..prompts.m6_prompts import (
     M6_EVIDENCE_VERDICT_SYSTEM,
     M6_EVIDENCE_VERDICT_TEMPLATE,
+    M6_FORMAT_NOTE,
     M6_REASON_FIRST,
     M6_REVIEWER_PROMPTS,
     M6_USER_TEMPLATE,
@@ -316,7 +317,12 @@ class M6ReviewIteration(ModuleProtocol):
             # Anchor the score (rubric) and force reason-before-score, both
             # sourced from the single rubric definition.
             system_prompt = "\n\n".join(
-                p for p in (M6_REVIEWER_PROMPTS[dim], review_rubric_line(dim), M6_REASON_FIRST) if p
+                p for p in (
+                    M6_REVIEWER_PROMPTS[dim],
+                    review_rubric_line(dim),
+                    M6_REASON_FIRST,
+                    M6_FORMAT_NOTE,
+                ) if p
             )
             started_at = time.monotonic()
             emit_event(

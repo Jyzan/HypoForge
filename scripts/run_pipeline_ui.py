@@ -18,7 +18,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="HypoForge M1-M6 local dashboard")
     parser.add_argument(
         "--config",
-        default=str(REPO_ROOT / "configs/full_pipeline_m2agentic_qwen37plus_live.yaml"),
+        default=str(REPO_ROOT / "configs/web_ui.yaml"),
         help="M1-M6 YAML configuration",
     )
     parser.add_argument(
