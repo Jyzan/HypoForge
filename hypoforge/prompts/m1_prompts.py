@@ -123,6 +123,13 @@ Rules:
   examples, or likely solutions as entity sources.
 - Aliases may clarify an entity, but aliases are not independent entities and
   cannot justify an entity absent from the original question.
+- Provide aliases in BOTH languages when the question is in Chinese or
+  English: the professional term in the other language (a Chinese question
+  gets the English term, an English question gets the Chinese term) plus
+  common synonyms, abbreviations, or parenthetical variants that appear in
+  the literature. Downstream modules match these names literally, so every
+  alias must be a real name someone would quote — never a paraphrase,
+  translation-on-the-fly, or definition.
 
 Return JSON with only `entities`.
 """

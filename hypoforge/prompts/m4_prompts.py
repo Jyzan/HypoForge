@@ -31,6 +31,19 @@ task contract, return its exact contract ID plus a short literal excerpt copied
 from this hypothesis's statement, mechanism, or prediction. Never claim an ID
 whose meaning is absent from the cited excerpt.
 
+Task contract fidelity (hard gate):
+- Every required task entity name MUST appear verbatim — the exact characters,
+  no translation or paraphrase — in the statement or mechanism. The validator
+  matches these names literally, so quote one of the supplied exact
+  names/aliases from the task contract block.
+- Match the hypothesis language to the original question. Use the alias in the
+  sentence's language when the contract lists one (e.g. "immune system" in an
+  English sentence if listed as an alias), or parenthesize as
+  ``中文名（English term）``. Never embed a Chinese contract name inside an
+  English sentence.
+- Requirement excerpts must be copied character-for-character from the
+  hypothesis text and must name the requirement's primary entity.
+
 Rules:
 - Hypotheses must be *novel* — do not restate established facts.
 - Every hypothesis must be *testable* with current or near-future experimental methods.
@@ -70,6 +83,8 @@ Conflicts (where hypotheses could resolve tension):
 
 Original question: {original_question}
 {feedback_context}
+
+{task_contract_block}
 Generate {num_candidates} candidate hypotheses.
 """
 
@@ -86,6 +101,9 @@ patch, prose, or explanations outside the objects.
 Binding rules:
 - Preserve the original research object, domain, relation, and requested outcome.
 - Address every required task entity and requirement in the supplied contract.
+- Entity names MUST appear verbatim (exact characters, same language, no
+  translation or paraphrase) in the statement or mechanism — quote one of the
+  supplied exact names/aliases from the task contract block.
 - In `task_trace`, use only contract IDs present in the supplied context.
 - Every `output_excerpt` must be copied literally from that same hypothesis's
   statement, mechanism, observable predictions, or falsification conditions.
@@ -115,6 +133,8 @@ Machine-check diagnostics:
 
 Original question: {original_question}
 {feedback_context}
+
+{task_contract_block}
 Repair the candidates so that their content and literal task traces satisfy the
 binding task contract. Do not add evidence that is absent from the graph context.
 """

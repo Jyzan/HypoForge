@@ -322,3 +322,43 @@ async def test_initial_decomposition_call_cannot_generate_entities_or_contract()
         "机械臂",
         "离线强化学习",
     ]
+
+
+@pytest.mark.asyncio
+async def test_entity_extraction_requests_bilingual_aliases() -> None:
+    """M1 extraction must request bilingual aliases so downstream literal
+    alignment gates (M4-M6) can match contract entities in either language."""
+    question = "肠道微生物组如何影响人体免疫系统？"
+    module = module_with([
+        {
+            "entities": [{
+                "name": "肠道微生物组",
+                "source_mention": "肠道微生物组",
+                "aliases": ["gut microbiome", "肠道菌群", "gut microbiota"],
+                "role": "primary_object",
+                "required": True,
+                "extraction_reason": "directly studied research object",
+            }],
+        },
+        {
+            "items": [{
+                "candidate_name": "肠道微生物组",
+                "accepted": True,
+                "source_mention": "肠道微生物组",
+                "reason": "literal term in the question",
+            }],
+            "missing_explicit_entities": [],
+            "complete": True,
+        },
+    ])
+
+    entities = await module._extract_and_audit_entities(question)
+
+    extraction_prompt = module.client.calls[0]["system_prompt"]
+    assert "BOTH languages" in extraction_prompt
+    assert "must be a real name someone would quote" in extraction_prompt
+    assert len(entities) == 1
+    # 双语 aliases 保留进契约，供 M4 的字面匹配使用。
+    assert set(entities[0].aliases) == {
+        "gut microbiome", "肠道菌群", "gut microbiota",
+    }

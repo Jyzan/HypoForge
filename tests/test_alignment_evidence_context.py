@@ -374,6 +374,116 @@ async def test_m4_repairs_contract_diagnostics_once_without_weakening_gate() -> 
     assert result["top_hypotheses"][0].statement == valid_statement
 
 
+@pytest.mark.asyncio
+async def test_m4_generator_prompt_carries_literal_contract_names() -> None:
+    """The generator must see the exact contract names/aliases so it can quote
+    them verbatim — the alignment gate matches them character-for-character."""
+    state = _contract_state(
+        "锂金属电池",
+        "lithium-metal battery",
+        "reduce dendrite growth",
+        "How can an electrolyte reduce dendrite growth in a lithium-metal battery?",
+    )
+    valid = {
+        "hypothesis_id": "H1",
+        "statement": (
+            "A 锂金属电池 electrolyte reduces dendrite growth during cycling."
+        ),
+        "mechanism": "锂金属电池 ion flux homogenization -> less dendrite growth",
+        "observable_predictions": ["Dendrite coverage decreases."],
+        "falsification_conditions": ["Dendrite growth is unchanged."],
+        "supporting_evidence": [],
+        "task_trace": {
+            "entity_mentions": [{
+                "contract_id": "E1",
+                "output_excerpt": "锂金属电池",
+            }],
+            "requirement_mentions": [{
+                "contract_id": "R1",
+                "output_excerpt": "A 锂金属电池 electrolyte reduces dendrite growth during cycling.",
+            }],
+        },
+    }
+    client = HypothesisRepairClient([
+        [valid],
+        [{
+            "hypothesis_id": "H1",
+            "consistent": True,
+            "rationale": "same research object",
+        }],
+    ])
+    module = M4HypothesisGeneration(num_candidates=1, top_k=1, mode="direct")
+    module.client = client
+
+    result = await module._run_llm(state)
+
+    generator_prompt = client.calls[0]["user_prompt"]
+    assert "锂金属电池" in generator_prompt
+    assert "lithium-metal battery" in generator_prompt
+    assert "R1" in generator_prompt
+    assert "Do not translate or paraphrase" in generator_prompt
+    assert result["top_hypotheses"][0].statement == valid["statement"]
+
+
+@pytest.mark.asyncio
+async def test_m4_repair_prompt_carries_literal_contract_names() -> None:
+    """The deterministic repair must also see the exact contract names."""
+    state = _contract_state(
+        "锂金属电池",
+        "lithium-metal battery",
+        "reduce dendrite growth",
+        "How can an electrolyte reduce dendrite growth in a lithium-metal battery?",
+    )
+    invalid = {
+        "hypothesis_id": "H1",
+        "statement": "A generic device becomes more stable after treatment.",
+        "mechanism": "treatment -> stability",
+        "observable_predictions": ["Failure frequency decreases."],
+        "falsification_conditions": ["Failure frequency does not change."],
+        "supporting_evidence": [],
+        "task_trace": {},
+    }
+    valid = {
+        "hypothesis_id": "H1",
+        "statement": (
+            "A 锂金属电池 electrolyte reduces dendrite growth during cycling."
+        ),
+        "mechanism": "锂金属电池 ion flux homogenization -> less dendrite growth",
+        "observable_predictions": ["Dendrite coverage decreases."],
+        "falsification_conditions": ["Dendrite growth is unchanged."],
+        "supporting_evidence": [],
+        "task_trace": {
+            "entity_mentions": [{
+                "contract_id": "E1",
+                "output_excerpt": "锂金属电池",
+            }],
+            "requirement_mentions": [{
+                "contract_id": "R1",
+                "output_excerpt": "A 锂金属电池 electrolyte reduces dendrite growth during cycling.",
+            }],
+        },
+    }
+    client = HypothesisRepairClient([
+        [invalid],
+        [valid],
+        [{
+            "hypothesis_id": "H1",
+            "consistent": True,
+            "rationale": "same research object",
+        }],
+    ])
+    module = M4HypothesisGeneration(num_candidates=1, top_k=1, mode="direct")
+    module.client = client
+
+    result = await module._run_llm(state)
+
+    repair_prompt = client.calls[1]["user_prompt"]
+    assert "锂金属电池" in repair_prompt
+    assert "lithium-metal battery" in repair_prompt
+    assert "Binding task contract" in repair_prompt
+    assert result["top_hypotheses"][0].statement == valid["statement"]
+
+
 def _pose_estimation_contract_state() -> PipelineState:
     question = "如何训练模型使之可以从单张图片识别出物体的位置、旋转等信息？"
     return PipelineState(
@@ -604,7 +714,9 @@ def test_m5_requires_original_language_and_literal_contract_terms() -> None:
 
     assert "same language as the original question" in prompt
     assert "verbatim" in prompt
-    assert "contract id alone" in prompt
+    assert "never embed a chinese" in prompt
+    assert "contract name inside an english sentence" in prompt
+    assert "never paraphrase an entity" in prompt
 
 
 def test_m5_canonicalizes_trace_excerpts_from_plan_content() -> None:

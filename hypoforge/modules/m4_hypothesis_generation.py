@@ -306,6 +306,54 @@ class M4HypothesisGeneration(ModuleProtocol):
         return canonical
 
     @staticmethod
+    def _render_task_contract_block(state: PipelineState) -> str:
+        """Render the binding M1 task contract for literal reproduction.
+
+        The alignment gate matches entity names character-for-character, so
+        the generator must see the exact names/aliases it has to quote.
+        Returns an empty string when there is no binding contract.
+        """
+        card = state.problem_card
+        if card is None:
+            return ""
+        contract = card.task_contract
+        if not contract.entities and not contract.requirements:
+            return ""
+        lines = [
+            "Binding task contract (hard alignment gate):",
+            "Required task entities — quote one of the exact names below "
+            "verbatim (same characters, same language) in the hypothesis "
+            "statement or mechanism:",
+        ]
+        for entity in contract.entities:
+            terms = list(dict.fromkeys(
+                term for term in [entity.name, *entity.aliases]
+                if str(term).strip()
+            ))
+            mark = "required" if entity.required else "optional"
+            rendered = (
+                f"- {entity.entity_id}: {entity.name} ({entity.role}, {mark})"
+            )
+            if len(terms) > 1:
+                rendered += f" — exact names/aliases: {' | '.join(terms)}"
+            lines.append(rendered)
+        if contract.requirements:
+            lines.append(
+                "Required auditable requirements — each must be traceable via "
+                "a literal excerpt that names its primary entity:"
+            )
+            for requirement in contract.requirements:
+                lines.append(
+                    f"- {requirement.requirement_id}: {requirement.relation} "
+                    f"(primary entity: {requirement.primary_entity_id})"
+                )
+        lines.append(
+            "Do not translate or paraphrase these names — the validator "
+            "matches them literally (character-for-character)."
+        )
+        return "\n".join(lines)
+
+    @staticmethod
     def _check_context_contract(
         state: PipelineState,
         context: GraphContext,
@@ -550,6 +598,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                     ),
                     original_question=question,
                     feedback_context=feedback_context,
+                    task_contract_block=self._render_task_contract_block(state),
                 ),
                 output_schema={
                     "type": "array",
@@ -876,6 +925,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                     original_question=question,
                     num_candidates=self.num_candidates,
                     feedback_context=feedback_context,
+                    task_contract_block=self._render_task_contract_block(state),
                 ),
                 output_schema=generator_schema,
                 max_tokens=16384,
