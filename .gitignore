@@ -38,3 +38,8 @@ knowledge_graph/
 dist/
 build/
 *.egg-info/
+
+# Local tooling & scratch (not project artifacts)
+docs/
+.chatgpt/
+tmp_pytest/
