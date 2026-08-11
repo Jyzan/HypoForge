@@ -582,18 +582,17 @@ class RunManager:
             if path.is_file()
         ]
 
-    def result(self, run_id: str) -> dict[str, Any] | None:
-        run_dir = self.output_root / run_id
-        state_path = run_dir / f"{run_id}.json"
-        if not state_path.exists():
-            return None
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        scores_path = run_dir / f"{run_id}_scores.json"
-        scores = (
-            json.loads(scores_path.read_text(encoding="utf-8"))
-            if scores_path.exists()
-            else None
-        )
+    @staticmethod
+    def _public_state_payload(
+        run_id: str,
+        state: dict[str, Any],
+        *,
+        scores: dict[str, Any] | None = None,
+        is_final: bool,
+        snapshot_source: str = "",
+    ) -> dict[str, Any]:
+        """Return the browser-safe subset of a persisted pipeline state."""
+
         return {
             "run_id": run_id,
             "question": state.get("input_question", ""),
@@ -623,7 +622,63 @@ class RunManager:
                 "output": state.get("total_output_tokens", 0),
             },
             "scores": scores,
+            "last_module": state.get("_last_module", ""),
+            "is_final": is_final,
+            "snapshot_source": snapshot_source,
         }
+
+    def result(self, run_id: str) -> dict[str, Any] | None:
+        run_dir = self.output_root / run_id
+        state_path = run_dir / f"{run_id}.json"
+        if not state_path.exists():
+            return None
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        scores_path = run_dir / f"{run_id}_scores.json"
+        scores = (
+            json.loads(scores_path.read_text(encoding="utf-8"))
+            if scores_path.exists()
+            else None
+        )
+        return self._public_state_payload(
+            run_id,
+            state,
+            scores=scores,
+            is_final=True,
+            snapshot_source=state_path.name,
+        )
+
+    def latest_state(self, run_id: str) -> dict[str, Any] | None:
+        """Return the newest readable state for final, failed, or live runs.
+
+        The final state remains authoritative. Before it exists, the atomic
+        checkpoint is preferred, followed by the latest completed-module
+        snapshot. This preserves inspectability when a later module fails.
+        """
+
+        final = self.result(run_id)
+        if final is not None:
+            return final
+
+        run_dir = self.output_root / run_id
+        candidates = [run_dir / f"{run_id}_checkpoint.json"]
+        snapshots_dir = run_dir / "snapshots"
+        if snapshots_dir.is_dir():
+            candidates.extend(sorted(snapshots_dir.glob("*.json"), reverse=True))
+
+        for path in candidates:
+            if not path.is_file():
+                continue
+            try:
+                state = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            return self._public_state_payload(
+                run_id,
+                state,
+                is_final=False,
+                snapshot_source=str(path.relative_to(run_dir)),
+            )
+        return None
 
     def rounds(self, run_id: str) -> dict[str, Any]:
         """Round timeline with a stable contract shape (read from state.json):
@@ -853,6 +908,13 @@ class HypoForgeRequestHandler(BaseHTTPRequestHandler):
                 self._json(
                     {"result": result},
                     HTTPStatus.OK if result is not None else HTTPStatus.ACCEPTED,
+                )
+                return
+            if action == "state":
+                state = self.server.manager.latest_state(run_id)
+                self._json(
+                    {"state": state},
+                    HTTPStatus.OK if state is not None else HTTPStatus.ACCEPTED,
                 )
                 return
             if action == "artifacts":

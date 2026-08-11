@@ -323,6 +323,33 @@ class GraphAuditRecord(BaseModel):
     iteration: int = Field(default=0, ge=0)
 
 
+class EntityMergeMember(BaseModel):
+    """Lossless snapshot of one entity before a graph-level merge."""
+
+    node_id: str
+    name: str
+    similarity_to_canonical: float = Field(ge=-1.0, le=1.0)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class EntityMergeRecord(BaseModel):
+    """Append-only audit record for one final-graph entity merge group."""
+
+    merge_id: str
+    round_index: int = Field(default=0, ge=0)
+    threshold: float = Field(default=0.92, ge=-1.0, le=1.0)
+    embedding_model: str = ""
+    method: Literal["exact", "embedding_cosine"]
+    canonical_node_id: str
+    canonical_name: str
+    members: List[EntityMergeMember] = Field(default_factory=list)
+    node_count_before: int = Field(default=0, ge=0)
+    node_count_after: int = Field(default=0, ge=0)
+    redirected_edge_count: int = Field(default=0, ge=0)
+    deduplicated_edge_count: int = Field(default=0, ge=0)
+    removed_self_loop_count: int = Field(default=0, ge=0)
+
+
 class EvidenceGraph(BaseModel):
     """Full evidence graph (M3 output)."""
 
@@ -335,6 +362,7 @@ class EvidenceGraph(BaseModel):
     knowledge_gaps: List[str] = Field(default_factory=list)
     version: int = Field(default=1, ge=1)
     audit_log: List[GraphAuditRecord] = Field(default_factory=list)
+    entity_merge_log: List[EntityMergeRecord] = Field(default_factory=list)
 
 
 # ============================================================================
@@ -438,6 +466,25 @@ class ReviewResult(BaseModel):
     graph_correction_requests: List[GraphCorrectionRequest] = Field(default_factory=list)
     version: int = 1
 
+    @field_validator("reasoning", "suggestions", mode="before")
+    @classmethod
+    def _normalise_review_text(cls, value: Any) -> Any:
+        """Accept the list form emitted by some structured-review responses.
+
+        The public state contract keeps ``reasoning`` and ``suggestions`` as
+        text because downstream modules and interfaces consume displayable
+        strings. Qwen may nevertheless return bullet points as a JSON array,
+        so join those entries at the contract boundary instead of failing the
+        entire M6 iteration.
+        """
+        if isinstance(value, (list, tuple)):
+            return "\n".join(
+                str(item).strip()
+                for item in value
+                if str(item).strip()
+            )
+        return value
+
 
 # ============================================================================
 # M2 增强导出 — canonical KnowledgeExport (agentic M2 → M3)
@@ -516,6 +563,11 @@ class M2PaperExport(BaseModel):
     document_source_uri: str = ""
     document_license: str = ""
     degraded_to_abstract: bool = False
+    # Structured full-text failure attribution; empty when full text was
+    # retrieved successfully. Categories: publisher_blocked / invalid_pdf_link
+    # / no_fulltext_available / other.
+    fulltext_failure_category: str = ""
+    fulltext_failure_detail: str = ""
     chunks_parsed: int = 0
     chunks_retrieved: int = 0
     stage_elapsed_seconds: Dict[str, float] = Field(default_factory=dict)

@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 from time import monotonic as _monotonic
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Awaitable, Callable
@@ -14,6 +15,13 @@ from pathlib import Path
 
 from ..models import ContentLevel, DocumentRecord, PaperRecord
 from ..protocols import FulltextResolverProtocol
+from .attribution import (
+    BLOCKED_HTTP_CODES,
+    INVALID_PDF_LINK,
+    NO_FULLTEXT_AVAILABLE,
+    OTHER,
+    PUBLISHER_BLOCKED,
+)
 
 
 ArxivPDFFetchBackend = Callable[[str, float], Awaitable[bytes]]
@@ -25,6 +33,37 @@ class ArxivDownloadTimeoutError(TimeoutError):
 
 def _safe_error(exc: BaseException) -> str:
     return " ".join(f"{type(exc).__name__}: {exc}".split())[:500]
+
+
+def _percent_encode_non_ascii(component: str, safe: str) -> str:
+    """Percent-encode non-ASCII characters without touching ASCII content."""
+
+    if component.isascii():
+        return component
+    # unquote → quote normalises partially encoded input and avoids
+    # double-encoding already percent-encoded sequences.
+    return urllib.parse.quote(urllib.parse.unquote(component), safe=safe)
+
+
+def _safe_request_url(url: str) -> str:
+    """Make a URL safe for ``urllib.request`` without changing ASCII URLs.
+
+    Publisher OA links occasionally carry raw Chinese characters in the path
+    or query, which makes ``urllib.request.Request`` raise
+    ``UnicodeEncodeError``.  Only components containing non-ASCII characters
+    are normalised, so ASCII-only URLs stay byte-for-byte unchanged.
+    """
+
+    parts = urllib.parse.urlsplit(url)
+    return urllib.parse.urlunsplit(
+        (
+            parts.scheme,
+            _percent_encode_non_ascii(parts.netloc, ":%@"),
+            _percent_encode_non_ascii(parts.path, "/%"),
+            _percent_encode_non_ascii(parts.query, "&=%+"),
+            _percent_encode_non_ascii(parts.fragment, ""),
+        )
+    )
 
 
 def _set_response_read_timeout(response: object, seconds: float) -> bool:
@@ -115,7 +154,7 @@ async def _default_fetch(
     def fetch() -> bytes:
         started = _monotonic()
         request = urllib.request.Request(
-            url,
+            _safe_request_url(url),
             headers={"User-Agent": "HypoForge/0.1 arxiv-fulltext"},
         )
         socket_timeout = min(timeout, 30.0, download_timeout_seconds)
@@ -210,15 +249,26 @@ class ArxivPDFResolver(FulltextResolverProtocol):
             ),
         )
 
-    def _abstract_document(self, paper: PaperRecord, error: str) -> DocumentRecord:
+    def _abstract_document(
+        self,
+        paper: PaperRecord,
+        error: str,
+        *,
+        category: str = "",
+        detail: str = "",
+    ) -> DocumentRecord:
         abstract = " ".join(paper.abstract.split())
         if not abstract:
-            detail = f"{error}; no readable content" if error else "no readable content"
+            detail_message = (
+                f"{error}; no readable content" if error else "no readable content"
+            )
             return DocumentRecord(
                 document_id=self._document_id(paper, "metadata"),
                 paper_id=paper.paper_id,
                 content_level=ContentLevel.METADATA,
-                retrieval_error=detail,
+                retrieval_error=detail_message,
+                retrieval_failure_category=category,
+                retrieval_failure_detail=detail or detail_message,
             )
         path = self._paper_dir(paper) / "abstract.json"
         payload = json.dumps(
@@ -232,13 +282,40 @@ class ArxivPDFResolver(FulltextResolverProtocol):
             content_level=ContentLevel.ABSTRACT,
             local_path=str(path.resolve()),
             retrieval_error=error,
+            retrieval_failure_category=category,
+            retrieval_failure_detail=detail or error,
         )
+
+    @staticmethod
+    def _attribute_failure(exc: BaseException, source_uri: str) -> tuple[str, str]:
+        """Classify one download failure into (category, readable detail)."""
+
+        code = getattr(exc, "code", None)
+        if isinstance(exc, urllib.error.HTTPError) and isinstance(code, int):
+            if code in BLOCKED_HTTP_CODES:
+                return (
+                    PUBLISHER_BLOCKED,
+                    f"HTTP {code}：出版商反爬拦截，拒绝下载 {source_uri}",
+                )
+            return OTHER, f"HTTP {code}：下载失败 {source_uri}"
+        message = _safe_error(exc)
+        if "invalid PDF response" in message:
+            return (
+                INVALID_PDF_LINK,
+                f"链接响应体不是 PDF（可能是落地页/HTML）：{source_uri}",
+            )
+        if "download deadline" in message:
+            return OTHER, f"下载超时：{source_uri}"
+        return OTHER, message
 
     async def resolve_abstract(self, paper: PaperRecord) -> DocumentRecord:
         """Materialize the real abstract without another network request."""
+        message = "open-access PDF full text unavailable; used abstract"
         return self._abstract_document(
             paper,
-            "open-access PDF full text unavailable; used abstract",
+            message,
+            category=NO_FULLTEXT_AVAILABLE,
+            detail=message,
         )
 
     async def resolve(self, paper: PaperRecord) -> DocumentRecord:
@@ -250,7 +327,12 @@ class ArxivPDFResolver(FulltextResolverProtocol):
             quoted_id = urllib.parse.quote(arxiv_id, safe="/.")
             source_uri = f"https://arxiv.org/pdf/{quoted_id}"
         else:
-            return self._abstract_document(paper, "open-access PDF identifier unavailable")
+            return self._abstract_document(
+                paper,
+                "open-access PDF identifier unavailable",
+                category=NO_FULLTEXT_AVAILABLE,
+                detail="无 OA PDF 链接且无 arXiv 标识符，无法定位全文",
+            )
         path = self._paper_dir(paper) / "paper.pdf"
         if self._valid_cached_pdf(path):
             return self._pdf_document(paper, path, source_uri)
@@ -290,4 +372,10 @@ class ArxivPDFResolver(FulltextResolverProtocol):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return self._abstract_document(paper, _safe_error(exc))
+            category, detail = self._attribute_failure(exc, source_uri)
+            return self._abstract_document(
+                paper,
+                _safe_error(exc),
+                category=category,
+                detail=detail,
+            )

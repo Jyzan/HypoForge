@@ -22,6 +22,7 @@ from ..protocols import (
     PaperReaderProtocol,
     ReadingExtractionWorkflowProtocol,
 )
+from .attribution import OTHER, attribute_error_text
 from .store import InMemoryChunkStore
 
 T = TypeVar("T")
@@ -190,6 +191,8 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
             "document_id": document.document_id,
             "document_source_uri": document.source_uri,
             "document_license": document.license,
+            "fulltext_failure_category": document.retrieval_failure_category,
+            "fulltext_failure_detail": document.retrieval_failure_detail,
         }
 
     async def _read_one(
@@ -215,10 +218,13 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
         except asyncio.TimeoutError:
             fallback = getattr(self.resolver, "resolve_abstract", None)
             if not callable(fallback):
+                message = "fulltext_resolver timed out; abstract fallback unavailable"
                 return PaperReadingResult(
                     paper_id=paper.paper_id,
                     stage_elapsed_seconds=timings,
-                    errors=["fulltext_resolver timed out; abstract fallback unavailable"],
+                    fulltext_failure_category=attribute_error_text(message),
+                    fulltext_failure_detail=message,
+                    errors=[message],
                 )
             resolver_errors.append("fulltext_resolver timed out; used abstract")
             try:
@@ -231,19 +237,31 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
             except asyncio.CancelledError:
                 raise
             except Exception as fallback_exc:
+                fallback_error = _error("abstract_fallback", fallback_exc)
                 return PaperReadingResult(
                     paper_id=paper.paper_id,
                     stage_elapsed_seconds=timings,
+                    fulltext_failure_category=attribute_error_text(fallback_error),
+                    fulltext_failure_detail=fallback_error,
                     errors=[
                         *resolver_errors,
-                        _error("abstract_fallback", fallback_exc),
+                        fallback_error,
                     ],
                 )
+            document = document.model_copy(
+                update={
+                    "retrieval_failure_category": OTHER,
+                    "retrieval_failure_detail": "全文解析超时，已降级为摘要",
+                }
+            )
         except Exception as exc:
+            resolver_error = _error("fulltext_resolver", exc)
             return PaperReadingResult(
                 paper_id=paper.paper_id,
                 stage_elapsed_seconds=timings,
-                errors=[_error("fulltext_resolver", exc)],
+                fulltext_failure_category=attribute_error_text(resolver_error),
+                fulltext_failure_detail=resolver_error,
+                errors=[resolver_error],
             )
 
         document_errors = [
@@ -304,7 +322,14 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
                     details={"paper_id": paper.paper_id, "title": paper.title},
                 )
                 self.store.replace(paper.paper_id, chunks)
-                document = fallback_document
+                document = fallback_document.model_copy(
+                    update={
+                        # Retrieval itself succeeded; the parse failure is the
+                        # real reason this paper degraded to its abstract.
+                        "retrieval_failure_category": OTHER,
+                        "retrieval_failure_detail": parser_error,
+                    }
+                )
                 document_errors = [
                     *document_errors,
                     parser_error,

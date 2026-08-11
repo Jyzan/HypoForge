@@ -6,6 +6,8 @@ import asyncio
 import re
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
+from typing import Dict, List, Set, Tuple
 
 from ...observability import emit_event
 from ..models import (
@@ -29,12 +31,54 @@ from ..protocols import (
 )
 from .budget import calculate_remaining, choose_stop_reason, estimate_tokens
 from .ranking import domain_token_overlap, rerank_with_scout, select_retained_papers
+from .round_plan import (
+    RoundSpec,
+    classify_entities,
+    plan_entity_rounds,
+    poor_round_reason,
+)
 
 
 class _SearchTimeBudgetExpired(TimeoutError):
     def __init__(self, stage: str) -> None:
         super().__init__(f"search time budget exhausted during {stage}")
         self.stage = stage
+
+
+class _RoundHalt(Exception):
+    """Internal control flow: a search round ended the run early."""
+
+    def __init__(self, stop_reason: StopReason) -> None:
+        super().__init__(stop_reason.value)
+        self.stop_reason = stop_reason
+
+
+@dataclass
+class _RoundContext:
+    """Mutable state shared between search rounds inside one ``run()`` call."""
+
+    state: SearchState
+    limits: SearchBudget
+    alignment_question: str
+    stage_elapsed_seconds: Dict[str, float]
+    existing_papers: Tuple[PaperRecord, ...] = ()
+    existing_ids: Set[str] = field(default_factory=set)
+    run_started_at: float = 0.0
+    all_queries: List[SearchQuery] = field(default_factory=list)
+    query_history: Set[Tuple[str, str]] = field(default_factory=set)
+    canonical_history: Dict[str, PaperRecord] = field(default_factory=dict)
+    candidate_pool: Dict[str, PaperRecord] = field(default_factory=dict)
+    scout_by_paper: Dict[str, ScoutNote] = field(default_factory=dict)
+    coverage: CoverageReport = field(default_factory=CoverageReport)
+    ranked: List[PaperRecord] = field(default_factory=list)
+    papers_found: int = 0
+    failed_sources: List[str] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+    source_result_counts: Dict[str, int] = field(default_factory=dict)
+    reused_ids: Set[str] = field(default_factory=set)
+    # Snapshots taken right before each round, used for per-round deltas.
+    round_start_counts: Dict[str, int] = field(default_factory=dict)
+    round_start_papers_found: int = 0
 
 
 class IterativeSearchAgent:
@@ -249,6 +293,7 @@ class IterativeSearchAgent:
         stage_clock: Callable[[], float] = time.perf_counter,
         token_estimator: Callable[[str], int] = estimate_tokens,
         retention_judge_client: object | None = None,
+        entity_classifier: object | None = None,
     ) -> None:
         for name, value in (
             ("final_k", final_k),
@@ -289,6 +334,9 @@ class IterativeSearchAgent:
         self.clock = clock
         self.stage_clock = stage_clock
         self.token_estimator = token_estimator
+        # LLM client for the must/unmust entity classification used by the
+        # entity-group round strategy (None → deterministic fallback).
+        self.entity_classifier = entity_classifier
         self._search_cache: dict[tuple[str, str, int], list[PaperRecord]] = {}
 
     async def run(
@@ -299,7 +347,21 @@ class IterativeSearchAgent:
         question_type: str = "",
         budget: SearchBudget | None = None,
         existing_papers: Sequence[PaperRecord] = (),
+        supplement_entities: Sequence[str] = (),
+        round_strategy: str = "coverage",
     ) -> SearchRunResult:
+        """Run the iterative search for one atomic sub-question.
+
+        ``round_strategy`` selects how rounds are organised:
+
+        - ``"coverage"`` (default, legacy): the coverage evaluator decides
+          whether another planner round runs.  Used by the supplement
+          (gap-search) path, the minimal path and DI-fake callers.
+        - ``"entity_group"``: rounds follow the deterministic must/unmust
+          entity grouping plan plus a single zero-result rescue round;
+          the coverage evaluator never decides rounds there.
+        """
+
         limits = budget or SearchBudget()
         started_at = self.clock()
         deadline_started_at = time.monotonic()
@@ -315,28 +377,23 @@ class IterativeSearchAgent:
             if domains else "",
         ]))
         state.remaining_budget = calculate_remaining(limits, state)
-        all_queries: list[SearchQuery] = []
-        query_history: set[tuple[str, str]] = set()
-        canonical_history: dict[str, PaperRecord] = {}
-        candidate_pool: dict[str, PaperRecord] = {}
-        scout_by_paper: dict[str, ScoutNote] = {}
-        coverage = CoverageReport()
-        ranked: list[PaperRecord] = []
-        papers_found = 0
-        failed_sources: list[str] = []
-        errors: list[str] = []
-        source_result_counts: dict[str, int] = {}
-        reused_ids: set[str] = set()
         existing_ids = {paper.paper_id for paper in existing_papers}
-        stop_reason = None
-        stage_elapsed_seconds = {
-            "query_planner": 0.0,
-            "source_search": 0.0,
-            "paper_deduplicator": 0.0,
-            "paper_ranker": 0.0,
-            "scout_reader": 0.0,
-            "coverage_evaluator": 0.0,
-        }
+        ctx = _RoundContext(
+            state=state,
+            limits=limits,
+            alignment_question=alignment_question,
+            stage_elapsed_seconds={
+                "query_planner": 0.0,
+                "source_search": 0.0,
+                "paper_deduplicator": 0.0,
+                "paper_ranker": 0.0,
+                "scout_reader": 0.0,
+                "coverage_evaluator": 0.0,
+            },
+            existing_papers=tuple(existing_papers),
+            existing_ids=existing_ids,
+            run_started_at=started_at,
+        )
 
         async def measure(stage: str, operation):
             stage_started_at = self.stage_clock()
@@ -392,293 +449,98 @@ class IterativeSearchAgent:
                 raise
             finally:
                 elapsed = max(0.0, self.stage_clock() - stage_started_at)
-                stage_elapsed_seconds[stage] += elapsed
+                ctx.stage_elapsed_seconds[stage] += elapsed
 
         def mark_time_budget_expired(exc: _SearchTimeBudgetExpired) -> StopReason:
-            errors.append(self._format_error(exc.stage, exc))
+            ctx.errors.append(self._format_error(exc.stage, exc))
             state.elapsed_seconds = max(
                 state.elapsed_seconds, float(limits.max_seconds)
             )
             state.remaining_budget = calculate_remaining(limits, state)
             return StopReason.TIME_BUDGET
 
+        if round_strategy == "entity_group":
+            stop_reason = await self._entity_group_rounds(
+                ctx,
+                measure,
+                mark_time_budget_expired,
+                deadline_started_at,
+                sub_question,
+                key_entities,
+                domains,
+                supplement_entities,
+            )
+        else:
+            stop_reason = await self._legacy_coverage_loop(
+                ctx,
+                measure,
+                mark_time_budget_expired,
+                deadline_started_at,
+                sub_question,
+                key_entities,
+                domains,
+                supplement_entities,
+            )
+        return await self._finalize_search(
+            ctx,
+            sub_question,
+            key_entities,
+            existing_ids,
+            started_at,
+            stop_reason,
+        )
+
+    async def _legacy_coverage_loop(
+        self,
+        ctx: _RoundContext,
+        measure,
+        mark_time_budget_expired,
+        deadline_started_at: float,
+        sub_question: str,
+        key_entities: Sequence[str],
+        domains: Sequence[str],
+        supplement_entities: Sequence[str],
+    ) -> StopReason:
+        """Legacy round organisation: the coverage evaluator decides whether
+        another planner round runs.  Kept verbatim for the supplement (gap)
+        path, the minimal path and DI-fake callers."""
+
+        state = ctx.state
+        limits = ctx.limits
+        stop_reason: StopReason | None = None
         while stop_reason is None:
+            # M2-local supplementary concepts only reach the query
+            # planner (and only when present, so narrower planner
+            # implementations keep working unchanged).
+            planner_kwargs: dict = {}
+            if supplement_entities:
+                planner_kwargs["supplement_entities"] = list(supplement_entities)
             try:
-                planned = await measure(
-                    "query_planner",
-                    self.query_planner.plan(
-                        sub_question,
-                        key_entities=key_entities,
-                        domains=domains,
-                        state=state.model_copy(deep=True),
-                    ),
+                successful_queries = await self._execute_round(
+                    ctx,
+                    measure,
+                    mark_time_budget_expired,
+                    deadline_started_at,
+                    sub_question,
+                    key_entities,
+                    domains,
+                    planner_kwargs,
                 )
-            except _SearchTimeBudgetExpired as exc:
-                stop_reason = mark_time_budget_expired(exc)
+            except _RoundHalt as halt:
+                stop_reason = halt.stop_reason
                 break
-            except Exception as exc:
-                errors.append(self._format_error("query_planner", exc))
-                stop_reason = StopReason.ERROR
-                break
-            round_index = state.round_index + 1
-            queries: list[SearchQuery] = []
-            for planned_query in planned:
-                key = self._query_key(planned_query)
-                if key in query_history:
-                    continue
-                query_history.add(key)
-                if planned_query.target_source in state.unavailable_sources:
-                    continue
-                queries.append(
-                    planned_query.model_copy(update={"round_index": round_index})
-                )
-                if len(queries) >= state.remaining_budget.max_queries:
-                    break
-
-            if not queries:
-                errors.append("query planner produced no new executable queries")
-                stop_reason = StopReason.NO_RESULTS
-                break
-            emit_event(
-                "tool_result",
-                module="m2",
-                tool="query_planner",
-                status="completed",
-                message=f"第 {round_index} 轮生成 {len(queries)} 条检索式",
-                details={
-                    "round": round_index,
-                    "queries": [
-                        {
-                            "text": query.text,
-                            "source": query.target_source,
-                            "purpose": query.purpose,
-                        }
-                        for query in queries
-                    ],
-                },
-            )
 
             try:
-                search_results = await measure(
-                    "source_search",
-                    asyncio.gather(
-                        *(self._search(query) for query in queries),
-                        return_exceptions=True,
-                    ),
-                )
-            except _SearchTimeBudgetExpired as exc:
-                stop_reason = mark_time_budget_expired(exc)
-                break
-            # Empty results use a deterministic relaxation chain before asking
-            # the planner for another stochastic round. Every fallback is
-            # recorded and consumes the same query budget.
-            for original_query, original_result in list(zip(queries, search_results)):
-                if isinstance(original_result, BaseException) or original_result:
-                    continue
-                for relaxed in self._deterministic_relaxations(
-                    original_query, key_entities
-                ):
-                    if state.queries_executed + len(queries) >= limits.max_queries:
-                        break
-                    key = self._query_key(relaxed)
-                    if key in query_history:
-                        continue
-                    query_history.add(key)
-                    queries.append(relaxed)
-                    try:
-                        relaxed_result = await self._search(relaxed)
-                    except BaseException as exc:
-                        search_results.append(exc)
-                        break
-                    search_results.append(relaxed_result)
-                    if relaxed_result:
-                        break
-            raw_papers: list[PaperRecord] = []
-            successful_queries = 0
-            for query, result in zip(queries, search_results):
-                source_name = query.target_source
-                if isinstance(result, BaseException):
-                    if source_name not in failed_sources:
-                        failed_sources.append(source_name)
-                    state.unavailable_sources.add(source_name)
-                    errors.append(self._format_error(source_name, result))
-                    continue
-                successful_queries += 1
-                source_result_counts[source_name] = (
-                    source_result_counts.get(source_name, 0) + len(result)
-                )
-                for paper in result:
-                    providers = {
-                        provider.casefold() for provider in paper.sources
-                    }
-                    if providers and source_name.casefold() not in providers:
-                        for provider in sorted(providers):
-                            fallback_key = f"{source_name}->{provider}"
-                            source_result_counts[fallback_key] = (
-                                source_result_counts.get(fallback_key, 0) + 1
-                            )
-                raw_papers.extend(result)
-
-            papers_found += len(raw_papers)
-            emit_event(
-                "tool_result",
-                module="m2",
-                tool="source_search",
-                status="completed",
-                message=f"第 {round_index} 轮检索获得 {len(raw_papers)} 篇记录",
-                details={
-                    "round": round_index,
-                    "source_result_counts": dict(source_result_counts),
-                    "failed_sources": list(failed_sources),
-                },
-            )
-            all_queries.extend(queries)
-            state.queries_used = list(all_queries)
-            state.queries_executed += len(queries)
-            previous_ids = set(canonical_history)
-            try:
-                canonical_batch = await measure(
-                    "paper_deduplicator",
-                    self.deduplicator.deduplicate(
-                        raw_papers,
-                        existing_papers=[
-                            *existing_papers,
-                            *canonical_history.values(),
-                        ],
-                    ),
-                )
-            except _SearchTimeBudgetExpired as exc:
-                stop_reason = mark_time_budget_expired(exc)
-                break
-            except Exception as exc:
-                errors.append(self._format_error("paper_deduplicator", exc))
-                stop_reason = StopReason.ERROR
-                break
-            for paper in canonical_batch:
-                if (
-                    paper.paper_id not in canonical_history
-                    and len(canonical_history) >= limits.max_papers
-                ):
-                    continue
-                canonical_history[paper.paper_id] = paper
-                candidate_pool[paper.paper_id] = paper
-                if paper.paper_id in existing_ids:
-                    reused_ids.add(paper.paper_id)
-            emit_event(
-                "tool_result",
-                module="m2",
-                tool="paper_deduplicator",
-                status="completed",
-                message=f"去重后累计 {len(canonical_history)} 篇论文",
-                details={"round": round_index, "papers": len(canonical_history)},
-            )
-
-            try:
-                ranked = await measure(
-                    "paper_ranker",
-                    self.ranker.rank(
-                        alignment_question,
-                        list(candidate_pool.values()),
-                        limit=min(self.candidate_limit, limits.max_papers),
-                    ),
-                )
-            except _SearchTimeBudgetExpired as exc:
-                stop_reason = mark_time_budget_expired(exc)
-                break
-            except Exception as exc:
-                errors.append(self._format_error("paper_ranker", exc))
-                stop_reason = StopReason.ERROR
-                break
-            candidate_pool = {paper.paper_id: paper for paper in ranked}
-            emit_event(
-                "tool_result",
-                module="m2",
-                tool="paper_ranker",
-                status="completed",
-                message=f"排序后保留 {len(ranked)} 篇候选论文",
-                details={
-                    "round": round_index,
-                    "top_titles": [paper.title for paper in ranked[:5]],
-                },
-            )
-            new_papers = len(set(canonical_history) - previous_ids)
-            papers_needing_scout = [
-                paper for paper in ranked if paper.paper_id not in scout_by_paper
-            ]
-            try:
-                new_scout_notes = await measure(
-                    "scout_reader",
-                    self.scout_reader.read(alignment_question, papers_needing_scout),
-                )
-            except _SearchTimeBudgetExpired as exc:
-                stop_reason = mark_time_budget_expired(exc)
-                break
-            except Exception as exc:
-                errors.append(self._format_error("scout_reader", exc))
-                stop_reason = StopReason.ERROR
-                break
-            scout_by_paper.update(
-                {note.paper_id: note for note in new_scout_notes}
-            )
-            emit_event(
-                "tool_result",
-                module="m2",
-                tool="scout_reader",
-                status="completed",
-                message=f"快速阅读新增 {len(new_scout_notes)} 篇论文",
-                details={"round": round_index, "notes": len(new_scout_notes)},
-            )
-            scout_notes = [
-                scout_by_paper[paper.paper_id]
-                for paper in ranked
-                if paper.paper_id in scout_by_paper
-            ]
-            ranked = rerank_with_scout(
-                ranked,
-                scout_notes,
-                selection_limit=self.final_k,
-            )
-            candidate_pool = {paper.paper_id: paper for paper in ranked}
-            scout_notes = [
-                scout_by_paper[paper.paper_id]
-                for paper in ranked
-                if paper.paper_id in scout_by_paper
-            ]
-
-            state.round_index = round_index
-            state.candidate_paper_ids = list(candidate_pool)
-            state.unique_papers_seen = len(canonical_history)
-            if new_papers == 0:
-                state.consecutive_no_result_rounds += 1
-            else:
-                state.consecutive_no_result_rounds = 0
-            if new_papers < self.min_new_papers:
-                state.consecutive_low_gain_rounds += 1
-            else:
-                state.consecutive_low_gain_rounds = 0
-            state.known_terms.update(
-                term
-                for note in scout_notes
-                for term in (*note.key_terms, *note.entities)
-            )
-            state.estimated_tokens_used += self.token_estimator(
-                "\n".join(
-                    [
-                        sub_question,
-                        *(paper.abstract for paper in ranked),
-                        state.model_dump_json(),
-                    ]
-                )
-            )
-            state.elapsed_seconds = max(0.0, self.clock() - started_at)
-
-            try:
-                coverage = await measure(
+                ctx.coverage = await measure(
                     "coverage_evaluator",
                     self.coverage_evaluator.evaluate(
                         sub_question,
-                        ranked,
-                        scout_notes,
+                        ctx.ranked,
+                        [
+                            ctx.scout_by_paper[paper.paper_id]
+                            for paper in ctx.ranked
+                            if paper.paper_id in ctx.scout_by_paper
+                        ],
                         state.model_copy(deep=True),
                     ),
                 )
@@ -686,10 +548,10 @@ class IterativeSearchAgent:
                 stop_reason = mark_time_budget_expired(exc)
                 break
             except Exception as exc:
-                errors.append(self._format_error("coverage_evaluator", exc))
+                ctx.errors.append(self._format_error("coverage_evaluator", exc))
                 stop_reason = StopReason.ERROR
                 break
-            self._apply_coverage(state, coverage)
+            self._apply_coverage(state, ctx.coverage)
             emit_event(
                 "tool_result",
                 module="m2",
@@ -697,37 +559,557 @@ class IterativeSearchAgent:
                 status="completed",
                 message=(
                     "证据覆盖充分"
-                    if coverage.sufficient
+                    if ctx.coverage.sufficient
                     else "证据覆盖仍有缺口，将按预算决定是否迭代"
                 ),
                 details={
-                    "round": round_index,
-                    "sufficient": coverage.sufficient,
-                    "covered_topics": list(coverage.covered_topics),
-                    "missing_topics": list(coverage.missing_topics),
-                    "rationale": coverage.rationale,
+                    "round": state.round_index,
+                    "sufficient": ctx.coverage.sufficient,
+                    "covered_topics": list(ctx.coverage.covered_topics),
+                    "missing_topics": list(ctx.coverage.missing_topics),
+                    "rationale": ctx.coverage.rationale,
                 },
             )
             state.remaining_budget = calculate_remaining(limits, state)
             stop_reason = choose_stop_reason(
-                coverage=coverage,
+                coverage=ctx.coverage,
                 budget=limits,
                 state=state,
-                all_queries_failed=bool(queries) and successful_queries == 0,
-                has_candidates=bool(ranked),
+                all_queries_failed=successful_queries == 0,
+                has_candidates=bool(ctx.ranked),
                 no_result_round_limit=self.no_result_round_limit,
                 low_gain_round_limit=self.low_gain_round_limit,
             )
+        return stop_reason
 
+    async def _entity_group_rounds(
+        self,
+        ctx: _RoundContext,
+        measure,
+        mark_time_budget_expired,
+        deadline_started_at: float,
+        sub_question: str,
+        key_entities: Sequence[str],
+        domains: Sequence[str],
+        supplement_entities: Sequence[str],
+    ) -> StopReason:
+        """User-designed round organisation: must/unmust entity grouping
+        plus a single zero-result rescue round.
+
+        The coverage evaluator never decides rounds here; continuation is
+        driven entirely by the deterministic :class:`RoundPlan` and the
+        poor-result check.
+        """
+
+        state = ctx.state
+        limits = ctx.limits
+
+        all_entities = [*key_entities, *supplement_entities]
+        classification = await classify_entities(
+            self.entity_classifier, sub_question, all_entities, list(domains)
+        )
+        if classification.total == 0:
+            # Nothing to group: degrade to one plain round (legacy shape).
+            emit_event(
+                "tool_result",
+                module="m2",
+                tool="m2_round_plan",
+                status="warning",
+                message="子问题没有可用实体，实体分组轮次策略降级为单轮普通检索",
+                details={"sub_question": sub_question},
+            )
+            planner_kwargs: dict = {}
+            if supplement_entities:
+                planner_kwargs["supplement_entities"] = list(supplement_entities)
+            try:
+                successful = await self._execute_round(
+                    ctx,
+                    measure,
+                    mark_time_budget_expired,
+                    deadline_started_at,
+                    sub_question,
+                    key_entities,
+                    domains,
+                    planner_kwargs,
+                )
+            except _RoundHalt as halt:
+                return halt.stop_reason
+            if successful == 0 and not ctx.ranked:
+                return StopReason.ERROR
+            if state.round_index >= limits.max_rounds:
+                return StopReason.MAX_ROUNDS
+            if ctx.coverage.sufficient:
+                return StopReason.COVERAGE_SATISFIED
+            return StopReason.PLAN_COMPLETE
+
+        plan = await plan_entity_rounds(
+            self.entity_classifier, sub_question, classification
+        )
+
+        # Assemble the executable round queue: base rounds (Case A keeps its
+        # must-only follow-up in reserve and only enters it on poor results).
+        pending: List[tuple[RoundSpec, str]] = []
+        if plan.case == "A":
+            pending.append((plan.rounds[0], "base"))
+            must_only = list(plan.rescue_focus)
+            if must_only and must_only != list(plan.rounds[0].focus_entities):
+                pending.append(
+                    (RoundSpec(focus_entities=must_only, label="must_only"), "case_a_followup")
+                )
+        else:
+            pending.extend((spec, "base") for spec in plan.rounds)
+        rescue = (
+            RoundSpec(focus_entities=list(plan.rescue_focus), label="rescue_must_only"),
+            "rescue",
+        )
+        max_rounds = max(1, limits.max_rounds)
+
+        executed = 0
+        rescue_used = False
+        last_poor = ""
+        prev_poor = False
+        all_failed = False
+        while pending and executed < max_rounds:
+            spec, kind = pending.pop(0)
+            if kind == "case_a_followup" and (not prev_poor or rescue_used):
+                # Case A's must-only round is reserved for poor results, and
+                # it never duplicates an already-executed rescue round.
+                continue
+            state.remaining_budget = calculate_remaining(limits, state)
+            if state.remaining_budget.max_rounds <= 0:
+                return StopReason.MAX_ROUNDS
+            planner_kwargs = {"focus_entities": list(spec.focus_entities)}
+            if supplement_entities:
+                planner_kwargs["supplement_entities"] = list(supplement_entities)
+            try:
+                successful = await self._execute_round(
+                    ctx,
+                    measure,
+                    mark_time_budget_expired,
+                    deadline_started_at,
+                    sub_question,
+                    key_entities,
+                    domains,
+                    planner_kwargs,
+                )
+            except _RoundHalt as halt:
+                return halt.stop_reason
+            executed += 1
+            all_failed = successful == 0
+            current_must_only = list(spec.focus_entities) == list(
+                plan.rescue_focus
+            )
+
+            round_counts: Dict[str, int] = {}
+            for query in state.queries_used:
+                if query.round_index != state.round_index:
+                    continue
+                if query.target_source in ctx.failed_sources:
+                    # Failed sources did not return zero results — skip them.
+                    continue
+                round_counts.setdefault(query.target_source.casefold(), 0)
+            for source, count in ctx.source_result_counts.items():
+                if "->" in source:
+                    continue
+                key = source.casefold()
+                if key in round_counts:
+                    round_counts[key] += count - ctx.round_start_counts.get(source, 0)
+            round_total = ctx.papers_found - ctx.round_start_papers_found
+            poor = poor_round_reason(round_counts, round_total)
+            last_poor = poor
+            prev_poor = bool(poor)
+            if poor and kind != "rescue" and not rescue_used:
+                if current_must_only:
+                    # This round already searched the must entities only;
+                    # a rescue would repeat it verbatim (at-most-once rule).
+                    continue
+                if plan.rescue_focus:
+                    rescue_used = True
+                    pending.insert(0, rescue)
+                    emit_event(
+                        "tool_result",
+                        module="m2",
+                        tool="m2_zero_result_rescue",
+                        status="warning",
+                        message=(
+                            f"第 {state.round_index} 轮检索结果不佳（{poor}），"
+                            "触发零结果补救：追加仅必须实体轮"
+                        ),
+                        details={
+                            "sub_question": sub_question,
+                            "round": state.round_index,
+                            "reason": poor,
+                            "rescue_focus": list(plan.rescue_focus),
+                            "round_source_counts": dict(round_counts),
+                        },
+                    )
+                else:
+                    emit_event(
+                        "tool_result",
+                        module="m2",
+                        tool="m2_zero_result_rescue",
+                        status="warning",
+                        message=(
+                            f"第 {state.round_index} 轮检索结果不佳（{poor}），"
+                            "但无必须实体可用于补救，跳过补救轮"
+                        ),
+                        details={
+                            "sub_question": sub_question,
+                            "round": state.round_index,
+                            "reason": poor,
+                        },
+                    )
+
+        if all_failed and not ctx.ranked:
+            return StopReason.ERROR
+        state.remaining_budget = calculate_remaining(limits, state)
+        if state.queries_executed >= limits.max_queries:
+            return StopReason.QUERY_BUDGET
+        if state.unique_papers_seen >= limits.max_papers:
+            return StopReason.PAPER_BUDGET
+        if state.estimated_tokens_used >= limits.max_tokens:
+            return StopReason.TOKEN_BUDGET
+        if state.elapsed_seconds >= limits.max_seconds:
+            return StopReason.TIME_BUDGET
+        if state.round_index >= limits.max_rounds:
+            return StopReason.MAX_ROUNDS
+        if last_poor and not ctx.ranked:
+            return StopReason.NO_RESULTS
+        if ctx.coverage.sufficient:
+            return StopReason.COVERAGE_SATISFIED
+        return StopReason.PLAN_COMPLETE
+
+    async def _execute_round(
+        self,
+        ctx: _RoundContext,
+        measure,
+        mark_time_budget_expired,
+        deadline_started_at: float,
+        sub_question: str,
+        key_entities: Sequence[str],
+        domains: Sequence[str],
+        planner_kwargs: dict,
+    ) -> int:
+        """Execute one planner→search→dedup→rank→scout round.
+
+        Returns the number of successfully executed queries.  Raises
+        :class:`_RoundHalt` when a stage failure or budget expiry must end
+        the whole run (the stop reason is carried on the exception).
+        """
+
+        state = ctx.state
+        limits = ctx.limits
+        ctx.round_start_counts = dict(ctx.source_result_counts)
+        ctx.round_start_papers_found = ctx.papers_found
+        try:
+            planned = await measure(
+                "query_planner",
+                self.query_planner.plan(
+                    sub_question,
+                    key_entities=key_entities,
+                    domains=domains,
+                    state=state.model_copy(deep=True),
+                    **planner_kwargs,
+                ),
+            )
+        except _SearchTimeBudgetExpired as exc:
+            raise _RoundHalt(mark_time_budget_expired(exc)) from exc
+        except Exception as exc:
+            ctx.errors.append(self._format_error("query_planner", exc))
+            raise _RoundHalt(StopReason.ERROR) from exc
+
+        round_index = state.round_index + 1
+        queries: list[SearchQuery] = []
+        for planned_query in planned:
+            key = self._query_key(planned_query)
+            if key in ctx.query_history:
+                continue
+            ctx.query_history.add(key)
+            if planned_query.target_source in state.unavailable_sources:
+                continue
+            queries.append(
+                planned_query.model_copy(update={"round_index": round_index})
+            )
+            if len(queries) >= state.remaining_budget.max_queries:
+                break
+
+        if not queries:
+            ctx.errors.append("query planner produced no new executable queries")
+            raise _RoundHalt(StopReason.NO_RESULTS)
+        emit_event(
+            "tool_result",
+            module="m2",
+            tool="query_planner",
+            status="completed",
+            message=f"第 {round_index} 轮生成 {len(queries)} 条检索式",
+            details={
+                "round": round_index,
+                "queries": [
+                    {
+                        "text": query.text,
+                        "source": query.target_source,
+                        "purpose": query.purpose,
+                    }
+                    for query in queries
+                ],
+            },
+        )
+
+        try:
+            search_results = await measure(
+                "source_search",
+                asyncio.gather(
+                    *(self._search(query) for query in queries),
+                    return_exceptions=True,
+                ),
+            )
+        except _SearchTimeBudgetExpired as exc:
+            raise _RoundHalt(mark_time_budget_expired(exc)) from exc
+        # Empty results use a deterministic relaxation chain before asking
+        # the planner for another stochastic round. Every fallback is
+        # recorded and consumes the same query budget.
+        for original_query, original_result in list(zip(queries, search_results)):
+            if isinstance(original_result, BaseException) or original_result:
+                continue
+            for relaxed in self._deterministic_relaxations(
+                original_query, key_entities
+            ):
+                if state.queries_executed + len(queries) >= limits.max_queries:
+                    break
+                key = self._query_key(relaxed)
+                if key in ctx.query_history:
+                    continue
+                ctx.query_history.add(key)
+                queries.append(relaxed)
+                try:
+                    relaxed_result = await self._search(relaxed)
+                except BaseException as exc:
+                    search_results.append(exc)
+                    break
+                search_results.append(relaxed_result)
+                if relaxed_result:
+                    break
+        raw_papers: list[PaperRecord] = []
+        successful_queries = 0
+        for query, result in zip(queries, search_results):
+            source_name = query.target_source
+            if isinstance(result, BaseException):
+                if source_name not in ctx.failed_sources:
+                    ctx.failed_sources.append(source_name)
+                state.unavailable_sources.add(source_name)
+                ctx.errors.append(self._format_error(source_name, result))
+                continue
+            successful_queries += 1
+            ctx.source_result_counts[source_name] = (
+                ctx.source_result_counts.get(source_name, 0) + len(result)
+            )
+            for paper in result:
+                providers = {
+                    provider.casefold() for provider in paper.sources
+                }
+                if providers and source_name.casefold() not in providers:
+                    for provider in sorted(providers):
+                        fallback_key = f"{source_name}->{provider}"
+                        ctx.source_result_counts[fallback_key] = (
+                            ctx.source_result_counts.get(fallback_key, 0) + 1
+                        )
+            raw_papers.extend(result)
+
+        ctx.papers_found += len(raw_papers)
+        emit_event(
+            "tool_result",
+            module="m2",
+            tool="source_search",
+            status="completed",
+            message=f"第 {round_index} 轮检索获得 {len(raw_papers)} 篇记录",
+            details={
+                "round": round_index,
+                "source_result_counts": dict(ctx.source_result_counts),
+                "failed_sources": list(ctx.failed_sources),
+            },
+        )
+        ctx.all_queries.extend(queries)
+        state.queries_used = list(ctx.all_queries)
+        state.queries_executed += len(queries)
+        previous_ids = set(ctx.canonical_history)
+        try:
+            canonical_batch = await measure(
+                "paper_deduplicator",
+                self.deduplicator.deduplicate(
+                    raw_papers,
+                    existing_papers=[
+                        *ctx.existing_papers,
+                        *ctx.canonical_history.values(),
+                    ],
+                ),
+            )
+        except _SearchTimeBudgetExpired as exc:
+            raise _RoundHalt(mark_time_budget_expired(exc)) from exc
+        except Exception as exc:
+            ctx.errors.append(self._format_error("paper_deduplicator", exc))
+            raise _RoundHalt(StopReason.ERROR) from exc
+        for paper in canonical_batch:
+            if (
+                paper.paper_id not in ctx.canonical_history
+                and len(ctx.canonical_history) >= limits.max_papers
+            ):
+                continue
+            ctx.canonical_history[paper.paper_id] = paper
+            ctx.candidate_pool[paper.paper_id] = paper
+            if paper.paper_id in ctx.existing_ids:
+                ctx.reused_ids.add(paper.paper_id)
+        emit_event(
+            "tool_result",
+            module="m2",
+            tool="paper_deduplicator",
+            status="completed",
+            message=f"去重后累计 {len(ctx.canonical_history)} 篇论文",
+            details={"round": round_index, "papers": len(ctx.canonical_history)},
+        )
+
+        try:
+            ranked = await measure(
+                "paper_ranker",
+                self.ranker.rank(
+                    ctx.alignment_question,
+                    list(ctx.candidate_pool.values()),
+                    limit=min(self.candidate_limit, limits.max_papers),
+                ),
+            )
+        except _SearchTimeBudgetExpired as exc:
+            raise _RoundHalt(mark_time_budget_expired(exc)) from exc
+        except Exception as exc:
+            ctx.errors.append(self._format_error("paper_ranker", exc))
+            raise _RoundHalt(StopReason.ERROR) from exc
+        ctx.candidate_pool = {paper.paper_id: paper for paper in ranked}
+        emit_event(
+            "tool_result",
+            module="m2",
+            tool="paper_ranker",
+            status="completed",
+            message=f"排序后保留 {len(ranked)} 篇候选论文",
+            details={
+                "round": round_index,
+                "top_titles": [paper.title for paper in ranked[:5]],
+            },
+        )
+        new_papers = len(set(ctx.canonical_history) - previous_ids)
+        papers_needing_scout = [
+            paper for paper in ranked if paper.paper_id not in ctx.scout_by_paper
+        ]
+        try:
+            new_scout_notes = await measure(
+                "scout_reader",
+                self.scout_reader.read(ctx.alignment_question, papers_needing_scout),
+            )
+        except _SearchTimeBudgetExpired as exc:
+            raise _RoundHalt(mark_time_budget_expired(exc)) from exc
+        except Exception as exc:
+            ctx.errors.append(self._format_error("scout_reader", exc))
+            raise _RoundHalt(StopReason.ERROR) from exc
+        ctx.scout_by_paper.update(
+            {note.paper_id: note for note in new_scout_notes}
+        )
+        skipped_scout_ids = [
+            paper.paper_id
+            for paper in papers_needing_scout
+            if paper.paper_id not in ctx.scout_by_paper
+        ]
+        if skipped_scout_ids:
+            emit_event(
+                "tool_result",
+                module="m2",
+                tool="scout_reader",
+                status="warning",
+                message=f"快速阅读失败，已跳过 {len(skipped_scout_ids)} 篇论文",
+                details={"paper_ids": skipped_scout_ids, "round": round_index},
+            )
+        emit_event(
+            "tool_result",
+            module="m2",
+            tool="scout_reader",
+            status="completed",
+            message=f"快速阅读新增 {len(new_scout_notes)} 篇论文",
+            details={"round": round_index, "notes": len(new_scout_notes)},
+        )
+        scout_notes = [
+            ctx.scout_by_paper[paper.paper_id]
+            for paper in ranked
+            if paper.paper_id in ctx.scout_by_paper
+        ]
+        ranked = [
+            paper for paper in ranked if paper.paper_id in ctx.scout_by_paper
+        ]
+        ranked = rerank_with_scout(
+            ranked,
+            scout_notes,
+            selection_limit=self.final_k,
+        )
+        ctx.ranked = ranked
+        ctx.candidate_pool = {paper.paper_id: paper for paper in ranked}
+        scout_notes = [
+            ctx.scout_by_paper[paper.paper_id]
+            for paper in ranked
+            if paper.paper_id in ctx.scout_by_paper
+        ]
+
+        state.round_index = round_index
+        state.candidate_paper_ids = list(ctx.candidate_pool)
+        state.unique_papers_seen = len(ctx.canonical_history)
+        if new_papers == 0:
+            state.consecutive_no_result_rounds += 1
+        else:
+            state.consecutive_no_result_rounds = 0
+        if new_papers < self.min_new_papers:
+            state.consecutive_low_gain_rounds += 1
+        else:
+            state.consecutive_low_gain_rounds = 0
+        state.known_terms.update(
+            term
+            for note in scout_notes
+            for term in (*note.key_terms, *note.entities)
+        )
+        state.estimated_tokens_used += self.token_estimator(
+            "\n".join(
+                [
+                    sub_question,
+                    *(paper.abstract for paper in ranked),
+                    state.model_dump_json(),
+                ]
+            )
+        )
+        state.elapsed_seconds = max(0.0, self.clock() - ctx.run_started_at)
+        return successful_queries
+
+    async def _finalize_search(
+        self,
+        ctx: _RoundContext,
+        sub_question: str,
+        key_entities: Sequence[str],
+        existing_ids: set,
+        started_at: float,
+        stop_reason: StopReason,
+    ) -> SearchRunResult:
+        """Retention judging and result packaging shared by all strategies."""
+
+        state = ctx.state
+        ranked = ctx.ranked
         applicable_finalists = [
             paper
             for paper in ranked
             if paper.rank_scores.get("semantic_not_applicable", 0.0) < 0.5
         ]
-        # Domain token overlap is a weak prior, NOT a hard reject.  Literal
-        # token mismatch can produce false negatives (e.g. "robotics" vs
-        # "robotic", "machine learning" vs "neural network").  The primary
-        # hard gate remains Scout `semantic_not_applicable`.
+        contextual_fallback = not applicable_finalists and bool(ranked)
+        if contextual_fallback:
+            # A frontier question often has no paper that answers the complete
+            # relation.  In that case preserve the best adjacent papers as
+            # contextual/method evidence instead of collapsing the search to
+            # zero.  Scout scores still determine their order and provenance.
+            applicable_finalists = list(ranked)
+
+        # Domain token overlap is a weak diagnostic prior, NOT a hard reject.
+        # Literal token mismatch can produce false negatives (e.g. "robotics"
+        # vs "robotic", "machine learning" vs "neural network").
         if state.domains:
             for paper in applicable_finalists:
                 if domain_token_overlap(paper, state.domains) == 0.0:
@@ -736,7 +1118,7 @@ class IterativeSearchAgent:
         # Scout's semantic applicability judgment is the definitive gate.
         final_papers, applicable_decisions = select_retained_papers(
             applicable_finalists,
-            list(scout_by_paper.values()),
+            list(ctx.scout_by_paper.values()),
             final_k=self.final_k,
         )
         if self.retention_judge_client is not None:
@@ -744,10 +1126,42 @@ class IterativeSearchAgent:
                 await self._review_retention_boundary(
                     applicable_finalists,
                     applicable_decisions,
-                    list(scout_by_paper.values()),
+                    list(ctx.scout_by_paper.values()),
                     sub_question,
                     key_entities,
                 )
+            )
+        if not final_papers and applicable_finalists:
+            # The boundary judge may legitimately find no direct evidence, but
+            # M2 must still expose the strongest adjacent literature to M3.
+            # Directness remains visible in Scout scores; it is not an
+            # all-or-nothing retention gate.
+            final_papers = list(applicable_finalists[: self.final_k])
+            fallback_ids = {paper.paper_id for paper in final_papers}
+            for decision in applicable_decisions:
+                if decision.paper_id not in fallback_ids:
+                    continue
+                decision.decision = "retain"
+                if "context_evidence" not in decision.roles:
+                    decision.roles.append("context_evidence")
+                decision.reason = (
+                    "contextual fallback: retained the strongest adjacent "
+                    "paper because no direct paper survived the boundary review"
+                )
+            emit_event(
+                "tool_result",
+                module="m2",
+                tool="retention_fallback",
+                status="warning",
+                message=(
+                    f"未找到直接命中文献，保留 {len(final_papers)} 篇最相关的"
+                    "方法/背景论文"
+                ),
+                details={
+                    "papers": len(final_papers),
+                    "all_scout_not_applicable": contextual_fallback,
+                    "paper_ids": [paper.paper_id for paper in final_papers],
+                },
             )
         decisions_by_id = {
             decision.paper_id: decision for decision in applicable_decisions
@@ -765,27 +1179,26 @@ class IterativeSearchAgent:
                 )
             retention_decisions.append(decision)
         if ranked and not final_papers:
-            errors.append(
-                "domain guard rejected all ranked papers as not applicable; "
-                "no unrelated fallback papers were retained"
+            ctx.errors.append(
+                "no ranked paper could be retained, including contextual fallback"
             )
         return SearchRunResult(
             sub_question=sub_question,
-            queries=all_queries,
-            papers_found=papers_found,
-            papers_after_dedup=len(canonical_history),
+            queries=ctx.all_queries,
+            papers_found=ctx.papers_found,
+            papers_after_dedup=len(ctx.canonical_history),
             candidates=ranked,
             final_papers=final_papers,
-            coverage=coverage,
-            failed_sources=failed_sources,
+            coverage=ctx.coverage,
+            failed_sources=ctx.failed_sources,
             iterations=state.round_index,
             stop_reason=stop_reason,
-            errors=errors,
-            source_result_counts=source_result_counts,
-            stage_elapsed_seconds=stage_elapsed_seconds,
-            scout_notes=list(scout_by_paper.values()),
+            errors=ctx.errors,
+            source_result_counts=ctx.source_result_counts,
+            stage_elapsed_seconds=ctx.stage_elapsed_seconds,
+            scout_notes=list(ctx.scout_by_paper.values()),
             reused_paper_ids=[
-                paper.paper_id for paper in ranked if paper.paper_id in reused_ids
+                paper.paper_id for paper in ranked if paper.paper_id in ctx.reused_ids
             ],
             retention_decisions=retention_decisions,
             final_state=state,
@@ -859,7 +1272,12 @@ class IterativeSearchAgent:
             "You are the final LLM retention judge for a scientific literature "
             "search. Audit only the supplied boundary candidates. Use the title, "
             "abstract-derived Scout signals, directness, and explicit portfolio "
-            "roles. Do not reward generic vocabulary or duplicate evidence. "
+            "roles. Frontier questions often have no paper that answers the full "
+            "question. Low directness alone is not a reason to reject a paper: "
+            "retain useful methodological, review, background, component-level, "
+            "or adjacent evidence and label its role honestly. Reject papers only "
+            "when they concern a clearly different object/domain or add no useful "
+            "evidence beyond generic vocabulary or duplication. "
             "Output JSON matching the supplied schema only."
         )
         output_schema = {

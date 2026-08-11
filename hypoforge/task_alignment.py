@@ -328,17 +328,13 @@ def assess_task_alignment(
     )
 
 
-def search_entities_for_sub_question(
-    state: PipelineState,
-    sub_question: str,
-) -> list[str]:
-    """Return one search-ready alias per entity relevant to this sub-question."""
+def _relevant_entity_ids(contract: TaskContract, sub_question: str) -> list[str]:
+    """Ordered task-entity IDs bound to *sub_question*, with fallbacks.
 
-    card = state.problem_card
-    if card is None:
-        return []
-    contract = card.task_contract
-    entity_by_id = {entity.entity_id: entity for entity in contract.entities}
+    Resolution order: explicit requirement bindings, then literal entity
+    mentions in the sub-question text, then required primary objects.
+    """
+
     relevant_ids: list[str] = []
     for requirement in contract.requirements:
         if _normalise(requirement.sub_question) != _normalise(sub_question):
@@ -360,9 +356,51 @@ def search_entities_for_sub_question(
             for entity in contract.entities
             if entity.role == "primary_object" and entity.required
         )
+    return list(dict.fromkeys(item for item in relevant_ids if item))
+
+
+def sub_question_entity_terms(
+    state: PipelineState,
+    sub_question: str,
+) -> list[str]:
+    """All names and aliases of the task entities bound to *sub_question*.
+
+    Used by M2's local entity-generation step: the LLM must see the full
+    term surface of the existing entities, and the deterministic dedup
+    fallback compares candidate names against exactly these terms.
+    """
+
+    card = state.problem_card
+    if card is None:
+        return []
+    contract = card.task_contract
+    entity_by_id = {entity.entity_id: entity for entity in contract.entities}
+    output: list[str] = []
+    for entity_id in _relevant_entity_ids(contract, sub_question):
+        entity = entity_by_id.get(entity_id)
+        if entity is None:
+            continue
+        for term in _entity_terms(entity):
+            if term and term not in output:
+                output.append(term)
+    return output
+
+
+def search_entities_for_sub_question(
+    state: PipelineState,
+    sub_question: str,
+) -> list[str]:
+    """Return one search-ready alias per entity relevant to this sub-question."""
+
+    card = state.problem_card
+    if card is None:
+        return []
+    contract = card.task_contract
+    entity_by_id = {entity.entity_id: entity for entity in contract.entities}
+    relevant_ids = _relevant_entity_ids(contract, sub_question)
 
     output: list[str] = []
-    for entity_id in dict.fromkeys(item for item in relevant_ids if item):
+    for entity_id in relevant_ids:
         entity = entity_by_id.get(entity_id)
         if entity is None:
             continue

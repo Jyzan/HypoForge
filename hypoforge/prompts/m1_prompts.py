@@ -6,6 +6,12 @@ frontier scientific question and produce a structured decomposition.
 
 For the given question, you must:
 
+0. **Use English for every generated value** — even when the original user
+   question is written in another language, all domain labels and all
+   sub-questions must be written in clear scientific English. Translate the
+   user's meaning faithfully; never copy Chinese, Japanese, or Korean text
+   into these fields. Spell Greek-letter names out in English when needed.
+
 1. **Identify domains** — which scientific or engineering fields does this question span?
    (e.g. structural biology, robotics, control, materials science, genomics, …)
 
@@ -57,6 +63,9 @@ Judge all of these independently:
 - `merge_instructions`: exact groups to merge when over-fragmented.
 
 Do not invent a concrete technology that the original question did not name.
+The current sub-questions must be scientific English. Return
+`missing_aspects` and `merge_instructions` in English as well so every repair
+stage remains English-only.
 Return JSON only.
 """
 
@@ -72,7 +81,8 @@ M1_COVERAGE_SUPPLEMENT_SYSTEM_PROMPT = """\
 Generate exactly one short atomic sub-question for each supplied missing
 aspect. Each result contains one research object, one relation/action, and at
 most one question mark. Do not introduce a concrete method not named by the
-user. Return JSON with only `sub_questions`.
+user. Write every returned sub-question in scientific English, regardless of
+the language of the original question. Return JSON with only `sub_questions`.
 """
 
 M1_COVERAGE_SUPPLEMENT_USER_TEMPLATE = """\
@@ -90,6 +100,8 @@ M1_COVERAGE_MERGE_SYSTEM_PROMPT = """\
 Merge only the over-fragmented groups described by the audit. Return the full
 sub-question list, preserve all unmerged questions and the original core
 action, keep every result atomic, and never return more than 5 sub-questions.
+Write every returned sub-question in scientific English, regardless of the
+language of the original question.
 Return JSON with only `sub_questions`.
 """
 
@@ -113,23 +125,35 @@ M1_ENTITY_EXTRACTION_SYSTEM_PROMPT = """\
 Extract task entities from the original user question only.
 
 Rules:
-- Every entity name and `source_mention` must be the same literal professional
-  term or role that appears verbatim in the original question.
+- A valid scientific question must yield at least one entity. Never return an
+  empty list when the question explicitly names a research object, process,
+  method, outcome, context, or constraint.
+- `name` must be the canonical scientific English name of the entity, even
+  when the original question is written in another language. Do not place
+  Chinese, Japanese, or Korean text in `name`; spell Greek-letter names out in
+  English when needed.
+- `source_mention` must be the exact literal professional term or role that
+  appears verbatim in the original question. It may therefore remain in the
+  user's original language.
+- The English `name` must be a faithful translation or canonicalization of
+  `source_mention`; it must not add specificity that the source mention lacks.
 - Include the directly discussed research object as a required
   `primary_object`.
 - Also include explicitly named methods, interventions, outcomes, contexts,
   and constraints when they are important to the task.
 - Do not use generated sub-questions, background knowledge, inferred methods,
   examples, or likely solutions as entity sources.
-- Aliases may clarify an entity, but aliases are not independent entities and
-  cannot justify an entity absent from the original question.
-- Provide aliases in BOTH languages when the question is in Chinese or
-  English: the professional term in the other language (a Chinese question
-  gets the English term, an English question gets the Chinese term) plus
-  common synonyms, abbreviations, or parenthetical variants that appear in
-  the literature. Downstream modules match these names literally, so every
-  alias must be a real name someone would quote — never a paraphrase,
-  translation-on-the-fly, or definition.
+- Aliases may clarify an entity and must also be English, but aliases are not
+  independent entities and cannot justify an entity absent from the original
+  question.
+
+Translation examples (format only; do not copy entities absent from the user):
+- source mention `蛋白质错误折叠` -> English name `protein misfolding`
+- source mention `机械臂` -> English name `robot arm`
+- source mention `神经退行性疾病` -> English name `neurodegenerative diseases`
+
+At least one returned entity must have `role="primary_object"` and
+`required=true`.
 
 Return JSON with only `entities`.
 """
@@ -143,12 +167,25 @@ M1_ENTITY_AUDIT_SYSTEM_PROMPT = """\
 You are an independent source-grounding auditor. Compare candidate entities
 only with the original user question.
 
-For every candidate, accept it only when its name is a literal professional
-term or role in the original question. Report the exact source mention. Also
-list important explicit task entities that extraction missed. At least one
-accepted required `primary_object` must represent the object directly studied
-by the question. Do not infer entities from scientific knowledge or possible
-answers. Return JSON only.
+For every candidate, accept it only when all of the following hold:
+- `source_mention` is a literal professional term or role in the original
+  question;
+- `name` is a faithful canonical scientific English translation of that exact
+  source mention;
+- the English name does not add an inferred subtype, mechanism, method, or
+  solution absent from the source mention.
+
+Return the exact original-language source mention in your audit. Also list
+important explicit task entities that extraction missed. At least one accepted
+required `primary_object` must represent the object directly studied by the
+question. Do not infer entities from generated sub-questions, scientific
+background knowledge, or possible answers. Return JSON only.
+
+If the candidate list omits an explicit primary research object, process,
+method, or outcome from the original question, set `complete=false` and put
+the exact omitted original-language mentions in `missing_explicit_entities`.
+Never mark an empty candidate list complete for a valid scientific question
+that contains explicit task entities.
 """
 
 M1_ENTITY_AUDIT_USER_TEMPLATE = """\
@@ -164,6 +201,8 @@ M1_ENTITY_REPAIR_NOTE_TEMPLATE = """\
 The previous independent audit found these issues:
 {audit_feedback}
 Return a corrected entity list grounded only in the original user question.
+Keep entity `name` values in canonical scientific English and
+`source_mention` values verbatim from the original question.
 """
 
 
@@ -179,6 +218,7 @@ Rules:
   by that sub-question.
 - `related_entity_ids` may contain only other relevant supplied IDs.
 - `relation` must concisely state the single relation or action investigated.
+- `relation` must be written in English.
 - Assign stable requirement IDs R1, R2, ... in sub-question order.
 
 Return JSON with only `requirements`.

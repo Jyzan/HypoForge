@@ -1,13 +1,8 @@
 """
-Academic literature search tool — Semantic Scholar / OpenAlex dual backend.
+Academic literature search tool for Semantic Scholar.
 
-- If ``SEMANTIC_SCHOLAR_API_KEY`` is set in ``.env`` → uses Semantic Scholar
-  (higher rate limit, better precision for CS / biomedicine).
-- Otherwise → falls back to **OpenAlex** (free, no key required, 10 req/s,
-  covers all disciplines, works without a VPN).
-
-Both backends return the same standardised dict schema so M2 doesn't care
-which backend is active.
+OpenAlex is an independent source adapter. A failed or empty Semantic Scholar
+query is reported as such and is not redirected to OpenAlex.
 """
 
 from __future__ import annotations
@@ -52,7 +47,9 @@ def _resolve_config() -> tuple[str, str]:
         load_dotenv(override=True)
 
     key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "")
-    return key, "semantic_scholar" if key else "openalex"
+    # OpenAlex has its own source adapter.  Do not select it as a hidden
+    # replacement for this Semantic Scholar source.
+    return key, "semantic_scholar"
 
 
 _S2_API_KEY, _BACKEND = _resolve_config()
@@ -60,9 +57,8 @@ _OPENALEX_API_KEY = os.environ.get("OPENALEX_API_KEY", "")
 _OPENALEX_MAILTO = os.environ.get("OPENALEX_MAILTO", "")
 
 # Module-level 429 circuit-breaker.  When S2 repeatedly rate-limits us,
-# subsequent calls in the same process skip S2 entirely and go directly
-# to OpenAlex.  The breaker auto-resets after a quiet period so that a
-# later supplement round can try S2 again.
+# subsequent calls in the same process fail fast for a short cooldown.
+# OpenAlex is a separate configured source, not a fallback from this module.
 _s2_circuit_open_until: float = 0.0
 _CIRCUIT_COOLDOWN_SECONDS = 120.0  # keep S2 off for 2 min after a 429 storm
 
@@ -95,16 +91,12 @@ _OPENALEX_RATE_LIMIT = 0.12
 _last_request_time: float = 0.0
 _rate_limit_lock = threading.Lock()
 
-# Bypass the system proxy (e.g. Clash on 127.0.0.1:7897) for these APIs.
-# A shared proxy exit IP exhausts OpenAlex's daily free budget and trips
-# Semantic Scholar's per-IP limits; both endpoints are reachable directly
-# from CN networks, and a deterministic direct route keeps the OpenAlex
-# fallback within the caller's time budget.
+# Bypass the system proxy (e.g. Clash on 127.0.0.1:7897) for the API.
+# A shared proxy exit IP can trip Semantic Scholar's per-IP limits.
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 # Cap on the S2 stage of a search: rate-limit sleep + request + retries must
-# fit inside this window so the OpenAlex fallback always has room to run
-# within the agent's per-source timeout (default 30.0s).
+# fit inside the agent's per-source timeout (default 30.0s).
 _S2_STAGE_DEADLINE_SECONDS = 15.0
 _OPENALEX_STAGE_DEADLINE_SECONDS = 15.0
 
@@ -141,11 +133,12 @@ def _http_get_json(
 
     ``deadline`` (absolute ``time.monotonic()`` time) bounds the whole call:
     rate-limit waits, backoff sleeps and the socket timeout all respect it.
-    HTTP 429 fails fast instead of retrying — a rate-limited key/IP will not
-    recover inside the caller's budget, and the S2 circuit-breaker +
-    OpenAlex fallback in ``_search`` is the designed recovery path.
+    HTTP 429 fails fast instead of retrying. Other providers are not called
+    from this helper; source independence is handled by the search agent.
     """
-    is_s2 = bool(s2_api_key) and "semanticscholar.org" in url
+    # The endpoint determines the provider; an absent key must not make an
+    # S2 request look like an OpenAlex request or use OpenAlex's rate limit.
+    is_s2 = "semanticscholar.org" in url
     if is_s2 and _s2_circuit_open():
         # A concurrent worker already tripped the breaker; don't queue
         # behind an 8s rate-limit sleep for a doomed request.
@@ -172,8 +165,7 @@ def _http_get_json(
             last_exc = e
             if e.code == 429:
                 logger.debug(
-                    "429 rate-limited (attempt %d); failing fast to the "
-                    "fallback backend", attempt,
+                    "429 rate-limited (attempt %d); failing fast", attempt,
                 )
             raise
         except (urllib.error.URLError, OSError) as e:
@@ -387,48 +379,6 @@ def _oa_normalise(raw: dict) -> dict:
     }
 
 
-def _s2_with_oa_fallback(
-    query: str,
-    limit: int,
-    s2_api_key: str,
-    oa_api_key: str,
-    s2_error: "Exception | None" = None,
-    deadline: float | None = None,
-) -> List[dict]:
-    """Try Semantic Scholar (unless *s2_error* is already set), then OpenAlex.
-
-    ``s2_error`` pre-populates the error from an earlier S2 attempt (e.g. from
-    a circuit-breaker path that already failed).  When ``None`` a fresh S2
-    attempt is made first. ``deadline`` bounds only the S2 stage; OpenAlex
-    receives a fresh bounded stage so an exhausted S2 deadline cannot cancel
-    the fallback before it starts.
-    """
-    if s2_error is None:
-        try:
-            rows = _s2_search(query, limit, s2_api_key, deadline=deadline)
-            if rows:
-                return rows
-            logger.warning("Semantic Scholar returned zero results; falling back to OpenAlex")
-        except Exception as exc:
-            s2_error = exc
-            logger.warning(
-                "Semantic Scholar failed (%s); falling back to OpenAlex",
-                type(exc).__name__,
-            )
-    fallback_deadline = time.monotonic() + _OPENALEX_STAGE_DEADLINE_SECONDS
-    try:
-        return _oa_search(
-            query, limit, oa_api_key, deadline=fallback_deadline
-        )
-    except Exception as oa_error:
-        if s2_error is not None:
-            raise RuntimeError(
-                f"Semantic Scholar failed ({s2_error}); "
-                f"OpenAlex fallback failed ({oa_error})"
-            ) from oa_error
-        raise RuntimeError(f"OpenAlex fallback failed: {oa_error}") from oa_error
-
-
 # ============================================================================
 # Dispatcher
 # ============================================================================
@@ -436,73 +386,28 @@ def _s2_with_oa_fallback(
 def _search(query: str, limit: int = 20) -> List[dict]:
     """Dispatch search to the active backend.
 
-    When Semantic Scholar is the primary backend but is persistently
-    rate-limiting us (HTTP 429), a circuit-breaker opens and subsequent
-    calls skip straight to OpenAlex for a cooldown period.  This avoids
-    wasting 20+ seconds on doomed retries for every query in a batch.
-
-    The S2 stage is bounded by ``_S2_STAGE_DEADLINE_SECONDS`` so the OpenAlex
-    fallback always runs inside the agent's per-source timeout (30s default).
+    When Semantic Scholar is persistently rate-limiting us (HTTP 429), a
+    circuit-breaker opens and subsequent calls fail fast for a cooldown period.
+    OpenAlex is not invoked here; it has its own independent source adapter.
     """
-    if _BACKEND == "semantic_scholar":
-        deadline = time.monotonic() + _S2_STAGE_DEADLINE_SECONDS
-        s2_error: Exception | None = None
-        if _s2_circuit_open():
-            logger.info("S2 circuit is open (rate-limited); using OpenAlex directly")
-            s2_error = RuntimeError("S2 circuit open")
-        else:
-            try:
-                rows = _s2_search(query, limit, _S2_API_KEY, deadline=deadline)
-                if rows:
-                    return rows
-                logger.warning(
-                    "Semantic Scholar returned zero results; falling back to OpenAlex"
-                )
-                s2_error = RuntimeError("Semantic Scholar returned zero results")
-            except urllib.error.HTTPError as exc:
-                s2_error = exc
-                if exc.code == 429:
-                    _s2_circuit_break()
-                    logger.warning(
-                        "Semantic Scholar rate-limited (429); "
-                        "circuit-breaker open, falling back to OpenAlex"
-                    )
-                else:
-                    logger.warning(
-                        "Semantic Scholar failed (%s); falling back to OpenAlex",
-                        type(exc).__name__,
-                    )
-            except Exception as exc:
-                s2_error = exc
-                if isinstance(exc, TimeoutError):
-                    _s2_circuit_break()
-                    logger.warning(
-                        "Semantic Scholar stage deadline exceeded (%s); "
-                        "circuit-breaker open, falling back to OpenAlex",
-                        type(exc).__name__,
-                    )
-                else:
-                    logger.warning(
-                        "Semantic Scholar failed (%s); falling back to OpenAlex",
-                        type(exc).__name__,
-                    )
-        return _s2_with_oa_fallback(
-            query, limit, _S2_API_KEY, _OPENALEX_API_KEY,
-            s2_error=s2_error, deadline=deadline,
-        )
-    return _oa_search(
-        query, limit, _OPENALEX_API_KEY, _OPENALEX_MAILTO,
-        deadline=time.monotonic() + _OPENALEX_STAGE_DEADLINE_SECONDS,
-    )
+    deadline = time.monotonic() + _S2_STAGE_DEADLINE_SECONDS
+    if _s2_circuit_open():
+        raise RuntimeError("Semantic Scholar circuit is open (rate-limited)")
+    try:
+        return _s2_search(query, limit, _S2_API_KEY, deadline=deadline)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            _s2_circuit_break()
+        raise
+    except TimeoutError:
+        _s2_circuit_break()
+        raise
 
 
 def _fetch(identifier: str) -> dict:
     """Dispatch single-paper fetch to the active backend."""
-    if _BACKEND == "semantic_scholar":
-        deadline = time.monotonic() + _S2_STAGE_DEADLINE_SECONDS
-        return _s2_fetch(identifier, _S2_API_KEY, deadline=deadline)
-    else:
-        return _oa_fetch(identifier, _OPENALEX_API_KEY, _OPENALEX_MAILTO)
+    deadline = time.monotonic() + _S2_STAGE_DEADLINE_SECONDS
+    return _s2_fetch(identifier, _S2_API_KEY, deadline=deadline)
 
 
 # ============================================================================
@@ -511,11 +416,10 @@ def _fetch(identifier: str) -> dict:
 
 @ToolRegistry.register
 class SemanticScholarTool(ToolProtocol):
-    """Search academic papers via Semantic Scholar or OpenAlex.
+    """Search academic papers via Semantic Scholar only.
 
-    Backend selection is automatic:
-      - ``SEMANTIC_SCHOLAR_API_KEY`` set  →  Semantic Scholar (with key)
-      - empty / not set                    →  OpenAlex (free, 10 req/s)
+    Semantic Scholar is always the selected backend.  OpenAlex is exposed by
+    a separate source adapter and is not selected as an error fallback.
 
     Parameters
     ----------
@@ -524,47 +428,27 @@ class SemanticScholarTool(ToolProtocol):
     """
 
     tool_name = "semantic_scholar"
-    tool_description = (
-        "Search academic papers via Semantic Scholar / OpenAlex "
-        "(auto-selects backend based on API key availability)"
-    )
+    tool_description = "Search academic papers via Semantic Scholar."
 
     def __init__(self, api_key: str = "", openalex_api_key: str = ""):
         self.api_key = api_key or _S2_API_KEY
-        self.openalex_api_key = openalex_api_key or _OPENALEX_API_KEY
-        # If caller explicitly chose openalex (no s2 key, but has openalex key),
-        # route to OpenAlex. Otherwise default to semantic_scholar if we have a key.
-        if not api_key and openalex_api_key:
-            self._backend = "openalex"
-        elif not api_key and not openalex_api_key:
-            self._backend = "openalex" if not _S2_API_KEY else "semantic_scholar"
-        else:
-            self._backend = "semantic_scholar" if self.api_key else "openalex"
+        # Kept as a compatibility-only argument for callers that used the old
+        # dual-backend constructor. It is intentionally ignored.
+        self._backend = "semantic_scholar"
 
     @property
     def backend_name(self) -> str:
         return self._backend
 
     def _search_instance(self, query: str, limit: int) -> List[dict]:
-        if (
-            self.api_key == _S2_API_KEY
-            and self.openalex_api_key == _OPENALEX_API_KEY
-            and self._backend == _BACKEND
-        ):
+        if self.api_key == _S2_API_KEY and self._backend == _BACKEND:
             return _search(query, limit)
         deadline = time.monotonic() + _S2_STAGE_DEADLINE_SECONDS
-        if self._backend == "semantic_scholar":
-            return _s2_with_oa_fallback(
-                query, limit, self.api_key, self.openalex_api_key,
-                deadline=deadline,
-            )
-        return _oa_search(query, limit, self.openalex_api_key)
+        return _s2_search(query, limit, self.api_key, deadline=deadline)
 
     def _fetch_instance(self, identifier: str) -> dict:
-        if self._backend == "semantic_scholar":
-            deadline = time.monotonic() + _S2_STAGE_DEADLINE_SECONDS
-            return _s2_fetch(identifier, self.api_key, deadline=deadline)
-        return _oa_fetch(identifier, self.openalex_api_key)
+        deadline = time.monotonic() + _S2_STAGE_DEADLINE_SECONDS
+        return _s2_fetch(identifier, self.api_key, deadline=deadline)
 
     async def search(self, query: str, limit: int = 20, **kwargs) -> List[dict]:
         """Run an academic literature search.

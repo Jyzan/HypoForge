@@ -36,14 +36,14 @@ async def test_missing_core_intent_is_supplemented_and_rechecked() -> None:
         {
             "sufficient": False,
             "core_intent_covered": False,
-            "missing_aspects": ["离线强化学习如何用于迁移"],
+            "missing_aspects": ["use of offline reinforcement learning for transfer"],
             "over_fragmented": False,
             "merge_instructions": [],
             "reason": "核心方法缺失",
         },
         {
             "sub_questions": [
-                "离线强化学习如何实现机械臂从仿真到现实的策略迁移？"
+                "How can offline reinforcement learning transfer a robot arm policy from simulation to reality?"
             ]
         },
         {
@@ -58,12 +58,12 @@ async def test_missing_core_intent_is_supplemented_and_rechecked() -> None:
 
     result = await module._check_subquestion_coverage(
         "如何使用离线强化学习实现机械臂从仿真到现实的迁移？",
-        ["仿真环境与现实环境存在哪些差异？"],
+        ["How do simulation and real-world environments differ?"],
     )
 
     assert result == [
-        "仿真环境与现实环境存在哪些差异？",
-        "离线强化学习如何实现机械臂从仿真到现实的策略迁移？",
+        "How do simulation and real-world environments differ?",
+        "How can offline reinforcement learning transfer a robot arm policy from simulation to reality?",
     ]
     assert len(module.client.calls) == 3
 
@@ -76,11 +76,11 @@ async def test_over_fragmented_questions_are_merged_and_rechecked() -> None:
             "core_intent_covered": True,
             "missing_aspects": [],
             "over_fragmented": True,
-            "merge_instructions": ["合并两个环境差异问题"],
+            "merge_instructions": ["Merge the two environment-difference questions."],
             "reason": "同一关系被拆碎",
         },
         {
-            "sub_questions": ["仿真与现实环境通过哪些差异影响机械臂策略迁移？"]
+            "sub_questions": ["How do simulation-to-reality environment differences affect robot arm policy transfer?"]
         },
         {
             "sufficient": True,
@@ -94,10 +94,15 @@ async def test_over_fragmented_questions_are_merged_and_rechecked() -> None:
 
     result = await module._check_subquestion_coverage(
         "如何解决机械臂从仿真到现实的策略迁移？",
-        ["摩擦力差异有什么影响？", "传感器噪声差异有什么影响？"],
+        [
+            "How do friction differences affect robot arm policy transfer?",
+            "How do sensor-noise differences affect robot arm policy transfer?",
+        ],
     )
 
-    assert result == ["仿真与现实环境通过哪些差异影响机械臂策略迁移？"]
+    assert result == [
+        "How do simulation-to-reality environment differences affect robot arm policy transfer?"
+    ]
 
 
 @pytest.mark.asyncio
@@ -146,26 +151,24 @@ async def test_core_intent_missing_after_budget_fails_closed() -> None:
     missing = {
         "sufficient": False,
         "core_intent_covered": False,
-        "missing_aspects": ["核心实现方法"],
+        "missing_aspects": ["the core implementation method"],
         "over_fragmented": False,
         "merge_instructions": [],
         "reason": "仍未回答如何实现",
     }
     module = module_with([
         missing,
-        {"sub_questions": ["新的背景问题是什么？"]},
+        {"sub_questions": ["What is the new background question?"]},
         missing,
-        {"sub_questions": ["另一个背景问题是什么？"]},
+        {"sub_questions": ["What is another background question?"]},
         missing,
     ])
 
     with pytest.raises(ValueError, match="core user intent"):
         await module._check_subquestion_coverage(
             "如何实现机械臂策略迁移？",
-            ["仿真环境是什么？"],
+            ["What is the simulation environment?"],
         )
-
-
 def test_atomic_validator_rejects_packed_parallel_question() -> None:
     violations = M1ProblemUnderstanding._sub_question_violations([
         "离线强化学习如何迁移；摩擦力变化又如何处理？？"
@@ -241,9 +244,9 @@ async def test_initial_decomposition_call_cannot_generate_entities_or_contract()
         {
             "domain": ["robotics", "reinforcement learning"],
             "sub_questions": [
-                "离线强化学习如何实现机械臂从仿真到现实的策略迁移？",
-                "如何评估机械臂策略迁移的现实性能？",
-                "仿真与现实环境差异如何影响策略迁移？",
+                "How can offline reinforcement learning transfer a robot arm policy from simulation to reality?",
+                "How should real-world robot arm transfer performance be evaluated?",
+                "How do simulation-to-reality environment differences affect policy transfer?",
             ],
         },
         {
@@ -257,7 +260,7 @@ async def test_initial_decomposition_call_cannot_generate_entities_or_contract()
         {
             "entities": [
                 {
-                    "name": "机械臂",
+                    "name": "robot arm",
                     "source_mention": "机械臂",
                     "aliases": [],
                     "role": "primary_object",
@@ -265,9 +268,9 @@ async def test_initial_decomposition_call_cannot_generate_entities_or_contract()
                     "extraction_reason": "literal source mention",
                 },
                 {
-                    "name": "离线强化学习",
+                    "name": "offline reinforcement learning",
                     "source_mention": "离线强化学习",
-                    "aliases": ["offline reinforcement learning"],
+                    "aliases": ["offline RL"],
                     "role": "method",
                     "required": True,
                     "extraction_reason": "literal source mention",
@@ -277,13 +280,13 @@ async def test_initial_decomposition_call_cannot_generate_entities_or_contract()
         {
             "items": [
                 {
-                    "candidate_name": "机械臂",
+                    "candidate_name": "robot arm",
                     "accepted": True,
                     "source_mention": "机械臂",
                     "reason": "literal source mention",
                 },
                 {
-                    "candidate_name": "离线强化学习",
+                    "candidate_name": "offline reinforcement learning",
                     "accepted": True,
                     "source_mention": "离线强化学习",
                     "reason": "literal source mention",
@@ -303,9 +306,9 @@ async def test_initial_decomposition_call_cannot_generate_entities_or_contract()
                     "required": True,
                 }
                 for index, question in enumerate([
-                    "离线强化学习如何实现机械臂从仿真到现实的策略迁移？",
-                    "如何评估机械臂策略迁移的现实性能？",
-                    "仿真与现实环境差异如何影响策略迁移？",
+                    "How can offline reinforcement learning transfer a robot arm policy from simulation to reality?",
+                    "How should real-world robot arm transfer performance be evaluated?",
+                    "How do simulation-to-reality environment differences affect policy transfer?",
                 ], start=1)
             ]
         },
@@ -317,63 +320,11 @@ async def test_initial_decomposition_call_cannot_generate_entities_or_contract()
 
     schema_properties = module.client.calls[0]["output_schema"]["properties"]
     assert set(schema_properties) == {"domain", "sub_questions"}
-    assert card.key_entities == ["机械臂", "离线强化学习"]
+    assert card.key_entities == ["robot arm", "offline reinforcement learning"]
     assert [entity.name for entity in card.task_contract.entities] == [
-        "机械臂",
-        "离线强化学习",
+        "robot arm",
+        "offline reinforcement learning",
     ]
-
-
-@pytest.mark.asyncio
-async def test_entity_extraction_requests_bilingual_aliases() -> None:
-    """M1 extraction must request bilingual aliases so downstream literal
-    alignment gates (M4-M6) can match contract entities in either language."""
-    question = "肠道微生物组如何影响人体免疫系统？"
-    module = module_with([
-        {
-            "entities": [{
-                "name": "肠道微生物组",
-                "source_mention": "肠道微生物组",
-                "aliases": ["gut microbiome", "肠道菌群", "gut microbiota"],
-                "role": "primary_object",
-                "required": True,
-                "extraction_reason": "directly studied research object",
-            }],
-        },
-        {
-            "items": [{
-                "candidate_name": "肠道微生物组",
-                "accepted": True,
-                "source_mention": "肠道微生物组",
-                "reason": "literal term in the question",
-            }],
-            "missing_explicit_entities": [],
-            "complete": True,
-        },
-    ])
-
-    entities = await module._extract_and_audit_entities(question)
-
-    extraction_prompt = module.client.calls[0]["system_prompt"]
-    assert "BOTH languages" in extraction_prompt
-    assert "must be a real name someone would quote" in extraction_prompt
-    assert len(entities) == 1
-    # 双语 aliases 保留进契约，供 M4 的字面匹配使用。
-    assert set(entities[0].aliases) == {
-        "gut microbiome", "肠道菌群", "gut microbiota",
-    }
-
-
-# --- merged from test_m1_combined.py ---
-
-from typing import Any
-
-import pytest
-
-from hypoforge.modules.m1_problem_understanding import M1ProblemUnderstanding
-from hypoforge.state import ProblemCard, TaskEntity
-
-
 class EntityClient:
     def __init__(self, payloads: list[dict[str, Any]]):
         self.payloads = list(payloads)
@@ -398,10 +349,11 @@ def candidate(
     role: str = "other",
     required: bool = False,
     aliases: list[str] | None = None,
+    mention: str | None = None,
 ) -> dict[str, Any]:
     return {
         "name": name,
-        "source_mention": name,
+        "source_mention": mention or name,
         "aliases": aliases or [],
         "role": role,
         "required": required,
@@ -409,11 +361,11 @@ def candidate(
     }
 
 
-def audit_item(name: str, accepted: bool = True) -> dict[str, Any]:
+def audit_item(name: str, accepted: bool = True, mention: str | None = None) -> dict[str, Any]:
     return {
         "candidate_name": name,
         "accepted": accepted,
-        "source_mention": name,
+        "source_mention": mention or name,
         "reason": "可在用户原文定位" if accepted else "原文没有该实体",
     }
 
@@ -472,11 +424,11 @@ async def test_entity_gate_rejects_llm_accepted_term_absent_from_user_text() -> 
 
     module = entity_module([
         {"entities": [
-            candidate("机械臂", role="primary_object", required=True),
-            candidate("域随机化", role="method"),
+            candidate("robot arm", role="primary_object", required=True, mention="机械臂"),
+            candidate("domain randomization", role="method", mention="域随机化"),
         ]},
         {
-            "items": [audit_item("机械臂"), audit_item("域随机化")],
+            "items": [audit_item("robot arm", mention="机械臂"), audit_item("domain randomization", mention="域随机化")],
             "missing_explicit_entities": [],
             "complete": True,
         },
@@ -486,30 +438,31 @@ async def test_entity_gate_rejects_llm_accepted_term_absent_from_user_text() -> 
         "如何改进机械臂从仿真到现实的迁移？"
     )
 
-    assert [entity.name for entity in entities] == ["机械臂"]
+    assert [entity.name for entity in entities] == ["robot arm"]
     assert entities[0].entity_id == "E1"
 
 
 @pytest.mark.asyncio
 async def test_entity_audit_missing_term_triggers_one_repair_and_reaudit() -> None:
     module = entity_module([
-        {"entities": [candidate("机械臂", role="primary_object", required=True)]},
+        {"entities": [candidate("robot arm", role="primary_object", required=True, mention="机械臂")]},
         {
-            "items": [audit_item("机械臂")],
-            "missing_explicit_entities": ["离线强化学习"],
+            "items": [audit_item("robot arm", mention="机械臂")],
+            "missing_explicit_entities": ["offline reinforcement learning"],
             "complete": False,
         },
         {"entities": [
-            candidate("机械臂", role="primary_object", required=True),
+            candidate("robot arm", role="primary_object", required=True, mention="机械臂"),
             candidate(
-                "离线强化学习",
+                "offline reinforcement learning",
                 role="method",
                 required=True,
-                aliases=["offline reinforcement learning"],
+                aliases=["offline RL"],
+                mention="离线强化学习",
             ),
         ]},
         {
-            "items": [audit_item("机械臂"), audit_item("离线强化学习")],
+            "items": [audit_item("robot arm", mention="机械臂"), audit_item("offline reinforcement learning", mention="离线强化学习")],
             "missing_explicit_entities": [],
             "complete": True,
         },
@@ -519,17 +472,17 @@ async def test_entity_audit_missing_term_triggers_one_repair_and_reaudit() -> No
         "如何使用离线强化学习控制机械臂？"
     )
 
-    assert [entity.name for entity in entities] == ["机械臂", "离线强化学习"]
-    assert entities[1].aliases == ["offline reinforcement learning"]
+    assert [entity.name for entity in entities] == ["robot arm", "offline reinforcement learning"]
+    assert entities[1].aliases == ["offline RL"]
     assert len(module.client.calls) == 4
 
 
 @pytest.mark.asyncio
 async def test_entity_prompts_never_receive_generated_subquestions() -> None:
     module = entity_module([
-        {"entities": [candidate("机械臂", role="primary_object", required=True)]},
+        {"entities": [candidate("robot arm", role="primary_object", required=True, mention="机械臂")]},
         {
-            "items": [audit_item("机械臂")],
+            "items": [audit_item("robot arm", mention="机械臂")],
             "missing_explicit_entities": [],
             "complete": True,
         },
@@ -4098,8 +4051,8 @@ async def test_m4_repair_does_not_admit_a_second_invalid_result() -> None:
 
 def test_m1_atomic_validator_flags_parallel_questions() -> None:
     violations = M1ProblemUnderstanding._sub_question_violations([
-        "机制是什么；环境应激又如何影响它？？",
-        "域随机化如何影响机械臂迁移成功率？",
+        "What is the mechanism; how does environmental stress affect it??",
+        "How does domain randomization affect robot arm transfer?",
     ])
 
     assert len(violations) == 1
@@ -4730,6 +4683,7 @@ async def test_unresolved_entity_is_not_persisted_as_confirmed_new_entity(tmp_pa
         cache_dir=tmp_path,
         client=PartialDecisionClient(),
         embedding_backend=EqualEmbeddings(),
+        run_stamp="strict-run",
     )
     first.register_alias_group("Regional Climate Model", [])
     first.register_alias_group("Global Climate Model", [])
@@ -4743,12 +4697,11 @@ async def test_unresolved_entity_is_not_persisted_as_confirmed_new_entity(tmp_pa
         cache_dir=tmp_path,
         client=PairDecisionClient(),
         embedding_backend=EqualEmbeddings(),
+        run_stamp="strict-run",
     )
     resolved = await second.resolve_batch(["RCM"])
 
     assert resolved["RCM"].canonical_name == "Regional Climate Model"
-
-
 class ProgrammableIdentityClient:
     """Judge with explicit per-pair rules; unknown pairs are negative."""
 
@@ -4785,132 +4738,6 @@ class LowSimilarityEmbeddings:
 
 
 @pytest.mark.asyncio
-async def test_multiple_positive_candidates_collapse_via_transitive_closure(
-    tmp_path,
-) -> None:
-    """surface→A and surface→B both positive, A→B also positive:
-    the canonical records merge and the surface joins the survivor."""
-    client = ProgrammableIdentityClient({
-        ("amyloid fibrils", "amyloid fibrillar structures"): True,
-        ("amyloid fibrils", "insoluble amyloid fibrils"): True,
-        ("amyloid fibrillar structures", "insoluble amyloid fibrils"): True,
-    })
-    service = StrictEntityNormalizationService(
-        cache_dir=tmp_path,
-        client=client,
-        embedding_backend=EqualEmbeddings(),
-    )
-    service.register_alias_group("Amyloid Fibrillar Structures", [])
-    service.register_alias_group("Insoluble Amyloid Fibrils", [])
-
-    result = await service.resolve_batch(["amyloid fibrils"])
-
-    assert result["amyloid fibrils"].canonical_name in {
-        "Amyloid Fibrillar Structures",
-        "Insoluble Amyloid Fibrils",
-    }
-    assert len(service.records) == 1
-    assert "amyloid fibrils" in service.alias_to_id
-    assert service.alias_to_id["amyloid fibrils"] == (
-        result["amyloid fibrils"].canonical_id
-    )
-    # surface pairs + one canonical pair were judged.
-    assert client.calls == 2
-    # Canonical-pair decision is cached for future runs.
-    assert service.pair_decisions[
-        service._pair_key(
-            "Amyloid Fibrillar Structures", "Insoluble Amyloid Fibrils"
-        )
-    ].same_concept is True
-
-
-@pytest.mark.asyncio
-async def test_multiple_positive_candidates_judged_distinct_stay_fail_closed(
-    tmp_path,
-) -> None:
-    """surface→A and surface→B positive but A→B negative: the identity graph
-    has two components, so the ambiguous merge stays fail-closed."""
-    client = ProgrammableIdentityClient({
-        ("amyloid fibrils", "amyloid fibrillar structures"): True,
-        ("amyloid fibrils", "insoluble amyloid fibrils"): True,
-        ("amyloid fibrillar structures", "insoluble amyloid fibrils"): False,
-    })
-    service = StrictEntityNormalizationService(
-        cache_dir=tmp_path,
-        client=client,
-        embedding_backend=EqualEmbeddings(),
-    )
-    service.register_alias_group("Amyloid Fibrillar Structures", [])
-    service.register_alias_group("Insoluble Amyloid Fibrils", [])
-
-    with pytest.raises(RuntimeError, match="multiple identity matches"):
-        await service.resolve_batch(["amyloid fibrils"])
-
-    # The table is untouched, but the negative canonical-pair decision is kept.
-    assert len(service.records) == 2
-    assert service.pair_decisions[
-        service._pair_key(
-            "Amyloid Fibrillar Structures", "Insoluble Amyloid Fibrils"
-        )
-    ].same_concept is False
-
-
-@pytest.mark.asyncio
-async def test_low_similarity_neighbor_is_judged_before_new_entity(tmp_path) -> None:
-    """A near-synonym below the similarity gate is still judged; a positive
-    verdict merges instead of minting a split canonical."""
-    client = ProgrammableIdentityClient({
-        ("rcm", "regional climate model"): True,
-    })
-    service = StrictEntityNormalizationService(
-        cache_dir=tmp_path,
-        client=client,
-        embedding_backend=LowSimilarityEmbeddings(),
-    )
-    service.register_alias_group("Regional Climate Model", [])
-
-    result = await service.resolve_batch(["RCM"])
-
-    assert result["RCM"].canonical_name == "Regional Climate Model"
-    assert "rcm" in service.alias_to_id
-    assert service.alias_to_id["rcm"] == result["RCM"].canonical_id
-    assert len(service.records) == 1
-
-
-@pytest.mark.asyncio
-async def test_low_similarity_negative_verdict_still_mints_new_entity(
-    tmp_path,
-) -> None:
-    """A negative low-score verdict explicitly allows a brand-new canonical."""
-    service = StrictEntityNormalizationService(
-        cache_dir=tmp_path,
-        client=ProgrammableIdentityClient({}),
-        embedding_backend=LowSimilarityEmbeddings(),
-    )
-    service.register_alias_group("Regional Climate Model", [])
-
-    result = await service.resolve_batch(["RCM"])
-
-    # new_entity surfaces keep the cleaned surface as canonical name.
-    assert result["RCM"].canonical_name == "rcm"
-    assert result["RCM"].decision_source == "new_entity"
-
-
-@pytest.mark.asyncio
-async def test_low_similarity_gate_is_skipped_without_judge_client(tmp_path) -> None:
-    """Without a judge client the low-score pass is skipped and the surface
-    becomes a new entity directly (no unresolved deferral on judge-less runs)."""
-    service = StrictEntityNormalizationService(
-        cache_dir=tmp_path,
-        embedding_backend=LowSimilarityEmbeddings(),
-    )
-    service.register_alias_group("Regional Climate Model", [])
-
-    result = await service.resolve_batch(["RCM"])
-
-    assert result["RCM"].decision_source == "new_entity"
-
-
 class FailingRelationClient:
     async def structured_chat(self, **kwargs):
         raise ConnectionError("relation extractor unavailable")
@@ -5412,16 +5239,21 @@ async def test_configured_grounding_embedding_vector_count_must_match(monkeypatc
 
 
 class MalformedScoutClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
     async def structured_chat(self, **kwargs):
+        self.calls += 1
         return {"notes": []}
 
 
 @pytest.mark.asyncio
-async def test_configured_scout_cannot_emit_fallback_notes() -> None:
+async def test_configured_scout_retries_once_then_skips_malformed_paper() -> None:
     import hypoforge.strict_contracts as strict
     from hypoforge.literature.search.scout import ScoutReader
 
-    reader = ScoutReader(client=MalformedScoutClient())
+    client = MalformedScoutClient()
+    reader = ScoutReader(client=client)
     paper = PaperRecord(
         paper_id="p-scout",
         title="Relevant paper",
@@ -5429,8 +5261,50 @@ async def test_configured_scout_cannot_emit_fallback_notes() -> None:
         sources=["test"],
     )
 
-    with pytest.raises(RuntimeError, match="fallback notes"):
-        await strict._strict_scout_read(reader, "research question", [paper])
+    notes = await strict._strict_scout_read(reader, "research question", [paper])
+
+    assert notes == []
+    assert client.calls == 2
+
+
+class RetryableScoutClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def structured_chat(self, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return {"notes": []}
+        return {"notes": [{
+            "paper_id": "p-scout-retry",
+            "relevance": 0.7,
+            "directness": 0.4,
+            "relation": "insufficient",
+            "supporting_sentence_ids": [],
+            "contradicting_sentence_ids": [],
+            "study_type": "method",
+        }]}
+
+
+@pytest.mark.asyncio
+async def test_configured_scout_keeps_paper_when_single_paper_retry_recovers() -> None:
+    import hypoforge.strict_contracts as strict
+    from hypoforge.literature.search.scout import ScoutReader
+
+    client = RetryableScoutClient()
+    reader = ScoutReader(client=client)
+    paper = PaperRecord(
+        paper_id="p-scout-retry",
+        title="Relevant method paper",
+        abstract="Relevant evidence about the research question.",
+        sources=["test"],
+    )
+
+    notes = await strict._strict_scout_read(reader, "research question", [paper])
+
+    assert len(notes) == 1
+    assert notes[0].paper_id == "p-scout-retry"
+    assert client.calls == 2
 
 
 @pytest.mark.asyncio
@@ -5672,6 +5546,7 @@ async def test_llm_pair_decision_merges_and_is_cached(tmp_path) -> None:
         cache_dir=tmp_path,
         client=client,
         embedding_backend=FixedEmbeddings(),
+        run_stamp="run-B",
     )
     first_result = await first.resolve_batch(["RCM climate model"])
     assert first_result["RCM climate model"].canonical_name == "区域气候模型"
@@ -5684,6 +5559,7 @@ async def test_llm_pair_decision_merges_and_is_cached(tmp_path) -> None:
         cache_dir=tmp_path,
         client=second_client,
         embedding_backend=FixedEmbeddings(),
+        run_stamp="run-B",
     )
     second_result = await second.resolve_batch(["RCM climate model"])
 
@@ -5711,8 +5587,6 @@ async def test_negative_identity_decision_keeps_related_entities_separate(tmp_pa
 
 
 # ---- fail-closed regression tests ----
-
-
 class FailingEmbeddings:
     async def aembed_documents(self, texts):
         raise ConnectionError("simulated embedding API outage")

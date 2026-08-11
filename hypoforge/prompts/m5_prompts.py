@@ -56,7 +56,9 @@ the following elements:
 
 9. **Expected results (if refuted)** — what outcomes would falsify the hypothesis.
 
-10. **Timeline** — rough estimate of each phase.
+10. **Timeline** — rough estimate of each phase. Use ``Months X-Y: <phase>``
+    prefixed lines, one phase per line (e.g. "Months 1-3: Human recruitment
+    and sample collection.").
 
 11. **Risks & alternatives** — technical risks, sample risks, fallback approaches.
 
