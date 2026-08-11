@@ -349,8 +349,12 @@
   .plan-sec h4::before{content:"";width:4px;height:14px;border-radius:2px;background:var(--accent)}
   .plan-sec p,.plan-sec li{font-size:13.5px;color:var(--ink2)}
   .plan-sec ul{padding-left:20px}
-  .score-row{display:flex;gap:12px;flex-wrap:wrap}
-  .score-chip{flex:1;min-width:110px;background:var(--bg);border-radius:12px;padding:10px 14px;text-align:center}
+  .score-row{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+  /* M6 评审结果：保持一行排开（宽度不足时换行），与独立评分摘要的 4 列网格分开 */
+  .score-row.review{display:flex;flex-wrap:wrap}
+  .score-row.review .score-chip{flex:1 1 150px;max-width:200px}
+  .score-chip{background:var(--bg);border-radius:12px;padding:10px 14px;text-align:center;min-width:0;overflow:hidden}
+  .score-chip .k{overflow-wrap:anywhere}
   .score-chip .v{font-size:22px;font-weight:700;color:var(--ink)}
   .score-chip .k{font-size:12.5px;color:var(--ink2)}
   .review-item{border-top:1px dashed var(--line);padding:10px 0}
@@ -559,6 +563,7 @@
     .row-nodes{grid-template-columns:repeat(2,1fr)}
     .mid-grid{grid-template-columns:1fr}
     .cred-grid{grid-template-columns:1fr}
+    .score-row{grid-template-columns:repeat(2,1fr)}
   }
   @media (max-width:860px){
     #sidebar{position:fixed;left:0;top:60px;bottom:0;z-index:60;transform:translateX(-100%);transition:transform .25s;box-shadow:var(--shadow-lg)}
@@ -1231,10 +1236,13 @@ async function refreshArtifacts(){
 }
 function listHtml(items){ return items && items.length ? `<ul>${items.map(x => `<li>${esc(x)}</li>`).join("")}</ul>` : "<p>暂无</p>"; }
 function scoreRowsHtml(scores){
-  return Object.entries(scores || {}).map(([key, value]) => {
+  const entries = Object.entries(scores || {});
+  if(!entries.length) return "";
+  // 所有 chip 放进同一个 flex 容器，按行自动换行（2 行 4 列）。
+  return `<div class="score-row" style="margin:6px 0">` + entries.map(([key, value]) => {
     const number = Number(value), pct = number <= 1 ? number * 100 : number * 20;
-    return `<div class="score-row" style="margin:6px 0"><div class="score-chip"><div class="v">${number.toFixed(2)}</div><div class="k">${esc(key)}</div></div></div>`;
-  }).join("");
+    return `<div class="score-chip"><div class="v">${number.toFixed(2)}</div><div class="k">${esc(key)}</div></div>`;
+  }).join("") + `</div>`;
 }
 function planDetailsHtml(p, index){
   const evidence = (p.supporting_evidence_ids || []).join(", ") || "待验证";
@@ -1653,7 +1661,7 @@ function m6DetailsHtml(r){
     return `<details class="detail-card" ${index === versions.length - 1 ? "open" : ""}>
       <summary><span class="paper-title">第 ${version} 版评审</span><span class="detail-chip ${overall ? reviewScoreClass(overall) : "neutral"}">总体 ${overall ? Number(overall.score).toFixed(1) : "—"} / 5</span></summary>
       <div class="detail-card-body">
-        <div class="score-row">${versionReviews.map(review => `<div class="score-chip"><div class="v">${Number(review.score).toFixed(1)}</div><div class="k">${esc(DIM_LABELS[review.dimension] || review.dimension)}</div></div>`).join("")}</div>
+        <div class="score-row review">${versionReviews.map(review => `<div class="score-chip"><div class="v">${Number(review.score).toFixed(1)}</div><div class="k">${esc(DIM_LABELS[review.dimension] || review.dimension)}</div></div>`).join("")}</div>
         <div class="detail-list">${versionReviews.map(m6ReviewHtml).join("")}</div>
       </div>
     </details>`;
@@ -1884,7 +1892,7 @@ function renderPlanBody(v, label){
   if(v && v.reviews?.length){
     const chips = v.reviews.map(r =>
       `<div class="score-chip"><div class="v">${r.score == null ? "--" : Number(r.score).toFixed(1)}</div><div class="k">${esc(DIM_LABELS[r.dimension] || r.dimension || "")}</div></div>`).join("");
-    sections.push(`<div class="plan-sec"><h4>M6 评审结果（${esc(label)}）</h4><div class="score-row">${chips}</div>` +
+    sections.push(`<div class="plan-sec"><h4>M6 评审结果（${esc(label)}）</h4><div class="score-row review">${chips}</div>` +
       v.reviews.filter(r => (r.reasoning || r.comments)).map(r =>
         `<div class="review-item"><div class="dim">${esc(DIM_LABELS[r.dimension] || r.dimension || "")}</div><div class="txt">${renderMarkdown(r.reasoning || r.comments)}</div></div>`).join("") + `</div>`);
   }
@@ -1998,7 +2006,7 @@ function renderOverallBody(){
     if(v.reviews?.length){
       const chips = v.reviews.map(r =>
         `<div class="score-chip"><div class="v">${r.score == null ? "--" : Number(r.score).toFixed(1)}</div><div class="k">${esc(DIM_LABELS[r.dimension] || r.dimension || "")}</div></div>`).join("");
-      sections.push(`<div class="plan-sec"><h4>M6 评审结果（${esc(e.label)}）</h4><div class="score-row">${chips}</div>` +
+      sections.push(`<div class="plan-sec"><h4>M6 评审结果（${esc(e.label)}）</h4><div class="score-row review">${chips}</div>` +
         v.reviews.filter(r => (r.reasoning || r.comments)).map(r =>
           `<div class="review-item"><div class="dim">${esc(DIM_LABELS[r.dimension] || r.dimension || "")}</div><div class="txt">${renderMarkdown(r.reasoning || r.comments)}</div></div>`).join("") + `</div>`);
     }
