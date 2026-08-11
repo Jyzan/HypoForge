@@ -160,6 +160,7 @@
   .config-field label{display:block;margin-bottom:6px;color:var(--ink3);font-size:10px;font-weight:750;letter-spacing:.04em}
   .config-field input{width:100%;border:0;outline:0;background:transparent;color:var(--ink);font-size:12px}
   .security-note{margin:0 20px 14px;color:var(--green);font-size:11.5px}
+  .cred-hint{margin:0 20px 6px;color:var(--ink3);font-size:11.5px;line-height:1.6}
   .hidden{display:none!important}
   /* ---------- Pipeline 图 ---------- */
   .pipeline-card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:22px 24px;margin-bottom:20px}
@@ -647,17 +648,18 @@
           </div>
           <div class="config-field">
             <label for="semanticApiKey">Semantic Scholar API Key</label>
-            <input id="semanticApiKey" type="password" placeholder="留空则使用本机配置或 OpenAlex" autocomplete="new-password" spellcheck="false">
+            <input id="semanticApiKey" type="password" placeholder="留空则用本机配置" autocomplete="new-password" spellcheck="false">
           </div>
           <div class="config-field">
             <label for="openalexApiKey">OpenAlex API Key</label>
-            <input id="openalexApiKey" type="password" placeholder="留空则使用本机配置或匿名请求" autocomplete="new-password" spellcheck="false">
+            <input id="openalexApiKey" type="password" placeholder="一般无需填写" autocomplete="new-password" spellcheck="false">
           </div>
           <div class="config-field">
             <label for="openalexMailto">OpenAlex Mailto（可选）</label>
-            <input id="openalexMailto" type="text" placeholder="邮箱，进入礼貌池；留空则使用本机配置" autocomplete="off" spellcheck="false">
+            <input id="openalexMailto" type="text" placeholder="可选，提升限流配额" autocomplete="off" spellcheck="false">
           </div>
         </div>
+        <div class="cred-hint">Semantic Scholar 建议填写 Key（匿名限流严格）；OpenAlex 匿名即可使用，Mailto 用于礼貌池提升限流；千问 Key 留空则使用本机配置（.env）。</div>
         <div class="security-note">凭证仅用于本次运行，不写入运行记录、浏览器存储或项目文件。</div>
       </details>
 
