@@ -61,7 +61,7 @@ class M6ReviewIteration(ModuleProtocol):
         valid_evidence_ids: set[str],
         version: int,
     ) -> List[GraphCorrectionRequest]:
-        if review.dimension.value != "evidence_consistency":
+        if review.dimension.value != "objective_evidence_consistency":
             return []
         output: List[GraphCorrectionRequest] = []
         for request in review.graph_correction_requests:

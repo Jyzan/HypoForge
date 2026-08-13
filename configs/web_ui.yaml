@@ -94,7 +94,6 @@ module_overrides:
       reviewer_timeout_seconds: 180.0
       reviewers:
         - scientific_logic
-        - evidence_consistency
         - method_feasibility
         - overall
 

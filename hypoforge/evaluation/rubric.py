@@ -68,7 +68,6 @@ HYPOTHESIS_RUBRIC: Dict[str, str] = {
 
 REVIEW_DIMENSIONS: tuple[str, ...] = (
     "scientific_logic",
-    "evidence_consistency",
     "method_feasibility",
 )
 
@@ -139,10 +138,6 @@ REVIEW_RUBRIC: Dict[str, str] = {
     "scientific_logic": (
         "1 = incoherent or circular; 3 = plausible but with logical gaps; "
         "5 = rigorous — every step justified and the predictions follow from the mechanism."
-    ),
-    "evidence_consistency": (
-        "1 = contradicts established facts; 3 = broadly consistent but ignores some conflicts; "
-        "5 = fully consistent and explicitly engages the conflicting evidence."
     ),
     "method_feasibility": (
         "1 = not executable as written; 3 = feasible but controls / sample size / statistics "
