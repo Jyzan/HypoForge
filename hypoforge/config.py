@@ -55,8 +55,8 @@ _find_and_load_dotenv()
 
 # Tier → default model mapping (uses the latest available models from the API)
 DEFAULT_MODEL_MAP = {
-    "base":  "qwen3.7-max",
-    "max":   "qwen3.7-max",
+    "base":  "qwen3.7-max-2026-06-08",
+    "max":   "qwen3.7-max-2026-06-08",
     "plus":  "qwen3.7-plus",
     "turbo": "qwen3.6-flash",
 }
@@ -65,7 +65,7 @@ DEFAULT_MODEL_MAP = {
 class LLMConfig(BaseModel):
     """Configuration for a single LLM endpoint."""
 
-    model: str = "qwen3.7-max"
+    model: str = "qwen3.7-max-2026-06-08"
     api_base: str = ""
     api_key: str = ""
     max_tokens: int = 4096
@@ -253,7 +253,7 @@ class PipelineConfig(BaseModel):
     #   revision_count  = M6→M4 revision hops, audit/display only — it never
     #     participates in any stop condition.
     followup_routing: bool = False      # M1 may skip M2/M3 for search-free followups
-    m6_evidence_revisit: bool = False   # M6 evidence-sufficiency verdict may re-route to M2
+    m6_evidence_revisit: bool = True   # M6 evidence-sufficiency verdict may re-route to M2
     max_search_rounds: int = 2          # max M2 executions (fresh + supplement rounds)
     supplement_paper_budget: int = 6    # paper budget per supplement search round
     gap_no_improvement_limit: int = 3   # mark a gap unimprovable after N rounds without improvement
