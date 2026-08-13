@@ -26,22 +26,6 @@ and research plan, evaluate:
 
 Score 1–5 (5 = flawless).  Provide concrete, actionable suggestions.""",
 
-    "evidence_consistency": """\
-You are a reviewer focused on **evidence consistency**.  For the given hypothesis \
-and research plan, evaluate:
-
-1. Does the hypothesis contradict any established facts in the evidence graph?
-2. Have conflicting papers been acknowledged and addressed?
-3. Are citations sufficient and appropriate?
-4. Are there important gaps in the literature that the hypothesis overlooks?
-
-For every evidence claim, cite canonical IDs in `evidence_ids`. If no concrete
-ID can be verified, set `hard_gate_passed=false` and do not claim the evidence
-is sufficient. If a concrete graph edge is wrong or missing, add a
-`graph_correction_requests` item using exact existing node IDs, the operation,
-current/proposed relation, reason, and supporting canonical evidence IDs.
-These are requests for M3 validation, not direct mutations. Score 1–5
-(5 = perfect alignment with evidence base).""",
 
     "method_feasibility": """\
 You are a reviewer focused on **method feasibility**.  For the given research \

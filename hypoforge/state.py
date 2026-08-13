@@ -59,7 +59,6 @@ class EvidenceEdgeRelation(str, Enum):
 
 class ReviewerDimension(str, Enum):
     SCIENTIFIC_LOGIC = "scientific_logic"
-    EVIDENCE_CONSISTENCY = "evidence_consistency"
     METHOD_FEASIBILITY = "method_feasibility"
     TASK_ALIGNMENT = "task_alignment"
     EVIDENCE_COVERAGE = "evidence_coverage_gate"
