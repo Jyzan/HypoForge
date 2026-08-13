@@ -292,11 +292,23 @@ class M6ReviewIteration(ModuleProtocol):
             f"Semantic pair audit: {semantic_alignment_rationale}",
         ]))
 
+        failed_hyp = not hypothesis_alignment.passed or not semantic_alignment_passed
+        failed_plan = not plan_alignment.passed
+        if failed_hyp and failed_plan:
+            alignment_attr = "both"
+        elif failed_hyp:
+            alignment_attr = "hypothesis"
+        elif failed_plan:
+            alignment_attr = "plan"
+        else:
+            alignment_attr = "both"
+
         # Task alignment is a deterministic, independent hard gate. It does
         # not consume an LLM call and cannot be overridden by a plausible but
         # off-topic model self-assessment.
         new_reviews: List[ReviewResult] = [ReviewResult(
             dimension=ReviewerDimension("task_alignment"),
+            attribution=alignment_attr,
             reasoning=deterministic_alignment_rationale,
             score=5.0 if deterministic_alignment_passed else 1.0,
             comments="Compared the task contract with the hypothesis and study subject.",
@@ -366,6 +378,12 @@ class M6ReviewIteration(ModuleProtocol):
             payload = dict(payload)
             payload["dimension"] = dim
             payload["version"] = version
+            if dim in {"scientific_logic", "testability", "novelty"}:
+                payload["attribution"] = "hypothesis"
+            elif dim in {"method_feasibility"}:
+                payload["attribution"] = "plan"
+            else:
+                payload["attribution"] = "both"
             review = ReviewResult.model_validate(payload)
             cited_evidence = list(dict.fromkeys(
                 identifier
@@ -398,10 +416,28 @@ class M6ReviewIteration(ModuleProtocol):
             
             # 1. evidence_coverage
             coverage = gates.get("evidence_coverage", 0.0)
+            coverage_hyp = gates.get("evidence_coverage_hypothesis", 1.0)
+            coverage_plan = gates.get("evidence_coverage_plan", 1.0)
             coverage_score = coverage * 5.0
             coverage_passed = coverage_score >= 4.5
+            
+            if not coverage_passed:
+                failed_hyp = coverage_hyp < 0.9
+                failed_plan = coverage_plan < 0.9
+                if failed_hyp and failed_plan:
+                    cov_attr = "both"
+                elif failed_hyp:
+                    cov_attr = "hypothesis"
+                elif failed_plan:
+                    cov_attr = "plan"
+                else:
+                    cov_attr = "both"
+            else:
+                cov_attr = "both"
+                
             new_reviews.append(ReviewResult(
                 dimension=ReviewerDimension("evidence_coverage_gate"),
+                attribution=cov_attr,
                 reasoning=f"Calculated evidence coverage is {coverage*100:.1f}%.",
                 score=round(coverage_score, 1),
                 comments="Objective code-level assessment of cited evidence coverage.",
@@ -416,6 +452,7 @@ class M6ReviewIteration(ModuleProtocol):
             completeness_passed = completeness_score >= 3.0
             new_reviews.append(ReviewResult(
                 dimension=ReviewerDimension("answer_completeness_gate"),
+                attribution="plan",
                 reasoning=f"Calculated answer completeness is {completeness*100:.1f}%.",
                 score=round(completeness_score, 1),
                 comments="Objective code-level assessment of research plan structural completeness.",
@@ -429,6 +466,7 @@ class M6ReviewIteration(ModuleProtocol):
             source_score = source * 5.0
             new_reviews.append(ReviewResult(
                 dimension=ReviewerDimension("source_quality_gate"),
+                attribution="both",
                 reasoning=f"Calculated source quality is {source*100:.1f}%.",
                 score=round(source_score, 1),
                 comments="Objective code-level assessment of source paper text availability.",
@@ -456,8 +494,11 @@ class M6ReviewIteration(ModuleProtocol):
                 if m_name == "evidence_consistency":
                     dim_name = "objective_evidence_consistency"
                     
+                m_attr = "hypothesis"
+                    
                 new_reviews.append(ReviewResult(
                     dimension=ReviewerDimension(dim_name),
+                    attribution=m_attr,
                     reasoning=f"Calculated {m_name} score is {m_score:.2f} (scaled to {m_score_scaled:.1f}/5).",
                     score=round(m_score_scaled, 1),
                     comments=f"Objective metric {m_name} from MetricRegistry.",

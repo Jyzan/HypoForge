@@ -41,7 +41,7 @@ class PipelineCancelled(Exception):
 
 def _route_after_m6(
     state: PipelineState, config: Any
-) -> Literal["end", "revise_m3", "revise_m4", "supplement_m2"]:
+) -> Literal["end", "revise_m3", "revise_m4", "revise_m5", "supplement_m2"]:
     """Routing decision after M6 (v2 contract — priority order is strict).
 
     1. ``iteration_count >= max_iterations`` → ``"end"`` (the ONLY hard stop;
@@ -97,6 +97,21 @@ def _route_after_m6(
     evidence_sufficient = verdict is None or verdict.sufficient
     recent = [r for r in state.reviews if r.version == state.iteration_count]
     if any(review.hard_gate_passed is False for review in recent):
+        failed_reviews = [r for r in recent if r.hard_gate_passed is False]
+        requires_m4 = False
+        requires_m5 = False
+        for r in failed_reviews:
+            if r.attribution in ("hypothesis", "both"):
+                requires_m4 = True
+            elif r.attribution == "plan":
+                requires_m5 = True
+        
+        if revision_route == "revise_m3":
+            return "revise_m3"
+        elif requires_m4:
+            return "revise_m4"
+        elif requires_m5:
+            return "revise_m5"
         return revision_route
     overall = [r for r in recent if r.dimension.value == "overall"]
     if (
@@ -513,6 +528,7 @@ class PipelineRunner:
                         "end": END,
                         "revise_m3": "m3",
                         "revise_m4": iteration_target,
+                        "revise_m5": "m5",
                         "supplement_m2": "m2",
                     },
                 )

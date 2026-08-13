@@ -462,6 +462,7 @@ class ReviewResult(BaseModel):
     """A single reviewer's assessment (M6 output)."""
 
     dimension: ReviewerDimension
+    attribution: Literal["hypothesis", "plan", "both"] = "both"
     reasoning: str = ""  # written *before* the score (reason-before-score)
     score: float = Field(ge=1.0, le=5.0)
     comments: str = ""

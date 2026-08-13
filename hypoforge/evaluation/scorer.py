@@ -242,13 +242,21 @@ def _quality_gates(state: PipelineState) -> Dict[str, Any]:
 
     claim_units = 0
     supported_units = 0
+    hyp_claim_units = 0
+    hyp_supported_units = 0
     for hypothesis in state.top_hypotheses:
         claim_units += 1
+        hyp_claim_units += 1
         cited = set(hypothesis.supporting_evidence)
         if cited and all(item in valid_evidence for item in cited):
             supported_units += 1
+            hyp_supported_units += 1
+            
+    plan_claim_units = 0
+    plan_supported_units = 0
     for plan in state.research_plans:
         claim_units += 1
+        plan_claim_units += 1
         cited = set(plan.supporting_evidence_ids)
         cited.update(
             evidence_id
@@ -258,7 +266,11 @@ def _quality_gates(state: PipelineState) -> Dict[str, Any]:
         )
         if cited and all(item in valid_evidence for item in cited):
             supported_units += 1
+            plan_supported_units += 1
+            
     evidence_coverage = supported_units / claim_units if claim_units else 0.0
+    evidence_coverage_hypothesis = hyp_supported_units / hyp_claim_units if hyp_claim_units else 1.0
+    evidence_coverage_plan = plan_supported_units / plan_claim_units if plan_claim_units else 1.0
 
     plan_completeness = [score_plan_completeness(plan) for plan in state.research_plans]
     anchor_coverage = [row["score"] for row in alignment_rows]
@@ -287,6 +299,8 @@ def _quality_gates(state: PipelineState) -> Dict[str, Any]:
             "items": alignment_rows,
         },
         "evidence_coverage": round(evidence_coverage, 4),
+        "evidence_coverage_hypothesis": round(evidence_coverage_hypothesis, 4),
+        "evidence_coverage_plan": round(evidence_coverage_plan, 4),
         "answer_completeness": round(answer_completeness, 4),
         "source_quality": round(source_quality, 4),
     }

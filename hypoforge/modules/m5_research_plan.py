@@ -92,20 +92,22 @@ class M5ResearchPlan(ModuleProtocol):
         if state.iteration_count <= 0 or not state.reviews:
             return followup_block
         latest = max(review.version for review in state.reviews)
-        feedback = [
-            review.suggestions or review.comments or ""
-            for review in state.reviews
-            if review.version == latest
-            and review.dimension.value == "method_feasibility"
-        ]
-        feedback = [item.strip() for item in feedback if item.strip()]
+        feedback = []
+        for review in state.reviews:
+            if review.version != latest:
+                continue
+            attr = getattr(review, "attribution", "both")
+            if attr in ("plan", "both") and review.hard_gate_passed is False:
+                msg = review.suggestions or review.comments or ""
+                if msg.strip():
+                    feedback.append(f"[{review.dimension.value}] {msg.strip()}")
         if not feedback:
             return followup_block
         lines = [
             "",
-            "Research-plan revision guidance from the latest method-feasibility review:",
+            "Research-plan revision guidance from the latest review iteration:",
             *[f"- {item}" for item in feedback],
-            "Apply only suggestions relevant to this hypothesis and keep them in the research plan, not the hypothesis statement.",
+            "Apply only suggestions relevant to this hypothesis and keep them in the research plan.",
         ]
         return followup_block + "\n".join(lines)
 
