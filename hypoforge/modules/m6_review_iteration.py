@@ -466,7 +466,8 @@ class M6ReviewIteration(ModuleProtocol):
             independent_metrics = metric_report.get("independent", {})
             for m_name, m_score in independent_metrics.items():
                 m_score_scaled = m_score * 5.0
-                m_passed = m_score_scaled >= 2.5
+                threshold = 1.5 if m_name == "novelty" else 2.5
+                m_passed = m_score_scaled >= threshold
                 dim_name = f"{m_name}_metric"
                 if m_name == "evidence_consistency":
                     dim_name = "objective_evidence_consistency"
@@ -476,7 +477,7 @@ class M6ReviewIteration(ModuleProtocol):
                     reasoning=f"Calculated {m_name} score is {m_score:.2f} (scaled to {m_score_scaled:.1f}/5).",
                     score=round(m_score_scaled, 1),
                     comments=f"Objective metric {m_name} from MetricRegistry.",
-                    suggestions="" if m_passed else f"Improve {m_name} to meet the minimum threshold of 2.5/5.",
+                    suggestions="" if m_passed else f"Improve {m_name} to meet the minimum threshold of {threshold}/5.",
                     hard_gate_passed=m_passed,
                     version=version,
                 ))
