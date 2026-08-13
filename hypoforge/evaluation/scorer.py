@@ -261,9 +261,8 @@ def _quality_gates(state: PipelineState) -> Dict[str, Any]:
     plan_completeness = [score_plan_completeness(plan) for plan in state.research_plans]
     anchor_coverage = [row["score"] for row in alignment_rows]
     answer_completeness = (
-        0.5 * (sum(plan_completeness) / len(plan_completeness))
-        + 0.5 * (sum(anchor_coverage) / len(anchor_coverage))
-        if plan_completeness and anchor_coverage else 0.0
+        sum(plan_completeness) / len(plan_completeness)
+        if plan_completeness else 0.0
     )
 
     paper_quality: list[float] = []
