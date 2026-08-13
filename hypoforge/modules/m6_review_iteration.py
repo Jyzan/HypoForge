@@ -443,8 +443,8 @@ class M6ReviewIteration(ModuleProtocol):
             metric_report = await score_hypothesis_async(
                 hypothesis,
                 knowledge_entries,
-                llm_config=getattr(self.config, "llm", None),
-                embed_config=getattr(self.config, "embedding", None),
+                llm_config=getattr(config, "llm", None),
+                embed_config=getattr(config, "embedding", None),
                 evidence_graph=state.evidence_graph
             )
             independent_metrics = metric_report.get("independent", {})
