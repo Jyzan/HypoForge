@@ -550,15 +550,18 @@ class M3EvidenceGraph(ModuleProtocol):
             assert state.m2_knowledge_export is not None
             try:
                 grounded = await self._grounder.run(state)
+                report = grounded.get("report")
                 graph = self._merge_grounding(
                     graph,
                     grounded.get("evidence_records", []),
                     grounded.get("claims", []),
                     grounded.get("relations", []),
-                    grounded.get("report"),
+                    report,
                     entity_normalizer=self._normalise_task_entity,
                 )
                 result["evidence_graph"] = graph
+                if report is not None:
+                    result["grounding_report"] = report
             except Exception as exc:
                 if self.grounding_enabled:
                     raise RuntimeError(
