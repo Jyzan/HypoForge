@@ -817,7 +817,7 @@ class M4HypothesisGeneration(ModuleProtocol):
         if recent:
             parts.append("\nReviewer feedback (address these):")
             for r in recent:
-                fix = r.suggestions or r.comments or ""
+                fix = " ".join(filter(None, [r.reasoning, r.suggestions, r.comments]))
                 parts.append(f"- [{r.dimension.value}] {r.score:.1f}/5 — {fix}")
 
         if guidance:
