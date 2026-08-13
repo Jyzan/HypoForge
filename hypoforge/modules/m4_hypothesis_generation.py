@@ -812,7 +812,7 @@ class M4HypothesisGeneration(ModuleProtocol):
         recent = [
             r for r in state.reviews
             if r.version == latest
-            and r.dimension.value in {"scientific_logic", "evidence_consistency"}
+            and r.dimension.value != "overall"
         ]
         if recent:
             parts.append("\nReviewer feedback (address these):")

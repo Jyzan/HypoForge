@@ -62,6 +62,12 @@ class ReviewerDimension(str, Enum):
     EVIDENCE_CONSISTENCY = "evidence_consistency"
     METHOD_FEASIBILITY = "method_feasibility"
     TASK_ALIGNMENT = "task_alignment"
+    EVIDENCE_COVERAGE = "evidence_coverage_gate"
+    ANSWER_COMPLETENESS = "answer_completeness_gate"
+    SOURCE_QUALITY = "source_quality_gate"
+    TESTABILITY = "testability_metric"
+    NOVELTY = "novelty_metric"
+    OBJECTIVE_EVIDENCE_CONSISTENCY = "objective_evidence_consistency"
     OVERALL = "overall"
 
 
