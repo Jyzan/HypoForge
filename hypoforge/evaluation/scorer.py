@@ -102,7 +102,9 @@ async def score_hypothesis_async(
             else:
                 independent[name] = float(result)
                 traces[name] = None
-        except NotImplementedError:
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"Metric {name} failed during computation: {e}")
             continue
 
     return {
