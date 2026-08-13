@@ -115,7 +115,6 @@ class M6ReviewIteration(ModuleProtocol):
             raise ValueError("reviewer_timeout_seconds must be positive")
         self.reviewer_dims = reviewers or [
             "scientific_logic",
-            "evidence_consistency",
             "method_feasibility",
             "overall",
         ]
@@ -381,21 +380,6 @@ class M6ReviewIteration(ModuleProtocol):
                     version=version,
                 )
             )
-            if dim == "evidence_consistency":
-                if not valid_evidence_ids:
-                    updates.update({
-                        "score": 1.0,
-                        "hard_gate_passed": False,
-                        "suggestions": "No auditable evidence IDs are available; return to M2/M3 and fill a searchable evidence gap.",
-                    })
-                elif not cited_evidence:
-                    updates.update({
-                        "score": min(review.score, 2.0),
-                        "hard_gate_passed": False,
-                        "suggestions": "Evidence sufficiency cannot pass without citing at least one canonical evidence ID. " + review.suggestions,
-                    })
-                else:
-                    updates["hard_gate_passed"] = True
             review = review.model_copy(update=updates)
             new_reviews.append(review)
             emit_event(
