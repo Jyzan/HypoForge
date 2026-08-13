@@ -306,7 +306,7 @@ class GraphCorrectionRequest(BaseModel):
     proposed_relation: Optional[EvidenceEdgeRelation] = None
     evidence_ids: List[str] = Field(default_factory=list)
     reason: str
-    requested_by: str = "evidence_consistency"
+    requested_by: str = "objective_evidence_consistency"
     iteration: int = Field(default=0, ge=0)
     status: Literal["pending", "applied", "rejected"] = "pending"
     rejection_reason: str = ""
