@@ -242,7 +242,8 @@ def _quality_gates(state: PipelineState) -> Dict[str, Any]:
     supported_units = 0
     for hypothesis in state.top_hypotheses:
         claim_units += 1
-        if any(item in valid_evidence for item in hypothesis.supporting_evidence):
+        cited = set(hypothesis.supporting_evidence)
+        if cited and all(item in valid_evidence for item in cited):
             supported_units += 1
     for plan in state.research_plans:
         claim_units += 1
@@ -253,7 +254,7 @@ def _quality_gates(state: PipelineState) -> Dict[str, Any]:
             for evidence_id in link.supporting_evidence_ids
             if link.support_status == "supported"
         )
-        if cited & valid_evidence:
+        if cited and all(item in valid_evidence for item in cited):
             supported_units += 1
     evidence_coverage = supported_units / claim_units if claim_units else 0.0
 

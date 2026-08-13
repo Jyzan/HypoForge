@@ -415,7 +415,7 @@ class M6ReviewIteration(ModuleProtocol):
             # 1. evidence_coverage
             coverage = gates.get("evidence_coverage", 0.0)
             coverage_score = coverage * 5.0
-            coverage_passed = coverage_score >= 2.5
+            coverage_passed = coverage_score >= 4.5
             new_reviews.append(ReviewResult(
                 dimension=ReviewerDimension("evidence_coverage_gate"),
                 reasoning=f"Calculated evidence coverage is {coverage*100:.1f}%.",
@@ -429,7 +429,7 @@ class M6ReviewIteration(ModuleProtocol):
             # 2. answer_completeness
             completeness = gates.get("answer_completeness", 0.0)
             completeness_score = completeness * 5.0
-            completeness_passed = completeness_score >= 2.5
+            completeness_passed = completeness_score >= 3.0
             new_reviews.append(ReviewResult(
                 dimension=ReviewerDimension("answer_completeness_gate"),
                 reasoning=f"Calculated answer completeness is {completeness*100:.1f}%.",
