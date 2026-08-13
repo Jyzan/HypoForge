@@ -30,6 +30,8 @@ from ..prompts.m6_prompts import (
     M6_USER_TEMPLATE,
 )
 from ..evaluation.rubric import review_rubric_line
+from ..evaluation.scorer import _quality_gates, score_hypothesis_async, _collect_knowledge_entries
+from ..evaluation.metrics import MetricRegistry
 from ..registry import ModuleRegistry
 from ..state import (
     EvidenceGap,
@@ -405,6 +407,81 @@ class M6ReviewIteration(ModuleProtocol):
                 elapsed_seconds=time.monotonic() - started_at,
                 details={"version": version, "score": review.score},
             )
+
+        # --- NEW: Objective Quality Gates & Metrics ---
+        try:
+            gates = _quality_gates(state)
+            
+            # 1. evidence_coverage
+            coverage = gates.get("evidence_coverage", 0.0)
+            coverage_score = coverage * 5.0
+            coverage_passed = coverage_score >= 2.5
+            new_reviews.append(ReviewResult(
+                dimension=ReviewerDimension("evidence_coverage_gate"),
+                reasoning=f"Calculated evidence coverage is {coverage*100:.1f}%.",
+                score=round(coverage_score, 1),
+                comments="Objective code-level assessment of cited evidence coverage.",
+                suggestions="" if coverage_passed else "Cite more valid evidence IDs from the evidence graph.",
+                hard_gate_passed=coverage_passed,
+                version=version,
+            ))
+
+            # 2. answer_completeness
+            completeness = gates.get("answer_completeness", 0.0)
+            completeness_score = completeness * 5.0
+            completeness_passed = completeness_score >= 2.5
+            new_reviews.append(ReviewResult(
+                dimension=ReviewerDimension("answer_completeness_gate"),
+                reasoning=f"Calculated answer completeness is {completeness*100:.1f}%.",
+                score=round(completeness_score, 1),
+                comments="Objective code-level assessment of research plan structural completeness.",
+                suggestions="" if completeness_passed else "Ensure the research plan contains required structured sections.",
+                hard_gate_passed=completeness_passed,
+                version=version,
+            ))
+
+            # 3. source_quality
+            source = gates.get("source_quality", 0.0)
+            source_score = source * 5.0
+            new_reviews.append(ReviewResult(
+                dimension=ReviewerDimension("source_quality_gate"),
+                reasoning=f"Calculated source quality is {source*100:.1f}%.",
+                score=round(source_score, 1),
+                comments="Objective code-level assessment of source paper text availability.",
+                suggestions="Try to search for papers with structured fulltext or OA PDFs.",
+                hard_gate_passed=True,
+                version=version,
+            ))
+
+            # 4. Metrics
+            knowledge_entries = _collect_knowledge_entries(state)
+            # score_hypothesis_async runs all implemented independent metrics
+            metric_report = await score_hypothesis_async(
+                hypothesis,
+                knowledge_entries,
+                llm_config=getattr(self.config, "llm", None),
+                embed_config=getattr(self.config, "embedding", None),
+                evidence_graph=state.evidence_graph
+            )
+            independent_metrics = metric_report.get("independent", {})
+            for m_name, m_score in independent_metrics.items():
+                m_score_scaled = m_score * 5.0
+                m_passed = m_score_scaled >= 2.5
+                dim_name = f"{m_name}_metric"
+                if m_name == "evidence_consistency":
+                    dim_name = "objective_evidence_consistency"
+                    
+                new_reviews.append(ReviewResult(
+                    dimension=ReviewerDimension(dim_name),
+                    reasoning=f"Calculated {m_name} score is {m_score:.2f} (scaled to {m_score_scaled:.1f}/5).",
+                    score=round(m_score_scaled, 1),
+                    comments=f"Objective metric {m_name} from MetricRegistry.",
+                    suggestions="" if m_passed else f"Improve {m_name} to meet the minimum threshold of 2.5/5.",
+                    hard_gate_passed=m_passed,
+                    version=version,
+                ))
+        except Exception as e:
+            logger.warning(f"Failed to compute objective quality gates/metrics: {e}")
 
         # Compute overall as the mean of the specialist scores.
         if "overall" in self.reviewer_dims and new_reviews:
