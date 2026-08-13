@@ -854,7 +854,18 @@ const PATH_LABELS = { "full":"全量检索", "revise":"修订", "supplement":"�
 // routing_history 的 to_module（decision）→ 时间线徽标类型。
 const DECISION_TO_PATH = { "supplement_m2":"supplement", "revise_m4":"revise", "direct_m4":"skip-search", "search_m2":"full", "end":"end" };
 const GAP_LABELS = { "open":"待补检索", "pending_grounding":"待 Grounding", "closed":"已闭合", "unimprovable":"无法改进", "unknown":"未知" };
-const DIM_LABELS = { "task_alignment":"任务对齐", "scientific_logic":"科学逻辑", "evidence_consistency":"证据一致性", "method_feasibility":"方法可行性", "overall":"综合评分" };
+const DIM_LABELS = { 
+  "task_alignment":"任务对齐", 
+  "scientific_logic":"科学逻辑", 
+  "method_feasibility":"方法可行性", 
+  "overall":"综合评分",
+  "evidence_coverage_gate": "证据覆盖率门禁",
+  "answer_completeness_gate": "答案完整度门禁",
+  "source_quality_gate": "证据来源质量门禁",
+  "novelty_metric": "创新性独立打分",
+  "testability_metric": "可测性独立打分",
+  "objective_evidence_consistency": "客观证据一致性"
+};
 const STRUCTURED_DRAWER_MODULES = new Set(["m1","m2","m4","m5","m6"]);
 
 let currentRun = null, runRecord = null, lastSequence = 0, timer = null;
