@@ -3333,14 +3333,18 @@ def test_method_feedback_is_routed_to_m5_not_m4() -> None:
         reviews=[
             ReviewResult(
                 dimension=ReviewerDimension("scientific_logic"),
+                attribution="hypothesis",
                 score=3.0,
                 suggestions="clarify the causal mechanism",
+                hard_gate_passed=False,
                 version=1,
             ),
             ReviewResult(
                 dimension=ReviewerDimension("method_feasibility"),
+                attribution="plan",
                 score=3.0,
                 suggestions="add a power analysis",
+                hard_gate_passed=False,
                 version=1,
             ),
         ],
@@ -4263,17 +4267,19 @@ async def test_m6_fails_closed_when_evidence_review_cites_no_id() -> None:
 
     result = await module(state)
     reviewed = state.model_copy(update=result)
-    evidence_review = next(
+    coverage_review = next(
         review for review in reviewed.reviews
-        if review.dimension.value == "evidence_consistency"
+        if review.dimension.value == "evidence_coverage_gate"
     )
     overall = next(
         review for review in reviewed.reviews
         if review.dimension.value == "overall"
     )
 
-    assert evidence_review.score == 2.0
-    assert evidence_review.hard_gate_passed is False
+    # The evidence_consistency reviewer is gone; the objective coverage gate
+    # now fails closed when a unit cites no auditable evidence ID.
+    assert coverage_review.score < 4.5  # below the 90% pass line
+    assert coverage_review.hard_gate_passed is False
     assert overall.hard_gate_passed is False
     assert _should_continue_iterating(reviewed) == "iterate"
 
@@ -4555,7 +4561,7 @@ def test_graph_correction_rejects_request_without_evidence() -> None:
 
 def test_m6_normalizes_request_id_and_filters_unknown_evidence() -> None:
     review = ReviewResult(
-        dimension=ReviewerDimension.EVIDENCE_CONSISTENCY,
+        dimension=ReviewerDimension("objective_evidence_consistency"),
         score=2,
         graph_correction_requests=[correction(
             request_id="", evidence_ids=["ev-1", "invented"],
@@ -5861,11 +5867,14 @@ def test_route_after_m6_low_score_revises_m4():
 def test_route_after_m6_switch_off_verdict_is_ignored():
     """Switch off → the verdict never influences routing (legacy behaviour)."""
     state = _insufficient_state(score=3.0)
-    assert _route_after_m6(state, PipelineConfig(verbose=False)) == "revise_m4"
+    # m6_evidence_revisit now defaults True — the test pins the switch OFF
+    # explicitly to exercise the legacy verdict-ignored behaviour.
+    switch_off = PipelineConfig(verbose=False, m6_evidence_revisit=False)
+    assert _route_after_m6(state, switch_off) == "revise_m4"
     assert _route_after_m6(state, None) == "revise_m4"
     # high score + hostile verdict still ends when the switch is off
     high = _insufficient_state(score=4.9)
-    assert _route_after_m6(high, PipelineConfig(verbose=False)) == "end"
+    assert _route_after_m6(high, switch_off) == "end"
 
 
 # --------------------------------------------------------------------------- #
@@ -5989,10 +5998,12 @@ def test_should_continue_iterating_wrapper_keeps_legacy_vocabulary():
     assert _should_continue_iterating(low_score) == "iterate"
 
 
-def test_default_config_routing_is_equivalent_to_legacy():
-    """With both switches off, the new routers must reproduce the legacy
-    m6→{iterate,end} behaviour and the legacy linear m1→m2 edge."""
-    config = PipelineConfig(verbose=False)
+def test_switches_off_config_routing_is_equivalent_to_legacy():
+    """With both switches explicitly off, the new routers must reproduce the
+    legacy m6→{iterate,end} behaviour and the legacy linear m1→m2 edge.
+    (m6_evidence_revisit now defaults True; the switch-off contract is
+    tested explicitly.)"""
+    config = PipelineConfig(verbose=False, m6_evidence_revisit=False)
     assert config.followup_routing is False
     assert config.m6_evidence_revisit is False
 
@@ -6057,7 +6068,9 @@ def test_topology_switches_off_is_exactly_legacy_wiring():
     """HARD ACCEPTANCE: followup_routing=false and m6_evidence_revisit=false
     → conditional edges NOT installed; plain linear spine + legacy two-way
     m6 iteration edge (byte-for-byte the pre-refactor topology)."""
-    edges = _edges_of(PipelineConfig(verbose=False))
+    edges = _edges_of(PipelineConfig(
+        verbose=False, followup_routing=False, m6_evidence_revisit=False,
+    ))
 
     for src, dst in [("m1", "m2"), ("m2", "m3"), ("m3", "m4"), ("m4", "m5"), ("m5", "m6")]:
         assert (src, dst) in edges, f"missing linear edge {src}→{dst}"
@@ -6540,14 +6553,16 @@ def test_build_followup_seed_memory_cache_falls_back_to_config():
 # Config switches
 # --------------------------------------------------------------------------- #
 
-def test_iteration_core_switches_default_off():
+def test_iteration_core_switches_defaults():
     config = PipelineConfig.from_defaults()
     assert config.followup_routing is False
-    assert config.m6_evidence_revisit is False
+    # flipped to True by ba60c21 (prevent futile M4 iterations)
+    assert config.m6_evidence_revisit is True
     assert config.max_search_rounds == 2
     assert config.supplement_paper_budget == 6
     assert config.gap_no_improvement_limit == 3
     assert config.gap_no_gain_limit == 3
+    assert config.max_plan_revisions == 2
 
 
 def test_iteration_core_switches_load_from_yaml(tmp_path):
@@ -6671,20 +6686,27 @@ def make_m6_module(client, revisit: bool = True, limit: int = 3) -> M6ReviewIter
 
 @pytest.mark.asyncio
 async def test_m6_switch_off_never_calls_verdict() -> None:
-    # Exactly three reviewer payloads; a 4th call would raise — proving the
+    # Exactly two reviewer payloads; a 3rd call would raise — proving the
     # verdict call is never issued when the switch is off.
-    client = FakeM6Client([_review_payload()] * 3)
+    client = FakeM6Client([_review_payload()] * 2)
     module = make_m6_module(client, revisit=False)
     state = make_m6_state()
 
     patch = await module(state)
 
-    assert client.calls == 3
+    assert client.calls == 2
     assert set(patch) == {
         "reviews", "iteration_count", "graph_correction_requests",
     }  # no evidence-verdict keys
     assert patch["iteration_count"] == 1
-    assert len(patch["reviews"]) == 5  # alignment gate + 3 specialists + overall
+    # alignment gate + 2 specialists + 3 objective gates + 3 metric dims + overall
+    assert len(patch["reviews"]) == 10
+    assert {r.dimension.value for r in patch["reviews"]} == {
+        "task_alignment", "scientific_logic", "method_feasibility",
+        "evidence_coverage_gate", "answer_completeness_gate",
+        "source_quality_gate", "testability_metric", "novelty_metric",
+        "objective_evidence_consistency", "overall",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -6714,13 +6736,13 @@ async def test_m6_verdict_matches_existing_gap_inherits_attempts() -> None:
             "suggested_queries": ["Hsp70 co-chaperone binding assay"],
         }],
     }
-    client = FakeM6Client([_review_payload()] * 3 + [verdict_payload])
+    client = FakeM6Client([_review_payload()] * 2 + [verdict_payload])
     module = make_m6_module(client)
     state = make_m6_state(evidence_gaps=[existing])
 
     patch = await module(state)
 
-    assert client.calls == 4  # 3 reviewers + 1 verdict
+    assert client.calls == 3  # 2 reviewers + 1 verdict
     assert patch["evidence_verdict"].sufficient is False
     gaps = patch["evidence_gaps"]
     assert len(gaps) == 1
@@ -6733,13 +6755,13 @@ async def test_m6_verdict_matches_existing_gap_inherits_attempts() -> None:
 
 @pytest.mark.asyncio
 async def test_m6_verdict_fail_closed() -> None:
-    client = FakeM6Client([_review_payload()] * 3 + [RuntimeError("boom")])
+    client = FakeM6Client([_review_payload()] * 2 + [RuntimeError("boom")])
     module = make_m6_module(client)
     state = make_m6_state()
 
     patch = await module(state)
 
-    assert client.calls == 4  # the verdict call was attempted
+    assert client.calls == 3  # the verdict call was attempted
     verdict = patch["evidence_verdict"]
     assert verdict.sufficient is False
     assert len(verdict.gaps) == 1
@@ -8627,12 +8649,14 @@ async def test_m4_feedback_loop_and_no_hang():
         reviews=[
             ReviewResult(
                 dimension=ReviewerDimension("scientific_logic"),
+                attribution="hypothesis",
                 score=3.0,
                 suggestions="clarify the causal mechanism",
                 version=1,
             ),
             ReviewResult(
                 dimension=ReviewerDimension("method_feasibility"),
+                attribution="plan",
                 score=3.0,
                 suggestions="add a power analysis",
                 version=1,
