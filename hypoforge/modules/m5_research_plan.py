@@ -96,6 +96,8 @@ class M5ResearchPlan(ModuleProtocol):
         for review in state.reviews:
             if review.version != latest:
                 continue
+            if review.dimension.value == "overall":
+                continue  # aggregate review adds no plan-revision signal
             attr = getattr(review, "attribution", "both")
             if attr in ("plan", "both") and review.hard_gate_passed is False:
                 msg = review.suggestions or review.comments or ""

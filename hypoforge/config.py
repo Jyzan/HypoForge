@@ -254,6 +254,7 @@ class PipelineConfig(BaseModel):
     #     participates in any stop condition.
     followup_routing: bool = False      # M1 may skip M2/M3 for search-free followups
     m6_evidence_revisit: bool = True   # M6 evidence-sufficiency verdict may re-route to M2
+    max_plan_revisions: int = 2        # consecutive plan-only (revise_m5) rounds before forcing a hypothesis revision
     max_search_rounds: int = 2          # max M2 executions (fresh + supplement rounds)
     supplement_paper_budget: int = 6    # paper budget per supplement search round
     gap_no_improvement_limit: int = 3   # mark a gap unimprovable after N rounds without improvement
@@ -330,6 +331,7 @@ class PipelineConfig(BaseModel):
             for key in (
                 "followup_routing",
                 "m6_evidence_revisit",
+                "max_plan_revisions",
                 "max_search_rounds",
                 "supplement_paper_budget",
                 "gap_no_improvement_limit",

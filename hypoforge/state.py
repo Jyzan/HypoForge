@@ -464,7 +464,9 @@ class ReviewResult(BaseModel):
     dimension: ReviewerDimension
     attribution: Literal["hypothesis", "plan", "both"] = "both"
     reasoning: str = ""  # written *before* the score (reason-before-score)
-    score: float = Field(ge=1.0, le=5.0)
+    # 1–5 for LLM reviewers; objective gates/metrics scale 0–1 × 5 and may
+    # legitimately score 0 (e.g. 0% evidence coverage).
+    score: float = Field(ge=0.0, le=5.0)
     comments: str = ""
     suggestions: str = ""
     evidence_ids: List[str] = Field(default_factory=list)
@@ -903,6 +905,10 @@ class PipelineState(BaseModel):
     # revision_count = number of M4 revision rounds (audit/display only —
     # never gates routing).
     revision_count: int = 0
+    # plan_revision_count = number of CONSECUTIVE plan-only (revise_m5)
+    # rounds. GATES routing: capped by config.max_plan_revisions so a stuck
+    # plan cannot starve M4's hypothesis-revision budget.
+    plan_revision_count: int = 0
     search_ledger: SearchLedger = Field(default_factory=SearchLedger)
     routing_history: List[RoutingDecision] = Field(default_factory=list)
 

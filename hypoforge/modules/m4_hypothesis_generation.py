@@ -813,6 +813,7 @@ class M4HypothesisGeneration(ModuleProtocol):
             r for r in state.reviews
             if r.version == latest
             and r.dimension.value != "overall"
+            and getattr(r, "attribution", "both") in {"hypothesis", "both"}
         ]
         if recent:
             parts.append("\nReviewer feedback (address these):")

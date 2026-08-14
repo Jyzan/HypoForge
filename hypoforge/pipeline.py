@@ -111,6 +111,15 @@ def _route_after_m6(
         elif requires_m4:
             return "revise_m4"
         elif requires_m5:
+            # Backstop: consecutive plan-only revisions that cannot fix the
+            # plan (e.g. a structural generator limit) must not starve M4's
+            # hypothesis-revision budget — force a hypothesis revision.
+            limit = (
+                getattr(config, "max_plan_revisions", 2)
+                if config is not None else 2
+            )
+            if state.plan_revision_count >= limit:
+                return "revise_m4"
             return "revise_m5"
         return revision_route
     overall = [r for r in recent if r.dimension.value == "overall"]
@@ -1068,8 +1077,15 @@ class PipelineRunner:
             return
         self._record_routing_event(decision)
         patch["routing_history"] = list(state.routing_history) + [decision]
-        if name == "m6" and decision.to_module in {"revise_m3", "revise_m4"}:
-            patch["revision_count"] = state.revision_count + 1
+        if name == "m6":
+            if decision.to_module in {"revise_m3", "revise_m4"}:
+                patch["revision_count"] = state.revision_count + 1
+            # Consecutive revise_m5 rounds are counted for the backstop; any
+            # other m6 route breaks the streak.
+            patch["plan_revision_count"] = (
+                state.plan_revision_count + 1
+                if decision.to_module == "revise_m5" else 0
+            )
         if name == "m1" and decision.to_module == "direct_m4":
             # The conditional edge bypasses M2/M3 entirely, so their wrappers
             # never run — emit the explicit module_skipped events here to keep
