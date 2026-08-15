@@ -270,6 +270,7 @@ def _oa_search(
     api_key: str = "",
     mailto: str = "",
     deadline: float | None = None,
+    open_access_only: bool = False,
 ) -> List[dict]:
     """Search OpenAlex, return standardised paper dicts."""
     clean_query = _normalize_openalex_query(query)
@@ -278,8 +279,13 @@ def _oa_search(
     params = {
         "search": clean_query,
         "per_page": str(min(limit, 200)),
-        "sort": "relevance_score:desc",
+        "sort": (
+            "cited_by_count:desc" if open_access_only
+            else "relevance_score:desc"
+        ),
     }
+    if open_access_only:
+        params["filter"] = "is_oa:true"
     if api_key:
         params["api_key"] = api_key
     if mailto:
@@ -519,6 +525,7 @@ async def search_openalex_strict(
     limit: int = 20,
     api_key: str = "",
     mailto: str = "",
+    open_access_only: bool = False,
 ) -> List[dict]:
     """Search OpenAlex directly and propagate transport failures."""
     clean_query = _normalize_openalex_query(query)
@@ -535,6 +542,7 @@ async def search_openalex_strict(
         resolved_key,
         resolved_mailto,
         deadline,
+        open_access_only,
     )
 
 

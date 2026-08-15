@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import urllib.request
+import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -15,6 +16,50 @@ from ..protocols import FulltextResolverProtocol
 from .attribution import NO_FULLTEXT_AVAILABLE, attribute_error_text
 
 FetchBackend = Callable[[str, float], Awaitable[bytes]]
+
+
+def _local_tag(element: ET.Element) -> str:
+    return element.tag.rsplit("}", 1)[-1].casefold()
+
+
+def _europe_pmc_xml_to_bioc(raw: bytes, paper_id: str) -> dict:
+    """Convert Europe PMC JATS paragraphs to parser-compatible BioC JSON."""
+
+    root = ET.fromstring(raw)
+    parents = {child: parent for parent in root.iter() for child in parent}
+    passages: list[dict] = []
+    offset = 0
+    for element in root.iter():
+        if _local_tag(element) != "p":
+            continue
+        ancestor = parents.get(element)
+        inside_content = False
+        section = "other"
+        while ancestor is not None:
+            tag = _local_tag(ancestor)
+            if tag in {"abstract", "body"}:
+                inside_content = True
+                if tag == "abstract" and section == "other":
+                    section = "abstract"
+            if tag == "sec" and section == "other":
+                title = next((
+                    " ".join(child.itertext()).strip()
+                    for child in ancestor if _local_tag(child) == "title"
+                ), "")
+                if title:
+                    section = title
+            ancestor = parents.get(ancestor)
+        text = " ".join(" ".join(element.itertext()).split())
+        if inside_content and text:
+            passages.append({
+                "infons": {"section_type": section},
+                "offset": offset,
+                "text": text,
+            })
+            offset += len(text) + 1
+    if not passages:
+        raise ValueError("Europe PMC fullTextXML has no readable paragraphs")
+    return {"source": "Europe PMC", "documents": [{"id": paper_id, "passages": passages}]}
 
 
 def _safe_error(exc: BaseException) -> str:
@@ -69,18 +114,47 @@ class PMCFulltextResolver(FulltextResolverProtocol):
         "https://www.ncbi.nlm.nih.gov/research/bionlp/RESTful/"
         "pmcoa.cgi/BioC_json"
     )
+    EUROPE_PMC_ROOT = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 
     def __init__(
         self,
         cache_dir: str | Path = ".cache/hypoforge/literature/documents",
         timeout_seconds: float = 30.0,
         backend: FetchBackend | None = None,
+        europe_pmc_backend: FetchBackend | None = None,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         self.cache_dir = Path(cache_dir)
         self.timeout_seconds = float(timeout_seconds)
         self.backend = backend or _default_fetch
+        self.europe_pmc_backend = (
+            europe_pmc_backend
+            if europe_pmc_backend is not None
+            else (_default_fetch if backend is None else None)
+        )
+
+    async def _europe_pmc_fallback(
+        self,
+        paper: PaperRecord,
+        path: Path,
+    ) -> DocumentRecord | None:
+        if self.europe_pmc_backend is None or not paper.pmcid:
+            return None
+        source_uri = f"{self.EUROPE_PMC_ROOT}/{paper.pmcid}/fullTextXML"
+        raw = await self.europe_pmc_backend(source_uri, self.timeout_seconds)
+        payload = _europe_pmc_xml_to_bioc(raw, paper.pmcid)
+        self._write_atomic(
+            path, json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        )
+        return DocumentRecord(
+            document_id=self._document_id(paper, "europe-pmc"),
+            paper_id=paper.paper_id,
+            content_level=ContentLevel.STRUCTURED_FULLTEXT,
+            source_uri=source_uri,
+            local_path=str(path.resolve()),
+            license="Europe PMC open full-text record",
+        )
 
     def _paper_dir(self, paper: PaperRecord) -> Path:
         stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", paper.paper_id).strip("_")
@@ -174,6 +248,12 @@ class PMCFulltextResolver(FulltextResolverProtocol):
             if decoded.lstrip().casefold().startswith("[error]"):
                 detail = " ".join(decoded.split())[:300]
                 message = f"PMC Open Access full text unavailable: {detail}"
+                try:
+                    fallback = await self._europe_pmc_fallback(paper, path)
+                    if fallback is not None:
+                        return fallback
+                except Exception as fallback_exc:
+                    message += f"; Europe PMC fallback: {_safe_error(fallback_exc)}"
                 return self._abstract_document(
                     paper,
                     message,
@@ -182,6 +262,12 @@ class PMCFulltextResolver(FulltextResolverProtocol):
                 )
             payload = json.loads(decoded)
             if not _has_nonempty_passage(payload):
+                try:
+                    fallback = await self._europe_pmc_fallback(paper, path)
+                    if fallback is not None:
+                        return fallback
+                except Exception:
+                    pass
                 return self._abstract_document(
                     paper,
                     "PMC BioC response has no non-empty passages",
@@ -202,6 +288,14 @@ class PMCFulltextResolver(FulltextResolverProtocol):
             raise
         except Exception as exc:
             message = _safe_error(exc)
+            try:
+                fallback = await self._europe_pmc_fallback(paper, path)
+                if fallback is not None:
+                    return fallback
+            except asyncio.CancelledError:
+                raise
+            except Exception as fallback_exc:
+                message += f"; Europe PMC fallback: {_safe_error(fallback_exc)}"
             return self._abstract_document(
                 paper,
                 message,

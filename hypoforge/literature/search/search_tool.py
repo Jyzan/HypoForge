@@ -15,8 +15,24 @@ from typing import Any, Dict, List, Optional
 from hypoforge.literature.models import PaperRecord, SearchQuery
 from hypoforge.literature.sources.academic_source import AcademicSource
 from hypoforge.literature.sources.arxiv_source import ArxivSource
-from hypoforge.literature.sources.openalex_source import OpenAlexSource
+from hypoforge.literature.sources.openalex_source import (
+    OpenAlexOpenAccessSource,
+    OpenAlexSource,
+)
+from hypoforge.literature.sources.openalex_enriched_scholar import (
+    OpenAlexEnrichedScholarSource,
+)
 from hypoforge.literature.sources.pubmed_source import PubMedSource
+from hypoforge.literature.sources.specialist_sources import (
+    AdsSource,
+    CrossrefSource,
+    DblpSource,
+    EuropePMCSource,
+    InspireSource,
+    NtrsSource,
+    OstiSource,
+    ZbMathSource,
+)
 from hypoforge.tools.semantic_scholar import SemanticScholarTool
 
 
@@ -70,6 +86,13 @@ class LiteratureSearchTool:
             ),
         },
         {
+            "name": "openalex_oa",
+            "display_name": "OpenAlex Open Access",
+            "description": (
+                "Conditional open-access discovery sorted by citation count."
+            ),
+        },
+        {
             "name": "arxiv",
             "display_name": "arXiv",
             "description": (
@@ -82,6 +105,22 @@ class LiteratureSearchTool:
                 "terms (use PubMed instead)."
             ),
         },
+        {
+            "name": "serper_openalex",
+            "display_name": "Serper Scholar → OpenAlex",
+            "description": (
+                "Mandatory cross-domain Google Scholar discovery through "
+                "Serper, followed by strict DOI/title enrichment in OpenAlex."
+            ),
+        },
+        {"name": "crossref", "display_name": "Crossref", "description": "Cross-domain DOI metadata and citation counts."},
+        {"name": "europe_pmc", "display_name": "Europe PMC", "description": "Biomedical metadata, citation counts, PMCID and open full text."},
+        {"name": "zbmath", "display_name": "zbMATH Open", "description": "Mathematics-focused bibliographic discovery."},
+        {"name": "inspire", "display_name": "INSPIRE-HEP", "description": "High-energy physics literature and arXiv identifiers."},
+        {"name": "ads", "display_name": "NASA ADS", "description": "Astronomy and astrophysics literature sorted by citations."},
+        {"name": "dblp", "display_name": "DBLP", "description": "Computer-science bibliographic discovery."},
+        {"name": "osti", "display_name": "DOE OSTI", "description": "Energy research papers and technical reports."},
+        {"name": "ntrs", "display_name": "NASA NTRS", "description": "NASA aerospace technical reports."},
     ]
 
     _TOOL_NAME_SET: set[str] = {d["name"] for d in TOOL_DEFINITIONS}
@@ -96,6 +135,9 @@ class LiteratureSearchTool:
         semantic_scholar_api_key: str = "",
         openalex_api_key: str = "",
         openalex_mailto: str = "",
+        serper_api_key: str = "",
+        ads_api_token: str = "",
+        crossref_mailto: str = "",
         zero_result_relaxation: bool = True,
     ):
         requested = {
@@ -128,6 +170,36 @@ class LiteratureSearchTool:
             if openalex_source is not None
             else OpenAlexSource(api_key=openalex_api_key, mailto=openalex_mailto)
         )
+        self._source_map: dict[str, object] = {
+            "pubmed": self._pubmed_source,
+            "semantic_scholar": self._academic_source,
+            "openalex": self._openalex_source,
+            "arxiv": self._arxiv_source,
+        }
+        if "openalex_oa" in requested:
+            self._source_map["openalex_oa"] = OpenAlexOpenAccessSource(
+                api_key=openalex_api_key,
+                mailto=openalex_mailto,
+            )
+        if "serper_openalex" in requested:
+            self._source_map["serper_openalex"] = OpenAlexEnrichedScholarSource(
+                serper_api_key=serper_api_key,
+                openalex_api_key=openalex_api_key,
+                openalex_mailto=openalex_mailto,
+            )
+        specialist_factories = {
+            "crossref": lambda: CrossrefSource(mailto=crossref_mailto),
+            "europe_pmc": EuropePMCSource,
+            "zbmath": ZbMathSource,
+            "inspire": InspireSource,
+            "ads": lambda: AdsSource(api_token=ads_api_token),
+            "dblp": DblpSource,
+            "osti": OstiSource,
+            "ntrs": NtrsSource,
+        }
+        for source_name, factory in specialist_factories.items():
+            if source_name in requested:
+                self._source_map[source_name] = factory()
 
     @property
     def tool_definitions(self) -> List[Dict[str, Any]]:
@@ -145,14 +217,8 @@ class LiteratureSearchTool:
         """Return individual ``LiteratureSourceProtocol`` implementations
         suitable for ``IterativeSearchAgent`` injection.
         """
-        source_map = {
-            "pubmed": self._pubmed_source,
-            "semantic_scholar": self._academic_source,
-            "openalex": self._openalex_source,
-            "arxiv": self._arxiv_source,
-        }
         return [
-            source_map[definition["name"]]
+            self._source_map[definition["name"]]
             for definition in self.TOOL_DEFINITIONS
             if definition["name"] in self._enabled_sources
         ]
@@ -169,18 +235,12 @@ class LiteratureSearchTool:
             purpose="direct",
             relation_to_question="Direct search.",
         )
-        if backend == "pubmed":
-            return await self._pubmed_source.search(query, limit=limit)
-        if backend == "semantic_scholar":
-            return await self._academic_source.search(query, limit=limit)
-        if backend == "openalex":
-            return await self._openalex_source.search(query, limit=limit)
-        if backend == "arxiv":
-            return await self._arxiv_source.search(query, limit=limit)
-        raise ValueError(
-            f"Unknown backend {backend!r}. "
-            f"Valid: {sorted(self._TOOL_NAME_SET)}"
-        )
+        source = self._source_map.get(backend)
+        if source is None:
+            raise ValueError(
+                f"Unknown backend {backend!r}. Valid: {sorted(self._TOOL_NAME_SET)}"
+            )
+        return await source.search(query, limit=limit)
 
     async def search_multi(
         self, queries: List[SearchQuery], limit: int = 20,

@@ -38,9 +38,11 @@ class OpenAlexSource(LiteratureSourceProtocol):
         backend: Optional[OpenAlexBackend] = None,
         api_key: str = "",
         mailto: str = "",
+        open_access_only: bool = False,
     ) -> None:
         self._api_key = str(api_key or "").strip()
         self._mailto = str(mailto or "").strip()
+        self._open_access_only = bool(open_access_only)
         self._default_backend = backend is None
         if backend is None:
             from hypoforge.tools.semantic_scholar import search_openalex_strict
@@ -61,6 +63,7 @@ class OpenAlexSource(LiteratureSourceProtocol):
                     limit,
                     api_key=self._api_key,
                     mailto=self._mailto,
+                    open_access_only=self._open_access_only,
                 )
             else:
                 raw = await self._backend(query.text, limit)
@@ -73,3 +76,16 @@ class OpenAlexSource(LiteratureSourceProtocol):
             for row in raw
             if _identifiable(row)
         ]
+
+
+class OpenAlexOpenAccessSource(OpenAlexSource):
+    """Citation-sorted OpenAlex search restricted to open-access works."""
+
+    source_name = "openalex_oa"
+
+    def __init__(self, *, api_key: str = "", mailto: str = "") -> None:
+        super().__init__(
+            api_key=api_key,
+            mailto=mailto,
+            open_access_only=True,
+        )

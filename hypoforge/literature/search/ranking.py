@@ -25,6 +25,13 @@ _WEIGHTS = {
     "metadata_quality": 0.075,
     "access_quality": 0.075,
 }
+_HIGH_CITATION_WEIGHTS = {
+    "query_relevance": 0.45,
+    "citation_impact": 0.35,
+    "recency": 0.05,
+    "metadata_quality": 0.075,
+    "access_quality": 0.075,
+}
 _ACCESS_SCORE = {
     FulltextStatus.UNKNOWN: 0.10,
     FulltextStatus.UNAVAILABLE: 0.0,
@@ -534,8 +541,14 @@ class PaperRanker(PaperRankerProtocol):
 
     tool_name = "paper_ranker"
 
-    def __init__(self, *, current_year: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        current_year: int | None = None,
+        prefer_high_citation: bool = False,
+    ) -> None:
         self.current_year = current_year or datetime.now(timezone.utc).year
+        self.prefer_high_citation = bool(prefer_high_citation)
 
     async def rank(
         self,
@@ -548,9 +561,12 @@ class PaperRanker(PaperRankerProtocol):
 
         citation_raw: list[float] = []
         for paper in papers:
-            age = _age(paper, self.current_year)
-            annualized = (paper.citation_count or 0) / ((age or 0) + 1)
-            citation_raw.append(math.log1p(annualized))
+            if self.prefer_high_citation:
+                citation_raw.append(math.log1p(paper.citation_count or 0))
+            else:
+                age = _age(paper, self.current_year)
+                annualized = (paper.citation_count or 0) / ((age or 0) + 1)
+                citation_raw.append(math.log1p(annualized))
         max_citation = max(citation_raw, default=0.0)
 
         ranked: list[tuple[float, int, str, PaperRecord]] = []
@@ -573,9 +589,12 @@ class PaperRanker(PaperRankerProtocol):
                 "metadata_quality": metadata_quality,
                 "access_quality": access_quality,
             }
+            configured_weights = (
+                _HIGH_CITATION_WEIGHTS if self.prefer_high_citation else _WEIGHTS
+            )
             active_weights = {
                 name: weight
-                for name, weight in _WEIGHTS.items()
+                for name, weight in configured_weights.items()
                 if (
                     (name != "citation_impact" or paper.citation_count is not None)
                 )

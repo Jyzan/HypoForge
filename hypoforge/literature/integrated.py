@@ -18,6 +18,8 @@ from .reading import (
     InMemoryChunkStore,
     PDFDocumentParser,
     PMCFulltextResolver,
+    EnrichingFulltextResolver,
+    OpenAccessEnricher,
     QwenPaperReader,
     RoutingDocumentParser,
     RoutingFulltextResolver,
@@ -30,6 +32,7 @@ from .search import (
     ScoutReader,
 )
 from .search.query_planner import QueryPlanner
+from .search.domain_routing import DomainRoutedQueryPlanner
 from .search.search_tool import LiteratureSearchTool
 
 
@@ -43,8 +46,18 @@ def build_integrated_search_adapter(
     semantic_scholar_api_key: str = "",
     openalex_api_key: str = "",
     openalex_mailto: str = "",
+    serper_api_key: str = "",
+    ads_api_token: str = "",
+    crossref_mailto: str = "",
+    unpaywall_email: str = "",
+    domain_routing_enabled: bool = False,
+    access_enrichment_timeout_seconds: float = 12.0,
+    fulltext_target_per_subquestion: int = 3,
+    fulltext_backfill_max_attempts: int = 8,
     zero_result_relaxation: bool = True,
     source_timeout_seconds: float = 30.0,
+    scout_timeout_seconds: float = 90.0,
+    scout_candidate_limit: int = 24,
     budget: SearchBudget | Mapping[str, Any] | None = None,
     reading_cache_dir: str | Path = ".cache/hypoforge/literature/documents",
     pmc_backend: FetchBackend | None = None,
@@ -61,18 +74,29 @@ def build_integrated_search_adapter(
         raise ValueError("final_k must be positive")
     if source_timeout_seconds <= 0:
         raise ValueError("source_timeout_seconds must be positive")
+    if scout_timeout_seconds <= 0 or scout_candidate_limit <= 0:
+        raise ValueError("Scout limits must be positive")
     if per_query_limit is not None and per_query_limit <= 0:
         raise ValueError("per_query_limit must be positive")
     if arxiv_max_pdf_bytes <= 0:
         raise ValueError("arxiv_max_pdf_bytes must be positive")
     if arxiv_download_timeout_seconds <= 0 or resolver_timeout_seconds <= 0:
         raise ValueError("reading timeouts must be positive")
+    if access_enrichment_timeout_seconds <= 0:
+        raise ValueError("access_enrichment_timeout_seconds must be positive")
+    if fulltext_backfill_max_attempts <= 0:
+        raise ValueError("fulltext_backfill_max_attempts must be positive")
+    if fulltext_target_per_subquestion <= 0:
+        raise ValueError("fulltext_target_per_subquestion must be positive")
 
     tool = search_tool or LiteratureSearchTool(
         enabled_sources=enabled_sources,
         semantic_scholar_api_key=semantic_scholar_api_key,
         openalex_api_key=openalex_api_key,
         openalex_mailto=openalex_mailto,
+        serper_api_key=serper_api_key,
+        ads_api_token=ads_api_token,
+        crossref_mailto=crossref_mailto,
         zero_result_relaxation=zero_result_relaxation,
     )
     if isinstance(budget, Mapping):
@@ -83,17 +107,24 @@ def build_integrated_search_adapter(
             max_queries=12,
             max_papers=max(100, final_k),
         )
-    planner = QueryPlanner(
+    base_planner = QueryPlanner(
         client=client,
         tool_definitions=tool.tool_definitions,
         max_rounds=resolved_budget.max_rounds,
         strict=True,
     )
+    planner = (
+        DomainRoutedQueryPlanner(
+            base_planner,
+            [definition["name"] for definition in tool.tool_definitions],
+        )
+        if domain_routing_enabled else base_planner
+    )
     agent = IterativeSearchAgent(
         query_planner=planner,
         sources=tool.as_source_list(),
         deduplicator=PaperDeduplicator(),
-        ranker=PaperRanker(),
+        ranker=PaperRanker(prefer_high_citation=domain_routing_enabled),
         scout_reader=ScoutReader(client),
         # Coverage must be satisfied by the same leading papers that the
         # agent will hand to the reading workflow, not by discarded tail
@@ -101,8 +132,10 @@ def build_integrated_search_adapter(
         # unchanged.
         coverage_evaluator=CoverageEvaluator(client, selection_limit=final_k),
         final_k=final_k,
-        candidate_limit=max(20, final_k),
+        candidate_limit=max(48, final_k),
         per_query_limit=per_query_limit or final_k,
+        scout_candidate_limit=scout_candidate_limit,
+        scout_timeout_seconds=scout_timeout_seconds,
         source_timeout_seconds=source_timeout_seconds,
         retention_judge_client=client,
         # Must/unmust entity classification for the entity-group round
@@ -124,9 +157,14 @@ def build_integrated_search_adapter(
         backend=arxiv_pdf_backend,
     )
     reading_workflow = FullTextReadingWorkflow(
-        resolver=RoutingFulltextResolver(
-            pmc_resolver,
-            arxiv_resolver,
+        resolver=EnrichingFulltextResolver(
+            RoutingFulltextResolver(pmc_resolver, arxiv_resolver),
+            OpenAccessEnricher(
+                email=unpaywall_email or openalex_mailto,
+                openalex_api_key=openalex_api_key,
+                semantic_scholar_api_key=semantic_scholar_api_key,
+                timeout_seconds=access_enrichment_timeout_seconds,
+            ),
         ),
         parser=RoutingDocumentParser(
             BioCDocumentParser(),
@@ -147,4 +185,7 @@ def build_integrated_search_adapter(
         entity_embedding_model=entity_embedding_model,
         subquestion_entity_client=client,
         round_strategy=round_strategy,
+        fulltext_backfill_enabled=domain_routing_enabled,
+        fulltext_backfill_target=fulltext_target_per_subquestion,
+        fulltext_backfill_max_attempts=fulltext_backfill_max_attempts,
     )

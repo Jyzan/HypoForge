@@ -63,9 +63,16 @@ from ..task_alignment import (
     sub_question_entity_terms,
 )
 from .export import build_m2_knowledge_export_run
-from .models import QueryIntent, SearchBudget, SearchQuery, StopReason
+from .models import (
+    PaperRetentionDecision,
+    QueryIntent,
+    SearchBudget,
+    SearchQuery,
+    StopReason,
+)
 from .protocols import QueryPlannerProtocol, ReadingExtractionWorkflowProtocol
 from .search import IterativeSearchAgent
+from .search.ranking import rerank_with_scout
 from .subquestion_entities import generate_subquestion_entities
 
 logger = logging.getLogger(__name__)
@@ -134,6 +141,11 @@ class AgenticM2Adapter(ModuleProtocol):
         entity_embedding_model: str = "",
         subquestion_entity_client: Any = None,
         round_strategy: str = "entity_group",
+        fulltext_backfill_enabled: bool = False,
+        fulltext_backfill_target: int = 0,
+        fulltext_backfill_max_attempts: int = 8,
+        fulltext_backfill_min_relevance: float = 0.70,
+        fulltext_backfill_min_directness: float = 0.45,
     ) -> None:
         self.search_agent = search_agent
         self.reading_workflow = reading_workflow
@@ -149,6 +161,184 @@ class AgenticM2Adapter(ModuleProtocol):
         # "coverage" keeps the legacy coverage-driven iteration.  The
         # supplement (gap) path always stays on the legacy one-shot flow.
         self.round_strategy = round_strategy
+        if fulltext_backfill_target < 0 or fulltext_backfill_max_attempts <= 0:
+            raise ValueError("full-text backfill limits are invalid")
+        if not 0 <= fulltext_backfill_min_relevance <= 1:
+            raise ValueError("fulltext_backfill_min_relevance must be in [0, 1]")
+        if not 0 <= fulltext_backfill_min_directness <= 1:
+            raise ValueError("fulltext_backfill_min_directness must be in [0, 1]")
+        self.fulltext_backfill_enabled = bool(fulltext_backfill_enabled)
+        self.fulltext_backfill_target = int(fulltext_backfill_target)
+        self.fulltext_backfill_max_attempts = int(fulltext_backfill_max_attempts)
+        self.fulltext_backfill_min_relevance = float(fulltext_backfill_min_relevance)
+        self.fulltext_backfill_min_directness = float(fulltext_backfill_min_directness)
+
+    @staticmethod
+    def _is_parsed_fulltext(reading: Any) -> bool:
+        level = getattr(getattr(reading, "content_level", None), "value", "")
+        return level in {"structured_fulltext", "pdf", "html", "ocr"} and int(
+            getattr(reading, "chunks_parsed", 0) or 0
+        ) > 0
+
+    async def _backfill_fulltext(
+        self,
+        sub_question: str,
+        search_result: Any,
+        reading_results: list,
+        *,
+        citation_floor: int = 0,
+        attempted_ids: set[str] | None = None,
+    ) -> tuple[Any, list]:
+        """Try lower-ranked strict candidates until the parsed-text target is met."""
+
+        if not self.fulltext_backfill_enabled:
+            return search_result, reading_results
+        target = self.fulltext_backfill_target or self.search_agent.final_k
+        fulltext_count = sum(self._is_parsed_fulltext(item) for item in reading_results)
+        if fulltext_count >= target:
+            return search_result, reading_results
+
+        selected_ids = {paper.paper_id for paper in search_result.final_papers}
+        attempted = attempted_ids if attempted_ids is not None else set()
+        note_by_id = {note.paper_id: note for note in search_result.scout_notes}
+        candidates = []
+        for paper in search_result.candidates:
+            if paper.paper_id in selected_ids:
+                continue
+            if paper.paper_id in attempted:
+                continue
+            if int(paper.citation_count or 0) < citation_floor:
+                continue
+            if float(paper.rank_scores.get("semantic_not_applicable", 0.0)) >= 0.5:
+                continue
+            note = note_by_id.get(paper.paper_id)
+            relevance = float(
+                note.relevance_to_question if note is not None
+                else paper.rank_scores.get("query_relevance", 0.0)
+            )
+            directness = float(
+                (note.directness_to_question if note is not None else relevance) or 0.0
+            )
+            if (
+                relevance < self.fulltext_backfill_min_relevance
+                or directness < self.fulltext_backfill_min_directness
+            ):
+                continue
+            candidates.append(paper)
+        candidates.sort(key=lambda paper: (
+            -int(paper.citation_count or 0),
+            -float(paper.rank_scores.get("post_scout_total", 0.0)),
+            paper.paper_id,
+        ))
+
+        retained = list(search_result.final_papers)
+        readings = list(reading_results)
+        attempts = 0
+        decisions = list(search_result.retention_decisions)
+        for paper in candidates:
+            if fulltext_count >= target or attempts >= self.fulltext_backfill_max_attempts:
+                break
+            attempts += 1
+            attempted.add(paper.paper_id)
+            probe = getattr(self.reading_workflow, "probe_parsed_fulltext", None)
+            if callable(probe) and not await probe(paper):
+                continue
+            one_paper_context = search_result.model_copy(update={"final_papers": [paper]})
+            result = list(await self.reading_workflow.run(
+                sub_question,
+                [paper],
+                search_context=one_paper_context,
+            ))
+            if not result or not self._is_parsed_fulltext(result[0]):
+                continue
+            retained.append(paper)
+            readings.extend(result)
+            selected_ids.add(paper.paper_id)
+            fulltext_count += 1
+            decisions.append(PaperRetentionDecision(
+                paper_id=paper.paper_id,
+                decision="retain",
+                roles=["fulltext_backfill"],
+                reason=(
+                    "strictly relevant candidate retained after successful "
+                    "open-fulltext download and parsing"
+                ),
+                rank_position=(
+                    next(
+                        index for index, candidate in enumerate(
+                            search_result.candidates, 1
+                        ) if candidate.paper_id == paper.paper_id
+                    )
+                ),
+            ))
+
+        if attempts:
+            emit_event(
+                "tool_result",
+                module="m2",
+                tool="fulltext_backfill",
+                status="completed" if fulltext_count >= target else "warning",
+                message=(
+                    f"全文回填完成：{fulltext_count}/{target}，"
+                    f"尝试候选 {attempts} 篇"
+                ),
+                details={
+                    "sub_question": sub_question,
+                    "target": target,
+                    "parsed_fulltexts": fulltext_count,
+                    "attempts": attempts,
+                },
+            )
+        return search_result.model_copy(update={
+            "final_papers": retained,
+            "retention_decisions": decisions,
+        }), readings
+
+    def _one_round_budget(self) -> SearchBudget:
+        base = self.budget or SearchBudget()
+        return base.model_copy(update={"max_rounds": 1})
+
+    async def _merge_search_phases(self, compact: Any, expanded: Any) -> Any:
+        """Merge compact and conditional expansion results without double counts."""
+
+        papers = await self.search_agent.deduplicator.deduplicate([
+            *compact.candidates,
+            *expanded.candidates,
+        ])
+        ranked = await self.search_agent.ranker.rank(
+            compact.sub_question,
+            papers,
+            limit=min(self.search_agent.candidate_limit, len(papers)),
+        )
+        note_by_id = {
+            note.paper_id: note
+            for note in [*compact.scout_notes, *expanded.scout_notes]
+        }
+        notes = [
+            note_by_id[paper.paper_id]
+            for paper in ranked if paper.paper_id in note_by_id
+        ]
+        ranked = rerank_with_scout(
+            ranked,
+            notes,
+            selection_limit=self.search_agent.final_k,
+        )
+        counts = dict(compact.source_result_counts)
+        for source, count in expanded.source_result_counts.items():
+            counts[source] = counts.get(source, 0) + count
+        return compact.model_copy(update={
+            "queries": [*compact.queries, *expanded.queries],
+            "papers_found": compact.papers_found + expanded.papers_found,
+            "papers_after_dedup": len(papers),
+            "candidates": ranked,
+            "failed_sources": list(dict.fromkeys([
+                *compact.failed_sources, *expanded.failed_sources,
+            ])),
+            "iterations": compact.iterations + expanded.iterations,
+            "errors": [*compact.errors, *expanded.errors],
+            "source_result_counts": counts,
+            "scout_notes": list(note_by_id.values()),
+        })
 
     async def _normalise_reading_entities(
         self,
@@ -279,7 +469,12 @@ class AgenticM2Adapter(ModuleProtocol):
                 sub_question,
                 key_entities=key_entities,
                 domains=domains,
-                budget=self.budget,
+                # The validated benchmark used one compact discovery round,
+                # then expanded only when parsed full text was insufficient.
+                budget=(
+                    self._one_round_budget()
+                    if self.fulltext_backfill_enabled else self.budget
+                ),
                 supplement_entities=supplement_entities,
                 round_strategy=self.round_strategy,
             )
@@ -313,6 +508,65 @@ class AgenticM2Adapter(ModuleProtocol):
                 search_result.final_papers,
                 search_context=search_result,
             )
+            attempted_backfill_ids: set[str] = set()
+            search_result, reading_results = await self._backfill_fulltext(
+                sub_question,
+                search_result,
+                list(reading_results),
+                citation_floor=100,
+                attempted_ids=attempted_backfill_ids,
+            )
+            target = self.fulltext_backfill_target or int(
+                getattr(self.search_agent, "final_k", 1)
+            )
+            parsed_count = sum(
+                self._is_parsed_fulltext(item) for item in reading_results
+            )
+            if self.fulltext_backfill_enabled and parsed_count < target:
+                expanded = await self.search_agent.run(
+                    sub_question,
+                    key_entities=key_entities,
+                    domains=domains,
+                    question_type="open_access_expansion",
+                    budget=self._one_round_budget(),
+                    existing_papers=search_result.candidates,
+                    supplement_entities=supplement_entities,
+                    round_strategy="coverage",
+                )
+                if expanded.candidates:
+                    search_result = await self._merge_search_phases(
+                        search_result, expanded
+                    )
+                    for citation_floor in (100, 20, 0):
+                        search_result, reading_results = (
+                            await self._backfill_fulltext(
+                                sub_question,
+                                search_result,
+                                list(reading_results),
+                                citation_floor=citation_floor,
+                                attempted_ids=attempted_backfill_ids,
+                            )
+                        )
+                        if sum(
+                            self._is_parsed_fulltext(item)
+                            for item in reading_results
+                        ) >= target:
+                            break
+                else:
+                    emit_event(
+                        "tool_result",
+                        module="m2",
+                        tool="expanded_open_fulltext_discovery",
+                        status="warning",
+                        message="扩展检索未返回候选，继续使用紧凑轮结果",
+                        details={
+                            "sub_question": sub_question,
+                            "errors": list(expanded.errors),
+                        },
+                    )
+            executed_queries[sub_question] = [
+                query.text for query in search_result.queries
+            ]
             reading_results = await self._normalise_reading_entities(
                 state, list(reading_results)
             )
@@ -760,6 +1014,8 @@ class AgenticM2Adapter(ModuleProtocol):
                 final_k=min(base.final_k, max(1, paper_limit)),
                 candidate_limit=base.candidate_limit,
                 per_query_limit=base.per_query_limit,
+                scout_candidate_limit=base.scout_candidate_limit,
+                scout_timeout_seconds=base.scout_timeout_seconds,
                 source_timeout_seconds=base.source_timeout_seconds,
                 retention_judge_client=base.retention_judge_client,
             )

@@ -18,6 +18,8 @@ class RoutingFulltextResolver(FulltextResolverProtocol):
         self.arxiv_resolver = arxiv_resolver
 
     def _resolver_for(self, paper: PaperRecord) -> FulltextResolverProtocol:
+        if paper.pmcid:
+            return self.pmc_resolver
         if (
             "arxiv" in paper.sources
             or paper.external_ids.get("arxiv")
@@ -27,6 +29,20 @@ class RoutingFulltextResolver(FulltextResolverProtocol):
         return self.pmc_resolver
 
     async def resolve(self, paper: PaperRecord) -> DocumentRecord:
+        if paper.pmcid:
+            structured = await self.pmc_resolver.resolve(paper)
+            if structured.content_level is ContentLevel.STRUCTURED_FULLTEXT:
+                return structured
+            if paper.external_ids.get("arxiv") or paper.external_ids.get("oa_pdf_url"):
+                pdf = await self.arxiv_resolver.resolve(paper)
+                if pdf.content_level is ContentLevel.PDF:
+                    return pdf
+                errors = "; ".join(filter(None, [
+                    structured.retrieval_error, pdf.retrieval_error,
+                ]))
+                preferred = structured if structured.local_path else pdf
+                return preferred.model_copy(update={"retrieval_error": errors})
+            return structured
         return await self._resolver_for(paper).resolve(paper)
 
     async def resolve_abstract(self, paper: PaperRecord) -> DocumentRecord:

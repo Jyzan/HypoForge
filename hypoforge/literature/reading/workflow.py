@@ -141,6 +141,35 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
             raise asyncio.TimeoutError
         return task.result()
 
+    async def probe_parsed_fulltext(self, paper: PaperRecord) -> bool:
+        """Download and parse once before spending PaperReader LLM tokens.
+
+        The resolver/parser caches make a subsequent ``run()`` inexpensive.
+        Abstract and metadata fallbacks intentionally return ``False``.
+        """
+
+        try:
+            document = await self._resolve_with_timeout(paper)
+            if (
+                document.content_level not in {
+                    ContentLevel.STRUCTURED_FULLTEXT,
+                    ContentLevel.PDF,
+                    ContentLevel.HTML,
+                    ContentLevel.OCR,
+                }
+                or not document.local_path
+            ):
+                return False
+            chunks = await self.parser.parse(document)
+            if not chunks:
+                return False
+            self.store.replace(paper.paper_id, chunks)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+
     @staticmethod
     async def _measure(
         timings: dict[str, float],

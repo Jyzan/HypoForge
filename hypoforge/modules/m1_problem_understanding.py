@@ -23,7 +23,7 @@ import time
 import unicodedata
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from ..observability import emit_event
 from ..protocol import ModuleProtocol
@@ -110,6 +110,18 @@ class _CandidateEntity(BaseModel):
         description="True for task-defining entities that the answer must address",
     )
     extraction_reason: str = ""
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def normalize_unknown_role(cls, value: object) -> str:
+        """Keep an otherwise valid extraction when Qwen invents a role label."""
+
+        allowed = {
+            "primary_object", "intervention", "outcome", "method",
+            "context", "constraint", "other",
+        }
+        normalized = str(value or "other").strip().casefold()
+        return normalized if normalized in allowed else "other"
 
 
 class _CandidateEntityList(BaseModel):

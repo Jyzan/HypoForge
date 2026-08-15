@@ -285,6 +285,8 @@ class IterativeSearchAgent:
         final_k: int = 10,
         candidate_limit: int = 30,
         per_query_limit: int = 20,
+        scout_candidate_limit: int | None = None,
+        scout_timeout_seconds: float = 90.0,
         source_timeout_seconds: float = 30.0,
         min_new_papers: int = 1,
         no_result_round_limit: int = 2,
@@ -300,6 +302,7 @@ class IterativeSearchAgent:
             ("candidate_limit", candidate_limit),
             ("per_query_limit", per_query_limit),
             ("source_timeout_seconds", source_timeout_seconds),
+            ("scout_timeout_seconds", scout_timeout_seconds),
             ("min_new_papers", min_new_papers),
             ("no_result_round_limit", no_result_round_limit),
             ("low_gain_round_limit", low_gain_round_limit),
@@ -327,6 +330,12 @@ class IterativeSearchAgent:
         self.final_k = final_k
         self.candidate_limit = candidate_limit
         self.per_query_limit = per_query_limit
+        self.scout_candidate_limit = int(
+            scout_candidate_limit or candidate_limit
+        )
+        if self.scout_candidate_limit <= 0:
+            raise ValueError("scout_candidate_limit must be positive")
+        self.scout_timeout_seconds = float(scout_timeout_seconds)
         self.source_timeout_seconds = source_timeout_seconds
         self.min_new_papers = min_new_papers
         self.no_result_round_limit = no_result_round_limit
@@ -469,6 +478,7 @@ class IterativeSearchAgent:
                 key_entities,
                 domains,
                 supplement_entities,
+                question_type,
             )
         else:
             stop_reason = await self._legacy_coverage_loop(
@@ -480,6 +490,7 @@ class IterativeSearchAgent:
                 key_entities,
                 domains,
                 supplement_entities,
+                question_type,
             )
         return await self._finalize_search(
             ctx,
@@ -500,6 +511,7 @@ class IterativeSearchAgent:
         key_entities: Sequence[str],
         domains: Sequence[str],
         supplement_entities: Sequence[str],
+        question_type: str = "",
     ) -> StopReason:
         """Legacy round organisation: the coverage evaluator decides whether
         another planner round runs.  Kept verbatim for the supplement (gap)
@@ -513,6 +525,8 @@ class IterativeSearchAgent:
             # planner (and only when present, so narrower planner
             # implementations keep working unchanged).
             planner_kwargs: dict = {}
+            if question_type:
+                planner_kwargs["question_type"] = question_type
             if supplement_entities:
                 planner_kwargs["supplement_entities"] = list(supplement_entities)
             try:
@@ -592,6 +606,7 @@ class IterativeSearchAgent:
         key_entities: Sequence[str],
         domains: Sequence[str],
         supplement_entities: Sequence[str],
+        question_type: str = "",
     ) -> StopReason:
         """User-designed round organisation: must/unmust entity grouping
         plus a single zero-result rescue round.
@@ -619,6 +634,8 @@ class IterativeSearchAgent:
                 details={"sub_question": sub_question},
             )
             planner_kwargs: dict = {}
+            if question_type:
+                planner_kwargs["question_type"] = question_type
             if supplement_entities:
                 planner_kwargs["supplement_entities"] = list(supplement_entities)
             try:
@@ -679,6 +696,8 @@ class IterativeSearchAgent:
             if state.remaining_budget.max_rounds <= 0:
                 return StopReason.MAX_ROUNDS
             planner_kwargs = {"focus_entities": list(spec.focus_entities)}
+            if question_type:
+                planner_kwargs["question_type"] = question_type
             if supplement_entities:
                 planner_kwargs["supplement_entities"] = list(supplement_entities)
             try:
@@ -997,16 +1016,35 @@ class IterativeSearchAgent:
         papers_needing_scout = [
             paper for paper in ranked if paper.paper_id not in ctx.scout_by_paper
         ]
+        semantic_pool = papers_needing_scout[: self.scout_candidate_limit]
+        lexical_tail = papers_needing_scout[self.scout_candidate_limit :]
         try:
-            new_scout_notes = await measure(
+            new_scout_notes = await asyncio.wait_for(measure(
                 "scout_reader",
-                self.scout_reader.read(ctx.alignment_question, papers_needing_scout),
+                self.scout_reader.read(ctx.alignment_question, semantic_pool),
+            ), timeout=self.scout_timeout_seconds)
+        except asyncio.TimeoutError:
+            from .scout import ScoutReader
+
+            ctx.errors.append(
+                f"scout_reader timed out after {self.scout_timeout_seconds}s; "
+                "used lexical fallback"
+            )
+            new_scout_notes = await ScoutReader(None).read(
+                ctx.alignment_question, semantic_pool
             )
         except _SearchTimeBudgetExpired as exc:
             raise _RoundHalt(mark_time_budget_expired(exc)) from exc
         except Exception as exc:
             ctx.errors.append(self._format_error("scout_reader", exc))
             raise _RoundHalt(StopReason.ERROR) from exc
+        if lexical_tail:
+            from .scout import ScoutReader
+
+            new_scout_notes = [
+                *new_scout_notes,
+                *await ScoutReader(None).read(ctx.alignment_question, lexical_tail),
+            ]
         ctx.scout_by_paper.update(
             {note.paper_id: note for note in new_scout_notes}
         )

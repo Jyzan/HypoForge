@@ -8854,6 +8854,375 @@ def test_resume_cursor_cannot_skip_incomplete_declared_output() -> None:
     assert runner._resume_last_module is None
 
 
+def test_domain_router_selects_only_relevant_specialist_sources() -> None:
+    from hypoforge.literature.search.domain_routing import route_specialist_sources
+
+    assert route_specialist_sources(
+        ["Mathematical Sciences"], "Will Navier-Stokes solutions remain smooth?"
+    ) == ["zbmath", "arxiv", "crossref"]
+    assert route_specialist_sources(
+        ["Medicine & Health"], "What causes autism?"
+    ) == ["europe_pmc"]
+    assert route_specialist_sources(
+        ["Astronomy"], "What is the universe made of?"
+    ) == ["ads", "arxiv", "inspire"]
+    assert "inspire" not in route_specialist_sources(
+        ["Biophysics", "Structural Biology"], "How do proteins fold?"
+    )
+
+
+@pytest.mark.asyncio
+async def test_domain_routed_planner_enforces_serper_and_filters_irrelevant_sources() -> None:
+    from hypoforge.literature.models import SearchQuery
+    from hypoforge.literature.search.domain_routing import DomainRoutedQueryPlanner
+
+    class Delegate:
+        async def plan(self, *args, **kwargs):
+            return [
+                SearchQuery(
+                    query_id="irrelevant",
+                    text="clinical query",
+                    target_source="europe_pmc",
+                    purpose="llm_choice",
+                    relation_to_question="test",
+                )
+            ]
+
+    planner = DomainRoutedQueryPlanner(
+        Delegate(), ["serper_openalex", "zbmath", "arxiv", "crossref", "europe_pmc"]
+    )
+    queries = await planner.plan(
+        "How are prime numbers distributed?",
+        key_entities=["prime numbers"],
+        domains=["Mathematical Sciences"],
+    )
+    targets = [query.target_source for query in queries]
+    assert targets[:2] == ["serper_openalex", "serper_openalex"]
+    assert {"zbmath", "arxiv", "crossref"}.issubset(targets)
+    assert "europe_pmc" not in targets
+
+
+@pytest.mark.asyncio
+async def test_domain_routed_planner_matches_compact_benchmark_call_matrix() -> None:
+    from collections import Counter
+    from hypoforge.literature.models import SearchQuery
+    from hypoforge.literature.search.domain_routing import DomainRoutedQueryPlanner
+
+    class Delegate:
+        async def plan(self, *args, **kwargs):
+            return [
+                SearchQuery(
+                    query_id="mechanism", text="Navier Stokes regularity",
+                    target_source="arxiv", purpose="core_mechanism",
+                    relation_to_question="test",
+                ),
+                SearchQuery(
+                    query_id="review", text="Navier Stokes foundational review",
+                    target_source="crossref", purpose="review",
+                    relation_to_question="test",
+                ),
+                SearchQuery(
+                    query_id="recent", text="Navier Stokes recent evidence",
+                    target_source="arxiv", purpose="recent_research",
+                    relation_to_question="test",
+                ),
+            ]
+
+    planner = DomainRoutedQueryPlanner(
+        Delegate(),
+        ["serper_openalex", "openalex_oa", "zbmath", "arxiv", "crossref"],
+    )
+    queries = await planner.plan(
+        "Will Navier-Stokes solutions remain smooth?",
+        domains=["Mathematical Sciences"],
+    )
+    counts = Counter(query.target_source for query in queries)
+    assert counts == {
+        "serper_openalex": 2,
+        "zbmath": 2,
+        "arxiv": 2,
+        "crossref": 2,
+    }
+    assert "openalex_oa" not in counts
+
+
+@pytest.mark.asyncio
+async def test_domain_routed_expansion_adds_citation_sorted_oa_search() -> None:
+    from collections import Counter
+    from hypoforge.literature.models import SearchQuery
+    from hypoforge.literature.search.domain_routing import DomainRoutedQueryPlanner
+
+    class Delegate:
+        async def plan(self, *args, **kwargs):
+            return [
+                SearchQuery(
+                    query_id="evidence", text="protein folding experiments",
+                    target_source="europe_pmc", purpose="supporting_evidence",
+                    relation_to_question="test",
+                ),
+                SearchQuery(
+                    query_id="open", text="protein folding open preprint",
+                    target_source="arxiv", purpose="open_preprint",
+                    relation_to_question="test",
+                ),
+            ]
+
+    planner = DomainRoutedQueryPlanner(
+        Delegate(), ["serper_openalex", "openalex_oa", "europe_pmc"],
+    )
+    queries = await planner.plan(
+        "How do proteins fold?",
+        domains=["Biology"],
+        question_type="open_access_expansion",
+    )
+    counts = Counter(query.target_source for query in queries)
+    assert counts == {
+        "serper_openalex": 2,
+        "openalex_oa": 2,
+        "europe_pmc": 2,
+    }
+    assert [query.target_source for query in queries[:4]] == [
+        "serper_openalex", "serper_openalex", "openalex_oa", "openalex_oa",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_domain_routed_planner_timeout_uses_tested_fallback_portfolio() -> None:
+    import asyncio
+    from collections import Counter
+    from hypoforge.literature.search.domain_routing import DomainRoutedQueryPlanner
+
+    class SlowDelegate:
+        async def plan(self, *args, **kwargs):
+            await asyncio.sleep(1)
+            return []
+
+    planner = DomainRoutedQueryPlanner(
+        SlowDelegate(),
+        ["serper_openalex", "crossref"],
+        planner_timeout_seconds=0.01,
+    )
+    queries = await planner.plan(
+        "How do proteins fold?", key_entities=["protein folding"],
+        domains=["Chemistry"],
+    )
+    assert Counter(query.target_source for query in queries) == {
+        "serper_openalex": 2,
+        "crossref": 2,
+    }
+
+
+def test_openalex_oa_search_uses_filter_and_citation_sort(monkeypatch) -> None:
+    from hypoforge.tools import semantic_scholar
+
+    captured = {}
+
+    def fake_get(url, deadline=None):
+        captured["url"] = url
+        return {"results": [], "meta": {"count": 0}}
+
+    monkeypatch.setattr(semantic_scholar, "_http_get_json", fake_get)
+    semantic_scholar._oa_search(
+        "protein folding", 5, open_access_only=True,
+    )
+    assert "filter=is_oa%3Atrue" in captured["url"]
+    assert "sort=cited_by_count%3Adesc" in captured["url"]
+
+
+def test_m1_unknown_candidate_role_degrades_to_other() -> None:
+    from hypoforge.modules.m1_problem_understanding import _CandidateEntity
+
+    candidate = _CandidateEntity.model_validate({
+        "name": "protein folding",
+        "source_mention": "蛋白质是如何折叠的",
+        "role": "process",
+    })
+    assert candidate.role == "other"
+
+
+@pytest.mark.asyncio
+async def test_fulltext_probe_stops_before_reader_for_abstract_only() -> None:
+    from hypoforge.literature.models import ContentLevel, DocumentRecord, PaperRecord
+    from hypoforge.literature.reading.store import InMemoryChunkStore
+    from hypoforge.literature.reading.workflow import FullTextReadingWorkflow
+
+    paper = PaperRecord(paper_id="p", title="paper", sources=["crossref"])
+
+    class Resolver:
+        async def resolve(self, value):
+            return DocumentRecord(
+                document_id="d", paper_id=value.paper_id,
+                content_level=ContentLevel.ABSTRACT,
+                local_path="/tmp/abstract.json",
+            )
+
+    class MustNotRun:
+        async def parse(self, document):
+            raise AssertionError("abstract must not be parsed as full text")
+
+        async def retrieve(self, *args, **kwargs):
+            raise AssertionError("retrieval must not run")
+
+        async def read(self, *args, **kwargs):
+            raise AssertionError("reader must not run")
+
+    workflow = FullTextReadingWorkflow(
+        resolver=Resolver(), parser=MustNotRun(), retriever=MustNotRun(),
+        reader=MustNotRun(), store=InMemoryChunkStore(),
+    )
+    assert await workflow.probe_parsed_fulltext(paper) is False
+
+
+@pytest.mark.asyncio
+async def test_serper_openalex_failure_keeps_scholar_discovery() -> None:
+    from hypoforge.literature.models import PaperRecord, SearchQuery
+    from hypoforge.literature.sources.openalex_enriched_scholar import (
+        OpenAlexEnrichedScholarSource,
+    )
+
+    paper = PaperRecord(paper_id="S:1", title="Protein folding", sources=["serper_scholar"])
+
+    class Scholar:
+        async def search(self, query, limit=20):
+            return [paper]
+
+    class BrokenOpenAlex:
+        async def search(self, query, limit=20):
+            raise TimeoutError("OpenAlex unavailable")
+
+    source = OpenAlexEnrichedScholarSource(
+        scholar_source=Scholar(), openalex_source=BrokenOpenAlex(),
+        enrichment_timeout_seconds=0.1,
+    )
+    result = await source.search(SearchQuery(
+        query_id="q", text="protein folding", target_source="serper_openalex",
+        purpose="test", relation_to_question="test",
+    ))
+    assert result == [paper]
+
+
+@pytest.mark.asyncio
+async def test_enriching_resolver_tries_multiple_oa_locations() -> None:
+    from hypoforge.literature.models import ContentLevel, DocumentRecord, PaperRecord
+    from hypoforge.literature.reading.access import (
+        AccessEnrichment, EnrichingFulltextResolver,
+    )
+
+    paper = PaperRecord(paper_id="DOI:x", title="x", doi="10.1/x", sources=["crossref"])
+
+    class Enricher:
+        async def enrich(self, value):
+            return AccessEnrichment(value, ("https://bad.test/x.pdf", "https://good.test/x.pdf"))
+
+    class Resolver:
+        def __init__(self):
+            self.urls = []
+
+        async def resolve(self, value):
+            url = value.external_ids.get("oa_pdf_url", "")
+            self.urls.append(url)
+            if "good.test" in url:
+                return DocumentRecord(
+                    document_id="d:pdf", paper_id=value.paper_id,
+                    content_level=ContentLevel.PDF, source_uri=url,
+                    local_path="/tmp/paper.pdf",
+                )
+            return DocumentRecord(
+                document_id="d:abstract", paper_id=value.paper_id,
+                content_level=ContentLevel.ABSTRACT, local_path="/tmp/abstract.json",
+                retrieval_error="invalid PDF",
+            )
+
+        async def resolve_abstract(self, value):
+            return await self.resolve(value)
+
+    inner = Resolver()
+    document = await EnrichingFulltextResolver(inner, Enricher()).resolve(paper)
+    assert document.content_level is ContentLevel.PDF
+    assert inner.urls == ["https://bad.test/x.pdf", "https://good.test/x.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_pmc_resolver_falls_back_to_europe_pmc_xml(tmp_path) -> None:
+    from hypoforge.literature.models import ContentLevel, PaperRecord
+    from hypoforge.literature.reading.resolver import PMCFulltextResolver
+
+    async def pmc_backend(url, timeout):
+        return b"[Error] no open-access BioC record"
+
+    async def europe_backend(url, timeout):
+        return b"<article><body><sec><title>Results</title><p>Readable full text.</p></sec></body></article>"
+
+    resolver = PMCFulltextResolver(
+        tmp_path, backend=pmc_backend, europe_pmc_backend=europe_backend,
+    )
+    document = await resolver.resolve(PaperRecord(
+        paper_id="PMC:1", title="x", pmcid="PMC1", sources=["europe_pmc"],
+    ))
+    assert document.content_level is ContentLevel.STRUCTURED_FULLTEXT
+    assert "europepmc" in document.source_uri
+
+
+@pytest.mark.asyncio
+async def test_ntrs_source_preserves_open_pdf_identifier(monkeypatch) -> None:
+    from hypoforge.literature.models import FulltextStatus, SearchQuery
+    from hypoforge.literature.sources import specialist_sources
+
+    async def fake_get(url, timeout, headers=None):
+        assert "/api/citations/search?" in url
+        assert "page%5Bsize%5D=2" in url
+        return {
+            "results": [{
+                "id": "20250000001",
+                "title": "Mars manufacturing systems",
+                "abstract": "An openly available NASA report.",
+                "distributionDate": "2025-04-10",
+                "authorAffiliations": [{
+                    "meta": {"author": {"name": "Ada Researcher"}},
+                }],
+                "downloads": [{
+                    "mimetype": "application/pdf",
+                    "links": {"pdf": "/api/citations/20250000001/downloads/report.pdf"},
+                }],
+            }],
+        }
+
+    monkeypatch.setattr(specialist_sources, "_get", fake_get)
+    source = specialist_sources.NtrsSource()
+    records = await source.search(SearchQuery(
+        query_id="q", text="Mars manufacturing", target_source="ntrs",
+        purpose="test", relation_to_question="test",
+    ), limit=2)
+
+    assert len(records) == 1
+    assert records[0].authors == ["Ada Researcher"]
+    assert records[0].external_ids["oa_pdf_url"] == (
+        "https://ntrs.nasa.gov/api/citations/20250000001/downloads/report.pdf"
+    )
+    assert records[0].fulltext_status is FulltextStatus.PDF_AVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_high_citation_ranker_prioritizes_absolute_impact() -> None:
+    from hypoforge.literature.models import PaperRecord
+    from hypoforge.literature.search.ranking import PaperRanker
+
+    papers = [
+        PaperRecord(
+            paper_id="classic", title="protein folding mechanism", year=1990,
+            citation_count=5000, sources=["serper_scholar"],
+        ),
+        PaperRecord(
+            paper_id="recent", title="protein folding mechanism", year=2026,
+            citation_count=20, sources=["crossref"],
+        ),
+    ]
+    ranked = await PaperRanker(
+        current_year=2026, prefer_high_citation=True
+    ).rank("protein folding mechanism", papers, limit=2)
+    assert ranked[0].paper_id == "classic"
+
+
 if __name__ == "__main__":
     # Allow running directly: python tests/test_pipeline.py
     async def _run_all():

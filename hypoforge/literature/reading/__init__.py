@@ -5,6 +5,7 @@ from .arxiv_resolver import (
     ArxivPDFFetchBackend,
     ArxivPDFResolver,
 )
+from .access import EnrichingFulltextResolver, OpenAccessEnricher
 from .parser import BioCDocumentParser, DocumentParseError, PDFDocumentParser
 from .reader import QwenPaperReader
 from .resolver import FetchBackend, PMCFulltextResolver
@@ -17,6 +18,7 @@ __all__ = [
     "ArxivPDFFetchBackend",
     "ArxivDownloadTimeoutError",
     "ArxivPDFResolver",
+    "EnrichingFulltextResolver",
     "BioCDocumentParser",
     "DocumentParseError",
     "FetchBackend",
@@ -24,6 +26,7 @@ __all__ = [
     "HybridEvidenceRetriever",
     "InMemoryChunkStore",
     "PMCFulltextResolver",
+    "OpenAccessEnricher",
     "PDFDocumentParser",
     "QwenPaperReader",
     "RoutingDocumentParser",
