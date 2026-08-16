@@ -663,8 +663,24 @@
             <label for="openalexMailto">OpenAlex Mailto（可选）</label>
             <input id="openalexMailto" type="text" placeholder="可选，提升限流配额" autocomplete="off" spellcheck="false">
           </div>
+          <div class="config-field">
+            <label for="serperApiKey">Serper API Key</label>
+            <input id="serperApiKey" type="password" placeholder="M2 通用检索主源，建议填写" autocomplete="new-password" spellcheck="false">
+          </div>
+          <div class="config-field">
+            <label for="adsApiToken">NASA ADS Token（可选）</label>
+            <input id="adsApiToken" type="password" placeholder="天文/宇宙学领域必需" autocomplete="new-password" spellcheck="false">
+          </div>
+          <div class="config-field">
+            <label for="unpaywallEmail">Unpaywall 邮箱（可选）</label>
+            <input id="unpaywallEmail" type="text" placeholder="用于 OA 地址解析，留空回退到 OpenAlex Mailto" autocomplete="off" spellcheck="false">
+          </div>
+          <div class="config-field">
+            <label for="crossrefMailto">Crossref 邮箱（可选）</label>
+            <input id="crossrefMailto" type="text" placeholder="建议填写以提升礼貌池限流" autocomplete="off" spellcheck="false">
+          </div>
         </div>
-        <div class="cred-hint">Semantic Scholar 建议填写 Key（匿名限流严格）；OpenAlex 匿名即可使用，Mailto 用于礼貌池提升限流；千问 Key 留空则使用本机配置（.env）。</div>
+        <div class="cred-hint">Serper 为 M2 通用检索主源，建议填写 Key；ADS 仅在处理天文/宇宙学问题时需要；千问 Key 留空则使用本机配置（.env）。</div>
         <div class="security-note">凭证仅用于本次运行，不写入运行记录、浏览器存储或项目文件。</div>
       </details>
 
@@ -2726,6 +2742,10 @@ async function submitFollowup(){
         semantic_scholar_api_key: $("semanticApiKey").value.trim(),
         openalex_api_key: $("openalexApiKey").value.trim(),
         openalex_mailto: $("openalexMailto").value.trim(),
+        serper_api_key: $("serperApiKey").value.trim(),
+        ads_api_token: $("adsApiToken").value.trim(),
+        unpaywall_email: $("unpaywallEmail").value.trim(),
+        crossref_mailto: $("crossrefMailto").value.trim(),
         parent_run_id: currentRun,
         followup: text,
       }),
@@ -2740,6 +2760,8 @@ async function submitFollowup(){
     input.value = "";
     $("qwenApiKey").value = ""; $("semanticApiKey").value = "";
     $("openalexApiKey").value = ""; $("openalexMailto").value = "";
+    $("serperApiKey").value = ""; $("adsApiToken").value = "";
+    $("unpaywallEmail").value = ""; $("crossrefMailto").value = "";
     await attachRun(data.run);
     await loadHistory();
     updateHint();
@@ -2784,6 +2806,10 @@ async function retryFromCheckpoint(){
         semantic_scholar_api_key: $("semanticApiKey").value.trim(),
         openalex_api_key: $("openalexApiKey").value.trim(),
         openalex_mailto: $("openalexMailto").value.trim(),
+        serper_api_key: $("serperApiKey").value.trim(),
+        ads_api_token: $("adsApiToken").value.trim(),
+        unpaywall_email: $("unpaywallEmail").value.trim(),
+        crossref_mailto: $("crossrefMailto").value.trim(),
         resume_of: currentRun,
       }),
     });
@@ -2791,6 +2817,8 @@ async function retryFromCheckpoint(){
     if(!response.ok) throw new Error(data.error || `启动失败（HTTP ${response.status}）`);
     $("qwenApiKey").value = ""; $("semanticApiKey").value = "";
     $("openalexApiKey").value = ""; $("openalexMailto").value = "";
+    $("serperApiKey").value = ""; $("adsApiToken").value = "";
+    $("unpaywallEmail").value = ""; $("crossrefMailto").value = "";
     $("runErrorBanner").classList.add("hidden");
     $("retryRow").classList.add("hidden");
     await attachRun(data.run);
@@ -2839,6 +2867,8 @@ async function submit(){
     input.value = ""; autoGrow(input);
     $("qwenApiKey").value = ""; $("semanticApiKey").value = "";
     $("openalexApiKey").value = ""; $("openalexMailto").value = "";
+    $("serperApiKey").value = ""; $("adsApiToken").value = "";
+    $("unpaywallEmail").value = ""; $("crossrefMailto").value = "";
     await attachRun(data.run);
     await loadHistory();
     updateHint();

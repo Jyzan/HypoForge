@@ -7655,6 +7655,10 @@ module_overrides:
         semantic_scholar_api_key="s2-secret-for-test",
         openalex_api_key="oa-secret-for-test",
         openalex_mailto="lab@example.org",
+        serper_api_key="serper-secret-for-test",
+        ads_api_token="ads-secret-for-test",
+        unpaywall_email="unpay@example.org",
+        crossref_mailto="crossref@example.org",
     )
     assert "secret" not in json.dumps(run)
 
@@ -7674,12 +7678,30 @@ module_overrides:
         config.module_overrides["m2"].kwargs["openalex_mailto"]
         == "lab@example.org"
     )
+    assert (
+        config.module_overrides["m2"].kwargs["serper_api_key"]
+        == "serper-secret-for-test"
+    )
+    assert (
+        config.module_overrides["m2"].kwargs["ads_api_token"]
+        == "ads-secret-for-test"
+    )
+    assert (
+        config.module_overrides["m2"].kwargs["unpaywall_email"]
+        == "unpay@example.org"
+    )
+    assert (
+        config.module_overrides["m2"].kwargs["crossref_mailto"]
+        == "crossref@example.org"
+    )
     persisted = (
         tmp_path / "runs" / run["run_id"] / "manifest.json"
     ).read_text(encoding="utf-8")
     assert "qwen-secret-for-test" not in persisted
     assert "s2-secret-for-test" not in persisted
     assert "oa-secret-for-test" not in persisted
+    assert "serper-secret-for-test" not in persisted
+    assert "ads-secret-for-test" not in persisted
 
 
 def test_run_manager_rejects_malformed_openalex_credentials(
@@ -7690,8 +7712,12 @@ def test_run_manager_rejects_malformed_openalex_credentials(
     )
     with pytest.raises(ValueError, match="API Key 长度异常"):
         manager.start("q", openalex_api_key="x" * 4097)
-    with pytest.raises(ValueError, match="Mailto 长度异常"):
+    with pytest.raises(ValueError, match="邮箱地址长度异常"):
         manager.start("q", openalex_mailto="a" * 321)
+    with pytest.raises(ValueError, match="API Key 长度异常"):
+        manager.start("q", serper_api_key="x" * 4097)
+    with pytest.raises(ValueError, match="邮箱地址长度异常"):
+        manager.start("q", unpaywall_email="a" * 321)
 
 
 def test_web_ui_preserves_open_event_details_and_has_ephemeral_key_fields() -> None:

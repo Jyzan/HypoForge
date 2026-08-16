@@ -79,6 +79,10 @@ class RunManager:
         semantic_scholar_api_key: str = "",
         openalex_api_key: str = "",
         openalex_mailto: str = "",
+        serper_api_key: str = "",
+        ads_api_token: str = "",
+        unpaywall_email: str = "",
+        crossref_mailto: str = "",
         parent_run_id: str = "",
         followup: str = "",
         resume_of: str = "",
@@ -89,6 +93,10 @@ class RunManager:
         semantic_scholar_api_key = str(semantic_scholar_api_key or "").strip()
         openalex_api_key = str(openalex_api_key or "").strip()
         openalex_mailto = " ".join(str(openalex_mailto or "").split())
+        serper_api_key = str(serper_api_key or "").strip()
+        ads_api_token = str(ads_api_token or "").strip()
+        unpaywall_email = " ".join(str(unpaywall_email or "").split())
+        crossref_mailto = " ".join(str(crossref_mailto or "").split())
         parent_run_id = " ".join(str(parent_run_id or "").split())
         followup = " ".join(str(followup or "").split())
         resume_of = " ".join(str(resume_of or "").split())
@@ -104,10 +112,16 @@ class RunManager:
             len(qwen_api_key) > 4096
             or len(semantic_scholar_api_key) > 4096
             or len(openalex_api_key) > 4096
+            or len(serper_api_key) > 4096
+            or len(ads_api_token) > 4096
         ):
             raise ValueError("API Key 长度异常")
-        if len(openalex_mailto) > 320:
-            raise ValueError("OpenAlex Mailto 长度异常")
+        if (
+            len(openalex_mailto) > 320
+            or len(unpaywall_email) > 320
+            or len(crossref_mailto) > 320
+        ):
+            raise ValueError("邮箱地址长度异常")
         if len(followup) > 4000:
             raise ValueError("追问内容过长，请控制在 4000 字以内")
         seed_state: dict[str, Any] | None = None
@@ -154,6 +168,10 @@ class RunManager:
                 "semantic_scholar_api_key": semantic_scholar_api_key,
                 "openalex_api_key": openalex_api_key,
                 "openalex_mailto": openalex_mailto,
+                "serper_api_key": serper_api_key,
+                "ads_api_token": ads_api_token,
+                "unpaywall_email": unpaywall_email,
+                "crossref_mailto": crossref_mailto,
             }
             if seed_state is not None:
                 # Memory-only, consumed once by the worker (like credentials).
@@ -295,6 +313,10 @@ class RunManager:
             )
             openalex_api_key = credentials.get("openalex_api_key", "")
             openalex_mailto = credentials.get("openalex_mailto", "")
+            serper_api_key = credentials.get("serper_api_key", "")
+            ads_api_token = credentials.get("ads_api_token", "")
+            unpaywall_email = credentials.get("unpaywall_email", "")
+            crossref_mailto = credentials.get("crossref_mailto", "")
             for tier in (
                 config.qwen.base,
                 config.qwen.max,
@@ -320,6 +342,19 @@ class RunManager:
                     m2_override.kwargs["openalex_api_key"] = openalex_api_key
                 if openalex_mailto:
                     m2_override.kwargs["openalex_mailto"] = openalex_mailto
+            m2_extra_credentials = {
+                "serper_api_key": serper_api_key,
+                "ads_api_token": ads_api_token,
+                "unpaywall_email": unpaywall_email,
+                "crossref_mailto": crossref_mailto,
+            }
+            if any(m2_extra_credentials.values()):
+                m2_override = config.module_overrides.setdefault(
+                    "m2", ModuleOverride()
+                )
+                for key, value in m2_extra_credentials.items():
+                    if value:
+                        m2_override.kwargs[key] = value
             manifest = {
                 "run_id": run_id,
                 "question": question,
@@ -1008,6 +1043,10 @@ class HypoForgeRequestHandler(BaseHTTPRequestHandler):
                 ),
                 openalex_api_key=payload.get("openalex_api_key", ""),
                 openalex_mailto=payload.get("openalex_mailto", ""),
+                serper_api_key=payload.get("serper_api_key", ""),
+                ads_api_token=payload.get("ads_api_token", ""),
+                unpaywall_email=payload.get("unpaywall_email", ""),
+                crossref_mailto=payload.get("crossref_mailto", ""),
                 parent_run_id=payload.get("parent_run_id", ""),
                 followup=payload.get("followup", ""),
                 resume_of=payload.get("resume_of", ""),
