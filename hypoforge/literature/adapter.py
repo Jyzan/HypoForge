@@ -81,6 +81,19 @@ _DEFAULT_SUPPLEMENT_PAPER_BUDGET = 6
 _MAX_SUGGESTED_QUERIES_PER_GAP = 3
 _WORD_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
+# Retention roles that commit the reading workflow to producing knowledge
+# entries / citable evidence.  "context_evidence" (appended by the contextual
+# fallback in search/agent.py) is the fallback artifact and is deliberately
+# absent: a batch retained purely as adjacent context is not a promise to
+# yield knowledge, and the reading contract must not crash on it.
+_KNOWLEDGE_RETENTION_ROLES = frozenset({
+    "core_evidence",
+    "method_evidence",
+    "recent_evidence",
+    "contradicting_evidence",
+    "fulltext_backfill",
+})
+
 
 # ============================================================================
 # Supplement-round helpers
@@ -381,21 +394,62 @@ class AgenticM2Adapter(ModuleProtocol):
         return output
 
     @staticmethod
+    def _is_context_only_retention(search_result: Any) -> bool:
+        """True when every retained paper's retention decision carries no
+        knowledge-producing role (contextual-fallback artifact only).
+
+        Empty ``retention_decisions`` (e.g. the strict cache-hit path) or any
+        retained paper without a retain decision falls back to legacy behavior
+        (False) so fakes and cache hits keep the full contract.
+        """
+        decisions = getattr(search_result, "retention_decisions", None) or []
+        if not decisions:
+            return False
+        by_id = {decision.paper_id: decision for decision in decisions}
+        retained = list(getattr(search_result, "final_papers", None) or [])
+        if not retained:
+            return False
+        for paper in retained:
+            decision = by_id.get(paper.paper_id)
+            if decision is None or decision.decision != "retain":
+                return False  # unknown provenance -> keep the contract
+            if set(decision.roles or []) & _KNOWLEDGE_RETENTION_ROLES:
+                return False
+        return True
+
+    @staticmethod
     def _validate_reading_contract(
         sub_question: str,
         search_result: Any,
         reading_results: list,
-    ) -> None:
+    ) -> bool:
         """Ensure the reading workflow produced at least one usable evidence item.
 
         Partial failures (some papers fail, others succeed) are acceptable.
         Total reading failure after papers were retained remains an error.
         Zero retained papers is represented as an explicit evidence gap rather
         than crashing all other sub-questions in M2.
+
+        Returns True when the knowledge requirement was waived because the
+        batch is context-only retention (contextual-fallback artifact);
+        False when the full contract applied and passed.
         """
         retained_count = len(search_result.final_papers)
         if retained_count == 0:
-            return
+            return False
+        if AgenticM2Adapter._is_context_only_retention(search_result):
+            emit_event(
+                "tool_result",
+                module="m2",
+                tool="reading_contract",
+                status="warning",
+                message=(
+                    f"仅保留上下文证据，跳过知识条目要求：{sub_question!r} "
+                    f"（{retained_count} 篇保留论文均为上下文回退证据）"
+                ),
+                details={"sub_question": sub_question, "retained": retained_count},
+            )
+            return True
         citable_count = sum(
             1 for r in reading_results
             if getattr(r, "evidence", None)
@@ -421,6 +475,7 @@ class AgenticM2Adapter(ModuleProtocol):
                 f"{sub_question!r} ({retained_count} retained paper(s), "
                 f"0 with knowledge entries)"
             )
+        return False
 
     async def __call__(
         self,
@@ -801,12 +856,36 @@ class AgenticM2Adapter(ModuleProtocol):
             reading_results = await self._normalise_reading_entities(
                 state, list(reading_results)
             )
-            self._validate_reading_contract(
+            contract_exempted = self._validate_reading_contract(
                 sub_question, filtered_result, list(reading_results),
             )
             export_run = build_m2_knowledge_export_run(
                 sub_question, filtered_result, reading_results
             )
+            if (
+                contract_exempted
+                and not export_run.knowledge_entries
+                and not export_run.evidence
+            ):
+                # Contextual-fallback batch only: no knowledge was produced
+                # and none was promised.  Keep the gap open instead of
+                # exporting an empty run and marking it grounded.
+                emit_event(
+                    "evidence_gap",
+                    module="m2",
+                    tool="evidence_gap",
+                    status="warning",
+                    message=(
+                        f"证据缺口 {gap.gap_id} 的补充检索仅保留上下文证据，"
+                        "未产生知识条目；缺口保持开放，等待后续补充检索"
+                    ),
+                    details={
+                        "gap_id": gap.gap_id,
+                        "sub_question": sub_question,
+                        "papers": len(new_papers),
+                    },
+                )
+                continue
             new_runs.append(export_run)
             grounded_gap_ids.add(gap.gap_id)
             self._merge_increment(

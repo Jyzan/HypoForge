@@ -4592,6 +4592,9 @@ from hypoforge.literature.models import (
     EvidenceLinkedKnowledge,
     PaperReadingResult,
     PaperRecord,
+    PaperRetentionDecision,
+    QueryIntent,
+    SearchQuery,
 )
 from hypoforge.memory import PaperStore
 from hypoforge.modules.m3_grounding.models import EvidenceRecord
@@ -5000,6 +5003,148 @@ async def test_agentic_cache_hit_is_read_before_pending_grounding(tmp_path) -> N
     assert result["m2_knowledge_export"].runs[0].knowledge_entries
 
 
+class _ContextOnlySearchAgent:
+    """Returns a fixed two-paper result with configurable retention decisions."""
+
+    def __init__(self, decisions=None) -> None:
+        self.decisions = decisions
+
+    async def run(self, sub_question, **kwargs):
+        papers = [
+            PaperRecord(paper_id="ctx-1", title="Context paper one", sources=["openalex"]),
+            PaperRecord(paper_id="ctx-2", title="Context paper two", sources=["openalex"]),
+        ]
+        if self.decisions is None:
+            self.decisions = [
+                PaperRetentionDecision(
+                    paper_id="ctx-1",
+                    decision="retain",
+                    roles=["context_evidence"],
+                    reason="contextual fallback: no direct paper survived the boundary review",
+                    rank_position=1,
+                ),
+                PaperRetentionDecision(
+                    paper_id="ctx-2",
+                    decision="retain",
+                    roles=["context_evidence"],
+                    reason="contextual fallback: no direct paper survived the boundary review",
+                    rank_position=2,
+                ),
+            ]
+        return SearchRunResult(
+            sub_question=sub_question,
+            papers_found=2,
+            papers_after_dedup=2,
+            candidates=list(papers),
+            final_papers=list(papers),
+            stop_reason=StopReason.COVERAGE_SATISFIED,
+            source_result_counts={"openalex": 2},
+            retention_decisions=self.decisions,
+        )
+
+
+@pytest.mark.asyncio
+async def test_strict_m2_supplement_context_only_fallback_keeps_gap_open() -> None:
+    adapter = StrictAgenticM2Adapter(
+        search_agent=_ContextOnlySearchAgent(),
+        reading_workflow=EchoReadingWorkflow(with_evidence=False),
+    )
+    state = make_supplement_state(
+        evidence_gaps=[make_gap(suggested_queries=["context query"])],
+    )
+
+    result = await adapter(state)
+
+    # context-only fallback batch with zero knowledge: no crash, gap stays
+    # open, no empty run exported.
+    assert result["evidence_gaps"][0].status == "open"
+    assert len(result["m2_knowledge_export"].runs) == 1  # prior run only
+    assert result["search_ledger"].queries_issued == [
+        "initial query",
+        "context query",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_strict_m2_supplement_knowledge_role_reading_failure_still_fails() -> None:
+    decisions = [
+        PaperRetentionDecision(
+            paper_id="ctx-1",
+            decision="retain",
+            roles=["core_evidence"],
+            reason="retained in the primary relevance-ranked Final-K set",
+            rank_position=1,
+        ),
+        PaperRetentionDecision(
+            paper_id="ctx-2",
+            decision="retain",
+            roles=["context_evidence"],
+            reason="contextual fallback",
+            rank_position=2,
+        ),
+    ]
+    adapter = StrictAgenticM2Adapter(
+        search_agent=_ContextOnlySearchAgent(decisions=decisions),
+        reading_workflow=EchoReadingWorkflow(with_evidence=False),
+    )
+    state = make_supplement_state(
+        evidence_gaps=[make_gap(suggested_queries=["context query"])],
+    )
+
+    with pytest.raises(RuntimeError, match="no (citable evidence|knowledge entries)"):
+        await adapter(state)
+
+
+@pytest.mark.asyncio
+async def test_strict_m2_supplement_empty_retention_decisions_keeps_legacy_contract() -> None:
+    adapter = StrictAgenticM2Adapter(
+        search_agent=_ContextOnlySearchAgent(decisions=[]),
+        reading_workflow=EchoReadingWorkflow(with_evidence=False),
+    )
+    state = make_supplement_state(
+        evidence_gaps=[make_gap(suggested_queries=["context query"])],
+    )
+
+    # No retention provenance (e.g. cache-hit path) keeps the full contract.
+    with pytest.raises(RuntimeError, match="no (citable evidence|knowledge entries)"):
+        await adapter(state)
+
+
+@pytest.mark.asyncio
+async def test_strict_m2_supplement_context_only_with_knowledge_exports_and_grounds() -> None:
+    adapter = StrictAgenticM2Adapter(
+        search_agent=_ContextOnlySearchAgent(),
+        reading_workflow=EchoReadingWorkflow(with_evidence=True),
+    )
+    state = make_supplement_state(
+        evidence_gaps=[make_gap(suggested_queries=["context query"])],
+    )
+
+    result = await adapter(state)
+
+    assert result["evidence_gaps"][0].status == "pending_grounding"
+    assert len(result["m2_knowledge_export"].runs) == 2
+    new_run = result["m2_knowledge_export"].runs[1]
+    assert [paper.paper_id for paper in new_run.papers] == ["ctx-1", "ctx-2"]
+    assert new_run.knowledge_entries
+
+
+@pytest.mark.asyncio
+async def test_base_m2_supplement_context_only_fallback_keeps_gap_open() -> None:
+    adapter = AgenticM2Adapter(
+        search_agent=_ContextOnlySearchAgent(),
+        reading_workflow=EchoReadingWorkflow(with_evidence=False),
+    )
+    state = make_supplement_state(
+        evidence_gaps=[make_gap(suggested_queries=["context query"])],
+    )
+
+    result = await adapter(state)
+
+    assert result["evidence_gaps"][0].status == "open"
+    assert len(result["m2_knowledge_export"].runs) == 1  # prior run only
+
+
 def test_registry_selects_strict_builtin_contracts() -> None:
     config = PipelineConfig(
         search=SearchConfig(implementation="agentic"),
@@ -5026,10 +5171,37 @@ def test_registry_selects_strict_builtin_contracts() -> None:
         config.evaluation.embedding.api_key_env_var
     )
 
+    # The strict M2 reconstruction must forward the agentic configuration the
+    # integrated factory set on the base adapter — dropping it silently
+    # disabled sub-question entity supplementation and full-text backfill.
+    adapter = instances["m2"].adapter
+    assert adapter.subquestion_entity_client is not None
+    assert adapter.round_strategy == "entity_group"
+    assert adapter.fulltext_backfill_enabled is False  # domain_routing off by default
+    assert adapter.fulltext_backfill_target == 3
+    assert adapter.fulltext_backfill_max_attempts == 8
+    assert adapter.fulltext_backfill_min_relevance == 0.70
+    assert adapter.fulltext_backfill_min_directness == 0.45
+
     # Default config (no entity_embedding_model) → empty string, no embedding.
     config_nonembed = PipelineConfig(search=SearchConfig(implementation="agentic"))
     instances_nonembed = ModuleRegistry.build_all(config_nonembed)
     assert instances_nonembed["m2"].adapter.entity_embedding_model == ""
+
+
+def test_strict_m2_facade_preserves_agentic_config_fields() -> None:
+    # The minimal variant needs no LLM client; its base adapter carries the
+    # AgenticM2Adapter defaults, and the strict reconstruction must forward
+    # them unchanged.
+    module = StrictAgenticM2Module(variant="minimal")
+    adapter = module.adapter
+    assert adapter.subquestion_entity_client is None
+    assert adapter.round_strategy == "entity_group"
+    assert adapter.fulltext_backfill_enabled is False
+    assert adapter.fulltext_backfill_target == 0
+    assert adapter.fulltext_backfill_max_attempts == 8
+    assert adapter.fulltext_backfill_min_relevance == 0.70
+    assert adapter.fulltext_backfill_min_directness == 0.45
 
 
 def test_registry_respects_explicit_empty_entity_embedding_model() -> None:
@@ -5455,6 +5627,152 @@ def test_m4_ranker_incomplete_top_k_cannot_fallback() -> None:
                 "scores": dimensions,
             }],
         )
+
+
+class _M4SequenceClient:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    async def structured_chat(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_m4_critic_all_rejected_runs_gate_recovery() -> None:
+    module = StrictM4HypothesisGeneration(mode="multi_agent")
+    candidates = [
+        HypothesisCard(hypothesis_id="H1", statement="hypothesis one"),
+        HypothesisCard(hypothesis_id="H2", statement="hypothesis two"),
+    ]
+    recovered = [
+        {
+            "hypothesis_id": "H3",
+            "statement": "Hsp70 co-chaperone binding improves client protein folding",
+        },
+        {
+            "hypothesis_id": "H4",
+            "statement": "Hsp70 nucleotide exchange accelerates substrate release",
+        },
+    ]
+    client = _M4SequenceClient([
+        [  # 1. critic: every candidate rejected
+            {"hypothesis_id": "H1", "pass": False, "critique": "missing mechanism", "issues": ["no evidence link"]},
+            {"hypothesis_id": "H2", "pass": False, "critique": "contradicts facts", "issues": []},
+        ],
+        recovered,  # 2. gate-recovery regeneration pass
+        [  # 3. semantic contract audit on the regenerated batch
+            {"hypothesis_id": "H3", "consistent": True, "rationale": "same object"},
+            {"hypothesis_id": "H4", "consistent": True, "rationale": "same object"},
+        ],
+        [  # 4. critic re-run on the merged set: old rejected, new pass
+            {"hypothesis_id": "H1", "pass": False, "critique": "still bad", "issues": []},
+            {"hypothesis_id": "H2", "pass": False, "critique": "still bad", "issues": []},
+            {"hypothesis_id": "H3", "pass": True, "critique": "ok", "issues": []},
+            {"hypothesis_id": "H4", "pass": True, "critique": "ok", "issues": []},
+        ],
+        [  # 5. falsifiability: survivors pass
+            {"hypothesis_id": "H3", "is_falsifiable": True, "assessment": "testable"},
+            {"hypothesis_id": "H4", "is_falsifiable": True, "assessment": "testable"},
+        ],
+    ])
+    module.client = client
+
+    survivors = await module._run_quality_gates(
+        PipelineState(input_question="Q", problem_card=make_problem_card()),
+        candidates,
+        generation_shortfall=False,
+        question="Q",
+    )
+
+    assert [card.hypothesis_id for card in survivors] == ["H3", "H4"]
+    assert len(client.calls) == 5
+    # the critic's critique text fed the regeneration prompt
+    assert "missing mechanism" in client.calls[1]["user_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_m4_critic_all_rejected_after_recovery_still_fails() -> None:
+    module = StrictM4HypothesisGeneration(mode="multi_agent")
+    candidates = [
+        HypothesisCard(hypothesis_id="H1", statement="hypothesis one"),
+        HypothesisCard(hypothesis_id="H2", statement="hypothesis two"),
+    ]
+    client = _M4SequenceClient([
+        [  # 1. critic: all rejected
+            {"hypothesis_id": "H1", "pass": False, "critique": "bad", "issues": []},
+            {"hypothesis_id": "H2", "pass": False, "critique": "bad", "issues": []},
+        ],
+        [],  # 2. regeneration yields nothing
+        [  # 3. critic re-run: still all rejected
+            {"hypothesis_id": "H1", "pass": False, "critique": "bad", "issues": []},
+            {"hypothesis_id": "H2", "pass": False, "critique": "bad", "issues": []},
+        ],
+    ])
+    module.client = client
+
+    with pytest.raises(RuntimeError, match="rejected every candidate"):
+        await module._run_quality_gates(
+            PipelineState(input_question="Q", problem_card=make_problem_card()),
+            candidates,
+            generation_shortfall=False,
+            question="Q",
+        )
+    assert len(client.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_m4_falsifiability_all_rejected_runs_gate_recovery() -> None:
+    module = StrictM4HypothesisGeneration(mode="multi_agent")
+    candidates = [
+        HypothesisCard(hypothesis_id="H1", statement="hypothesis one"),
+        HypothesisCard(hypothesis_id="H2", statement="hypothesis two"),
+    ]
+    recovered = [
+        {
+            "hypothesis_id": "H3",
+            "statement": "Hsp70 co-chaperone binding improves client protein folding",
+        },
+        {
+            "hypothesis_id": "H4",
+            "statement": "Hsp70 nucleotide exchange accelerates substrate release",
+        },
+    ]
+    client = _M4SequenceClient([
+        [  # 1. critic: pass
+            {"hypothesis_id": "H1", "pass": True, "critique": "ok", "issues": []},
+            {"hypothesis_id": "H2", "pass": True, "critique": "ok", "issues": []},
+        ],
+        [  # 2. falsifiability: every candidate rejected
+            {"hypothesis_id": "H1", "is_falsifiable": False, "assessment": "not testable"},
+            {"hypothesis_id": "H2", "is_falsifiable": False, "assessment": "no empirical test"},
+        ],
+        recovered,  # 3. gate-recovery regeneration pass
+        [  # 4. semantic contract audit on the regenerated batch
+            {"hypothesis_id": "H3", "consistent": True, "rationale": "same object"},
+            {"hypothesis_id": "H4", "consistent": True, "rationale": "same object"},
+        ],
+        [  # 5. falsifiability re-run: old rejected, new pass
+            {"hypothesis_id": "H1", "is_falsifiable": False, "assessment": "still not testable"},
+            {"hypothesis_id": "H2", "is_falsifiable": False, "assessment": "still not testable"},
+            {"hypothesis_id": "H3", "is_falsifiable": True, "assessment": "testable"},
+            {"hypothesis_id": "H4", "is_falsifiable": True, "assessment": "testable"},
+        ],
+    ])
+    module.client = client
+
+    survivors = await module._run_quality_gates(
+        PipelineState(input_question="Q", problem_card=make_problem_card()),
+        candidates,
+        generation_shortfall=False,
+        question="Q",
+    )
+
+    assert [card.hypothesis_id for card in survivors] == ["H3", "H4"]
+    assert len(client.calls) == 5
+    # the falsifiability assessment text fed the regeneration prompt
+    assert "not testable" in client.calls[2]["user_prompt"]
 
 
 @pytest.mark.asyncio

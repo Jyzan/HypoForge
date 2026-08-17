@@ -923,8 +923,34 @@ class StrictAgenticM2Adapter(AgenticM2Adapter):
                 sub_question, new_papers, search_context=filtered
             )
             reading = await self._normalise_reading_entities(state, list(reading))
-            self._validate_reading_contract(sub_question, filtered, list(reading))
+            contract_exempted = self._validate_reading_contract(
+                sub_question, filtered, list(reading)
+            )
             export_run = build_m2_knowledge_export_run(sub_question, filtered, reading)
+            if (
+                contract_exempted
+                and not export_run.knowledge_entries
+                and not export_run.evidence
+            ):
+                # Contextual-fallback batch only: no knowledge was produced
+                # and none was promised.  Keep the gap open instead of
+                # exporting an empty run and marking it grounded.
+                emit_event(
+                    "evidence_gap",
+                    module="m2",
+                    tool="evidence_gap",
+                    status="warning",
+                    message=(
+                        f"证据缺口 {gap.gap_id} 的补充检索仅保留上下文证据，"
+                        "未产生知识条目；缺口保持开放，等待后续补充检索"
+                    ),
+                    details={
+                        "gap_id": gap.gap_id,
+                        "sub_question": sub_question,
+                        "papers": len(new_papers),
+                    },
+                )
+                continue
             new_runs.append(export_run)
             self._merge_increment(
                 merged_results,
@@ -986,6 +1012,17 @@ class StrictM2LiteratureSearch(M2LiteratureSearch):
             entity_embedding_model=base.entity_embedding_model,
             entity_embedding_base_url=entity_embedding_base_url,
             entity_embedding_key_env=entity_embedding_key_env,
+            # Forward the agentic configuration the integrated factory set on
+            # the base adapter — dropping these silently disabled sub-question
+            # entity supplementation, full-text backfill and the open-access
+            # expansion search in production (strict is the default).
+            subquestion_entity_client=base.subquestion_entity_client,
+            round_strategy=base.round_strategy,
+            fulltext_backfill_enabled=base.fulltext_backfill_enabled,
+            fulltext_backfill_target=base.fulltext_backfill_target,
+            fulltext_backfill_max_attempts=base.fulltext_backfill_max_attempts,
+            fulltext_backfill_min_relevance=base.fulltext_backfill_min_relevance,
+            fulltext_backfill_min_directness=base.fulltext_backfill_min_directness,
         )
 
 
@@ -1206,6 +1243,21 @@ class StrictM3EvidenceGraph(M3EvidenceGraph):
         return result
 
 
+class M4GateAllRejectedError(RuntimeError):
+    """Every candidate was rejected by a strict M4 quality gate.
+
+    A ``RuntimeError`` subclass so existing ``pytest.raises(RuntimeError,
+    match=...)`` assertions keep matching.  Carries the raw review payload so
+    the strict gate-recovery pass can build regeneration feedback.
+    """
+
+    def __init__(self, message, *, gate, candidate_ids, reviews):
+        super().__init__(message)
+        self.gate = gate  # "critic" | "falsifiability"
+        self.candidate_ids = list(candidate_ids)
+        self.reviews = list(reviews)  # validated verdict dicts only
+
+
 class StrictM4HypothesisGeneration(M4HypothesisGeneration):
     """Make every configured M4 quality gate authoritative and complete."""
 
@@ -1289,9 +1341,12 @@ class StrictM4HypothesisGeneration(M4HypothesisGeneration):
                 f"{sorted(missing)}"
             )
         if not survivors:
-            raise RuntimeError(
+            raise M4GateAllRejectedError(
                 "M4 Critic rejected every candidate; rejected hypotheses cannot "
-                "be silently re-admitted."
+                "be silently re-admitted.",
+                gate="critic",
+                candidate_ids=[card.hypothesis_id for card in candidates],
+                reviews=[r for r in result if isinstance(r, dict)],
             )
         return survivors
 
@@ -1366,11 +1421,198 @@ class StrictM4HypothesisGeneration(M4HypothesisGeneration):
                 f"candidate IDs: {sorted(missing)}"
             )
         if not survivors:
-            raise RuntimeError(
+            raise M4GateAllRejectedError(
                 "M4 Falsifiability Checker rejected every candidate; "
-                "non-falsifiable hypotheses cannot be silently re-admitted."
+                "non-falsifiable hypotheses cannot be silently re-admitted.",
+                gate="falsifiability",
+                candidate_ids=[card.hypothesis_id for card in candidates],
+                reviews=[r for r in result if isinstance(r, dict)],
             )
         return survivors
+
+    # ------------------------------------------------------------------
+    # Gate-recovery: all-rejected candidates regenerate once with feedback
+    # ------------------------------------------------------------------
+
+    async def _run_quality_gates(
+        self,
+        state: PipelineState,
+        candidates,
+        *,
+        generation_shortfall: bool,
+        question: str = "",
+        graph_context=None,
+        feedback_context: str = "",
+    ):
+        """Run the quality gates; on all-rejected, regenerate once with the
+        gate's feedback and re-run the same gate (bounded to one pass).
+
+        The recovery keys on the structured :class:`M4GateAllRejectedError`,
+        never on ``generation_shortfall`` (which is stale after the contract
+        repair path).  Transport-level failures keep the base swallow-on-
+        shortfall semantics.
+        """
+        from .graph_context import build_graph_context as _build_graph_context
+
+        question = question or (
+            state.problem_card.original_question
+            if state.problem_card
+            else state.input_question
+        )
+        graph_context = graph_context or _build_graph_context(state)
+
+        try:
+            candidates = await self._run_critic(state, candidates)
+        except M4GateAllRejectedError as exc:
+            candidates = await self._recover_gate_rejection(
+                state,
+                candidates,
+                exc,
+                gate_name="M4 Critic",
+                feedback_block=self._critic_recovery_feedback_block(exc.reviews),
+                gate_call=self._run_critic,
+                question=question,
+                graph_context=graph_context,
+                feedback_context=feedback_context,
+            )
+        except Exception:
+            if not generation_shortfall:
+                raise
+            logger.warning(
+                "M4 Critic failed after the one retry still left too few "
+                "hypotheses; continuing with the generated candidates."
+            )
+
+        try:
+            candidates = await self._run_falsifiability(state, candidates)
+        except M4GateAllRejectedError as exc:
+            candidates = await self._recover_gate_rejection(
+                state,
+                candidates,
+                exc,
+                gate_name="M4 Falsifiability Checker",
+                feedback_block=self._falsifiability_recovery_feedback_block(
+                    exc.reviews
+                ),
+                gate_call=self._run_falsifiability,
+                question=question,
+                graph_context=graph_context,
+                feedback_context=feedback_context,
+            )
+        except Exception:
+            if not generation_shortfall:
+                raise
+            logger.warning(
+                "M4 Falsifiability Checker failed after the one retry still "
+                "left too few hypotheses; continuing with the current candidates."
+            )
+        return candidates
+
+    async def _recover_gate_rejection(
+        self,
+        state: PipelineState,
+        candidates,
+        exc: M4GateAllRejectedError,
+        *,
+        gate_name: str,
+        feedback_block: str,
+        gate_call,
+        question: str,
+        graph_context,
+        feedback_context: str,
+    ):
+        """One regeneration pass with the gate's feedback, then re-run the
+        same gate once.  A second all-rejected result raises with review
+        excerpts — the gate stays authoritative, never silently re-admits.
+        """
+        emit_event(
+            "tool_result",
+            module="m4",
+            tool="hypothesis_generator_gate_recovery",
+            status="warning",
+            message=f"{gate_name} 拒绝全部候选，执行一次生成修复并重新审查",
+            details={"gate": exc.gate, "rejected": len(candidates)},
+        )
+        _, regenerated, contract_failures = (
+            await self._generate_hypothesis_batch(
+                state,
+                question=question,
+                graph_context=graph_context,
+                feedback_context="\n".join(
+                    item for item in [feedback_context, feedback_block] if item
+                ),
+                tool_name="hypothesis_generator_gate_recovery",
+                attempt=3,
+            )
+        )
+        if contract_failures:
+            logger.warning(
+                "M4 gate recovery regeneration dropped %d candidate(s) for "
+                "contract failures",
+                len(contract_failures),
+            )
+        candidates = self._merge_generation_candidates(candidates, regenerated)
+        try:
+            return await gate_call(state, candidates)
+        except M4GateAllRejectedError as second_exc:
+            excerpts = "; ".join(
+                str(
+                    r.get("critique")
+                    or r.get("assessment")
+                    or ""
+                )[:120]
+                for r in second_exc.reviews
+                if isinstance(r, dict)
+            )[:400]
+            emit_event(
+                "tool_failed",
+                module="m4",
+                tool="hypothesis_generator_gate_recovery",
+                status="failed",
+                message=f"{gate_name} 修复后仍拒绝全部候选，无法放行",
+                details={"gate": exc.gate},
+            )
+            raise RuntimeError(
+                f"{gate_name} rejected every candidate, including after one "
+                "gate-recovery regeneration pass; the configured quality gate "
+                f"cannot be skipped. Review excerpts: {excerpts}"
+            ) from second_exc
+
+    @staticmethod
+    def _critic_recovery_feedback_block(reviews) -> str:
+        lines = [
+            "The previous candidate batch was rejected by the Critic. "
+            "Address the following critiques and generate improved, "
+            "distinct scientific hypotheses:"
+        ]
+        for review in reviews:
+            if not isinstance(review, dict):
+                continue
+            hypothesis_id = str(review.get("hypothesis_id") or "?")
+            critique = str(review.get("critique") or "").strip()
+            if critique:
+                lines.append(f"- [{hypothesis_id}] {critique}")
+            for issue in review.get("issues") or []:
+                text = str(issue).strip()
+                if text:
+                    lines.append(f"  - issue: {text}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _falsifiability_recovery_feedback_block(reviews) -> str:
+        lines = [
+            "The previous candidate batch was rejected by the Falsifiability "
+            "Checker. Generate hypotheses with explicit, empirically testable "
+            "falsification conditions:"
+        ]
+        for review in reviews:
+            if not isinstance(review, dict):
+                continue
+            hypothesis_id = str(review.get("hypothesis_id") or "?")
+            assessment = str(review.get("assessment") or "").strip()
+            if assessment:
+                lines.append(f"- [{hypothesis_id}] {assessment}")
+        return "\n".join(lines)
 
 
 class StrictM5ResearchPlan(M5ResearchPlan):

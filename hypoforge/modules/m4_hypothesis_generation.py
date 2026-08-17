@@ -1074,27 +1074,15 @@ class M4HypothesisGeneration(ModuleProtocol):
                 "top_hypotheses": top[: self.top_k],
             }
 
-        # ── Step 2: Critic ─────────────────────────────────────────────
-        try:
-            candidates = await self._run_critic(state, candidates)
-        except Exception:
-            if not generation_shortfall:
-                raise
-            logger.warning(
-                "M4 Critic failed after the one retry still left too few "
-                "hypotheses; continuing with the generated candidates."
-            )
-
-        # ── Step 3: Falsifiability Checker ─────────────────────────────
-        try:
-            candidates = await self._run_falsifiability(state, candidates)
-        except Exception:
-            if not generation_shortfall:
-                raise
-            logger.warning(
-                "M4 Falsifiability Checker failed after the one retry still "
-                "left too few hypotheses; continuing with the current candidates."
-            )
+        # ── Steps 2–3: Critic + Falsifiability quality gates ──────────
+        candidates = await self._run_quality_gates(
+            state,
+            candidates,
+            generation_shortfall=generation_shortfall,
+            question=question,
+            graph_context=graph_context,
+            feedback_context=feedback_context,
+        )
 
         # ── Step 4: Ranker (separate model tier) ───────────────────────
         ranker_client = self.ranker_client or self.client
@@ -1165,6 +1153,45 @@ class M4HypothesisGeneration(ModuleProtocol):
             "candidate_hypotheses": candidates,
             "top_hypotheses": top[: self.top_k],
         }
+
+    async def _run_quality_gates(
+        self,
+        state: PipelineState,
+        candidates: List[HypothesisCard],
+        *,
+        generation_shortfall: bool,
+        question: str = "",
+        graph_context: Optional[Any] = None,
+        feedback_context: str = "",
+    ) -> List[HypothesisCard]:
+        """Run the multi-agent quality gates (Critic → Falsifiability).
+
+        ``question`` / ``graph_context`` / ``feedback_context`` are unused
+        here; they are reserved for strict subclasses that regenerate
+        candidates with gate feedback when every candidate is rejected.
+        """
+        # ── Step 2: Critic ─────────────────────────────────────────────
+        try:
+            candidates = await self._run_critic(state, candidates)
+        except Exception:
+            if not generation_shortfall:
+                raise
+            logger.warning(
+                "M4 Critic failed after the one retry still left too few "
+                "hypotheses; continuing with the generated candidates."
+            )
+
+        # ── Step 3: Falsifiability Checker ─────────────────────────────
+        try:
+            candidates = await self._run_falsifiability(state, candidates)
+        except Exception:
+            if not generation_shortfall:
+                raise
+            logger.warning(
+                "M4 Falsifiability Checker failed after the one retry still "
+                "left too few hypotheses; continuing with the current candidates."
+            )
+        return candidates
 
     # ------------------------------------------------------------------
     # Multi-agent sub-steps (Critic, Falsifiability)
