@@ -241,6 +241,22 @@ class PipelineConfig(BaseModel):
     enable_iteration: bool = True
     iteration_module_target: str = "m4"
 
+    # ---- per-node wall-clock budgets (seconds) ----
+    # A single stage that blows its budget stops the run with the stage named,
+    # instead of a whole-question timeout.  Keys not listed fall back to
+    # ``node_timeout_default``; 0 disables the budget for that stage.
+    node_timeouts: Dict[str, float] = Field(
+        default_factory=lambda: {
+            "m1": 180.0,
+            "m2": 900.0,
+            "m3": 480.0,
+            "m4": 600.0,
+            "m5": 180.0,
+            "m6": 180.0,
+        }
+    )
+    node_timeout_default: float = 600.0
+
     # ---- iteration core (feature switches — default OFF keeps the 6 baseline
     # configs behaving exactly as before) ----
     # Three-counter semantics (single source of truth, mirrored in README):

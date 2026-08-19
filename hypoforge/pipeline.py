@@ -304,15 +304,49 @@ class PipelineRunner:
             self.cancel_event.is_set()
         )
 
-    async def _await_module_or_cancel(self, operation, module_name: str):
-        """Await one module while polling the web cancellation flag."""
+    def _node_timeout(self, module_name: str) -> float:
+        """Per-node wall-clock budget from config; 0 disables the budget."""
+        if not hasattr(self.config, "node_timeouts"):
+            return 0.0
+        timeouts = self.config.node_timeouts or {}
+        fallback = getattr(self.config, "node_timeout_default", 0.0)
+        return float(timeouts.get(module_name, fallback) or 0.0)
 
+    async def _await_module_or_cancel(self, operation, module_name: str):
+        """Await one module while polling the web cancellation flag.
+
+        A per-node wall-clock budget (``config.node_timeouts``) cancels a
+        stage that exceeds its budget, so a long sweep fails with the
+        offending stage named instead of a whole-question timeout.
+        """
+
+        timeout = self._node_timeout(module_name)
+        deadline = None if timeout <= 0 else time.monotonic() + timeout
         task = asyncio.create_task(operation)
         try:
             while True:
                 done, _ = await asyncio.wait({task}, timeout=0.2)
                 if task in done:
                     return task.result()
+                if deadline is not None and time.monotonic() >= deadline:
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
+                    self._record_event(
+                        "module_timed_out",
+                        module=module_name,
+                        status="failed",
+                        message=(
+                            f"{module_name.upper()} exceeded its "
+                            f"{timeout:.0f}s node budget"
+                        ),
+                        details={"budget_seconds": timeout},
+                    )
+                    raise RuntimeError(
+                        f"{module_name.upper()} exceeded its {timeout:.0f}s node "
+                        "budget; the run stops at this stage with its snapshot "
+                        "preserved."
+                    )
                 if not self._cancel_requested():
                     continue
                 task.cancel()
@@ -323,8 +357,8 @@ class PipelineRunner:
                     module=module_name,
                     status="cancelled",
                     message=(
-                        f"{module_name.upper()} 执行中收到停止请求，"
-                        "当前异步任务已取消"
+                        f"{module_name.upper()} received a stop request during "
+                        "execution; the running async task has been cancelled"
                     ),
                     details={
                         "tools": self._MODULE_TOOLS.get(module_name, []),
@@ -617,8 +651,8 @@ class PipelineRunner:
                     module=name,
                     status="cancelled",
                     message=(
-                        f"{name.upper()} 未执行：已收到停止请求，"
-                        f"流程在当前成果处终止"
+                        f"{name.upper()} did not run: a stop request was received; "
+                        f"the pipeline halts at the current results"
                     ),
                     details={"tools": self._MODULE_TOOLS.get(name, [])},
                 )
@@ -630,7 +664,7 @@ class PipelineRunner:
                     "module_skipped",
                     module=name,
                     status="skipped",
-                    message=f"{name.upper()} 已由 checkpoint 完成，跳过执行",
+                    message=f"{name.upper()} already completed via checkpoint; skipping execution",
                     details={"tools": self._MODULE_TOOLS.get(name, [])},
                 )
                 if self.config.verbose:
@@ -652,7 +686,7 @@ class PipelineRunner:
                     "module_started",
                     module=name,
                     status="running",
-                    message=f"{name.upper()} 开始执行",
+                    message=f"{name.upper()} started executing",
                     details={
                         "description": mod.description,
                         "tools": self._MODULE_TOOLS.get(name, []),
@@ -810,7 +844,7 @@ class PipelineRunner:
                     "module_completed",
                     module=name,
                     status="completed",
-                    message=f"{name.upper()} 执行完成",
+                    message=f"{name.upper()} execution completed",
                     elapsed_seconds=elapsed,
                     details=details,
                 )
@@ -828,7 +862,7 @@ class PipelineRunner:
                     "module_failed",
                     module=name,
                     status="failed",
-                    message=f"{name.upper()} 执行失败：{type(exc).__name__}: {exc}",
+                    message=f"{name.upper()} execution failed: {type(exc).__name__}: {exc}",
                     elapsed_seconds=elapsed,
                 )
                 if self.config.verbose:
@@ -923,7 +957,7 @@ class PipelineRunner:
                 "module_skip_suppressed",
                 module="m1",
                 status="running",
-                message="M1 处于追问运行（followup），强制不跳过，重跑 triage",
+                message="M1 is in a followup run; skip suppressed, triage re-runs",
                 details={
                     "reason": "followup triage required",
                     "tools": self._MODULE_TOOLS.get("m1", []),
@@ -955,8 +989,8 @@ class PipelineRunner:
                     module=name,
                     status="running",
                     message=(
-                        f"{name.upper()} 处于补搜轮（supplement_m2），"
-                        f"强制不跳过，重新执行"
+                        f"{name.upper()} is in a supplement round (supplement_m2); "
+                        f"skip suppressed, re-executing"
                     ),
                     details={
                         "reason": "supplement_m2 round",
@@ -1048,8 +1082,8 @@ class PipelineRunner:
             module=decision.from_module,
             status="completed",
             message=(
-                f"路由决策：{decision.from_module} → {decision.to_module}"
-                f"（{decision.decided_by}）"
+                f"Routing decision: {decision.from_module} → {decision.to_module} "
+                f"({decision.decided_by})"
             ),
             details={
                 "from": decision.from_module,
@@ -1097,7 +1131,7 @@ class PipelineRunner:
                         module=skipped,
                         status="skipped",
                         message=(
-                            f"{skipped.upper()} 因追问免检索（skip_search）跳过执行"
+                            f"{skipped.upper()} skipped because followup skip_search is active"
                         ),
                         details={
                             "tools": self._MODULE_TOOLS.get(skipped, []),
@@ -1256,7 +1290,7 @@ class PipelineRunner:
         self._record_event(
             "run_started",
             status="running",
-            message="HypoForge M1-M6 流程开始",
+            message="HypoForge M1-M6 pipeline started",
             details={
                 "question": question,
                 "enabled_modules": list(self.config.enabled_modules),
@@ -1394,8 +1428,9 @@ class PipelineRunner:
                 "run_cancelled",
                 status="cancelled",
                 message=(
-                    "流程已被手动停止：后续模块不再执行，"
-                    "已完成模块的成果已保留，可作为后续追问的父运行"
+                    "Pipeline manually stopped: no further modules will run; "
+                    "results of completed modules are preserved and can serve "
+                    "as the parent run of a follow-up"
                 ),
                 elapsed_seconds=time.perf_counter() - run_started_at,
                 details={
@@ -1431,7 +1466,7 @@ class PipelineRunner:
                     module="m6",
                     tool="posthoc_scorer",
                     status="running",
-                    message="独立评分开始",
+                    message="Independent scoring started",
                 )
                 scores_path = await save_scoring_report_async(
                     final_state,
@@ -1445,7 +1480,7 @@ class PipelineRunner:
                     module="m6",
                     tool="posthoc_scorer",
                     status="completed",
-                    message="独立评分完成",
+                    message="Independent scoring completed",
                     elapsed_seconds=time.perf_counter() - score_started_at,
                     details={"scores_path": str(scores_path)},
                 )
@@ -1462,13 +1497,13 @@ class PipelineRunner:
                     module="m6",
                     tool="posthoc_scorer",
                     status="failed",
-                    message=f"独立评分失败：{type(exc).__name__}: {exc}",
+                    message=f"Independent scoring failed: {type(exc).__name__}: {exc}",
                 )
 
         self._record_event(
             "run_completed",
             status="completed" if not final_state.errors else "completed_with_errors",
-            message="HypoForge M1-M6 流程结束",
+            message="HypoForge M1-M6 pipeline finished",
             elapsed_seconds=time.perf_counter() - run_started_at,
             details={
                 "errors": len(final_state.errors),
