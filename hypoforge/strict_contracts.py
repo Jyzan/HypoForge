@@ -409,7 +409,7 @@ async def _strict_scout_read(self, sub_question, papers):
                     module="m2",
                     tool="scout_reader_retry",
                     status="running",
-                    message=f"快速阅读结果不完整，单篇重试：{paper.title}",
+                    message=f"Scout reading results incomplete; retrying single paper: {paper.title}",
                     details={"paper_id": paper.paper_id},
                 )
                 retry_error = ""
@@ -434,7 +434,7 @@ async def _strict_scout_read(self, sub_question, papers):
                         module="m2",
                         tool="scout_reader_retry",
                         status="completed",
-                        message=f"单篇快速阅读重试成功：{paper.title}",
+                        message=f"Single-paper scout reading retry succeeded: {paper.title}",
                         details={"paper_id": paper.paper_id},
                     )
                     continue
@@ -449,7 +449,7 @@ async def _strict_scout_read(self, sub_question, papers):
                     module="m2",
                     tool="scout_reader_retry",
                     status="warning",
-                    message=f"单篇快速阅读重试仍失败，跳过论文：{paper.title}",
+                    message=f"Single-paper scout reading retry failed again; skipping paper: {paper.title}",
                     details={
                         "paper_id": paper.paper_id,
                         "error": retry_error,
@@ -713,10 +713,20 @@ class StrictEntityNormalizationService(EntityNormalizationService):
                 if decision.same_concept:
                     positive.append(candidate)
             if len(positive) > 1:
-                raise RuntimeError(
-                    f"Entity judge returned multiple identity matches for {surface!r}: "
-                    f"{positive}. Refusing an ambiguous merge."
+                # Multiple positives are common when distinct records denote
+                # the same concept family (e.g. "crispr-cas9" vs "crispr/cas9
+                # system"). One ambiguous name must not abort the whole
+                # question: keep the surface as a standalone unresolved entity
+                # (deliberately not cached, so later sub-questions defer the
+                # same way instead of silently merging to the first positive).
+                logger.warning(
+                    "Entity judge returned multiple identity matches for %r: %s. "
+                    "Deferring as unresolved; no merge performed.",
+                    surface,
+                    positive,
                 )
+                deferred_surfaces.add(surface)
+                continue
             for candidate, decision in explicit:
                 self.pair_decisions[self._pair_key(surface, candidate)] = decision
             if len(positive) == 1:
@@ -941,8 +951,9 @@ class StrictAgenticM2Adapter(AgenticM2Adapter):
                     tool="evidence_gap",
                     status="warning",
                     message=(
-                        f"证据缺口 {gap.gap_id} 的补充检索仅保留上下文证据，"
-                        "未产生知识条目；缺口保持开放，等待后续补充检索"
+                        f"Supplement search for evidence gap {gap.gap_id} kept "
+                        "only contextual evidence; no knowledge entries were "
+                        "produced; the gap stays open pending a later supplement search"
                     ),
                     details={
                         "gap_id": gap.gap_id,
@@ -1292,63 +1303,74 @@ class StrictM4HypothesisGeneration(M4HypothesisGeneration):
                 "required": ["hypothesis_id", "pass", "critique", "issues"],
             },
         }
-        try:
-            result = await self._observe_tool(
-                "hypothesis_critic",
-                self.client.structured_chat(
-                    system_prompt=M4_CRITIC_SYSTEM_PROMPT,
-                    user_prompt=M4_CRITIC_USER_TEMPLATE.format(
-                        graph_context=build_graph_context(state).render(),
-                        established_facts=self._graph_bucket_text(
-                            state, "established_facts"
-                        ),
-                        hypotheses_json=json.dumps(
-                            [card.model_dump(mode="json") for card in candidates],
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
+        base_prompt = M4_CRITIC_USER_TEMPLATE.format(
+            graph_context=build_graph_context(state).render(),
+            established_facts=self._graph_bucket_text(state, "established_facts"),
+            hypotheses_json=json.dumps(
+                [card.model_dump(mode="json") for card in candidates],
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+        user_prompt = base_prompt
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                result = await self._tool_call(
+                    "hypothesis_critic",
+                    self.client.structured_chat(
+                        system_prompt=M4_CRITIC_SYSTEM_PROMPT,
+                        user_prompt=user_prompt,
+                        output_schema=schema,
+                        max_tokens=8192,
+                        temperature=getattr(self.llm_config, "temperature", 0.1),
                     ),
-                    output_schema=schema,
-                    temperature=getattr(self.llm_config, "temperature", 0.1),
-                ),
-                details={"candidates": len(candidates)},
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "M4 Critic stage failed; the configured quality gate cannot be skipped."
-            ) from exc
+                    details={"candidates": len(candidates), "attempt": attempt},
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "M4 Critic stage failed; the configured quality gate cannot be skipped."
+                ) from exc
 
-        if not isinstance(result, list):
-            raise RuntimeError("M4 Critic returned a non-list verdict payload.")
-        by_id = {card.hypothesis_id: card for card in candidates}
-        reviewed: set[str] = set()
-        survivors = []
-        for review in result:
-            if not isinstance(review, dict):
+            if not isinstance(result, list):
+                # A format failure is not a quality decision: retry once with
+                # the raw payload as feedback before treating it as fatal.
+                if attempt >= 2:
+                    raise RuntimeError("M4 Critic returned a non-list verdict payload.")
+                logger.warning(
+                    "M4 Critic returned a non-list verdict payload; retrying once "
+                    "with the raw response as feedback."
+                )
+                user_prompt = self._critic_shape_retry_prompt(base_prompt, result)
                 continue
-            hypothesis_id = str(review.get("hypothesis_id") or "")
-            if hypothesis_id not in by_id or hypothesis_id in reviewed:
+
+            survivors, missing = self._parse_critic_verdicts(result, candidates)
+            if missing:
+                if attempt >= 2:
+                    raise RuntimeError(
+                        "M4 Critic did not return one valid verdict for candidate IDs: "
+                        f"{sorted(missing)}"
+                    )
+                logger.warning(
+                    "M4 Critic returned no valid verdict for candidate IDs %s; "
+                    "retrying once for the missing verdicts.",
+                    sorted(missing),
+                )
+                user_prompt = self._critic_missing_verdict_retry_prompt(
+                    base_prompt, sorted(missing)
+                )
                 continue
-            if not isinstance(review.get("pass"), bool):
-                continue
-            reviewed.add(hypothesis_id)
-            if review["pass"]:
-                survivors.append(by_id[hypothesis_id])
-        missing = set(by_id) - reviewed
-        if missing:
-            raise RuntimeError(
-                "M4 Critic did not return one valid verdict for candidate IDs: "
-                f"{sorted(missing)}"
-            )
-        if not survivors:
-            raise M4GateAllRejectedError(
-                "M4 Critic rejected every candidate; rejected hypotheses cannot "
-                "be silently re-admitted.",
-                gate="critic",
-                candidate_ids=[card.hypothesis_id for card in candidates],
-                reviews=[r for r in result if isinstance(r, dict)],
-            )
-        return survivors
+
+            if not survivors:
+                raise M4GateAllRejectedError(
+                    "M4 Critic rejected every candidate; rejected hypotheses cannot "
+                    "be silently re-admitted.",
+                    gate="critic",
+                    candidate_ids=[card.hypothesis_id for card in candidates],
+                    reviews=[r for r in result if isinstance(r, dict)],
+                )
+            return survivors
 
     async def _run_falsifiability(self, state: PipelineState, candidates):
         from .graph_context import build_graph_context
@@ -1372,34 +1394,107 @@ class StrictM4HypothesisGeneration(M4HypothesisGeneration):
                 "required": ["hypothesis_id", "is_falsifiable", "assessment"],
             },
         }
-        try:
-            result = await self._observe_tool(
-                "falsifiability_checker",
-                self.client.structured_chat(
-                    system_prompt=M4_FALSIFIABILITY_SYSTEM_PROMPT,
-                    user_prompt=M4_FALSIFIABILITY_USER_TEMPLATE.format(
-                        graph_context=build_graph_context(state).render(),
-                        hypotheses_json=json.dumps(
-                            [card.model_dump(mode="json") for card in candidates],
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
+        base_prompt = M4_FALSIFIABILITY_USER_TEMPLATE.format(
+            graph_context=build_graph_context(state).render(),
+            hypotheses_json=json.dumps(
+                [card.model_dump(mode="json") for card in candidates],
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+        user_prompt = base_prompt
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                result = await self._tool_call(
+                    "falsifiability_checker",
+                    self.client.structured_chat(
+                        system_prompt=M4_FALSIFIABILITY_SYSTEM_PROMPT,
+                        user_prompt=user_prompt,
+                        output_schema=schema,
+                        max_tokens=8192,
+                        temperature=getattr(self.llm_config, "temperature", 0.1),
                     ),
-                    output_schema=schema,
-                    temperature=getattr(self.llm_config, "temperature", 0.1),
-                ),
-                details={"candidates": len(candidates)},
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "M4 Falsifiability Checker failed; the configured quality gate "
-                "cannot be skipped."
-            ) from exc
+                    details={"candidates": len(candidates), "attempt": attempt},
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "M4 Falsifiability Checker failed; the configured quality gate "
+                    "cannot be skipped."
+                ) from exc
 
-        if not isinstance(result, list):
-            raise RuntimeError(
-                "M4 Falsifiability Checker returned a non-list verdict payload."
+            if not isinstance(result, list):
+                # A format failure is not a quality decision: retry once with
+                # the raw payload as feedback before treating it as fatal.
+                if attempt >= 2:
+                    raise RuntimeError(
+                        "M4 Falsifiability Checker returned a non-list verdict payload."
+                    )
+                logger.warning(
+                    "M4 Falsifiability Checker returned a non-list verdict payload; "
+                    "retrying once with the raw response as feedback."
+                )
+                user_prompt = self._falsifiability_shape_retry_prompt(
+                    base_prompt, result
+                )
+                continue
+
+            survivors, missing = self._parse_falsifiability_verdicts(
+                result, candidates
             )
+            if missing:
+                if attempt >= 2:
+                    raise RuntimeError(
+                        "M4 Falsifiability Checker did not return one valid verdict "
+                        f"for candidate IDs: {sorted(missing)}"
+                    )
+                logger.warning(
+                    "M4 Falsifiability Checker returned no valid verdict for "
+                    "candidate IDs %s; retrying once for the missing verdicts.",
+                    sorted(missing),
+                )
+                user_prompt = self._falsifiability_missing_verdict_retry_prompt(
+                    base_prompt, sorted(missing)
+                )
+                continue
+
+            if not survivors:
+                raise M4GateAllRejectedError(
+                    "M4 Falsifiability Checker rejected every candidate; "
+                    "non-falsifiable hypotheses cannot be silently re-admitted.",
+                    gate="falsifiability",
+                    candidate_ids=[card.hypothesis_id for card in candidates],
+                    reviews=[r for r in result if isinstance(r, dict)],
+                )
+            return survivors
+
+    # ------------------------------------------------------------------
+    # Verdict parsing + format-retry prompts (shared by the gate loops)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_critic_verdicts(result, candidates):
+        """Validate critic verdicts; returns (survivors, missing ID set)."""
+        by_id = {card.hypothesis_id: card for card in candidates}
+        reviewed: set[str] = set()
+        survivors = []
+        for review in result:
+            if not isinstance(review, dict):
+                continue
+            hypothesis_id = str(review.get("hypothesis_id") or "")
+            if hypothesis_id not in by_id or hypothesis_id in reviewed:
+                continue
+            if not isinstance(review.get("pass"), bool):
+                continue
+            reviewed.add(hypothesis_id)
+            if review["pass"]:
+                survivors.append(by_id[hypothesis_id])
+        return survivors, set(by_id) - reviewed
+
+    @staticmethod
+    def _parse_falsifiability_verdicts(result, candidates):
+        """Validate falsifiability verdicts; returns (survivors, missing ID set)."""
         by_id = {card.hypothesis_id: card for card in candidates}
         reviewed: set[str] = set()
         survivors = []
@@ -1414,21 +1509,61 @@ class StrictM4HypothesisGeneration(M4HypothesisGeneration):
             reviewed.add(hypothesis_id)
             if review["is_falsifiable"]:
                 survivors.append(by_id[hypothesis_id])
-        missing = set(by_id) - reviewed
-        if missing:
-            raise RuntimeError(
-                "M4 Falsifiability Checker did not return one valid verdict for "
-                f"candidate IDs: {sorted(missing)}"
-            )
-        if not survivors:
-            raise M4GateAllRejectedError(
-                "M4 Falsifiability Checker rejected every candidate; "
-                "non-falsifiable hypotheses cannot be silently re-admitted.",
-                gate="falsifiability",
-                candidate_ids=[card.hypothesis_id for card in candidates],
-                reviews=[r for r in result if isinstance(r, dict)],
-            )
-        return survivors
+        return survivors, set(by_id) - reviewed
+
+    @staticmethod
+    def _critic_shape_retry_prompt(base_prompt, payload) -> str:
+        """Retry prompt for a Critic response that parsed to a non-array."""
+        raw = (
+            str(payload.get("raw_response", payload))
+            if isinstance(payload, dict)
+            else str(payload)
+        )
+        return (
+            f"{base_prompt}\n\nYour previous response could not be parsed as the "
+            "required verdict array. Respond with valid JSON only: an object with "
+            'a single "entries" key whose value is the array of verdict objects, '
+            "one per candidate (hypothesis_id, boolean pass, critique, issues). "
+            "Raw response received (truncated to 500 chars): "
+            f"{raw[:500]}"
+        )
+
+    @staticmethod
+    def _critic_missing_verdict_retry_prompt(base_prompt, missing) -> str:
+        """Retry prompt for a Critic response with incomplete verdict coverage."""
+        return (
+            f"{base_prompt}\n\nYour previous response did not include one valid "
+            f"verdict for every candidate. Missing hypothesis_id(s): {missing}. "
+            'Return an "entries" array with exactly one verdict object per '
+            'candidate: "hypothesis_id", boolean "pass", "critique", "issues".'
+        )
+
+    @staticmethod
+    def _falsifiability_shape_retry_prompt(base_prompt, payload) -> str:
+        """Retry prompt for a Falsifiability response that parsed to a non-array."""
+        raw = (
+            str(payload.get("raw_response", payload))
+            if isinstance(payload, dict)
+            else str(payload)
+        )
+        return (
+            f"{base_prompt}\n\nYour previous response could not be parsed as the "
+            "required verdict array. Respond with valid JSON only: an object with "
+            'a single "entries" key whose value is the array of verdict objects, '
+            "one per candidate (hypothesis_id, boolean is_falsifiable, "
+            "assessment). Raw response received (truncated to 500 chars): "
+            f"{raw[:500]}"
+        )
+
+    @staticmethod
+    def _falsifiability_missing_verdict_retry_prompt(base_prompt, missing) -> str:
+        """Retry prompt for a Falsifiability response with missing verdicts."""
+        return (
+            f"{base_prompt}\n\nYour previous response did not include one valid "
+            f"verdict for every candidate. Missing hypothesis_id(s): {missing}. "
+            'Return an "entries" array with exactly one verdict object per '
+            'candidate: "hypothesis_id", boolean "is_falsifiable", "assessment".'
+        )
 
     # ------------------------------------------------------------------
     # Gate-recovery: all-rejected candidates regenerate once with feedback
@@ -1530,21 +1665,42 @@ class StrictM4HypothesisGeneration(M4HypothesisGeneration):
             module="m4",
             tool="hypothesis_generator_gate_recovery",
             status="warning",
-            message=f"{gate_name} 拒绝全部候选，执行一次生成修复并重新审查",
+            message=f"{gate_name} rejected every candidate; running one regeneration pass and re-reviewing",
             details={"gate": exc.gate, "rejected": len(candidates)},
         )
-        _, regenerated, contract_failures = (
-            await self._generate_hypothesis_batch(
-                state,
-                question=question,
-                graph_context=graph_context,
-                feedback_context="\n".join(
-                    item for item in [feedback_context, feedback_block] if item
-                ),
-                tool_name="hypothesis_generator_gate_recovery",
-                attempt=3,
+        try:
+            _, regenerated, contract_failures = (
+                await self._generate_hypothesis_batch(
+                    state,
+                    question=question,
+                    graph_context=graph_context,
+                    feedback_context="\n".join(
+                        item for item in [feedback_context, feedback_block] if item
+                    ),
+                    tool_name="hypothesis_generator_gate_recovery",
+                    attempt=3,
+                    # Recovery only needs a few fresh candidates to merge with
+                    # the rejected set — keep the pass small to bound the time.
+                    requested_count=min(self.num_candidates, 3),
+                )
             )
-        )
+        except Exception as regen_exc:
+            # A transport/format failure in the recovery pass is not a quality
+            # verdict: fail cleanly with the recovery step named, instead of
+            # leaking a chained exception that hides the original rejection.
+            emit_event(
+                "tool_failed",
+                module="m4",
+                tool="hypothesis_generator_gate_recovery",
+                status="failed",
+                message=f"{gate_name} gate-recovery regeneration failed",
+                details={"gate": exc.gate, "error": type(regen_exc).__name__},
+            )
+            raise RuntimeError(
+                f"{gate_name} gate recovery regeneration failed with "
+                f"{type(regen_exc).__name__}; the configured quality gate "
+                "cannot be skipped."
+            ) from regen_exc
         if contract_failures:
             logger.warning(
                 "M4 gate recovery regeneration dropped %d candidate(s) for "
@@ -1569,7 +1725,7 @@ class StrictM4HypothesisGeneration(M4HypothesisGeneration):
                 module="m4",
                 tool="hypothesis_generator_gate_recovery",
                 status="failed",
-                message=f"{gate_name} 修复后仍拒绝全部候选，无法放行",
+                message=f"{gate_name} still rejected every candidate after the fix; candidates cannot be admitted",
                 details={"gate": exc.gate},
             )
             raise RuntimeError(
@@ -1577,6 +1733,23 @@ class StrictM4HypothesisGeneration(M4HypothesisGeneration):
                 "gate-recovery regeneration pass; the configured quality gate "
                 f"cannot be skipped. Review excerpts: {excerpts}"
             ) from second_exc
+        except Exception as re_exc:
+            # Any non-rejection failure while re-running the gate (transport,
+            # format) is reported cleanly; the recovery candidates never get a
+            # silent pass, and the original rejection stays visible as cause.
+            emit_event(
+                "tool_failed",
+                module="m4",
+                tool="hypothesis_generator_gate_recovery",
+                status="failed",
+                message=f"{gate_name} could not be re-run after gate recovery",
+                details={"gate": exc.gate, "error": type(re_exc).__name__},
+            )
+            raise RuntimeError(
+                f"{gate_name} could not be re-run after gate recovery "
+                f"({type(re_exc).__name__}); rejected candidates cannot be "
+                "re-admitted."
+            ) from re_exc
 
     @staticmethod
     def _critic_recovery_feedback_block(reviews) -> str:

@@ -84,7 +84,7 @@ def _followup_requirement_block(state: PipelineState) -> str:
     if not text:
         return ""
     return (
-        "\n--- 用户追问要求 (user follow-up instruction, highest priority, must be honoured) ---\n"
+        "\n--- User follow-up instruction (highest priority, must be honoured) ---\n"
         f"{text}\n"
     )
 
@@ -108,6 +108,7 @@ class M4HypothesisGeneration(ModuleProtocol):
         ranker_llm_config: Optional[Any] = None,
         weights: Optional[Dict[str, float]] = None,
         interactive: bool = False,
+        llm_call_timeout: float = 240.0,
         semantic_alignment_timeout_seconds: float = 60.0,
         **kwargs,
     ):
@@ -126,6 +127,9 @@ class M4HypothesisGeneration(ModuleProtocol):
         self.semantic_alignment_timeout_seconds = float(
             semantic_alignment_timeout_seconds
         )
+        # Per-LLM-call ceiling: a single hung or queued call must not silently
+        # consume the whole node budget (mirrors m3's llm_call_timeout).
+        self.llm_call_timeout = max(10.0, float(llm_call_timeout))
         self.client = QwenClient.from_config(llm_config) if llm_config else None
         # Ranker uses a separate model tier to reduce self-scoring bias.
         # Falls back to the main client when no separate config is provided.
@@ -136,12 +140,28 @@ class M4HypothesisGeneration(ModuleProtocol):
     # LLM helpers
     # ------------------------------------------------------------------
 
+    def _tool_call(
+        self,
+        tool: str,
+        operation,
+        *,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """Observe one LLM tool call under the module's per-call timeout."""
+        return self._observe_tool(
+            tool,
+            operation,
+            details=details,
+            timeout=self.llm_call_timeout,
+        )
+
     @staticmethod
     async def _observe_tool(
         tool: str,
         operation,
         *,
         details: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
     ) -> Any:
         started_at = time.monotonic()
         emit_event(
@@ -149,18 +169,21 @@ class M4HypothesisGeneration(ModuleProtocol):
             module="m4",
             tool=tool,
             status="running",
-            message=f"M4 Agent 开始：{tool}",
+            message=f"M4 Agent started: {tool}",
             details=details,
         )
         try:
-            result = await operation
+            if timeout is not None:
+                result = await asyncio.wait_for(operation, timeout=timeout)
+            else:
+                result = await operation
         except asyncio.CancelledError:
             emit_event(
                 "tool_cancelled",
                 module="m4",
                 tool=tool,
                 status="cancelled",
-                message=f"M4 Agent 已取消：{tool}",
+                message=f"M4 Agent cancelled: {tool}",
                 elapsed_seconds=time.monotonic() - started_at,
                 details=details,
             )
@@ -171,7 +194,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                 module="m4",
                 tool=tool,
                 status="failed",
-                message=f"M4 Agent 失败：{tool}：{type(exc).__name__}: {exc}",
+                message=f"M4 Agent failed: {tool}: {type(exc).__name__}: {exc}",
                 elapsed_seconds=time.monotonic() - started_at,
                 details=details,
             )
@@ -181,7 +204,7 @@ class M4HypothesisGeneration(ModuleProtocol):
             module="m4",
             tool=tool,
             status="completed",
-            message=f"M4 Agent 完成：{tool}",
+            message=f"M4 Agent completed: {tool}",
             elapsed_seconds=time.monotonic() - started_at,
             details=details,
         )
@@ -354,6 +377,40 @@ class M4HypothesisGeneration(ModuleProtocol):
         return "\n".join(lines)
 
     @staticmethod
+    def _task_contract_reminder(state: PipelineState) -> str:
+        """Short reminder of the required task scope for feedback passes.
+
+        Iteration feedback (e.g. "be more novel") can push the generator away
+        from task alignment; the reminder re-anchors it to the required
+        entities and requirement traces before the feedback text.
+        """
+        card = state.problem_card
+        if card is None:
+            return ""
+        contract = card.task_contract
+        if not contract.entities and not contract.requirements:
+            return ""
+        lines = ["Task-contract reminder: iteration feedback must not break task alignment."]
+        entities = [
+            entity.name for entity in contract.entities if entity.required
+        ]
+        if entities:
+            lines.append(
+                "Required task entities that must stay in the hypothesis "
+                "output scope: " + ", ".join(entities) + "."
+            )
+        requirements = [
+            requirement.requirement_id
+            for requirement in contract.requirements
+            if requirement.required
+        ]
+        if requirements:
+            lines.append(
+                "Required auditable requirement traces: " + ", ".join(requirements) + "."
+            )
+        return "\n".join(lines) + "\n\n"
+
+    @staticmethod
     def _check_context_contract(
         state: PipelineState,
         context: GraphContext,
@@ -479,7 +536,7 @@ class M4HypothesisGeneration(ModuleProtocol):
             )
         )
         try:
-            verdicts = await self._observe_tool(
+            verdicts = await self._tool_call(
                 "hypothesis_contract_auditor",
                 asyncio.wait_for(
                     self.client.structured_chat(
@@ -574,7 +631,7 @@ class M4HypothesisGeneration(ModuleProtocol):
             state.problem_card.original_question
             if state.problem_card else state.input_question
         )
-        repaired = await self._observe_tool(
+        repaired = await self._tool_call(
             "hypothesis_contract_repair",
             self.client.structured_chat(
                 system_prompt=M4_CONTRACT_REPAIR_SYSTEM_PROMPT.format(
@@ -944,15 +1001,23 @@ class M4HypothesisGeneration(ModuleProtocol):
         feedback_context: str,
         tool_name: str,
         attempt: int,
+        requested_count: Optional[int] = None,
     ) -> tuple[Any, List[HypothesisCard], List[Dict[str, Any]]]:
-        """Run one generator pass and apply the normal context gates."""
+        """Run one generator pass and apply the normal context gates.
+
+        ``requested_count`` overrides ``self.num_candidates`` (used by gate
+        recovery to keep the regeneration pass small).
+        """
 
         assert self.client is not None
-        generated = await self._observe_tool(
+        requested = (
+            self.num_candidates if requested_count is None else int(requested_count)
+        )
+        generated = await self._tool_call(
             tool_name,
             self.client.structured_chat(
                 system_prompt=M4_GENERATOR_SYSTEM_PROMPT.format(
-                    num_candidates=self.num_candidates,
+                    num_candidates=requested,
                     rubric_block=hypothesis_rubric_block(),
                 ),
                 user_prompt=M4_GENERATOR_USER_TEMPLATE.format(
@@ -961,7 +1026,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                     established_facts=self._graph_bucket_text(state, "established_facts"),
                     conflicts=self._graph_bucket_text(state, "conflicts"),
                     original_question=question,
-                    num_candidates=self.num_candidates,
+                    num_candidates=requested,
                     feedback_context=feedback_context,
                     task_contract_block=self._render_task_contract_block(state),
                 ),
@@ -973,7 +1038,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                 temperature=max(getattr(self.llm_config, "temperature", 0.1), 0.4),
             ),
             details={
-                "requested_candidates": self.num_candidates,
+                "requested_candidates": requested,
                 "iteration": state.iteration_count + 1,
                 "attempt": attempt,
             },
@@ -996,6 +1061,12 @@ class M4HypothesisGeneration(ModuleProtocol):
         graph_context = build_graph_context(state)
         rendered_graph_context = graph_context.render()
 
+        # Iteration feedback (e.g. "be more novel") must not push the
+        # generator away from task alignment: re-anchor it to the required
+        # task scope first.
+        if feedback_context and state.problem_card is not None:
+            feedback_context = self._task_contract_reminder(state) + feedback_context
+
         # ── Step 1: Generator ──────────────────────────────────────────
         generated, candidates, contract_failures = await self._generate_hypothesis_batch(
             state,
@@ -1007,15 +1078,13 @@ class M4HypothesisGeneration(ModuleProtocol):
         )
         all_generated = list(self._normalise_hypotheses(generated))
 
-        # A short generator response is recoverable.  Give the model exactly
-        # one additional pass, then accept the smaller set if the problem
-        # genuinely does not yield the requested number of hypotheses.
-        # An empty set means contract validation failed, which already has a
-        # dedicated deterministic repair path below.  The extra generator pass
-        # is reserved for the recoverable case where at least one valid
-        # hypothesis exists but the batch is shorter than requested.
-        generation_shortfall = bool(candidates) and len(candidates) < self.num_candidates
-        if generation_shortfall:
+        # A short — or empty — generator response is recoverable.  Give the
+        # model exactly one additional pass, then accept the smaller set if
+        # the problem genuinely does not yield the requested number.  When
+        # contract validation discarded candidates, their reasons are fed back
+        # so the retry can fix task alignment.  An empty set that survives the
+        # retry still falls through to the deterministic repair path below.
+        if len(candidates) < self.num_candidates:
             retry_feedback = (
                 f"The previous pass produced only {len(candidates)} valid hypotheses, "
                 f"but {self.num_candidates} were requested. Generate additional "
@@ -1023,6 +1092,17 @@ class M4HypothesisGeneration(ModuleProtocol):
                 "Do not invent unsupported claims; returning fewer is acceptable "
                 "if no further defensible hypothesis exists."
             )
+            if contract_failures:
+                rationale_lines = [
+                    str(item.get("rationale") or "contract validation failed")
+                    for item in contract_failures[:5]
+                ]
+                retry_feedback += (
+                    "\nContract validation rejected some candidates. Address "
+                    "these reasons explicitly (keep required task entities and "
+                    "auditable requirement traces in scope):\n- "
+                    + "\n- ".join(rationale_lines)
+                )
             retry_generated, retry_candidates, retry_failures = (
                 await self._generate_hypothesis_batch(
                     state,
@@ -1038,7 +1118,7 @@ class M4HypothesisGeneration(ModuleProtocol):
             all_generated.extend(self._normalise_hypotheses(retry_generated))
             candidates = self._merge_generation_candidates(candidates, retry_candidates)
             contract_failures.extend(retry_failures)
-            generation_shortfall = len(candidates) < self.num_candidates
+        generation_shortfall = bool(candidates) and len(candidates) < self.num_candidates
 
         if not candidates:
             candidates, contract_failures = await self._repair_context_contract(
@@ -1104,7 +1184,7 @@ class M4HypothesisGeneration(ModuleProtocol):
         }
         ranker_schema = {"type": "array", "items": ranker_item_schema}
         try:
-            ranked = await self._observe_tool(
+            ranked = await self._tool_call(
                 "hypothesis_ranker",
                 ranker_client.structured_chat(
                     system_prompt=M4_RANKER_SYSTEM_PROMPT.format(
@@ -1221,7 +1301,7 @@ class M4HypothesisGeneration(ModuleProtocol):
             },
         }
         try:
-            result = await self._observe_tool(
+            result = await self._tool_call(
                 "hypothesis_critic",
                 self.client.structured_chat(
                     system_prompt=M4_CRITIC_SYSTEM_PROMPT,
@@ -1291,7 +1371,7 @@ class M4HypothesisGeneration(ModuleProtocol):
             },
         }
         try:
-            result = await self._observe_tool(
+            result = await self._tool_call(
                 "falsifiability_checker",
                 self.client.structured_chat(
                     system_prompt=M4_FALSIFIABILITY_SYSTEM_PROMPT,

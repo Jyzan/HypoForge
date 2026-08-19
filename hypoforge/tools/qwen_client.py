@@ -475,11 +475,22 @@ class QwenClient:
             logger.warning("Failed to parse JSON from model response. Raw: %s", raw[:500])
             return {"_parse_error": True, "raw_response": raw}
 
-        # Unwrap array-wrapper if we added one
-        if array_wrapped and isinstance(result, dict) and "entries" in result:
-            entries = result["entries"]
+        # Unwrap array-wrapper if we added one.  The model is asked to put
+        # the array under "entries", but models sometimes wrap it under their
+        # own key ("verdicts", "results", ...).  Accept a known wrapper key so
+        # a benign key choice does not surface upstream as a hard "non-list
+        # payload" failure.  The scan is deliberately limited to this
+        # whitelist: salvage artifacts ("items", "queries", "edges") and other
+        # arbitrary list-valued garbage must not be mistaken for the intended
+        # array — those dicts are returned as-is for the caller to handle.
+        if array_wrapped and isinstance(result, dict):
+            entries = result.get("entries")
             if isinstance(entries, list):
                 return entries  # type: ignore[return-value]
+            for key in ("verdicts", "results", "reviews", "data", "decisions"):
+                value = result.get(key)
+                if isinstance(value, list):
+                    return value
 
         return result
 
