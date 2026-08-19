@@ -416,7 +416,8 @@ class EntityNormalizationService:
                 tool="entity_embedding",
                 status="warning",
                 message=(
-                    "实体 embedding 网络不可用，已降级为字符串匹配与 LLM 实体判断"
+                    "Entity embedding network unavailable; degraded to string "
+                    "matching and LLM entity judgment"
                 ),
                 details={
                     "model": self.embedding_model,

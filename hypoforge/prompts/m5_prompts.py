@@ -10,7 +10,7 @@ Chinese question, never switch the prose to English. Every required task-entity
 ``name`` must appear verbatim in an appropriate plan field, but you may quote
 the alias that matches the plan's language when the contract lists one (an
 English sentence may use the English alias; a Chinese sentence uses the Chinese
-name), or parenthesize as ``中文名（English term）``. Never embed a Chinese
+name), or parenthesize as ``Chinese name (English term)``. Never embed a Chinese
 contract name inside an English sentence, and never paraphrase an entity in a
 way that hides the literal contract term. In particular, required
 primary-object names must appear verbatim (the name or a matching-language

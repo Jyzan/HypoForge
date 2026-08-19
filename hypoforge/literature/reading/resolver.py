@@ -222,7 +222,7 @@ class PMCFulltextResolver(FulltextResolverProtocol):
                 paper,
                 "PMC identifier unavailable",
                 category=NO_FULLTEXT_AVAILABLE,
-                detail="无 PMID/PMCID，无法查询 PMC OA 副本",
+                detail="No PMID/PMCID; cannot query the PMC OA copy",
             )
 
         path = self._paper_dir(paper) / "bioc.json"
@@ -258,7 +258,7 @@ class PMCFulltextResolver(FulltextResolverProtocol):
                     paper,
                     message,
                     category=NO_FULLTEXT_AVAILABLE,
-                    detail=f"PMC 无 OA 副本：{detail}",
+                    detail=f"PMC has no OA copy: {detail}",
                 )
             payload = json.loads(decoded)
             if not _has_nonempty_passage(payload):
@@ -272,7 +272,10 @@ class PMCFulltextResolver(FulltextResolverProtocol):
                     paper,
                     "PMC BioC response has no non-empty passages",
                     category=NO_FULLTEXT_AVAILABLE,
-                    detail="PMC BioC 响应没有正文段落（无 OA 副本）",
+                    detail=(
+                        "PMC BioC response has no full-text passages "
+                        "(no OA copy)"
+                    ),
                 )
             normalized = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self._write_atomic(path, normalized)

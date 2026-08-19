@@ -184,7 +184,7 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
             module="m2",
             tool=stage,
             status="running",
-            message=f"M2 阅读 Tool 开始：{stage}",
+            message=f"M2 reading tool started: {stage}",
             details=details,
         )
         try:
@@ -195,7 +195,7 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
                 module="m2",
                 tool=stage,
                 status="failed",
-                message=f"M2 阅读 Tool 失败：{stage}：{type(exc).__name__}: {exc}",
+                message=f"M2 reading tool failed: {stage}: {type(exc).__name__}: {exc}",
                 elapsed_seconds=time.monotonic() - started,
                 details=details,
             )
@@ -206,7 +206,7 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
                 module="m2",
                 tool=stage,
                 status="completed",
-                message=f"M2 阅读 Tool 完成：{stage}",
+                message=f"M2 reading tool completed: {stage}",
                 elapsed_seconds=time.monotonic() - started,
                 details=details,
             )
@@ -280,7 +280,9 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
             document = document.model_copy(
                 update={
                     "retrieval_failure_category": OTHER,
-                    "retrieval_failure_detail": "全文解析超时，已降级为摘要",
+                    "retrieval_failure_detail": (
+                        "full-text parsing timed out; degraded to abstract"
+                    ),
                 }
             )
         except Exception as exc:
@@ -501,7 +503,10 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
             module="m2",
             tool="reading_workflow",
             status="running",
-            message=f"开始全文/RAG 阅读 {len(papers)} 篇入选论文",
+            message=(
+                f"Starting full-text/RAG reading of {len(papers)} "
+                f"selected paper(s)"
+            ),
             details={"papers": len(papers), "sub_question": sub_question},
         )
         fetch_semaphore = asyncio.Semaphore(self.fetch_concurrency)
@@ -535,7 +540,10 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
                 module="m2",
                 tool="reading_workflow",
                 status="failed",
-                message=f"全文/RAG 阅读流程失败：{type(exc).__name__}: {exc}",
+                message=(
+                    f"Full-text/RAG reading workflow failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
                 elapsed_seconds=time.monotonic() - started_at,
             )
             raise
@@ -544,7 +552,7 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
             module="m2",
             tool="reading_workflow",
             status="completed",
-            message=f"全文/RAG 阅读完成：{len(results)} 篇",
+            message=f"Full-text/RAG reading completed: {len(results)} paper(s)",
             elapsed_seconds=time.monotonic() - started_at,
             details={
                 "papers": len(results),

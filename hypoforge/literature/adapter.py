@@ -292,8 +292,8 @@ class AgenticM2Adapter(ModuleProtocol):
                 tool="fulltext_backfill",
                 status="completed" if fulltext_count >= target else "warning",
                 message=(
-                    f"全文回填完成：{fulltext_count}/{target}，"
-                    f"尝试候选 {attempts} 篇"
+                    f"Full-text backfill completed: {fulltext_count}/{target}, "
+                    f"{attempts} candidate paper(s) attempted"
                 ),
                 details={
                     "sub_question": sub_question,
@@ -444,8 +444,10 @@ class AgenticM2Adapter(ModuleProtocol):
                 tool="reading_contract",
                 status="warning",
                 message=(
-                    f"仅保留上下文证据，跳过知识条目要求：{sub_question!r} "
-                    f"（{retained_count} 篇保留论文均为上下文回退证据）"
+                    f"Context-only evidence retained; knowledge-entry "
+                    f"requirement waived: {sub_question!r} "
+                    f"({retained_count} retained paper(s) are all "
+                    f"contextual fallback evidence)"
                 ),
                 details={"sub_question": sub_question, "retained": retained_count},
             )
@@ -546,7 +548,10 @@ class AgenticM2Adapter(ModuleProtocol):
                     module="m2",
                     tool="evidence_gap",
                     status="warning",
-                    message="本子问题未保留论文，记录证据缺口并继续其他子问题",
+                    message=(
+                        "No papers retained for this sub-question; recording "
+                        "an evidence gap and continuing with other sub-questions"
+                    ),
                     details={
                         "sub_question": sub_question,
                         "papers_found": search_result.papers_found,
@@ -613,7 +618,10 @@ class AgenticM2Adapter(ModuleProtocol):
                         module="m2",
                         tool="expanded_open_fulltext_discovery",
                         status="warning",
-                        message="扩展检索未返回候选，继续使用紧凑轮结果",
+                        message=(
+                            "Expanded search returned no candidates; "
+                            "continuing with the compact round results"
+                        ),
                         details={
                             "sub_question": sub_question,
                             "errors": list(expanded.errors),
@@ -791,8 +799,8 @@ class AgenticM2Adapter(ModuleProtocol):
                         module="m2",
                         status="completed",
                         message=(
-                            f"证据缺口 {gap.gap_id} 命中论文缓存 "
-                            f"{len(cached_papers)} 篇"
+                            f"Evidence gap {gap.gap_id} hit the paper cache "
+                            f"({len(cached_papers)} paper(s))"
                         ),
                         details={
                             "gap_id": gap.gap_id,
@@ -876,8 +884,10 @@ class AgenticM2Adapter(ModuleProtocol):
                     tool="evidence_gap",
                     status="warning",
                     message=(
-                        f"证据缺口 {gap.gap_id} 的补充检索仅保留上下文证据，"
-                        "未产生知识条目；缺口保持开放，等待后续补充检索"
+                        f"Supplement search for evidence gap {gap.gap_id} "
+                        "retained context-only evidence and produced no "
+                        "knowledge entries; the gap stays open for a later "
+                        "supplement search"
                     ),
                     details={
                         "gap_id": gap.gap_id,

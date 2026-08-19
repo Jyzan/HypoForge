@@ -181,7 +181,7 @@ async def generate_subquestion_entities(
         module="m2",
         tool=_TOOL_NAME,
         status="running",
-        message="M2 子问题本地实体生成开始",
+        message="M2 sub-question local entity generation started",
         details={
             "sub_question": sub_question,
             "existing_entity_count": len(terms),
@@ -218,8 +218,8 @@ async def generate_subquestion_entities(
             tool=_TOOL_NAME,
             status="warning",
             message=(
-                "M2 子问题本地实体生成失败，降级为仅使用已有实体："
-                f"{type(exc).__name__}"
+                "M2 sub-question local entity generation failed; degraded "
+                f"to existing entities only: {type(exc).__name__}"
             ),
             details={
                 "sub_question": sub_question,
@@ -240,7 +240,8 @@ async def generate_subquestion_entities(
         tool=_TOOL_NAME,
         status="completed",
         message=(
-            f"M2 子问题本地实体生成完成：新增 {len(new_entities)} 个检索概念"
+            f"M2 sub-question local entity generation completed: added "
+            f"{len(new_entities)} search concept(s)"
         ),
         details={
             "sub_question": sub_question,

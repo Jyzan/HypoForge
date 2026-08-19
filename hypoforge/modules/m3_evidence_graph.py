@@ -422,7 +422,7 @@ class M3EvidenceGraph(ModuleProtocol):
             module="m3",
             tool="rule_graph_builder",
             status="running",
-            message=f"开始将 {len(all_entries)} 条知识构造成基础证据图",
+            message=f"Building base evidence graph from {len(all_entries)} knowledge entries",
         )
 
         new_entries: list = []
@@ -443,7 +443,7 @@ class M3EvidenceGraph(ModuleProtocol):
                     module="m3",
                     tool="rule_graph_builder",
                     status="completed",
-                    message=f"增量更新：无新条目，复用现有图 ({len(graph.nodes)} 节点 / {len(graph.edges)} 边)",
+                    message=f"Incremental update: no new entries; reusing existing graph ({len(graph.nodes)} nodes / {len(graph.edges)} edges)",
                     elapsed_seconds=time.monotonic() - rule_started_at,
                 )
             else:
@@ -459,7 +459,7 @@ class M3EvidenceGraph(ModuleProtocol):
                     module="m3",
                     tool="rule_graph_builder",
                     status="completed",
-                    message=f"基础证据图完成：{len(graph.nodes)} 节点 / {len(graph.edges)} 边",
+                    message=f"Base evidence graph completed: {len(graph.nodes)} nodes / {len(graph.edges)} edges",
                     elapsed_seconds=time.monotonic() - rule_started_at,
                 )
         else:
@@ -470,7 +470,7 @@ class M3EvidenceGraph(ModuleProtocol):
                 module="m3",
                 tool="rule_graph_builder",
                 status="completed",
-                message=f"基础证据图完成：{len(graph.nodes)} 节点 / {len(graph.edges)} 边",
+                message=f"Base evidence graph completed: {len(graph.nodes)} nodes / {len(graph.edges)} edges",
                 elapsed_seconds=time.monotonic() - rule_started_at,
             )
 
@@ -484,7 +484,7 @@ class M3EvidenceGraph(ModuleProtocol):
                 module="m3",
                 tool="qwen_relation_extractor",
                 status="running",
-                message="开始抽取跨知识条目的语义关系",
+                message="Starting semantic relation extraction across knowledge entries",
             )
             try:
                 graph = await self._enhance_with_llm_batched(graph, new_entries)
@@ -503,7 +503,7 @@ class M3EvidenceGraph(ModuleProtocol):
                     module="m3",
                     tool="qwen_relation_extractor",
                     status="failed",
-                    message=f"语义关系抽取失败，保留规则图：{type(exc).__name__}: {exc}",
+                    message=f"Semantic relation extraction failed; retaining rule-based graph: {type(exc).__name__}: {exc}",
                     elapsed_seconds=time.monotonic() - llm_started_at,
                 )
             else:
@@ -512,7 +512,7 @@ class M3EvidenceGraph(ModuleProtocol):
                     module="m3",
                     tool="qwen_relation_extractor",
                     status="completed",
-                    message=f"语义关系抽取完成：证据图现有 {len(graph.edges)} 条边",
+                    message=f"Semantic relation extraction completed: evidence graph now has {len(graph.edges)} edges",
                     elapsed_seconds=time.monotonic() - llm_started_at,
                 )
 
@@ -628,8 +628,8 @@ class M3EvidenceGraph(ModuleProtocol):
             tool="entity_similarity_merger",
             status="running",
             message=(
-                f"开始检查 {entity_count} 个实体节点，"
-                f"合并阈值 {self.entity_merge_similarity_threshold:.2f}"
+                f"Checking {entity_count} entity node(s), "
+                f"merge threshold {self.entity_merge_similarity_threshold:.2f}"
             ),
             details={
                 "entity_count": entity_count,
@@ -667,7 +667,7 @@ class M3EvidenceGraph(ModuleProtocol):
                 tool="entity_similarity_merger",
                 status="degraded",
                 message=(
-                    "实体 embedding 不可用，已仅执行完全同名合并："
+                    "Entity embedding unavailable; only exact-name merges were applied: "
                     f"{outcome.degraded_reason}"
                 ),
                 elapsed_seconds=elapsed,
@@ -679,8 +679,8 @@ class M3EvidenceGraph(ModuleProtocol):
             tool="entity_similarity_merger",
             status="completed",
             message=(
-                f"实体合并完成：{outcome.entity_count_before} → "
-                f"{outcome.entity_count_after}，共 {outcome.merge_count} 组"
+                f"Entity merge completed: {outcome.entity_count_before} → "
+                f"{outcome.entity_count_after}, {outcome.merge_count} group(s)"
             ),
             elapsed_seconds=elapsed,
             details={
@@ -1590,7 +1590,7 @@ class M3EvidenceGraph(ModuleProtocol):
                     "evidence_gap_closed",
                     module="m3",
                     status="completed",
-                    message=f"证据缺口已闭合：新增 {gain} 条有效证据",
+                    message=f"Evidence gap closed: {gain} new effective evidence item(s)",
                     details={
                         "gap_id": gap.gap_id,
                         "gain": gain,
@@ -1606,8 +1606,8 @@ class M3EvidenceGraph(ModuleProtocol):
                     module="m3",
                     status="completed",
                     message=(
-                        f"证据缺口无新增证据（attempts={gap.attempts}，"
-                        f"status={gap.status}）"
+                        f"Evidence gap gained no new evidence (attempts={gap.attempts}, "
+                        f"status={gap.status})"
                     ),
                     details={
                         "gap_id": gap.gap_id,

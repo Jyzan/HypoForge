@@ -299,7 +299,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
             module="m1",
             tool="qwen_problem_understanding",
             status="running",
-            message="Qwen 开始拆分科学问题",
+            message="Qwen started decomposing the scientific question",
         )
         try:
             payload = await self.client.structured_chat(
@@ -315,7 +315,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
                 module="m1",
                 tool="qwen_problem_understanding",
                 status="failed",
-                message=f"问题拆分失败：{type(exc).__name__}: {exc}",
+                message=f"Problem decomposition failed: {type(exc).__name__}: {exc}",
                 elapsed_seconds=time.monotonic() - started_at,
             )
             raise
@@ -381,7 +381,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
             module="m1",
             tool="qwen_problem_understanding",
             status="completed",
-            message=f"问题拆分完成：{len(card.sub_questions)} 个子问题",
+            message=f"Problem decomposition completed: {len(card.sub_questions)} sub-question(s)",
             elapsed_seconds=time.monotonic() - started_at,
             details={
                 "sub_questions": list(card.sub_questions),
@@ -430,7 +430,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
                 module="m1",
                 tool="qwen_subquestion_coverage",
                 status="running",
-                message=f"子问题覆盖审查第 {round_index} 轮完成",
+                message=f"Sub-question coverage review round {round_index} completed",
                 details={
                     "round": round_index,
                     "sufficient": audit.sufficient,
@@ -451,7 +451,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
                     module="m1",
                     tool="qwen_subquestion_coverage",
                     status="completed",
-                    message=f"子问题覆盖审查通过（第 {round_index} 轮）",
+                    message=f"Sub-question coverage review passed (round {round_index})",
                     elapsed_seconds=time.monotonic() - started_at,
                     details={"sub_question_count": len(questions)},
                 )
@@ -535,7 +535,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
             module="m1",
             tool="qwen_subquestion_coverage",
             status="warning",
-            message="覆盖轮次耗尽，保留已覆盖核心意图的子问题",
+            message="Coverage rounds exhausted; retaining sub-questions that cover the core intent",
             elapsed_seconds=time.monotonic() - started_at,
             details={
                 "missing_aspects": list(final_audit.missing_aspects),
@@ -702,7 +702,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
                 module="m1",
                 tool="qwen_entity_source_audit",
                 status="warning" if attempt < self.entity_repair_attempts else "failed",
-                message="关键实体来源复核未通过，正在修复" if attempt < self.entity_repair_attempts else "关键实体来源复核未通过",
+                message="Key entity source audit failed; repairing" if attempt < self.entity_repair_attempts else "Key entity source audit failed",
                 details={
                     "attempt": attempt + 1,
                     "accepted_entities": [item.name for item in accepted],
@@ -835,7 +835,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
             module="m1",
             tool="qwen_followup_triage",
             status="running",
-            message="Qwen 开始判定追问是否免检索",
+            message="Qwen started deciding whether the follow-up can skip search",
             details={"parent_run_id": followup.parent_run_id},
         )
         try:
@@ -858,7 +858,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
                 module="m1",
                 tool="qwen_followup_triage",
                 status="failed",
-                message=f"追问判定失败：{type(exc).__name__}: {exc}",
+                message=f"Follow-up triage failed: {type(exc).__name__}: {exc}",
                 elapsed_seconds=time.monotonic() - started_at,
             )
             raise
@@ -907,7 +907,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
             tool="qwen_followup_triage",
             status="completed",
             message=(
-                f"追问判定完成：{'免检索（skip_search）' if skip_search else '需要新检索'}"
+                f"Follow-up triage completed: {'skip search (skip_search)' if skip_search else 'new search required'}"
             ),
             elapsed_seconds=time.monotonic() - started_at,
             details={

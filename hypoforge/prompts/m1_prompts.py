@@ -148,9 +148,9 @@ Rules:
   question.
 
 Translation examples (format only; do not copy entities absent from the user):
-- source mention `蛋白质错误折叠` -> English name `protein misfolding`
-- source mention `机械臂` -> English name `robot arm`
-- source mention `神经退行性疾病` -> English name `neurodegenerative diseases`
+- source mention `<non-English term for protein misfolding>` -> English name `protein misfolding`
+- source mention `<non-English term for robot arm>` -> English name `robot arm`
+- source mention `<non-English term for neurodegenerative diseases>` -> English name `neurodegenerative diseases`
 
 At least one returned entity must have `role="primary_object"` and
 `required=true`.

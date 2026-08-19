@@ -295,17 +295,19 @@ class ArxivPDFResolver(FulltextResolverProtocol):
             if code in BLOCKED_HTTP_CODES:
                 return (
                     PUBLISHER_BLOCKED,
-                    f"HTTP {code}：出版商反爬拦截，拒绝下载 {source_uri}",
+                    f"HTTP {code}: publisher anti-crawler blocked the "
+                    f"download of {source_uri}",
                 )
-            return OTHER, f"HTTP {code}：下载失败 {source_uri}"
+            return OTHER, f"HTTP {code}: download failed for {source_uri}"
         message = _safe_error(exc)
         if "invalid PDF response" in message:
             return (
                 INVALID_PDF_LINK,
-                f"链接响应体不是 PDF（可能是落地页/HTML）：{source_uri}",
+                f"Response body at the link is not a PDF (likely a "
+                f"landing page/HTML): {source_uri}",
             )
         if "download deadline" in message:
-            return OTHER, f"下载超时：{source_uri}"
+            return OTHER, f"Download timed out: {source_uri}"
         return OTHER, message
 
     async def resolve_abstract(self, paper: PaperRecord) -> DocumentRecord:
@@ -331,7 +333,10 @@ class ArxivPDFResolver(FulltextResolverProtocol):
                 paper,
                 "open-access PDF identifier unavailable",
                 category=NO_FULLTEXT_AVAILABLE,
-                detail="无 OA PDF 链接且无 arXiv 标识符，无法定位全文",
+                detail=(
+                    "No OA PDF link and no arXiv identifier; "
+                    "full text cannot be located"
+                ),
             )
         path = self._paper_dir(paper) / "paper.pdf"
         if self._valid_cached_pdf(path):

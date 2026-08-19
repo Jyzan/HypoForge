@@ -178,7 +178,7 @@ class M6ReviewIteration(ModuleProtocol):
             module="m6",
             tool="task_contract_auditor",
             status="running",
-            message="M6 任务对象语义复核开始",
+            message="M6 task-object semantic audit started",
             details={
                 "timeout_seconds": self.semantic_alignment_timeout_seconds,
             },
@@ -199,7 +199,7 @@ class M6ReviewIteration(ModuleProtocol):
                 module="m6",
                 tool="task_contract_auditor",
                 status="failed",
-                message="M6 任务对象语义复核超时",
+                message="M6 task-object semantic audit timed out",
                 elapsed_seconds=time.monotonic() - started_at,
             )
             raise RuntimeError(
@@ -214,8 +214,8 @@ class M6ReviewIteration(ModuleProtocol):
             tool="task_contract_auditor",
             status="completed",
             message=(
-                "M6 任务对象语义复核通过"
-                if consistent else "M6 任务对象语义复核未通过"
+                "M6 task-object semantic audit passed"
+                if consistent else "M6 task-object semantic audit failed"
             ),
             elapsed_seconds=time.monotonic() - started_at,
             details={"consistent": consistent},
@@ -343,7 +343,7 @@ class M6ReviewIteration(ModuleProtocol):
                 module="m6",
                 tool=f"reviewer:{dim}",
                 status="running",
-                message=f"评审 Agent 开始：{dim}",
+                message=f"Reviewer agent started: {dim}",
                 details={"version": version},
             )
             try:
@@ -405,7 +405,7 @@ class M6ReviewIteration(ModuleProtocol):
                 module="m6",
                 tool=f"reviewer:{dim}",
                 status="completed",
-                message=f"评审 Agent 完成：{dim}，评分 {review.score:.1f}/5",
+                message=f"Reviewer agent completed: {dim}, score {review.score:.1f}/5",
                 elapsed_seconds=time.monotonic() - started_at,
                 details={"version": version, "score": review.score},
             )
@@ -517,7 +517,7 @@ class M6ReviewIteration(ModuleProtocol):
                 module="m6",
                 tool="overall_score_aggregator",
                 status="running",
-                message="开始汇总总体评分",
+                message="Aggregating overall score",
                 details={"version": version},
             )
             specialist_scores = [r.score for r in new_reviews if r.score > 0]
@@ -551,7 +551,7 @@ class M6ReviewIteration(ModuleProtocol):
                 module="m6",
                 tool="overall_score_aggregator",
                 status="completed",
-                message=f"总体评分 {avg:.1f}/5",
+                message=f"Overall score {avg:.1f}/5",
                 elapsed_seconds=time.monotonic() - overall_started_at,
                 details={"version": version, "score": round(avg, 1)},
             )
@@ -618,7 +618,7 @@ class M6ReviewIteration(ModuleProtocol):
             module="m6",
             tool="evidence_sufficiency_judge",
             status="running",
-            message="证据充足性裁决开始",
+            message="Evidence sufficiency verdict started",
             details={"version": version},
         )
         try:
@@ -660,7 +660,7 @@ class M6ReviewIteration(ModuleProtocol):
                 module="m6",
                 tool="evidence_sufficiency_judge",
                 status="failed",
-                message=f"证据裁决失败（fail-closed）：{type(exc).__name__}: {exc}",
+                message=f"Evidence verdict failed (fail-closed): {type(exc).__name__}: {exc}",
                 elapsed_seconds=time.monotonic() - started_at,
                 details={"version": version},
             )
@@ -700,8 +700,8 @@ class M6ReviewIteration(ModuleProtocol):
             tool="evidence_sufficiency_judge",
             status="completed",
             message=(
-                f"证据裁决：{'sufficient' if verdict.sufficient else 'insufficient'}"
-                f"，{len(verdict.gaps)} 个 gap"
+                f"Evidence verdict: {'sufficient' if verdict.sufficient else 'insufficient'}"
+                f", {len(verdict.gaps)} gap(s)"
             ),
             elapsed_seconds=time.monotonic() - started_at,
             details={
@@ -837,8 +837,8 @@ class M6ReviewIteration(ModuleProtocol):
                     module="m6",
                     status="completed",
                     message=(
-                        f"连续 {streak} 轮全部缺口零证据增益，"
-                        f"{len(marked)} 个缺口置为 unimprovable，停止补搜"
+                        f"{streak} consecutive round(s) with zero evidence gain across "
+                        f"all gaps; {len(marked)} gap(s) marked unimprovable; supplement search stopped"
                     ),
                     details={
                         "gap_ids": marked,

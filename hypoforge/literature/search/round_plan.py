@@ -242,7 +242,10 @@ async def classify_entities(
             module="m2",
             tool=_CLASSIFY_TOOL,
             status="warning",
-            message="未配置实体分类 LLM，使用前 2 个实体作为必须实体的确定性兜底",
+            message=(
+                "No entity-classification LLM configured; using the first "
+                "2 entities as must entities (deterministic fallback)"
+            ),
             details={
                 "sub_question": sub_question,
                 "must_entities": list(classification.must_entities),
@@ -256,7 +259,7 @@ async def classify_entities(
         module="m2",
         tool=_CLASSIFY_TOOL,
         status="running",
-        message="M2 实体必须/非必须分类开始",
+        message="M2 entity must/unmust classification started",
         details={"sub_question": sub_question, "entities": list(ordered)},
     )
     try:
@@ -287,8 +290,9 @@ async def classify_entities(
             tool=_CLASSIFY_TOOL,
             status="warning",
             message=(
-                "实体分类 LLM 失败，降级为确定性兜底（前 2 个实体视为必须）："
-                f"{type(exc).__name__}"
+                "Entity-classification LLM failed; degraded to the "
+                f"deterministic fallback (first 2 entities treated as "
+                f"must): {type(exc).__name__}"
             ),
             details={
                 "sub_question": sub_question,
@@ -317,7 +321,8 @@ async def classify_entities(
         tool=_CLASSIFY_TOOL,
         status="completed",
         message=(
-            f"实体分类完成：必须 {len(must)} 个 / 非必须 {len(unmapped)} 个"
+            f"Entity classification completed: {len(must)} must / "
+            f"{len(unmapped)} unmapped"
         ),
         details={
             "sub_question": sub_question,
@@ -385,8 +390,8 @@ async def _assign_unmapped_with_llm(
             tool=_PLAN_TOOL,
             status="warning",
             message=(
-                "非必须实体分组 LLM 失败，降级为确定性均分："
-                f"{type(exc).__name__}"
+                "Unmust entity grouping LLM failed; degraded to "
+                f"deterministic even split: {type(exc).__name__}"
             ),
             details={"sub_question": sub_question},
         )
@@ -504,7 +509,8 @@ async def plan_entity_rounds(
         tool=_PLAN_TOOL,
         status="completed",
         message=(
-            f"轮次规划完成：Case {plan.case}，基础 {len(plan.rounds)} 轮"
+            f"Round planning completed: Case {plan.case}, "
+            f"{len(plan.rounds)} base round(s)"
         ),
         details={
             "sub_question": sub_question,

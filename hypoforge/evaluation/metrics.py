@@ -228,9 +228,9 @@ Rules:
 3. IMPORTANT: For both subject and object, provide an array of synonyms ('subject_synonyms' and 'object_synonyms'). This array MUST include common English and Chinese translations, academic aliases, and abbreviations.
 4. IMPORTANT: The 'subject' and 'object' might be composite phrases (e.g. 'Tau spread to posterior brain regions'). You MUST ALSO break them down into an array of irreducible core conceptual components ('subject_components' and 'object_components'). Each component should be an array of strings representing that core component and its synonyms (including common English/Chinese aliases).
 5. CRITICAL REQUIREMENT FOR COMPONENTS: When extracting components, ONLY extract the CORE biological/physical entities (e.g. specific proteins, genes, cells, brain regions, diseases). You MUST DISCARD granular, meaningless attributes, modifiers, or generic state words such as 'levels', 'concentration', 'activity', 'enzymatic activity', 'pathway', 'accumulation', 'spread', 'vulnerability', 'regional', 'amount', 'expression', etc. For example:
-   - "Aβ42 concentration" -> Core component is ONLY [["Aβ42", "amyloid-beta 42", "淀粉样蛋白β42"]]. Discard "concentration".
-   - "Neuronal cathepsin B activity" -> Core components are [["neuronal", "神经元"], ["cathepsin B", "CatB", "组织蛋白酶B"]]. Discard "activity".
-   - "Tau spread to posterior brain regions" -> Core components are [["Tau", "Tau蛋白"], ["posterior brain regions", "cortex", "后脑区域"]]. Discard "spread".
+   - "Aβ42 concentration" -> Core component is ONLY [["Aβ42", "amyloid-beta 42", "<Chinese translation of Aβ42>"]]. Discard "concentration".
+   - "Neuronal cathepsin B activity" -> Core components are [["neuronal", "<Chinese translation of neuronal>"], ["cathepsin B", "CatB", "<Chinese translation of cathepsin B>"]]. Discard "activity".
+   - "Tau spread to posterior brain regions" -> Core components are [["Tau", "<Chinese translation of Tau>"], ["posterior brain regions", "cortex", "<Chinese translation of posterior brain regions>"]]. Discard "spread".
 6. Extract the 'relation' (e.g. 'inhibits').
 7. Include the full sentence as 'claim' (it must be self-contained).
 8. Output ONLY a JSON object with the key "claims" containing a list of these objects.

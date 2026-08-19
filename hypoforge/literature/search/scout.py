@@ -127,7 +127,7 @@ def _valid_entity(value: object) -> bool:
     if re.search(r"[,，;；:：]", text):
         return False
     if re.match(
-        r"(?i)^(this|that|these|those|the|a|an|we|our|it|paper|study|本文|该研究|结果)",
+        r"(?i)^(this|that|these|those|the|a|an|we|our|it|paper|study|this paper|this study|results)",
         text,
     ) and len(text.split()) >= 4:
         return False

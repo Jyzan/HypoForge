@@ -44,7 +44,7 @@ def _followup_requirement_block(state: PipelineState) -> str:
     if not text:
         return ""
     return (
-        "\n--- 用户追问要求 (user follow-up instruction, highest priority, must be honoured) ---\n"
+        "\n--- User follow-up requirement (highest priority, must be honoured) ---\n"
         f"{text}\n"
     )
 
@@ -343,7 +343,7 @@ class M5ResearchPlan(ModuleProtocol):
                 module="m5",
                 tool="research_plan_designer",
                 status="running",
-                message=f"开始为假设 {h.hypothesis_id} 设计研究方案",
+                message=f"Designing research plan for hypothesis {h.hypothesis_id}",
                 details={"hypothesis_id": h.hypothesis_id},
             )
             alignment_feedback = ""
@@ -387,7 +387,7 @@ class M5ResearchPlan(ModuleProtocol):
                             tool="research_plan_designer",
                             status="retrying",
                             message=(
-                                f"假设 {h.hypothesis_id} 的方案生成超时，正在重试"
+                                f"Plan generation for hypothesis {h.hypothesis_id} timed out; retrying"
                             ),
                             details={
                                 "hypothesis_id": h.hypothesis_id,
@@ -442,7 +442,7 @@ class M5ResearchPlan(ModuleProtocol):
                 module="m5",
                 tool="research_plan_designer",
                 status="completed",
-                message=f"假设 {h.hypothesis_id} 的研究方案完成",
+                message=f"Research plan for hypothesis {h.hypothesis_id} completed",
                 elapsed_seconds=time.monotonic() - started_at,
                 details={
                     "hypothesis_id": h.hypothesis_id,

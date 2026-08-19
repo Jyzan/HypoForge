@@ -41,8 +41,8 @@ previously supported necessary facet missing unless valid contradictory
 evidence is supplied. Do not demand quantitative kinetics, a particular assay,
 or a specific regulator unless the exact sub-question requires it.
 
-Treat terms introduced by "e.g.", "for example", "such as", or "例如" as
-illustrative alternatives, not a checklist. For a "which factors" question,
+Treat terms introduced by "e.g.", "for example", "such as", or "for
+instance" as illustrative alternatives, not a checklist. For a "which factors" question,
 grounded identification of one or more valid factors and their relevant
 functional effect can be sufficient; exhaustive coverage of every example or
 factor class is not required. Evidence about an ATPase domain, nucleotide
@@ -71,13 +71,13 @@ _SCIENTIFIC_GAP_TERMS = {
     "relationship",
     "result",
     "target",
-    "机制",
-    "方法",
-    "结果",
-    "实体",
-    "效应",
-    "表型",
-    "测量",
+    "mechanism",
+    "method",
+    "result",
+    "entity",
+    "effect",
+    "phenotype",
+    "measurement",
 }
 _DIRECTIONAL_FACET_TERMS = {
     "against",
@@ -90,12 +90,12 @@ _DIRECTIONAL_FACET_TERMS = {
     "relation",
     "relationship",
     "support",
-    "反对",
-    "反驳",
-    "支持",
-    "效应",
-    "关系",
-    "机制",
+    "against",
+    "refute",
+    "support",
+    "effect",
+    "relationship",
+    "mechanism",
 }
 
 

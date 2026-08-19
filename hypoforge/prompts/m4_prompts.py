@@ -39,7 +39,7 @@ Task contract fidelity (hard gate):
 - Match the hypothesis language to the original question. Use the alias in the
   sentence's language when the contract lists one (e.g. "immune system" in an
   English sentence if listed as an alias), or parenthesize as
-  ``中文名（English term）``. Never embed a Chinese contract name inside an
+  ``Chinese name (English term)``. Never embed a Chinese contract name inside an
   English sentence.
 - Requirement excerpts must be copied character-for-character from the
   hypothesis text and must name the requirement's primary entity.

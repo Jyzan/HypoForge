@@ -101,13 +101,13 @@ class RunManager:
         followup = " ".join(str(followup or "").split())
         resume_of = " ".join(str(resume_of or "").split())
         if resume_of and (parent_run_id or followup):
-            raise ValueError("resume_of 不能与 parent_run_id/followup 同时提供")
+            raise ValueError("resume_of cannot be combined with parent_run_id/followup")
         if not question:
-            raise ValueError("问题不能为空")
+            raise ValueError("question cannot be empty")
         if len(question) > 4000:
-            raise ValueError("问题过长，请控制在 4000 字以内")
+            raise ValueError("question too long; please keep it within 4000 characters")
         if len(model_name) > 128:
-            raise ValueError("模型名称过长")
+            raise ValueError("model name too long")
         if (
             len(qwen_api_key) > 4096
             or len(semantic_scholar_api_key) > 4096
@@ -115,19 +115,19 @@ class RunManager:
             or len(serper_api_key) > 4096
             or len(ads_api_token) > 4096
         ):
-            raise ValueError("API Key 长度异常")
+            raise ValueError("API key length is invalid")
         if (
             len(openalex_mailto) > 320
             or len(unpaywall_email) > 320
             or len(crossref_mailto) > 320
         ):
-            raise ValueError("邮箱地址长度异常")
+            raise ValueError("email address length is invalid")
         if len(followup) > 4000:
-            raise ValueError("追问内容过长，请控制在 4000 字以内")
+            raise ValueError("follow-up content too long; please keep it within 4000 characters")
         seed_state: dict[str, Any] | None = None
         if parent_run_id or followup:
             if not parent_run_id or not followup:
-                raise ValueError("追问运行需要同时提供 parent_run_id 与 followup")
+                raise ValueError("a follow-up run requires both parent_run_id and followup")
             seed_state = self._load_parent_state(parent_run_id)
         elif resume_of:
             # Pure resume: the parent's checkpoint is authoritative for the
@@ -136,7 +136,9 @@ class RunManager:
             question = str(seed_state.get("input_question") or question)
         with self._lock:
             if any(item.get("status") == "running" for item in self._runs.values()):
-                raise RuntimeError("已有一条流程正在运行，当前运行结束后才能提交")
+                raise RuntimeError(
+                    "a run is already in progress; submit after the current run finishes"
+                )
             run_id = (
                 "ui-"
                 + datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -206,24 +208,24 @@ class RunManager:
         """
 
         if not re.fullmatch(r"[A-Za-z0-9._-]+", run_id):
-            raise ValueError("run_id 含非法字符")
+            raise ValueError("run_id contains invalid characters")
         with self._lock:
             record = self._runs.get(run_id)
             if record is not None and record.get("status") != "running":
                 raise RuntimeError(
-                    f"运行 {run_id} 已结束（状态：{record.get('status')}），"
-                    "无法停止"
+                    f"Run {run_id} already finished (status: {record.get('status')}), "
+                    "cannot be stopped"
                 )
             if record is None:
                 # Not live in this process — check the persisted manifest so
-                # already-finished runs report "已结束" instead of 404.
+                # already-finished runs report "already finished" instead of 404.
                 manifest = self.get(run_id)
                 if manifest is not None:
                     raise RuntimeError(
-                        f"运行 {run_id} 已结束"
-                        f"（状态：{manifest.get('status', '')}），无法停止"
+                        f"Run {run_id} already finished"
+                        f" (status: {manifest.get('status', '')}); cannot be stopped"
                     )
-                raise LookupError(f"运行 {run_id} 不存在")
+                raise LookupError(f"Run {run_id} does not exist")
             already = bool(record.get("cancel_requested"))
             record["cancel_requested"] = True
             cancel_event = self._cancel_events.get(run_id)
@@ -234,8 +236,8 @@ class RunManager:
                 "cancel_requested",
                 status="cancelling",
                 message=(
-                    "收到停止请求：正在取消当前异步任务，"
-                    "已完成模块的成果将保留"
+                    "stop requested: cancelling the running async task; "
+                    "results of completed modules are preserved"
                 ),
             )
         return {"run_id": run_id, "status": "cancelling"}
@@ -244,44 +246,44 @@ class RunManager:
         """Load and validate a parent run's final state for a follow-up run."""
 
         if not re.fullmatch(r"[A-Za-z0-9._-]+", parent_run_id):
-            raise ValueError("parent_run_id 含非法字符")
+            raise ValueError("parent_run_id contains invalid characters")
         state_path = self.output_root / parent_run_id / f"{parent_run_id}.json"
         if not state_path.exists():
             raise ValueError(
-                f"父运行 {parent_run_id} 的最终 state 不存在，无法发起追问"
+                f"Parent run {parent_run_id} has no final state; cannot start a follow-up"
             )
         try:
             data = json.loads(state_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(
-                f"父运行 {parent_run_id} 的 state 文件损坏，无法发起追问：{exc}"
+                f"Parent run {parent_run_id} state file is corrupted; cannot start a follow-up: {exc}"
             ) from exc
         if not isinstance(data, dict):
-            raise ValueError(f"父运行 {parent_run_id} 的 state 格式无效")
+            raise ValueError(f"Parent run {parent_run_id} has an invalid state format")
         return data
 
     def _load_checkpoint_state(self, run_id: str) -> dict[str, Any]:
         """Load and validate a run's checkpoint for a pure resume."""
 
         if not re.fullmatch(r"[A-Za-z0-9._-]+", run_id):
-            raise ValueError("resume_of 含非法字符")
+            raise ValueError("resume_of contains invalid characters")
         record = self._runs.get(run_id)
         if record and record.get("status") == "running":
-            raise ValueError("父运行仍在运行中，无法从断点重试")
+            raise ValueError("parent run is still running; cannot retry from checkpoint")
         ckpt_path = self.output_root / run_id / f"{run_id}_checkpoint.json"
         if not ckpt_path.exists():
             raise ValueError(
-                f"父运行 {run_id} 没有可用的断点（checkpoint）——"
-                "运行可能在第一个模块完成前失败，请重新发起运行"
+                f"Parent run {run_id} has no usable checkpoint — "
+                "it may have failed before the first module completed; please start a new run"
             )
         try:
             data = json.loads(ckpt_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(
-                f"父运行 {run_id} 的断点文件损坏，无法续传：{exc}"
+                f"Parent run {run_id} checkpoint file is corrupted; cannot resume: {exc}"
             ) from exc
         if not isinstance(data, dict):
-            raise ValueError(f"父运行 {run_id} 的断点格式无效")
+            raise ValueError(f"Parent run {run_id} has an invalid checkpoint format")
         return data
 
     def _read_final_state(self, run_id: str) -> dict[str, Any] | None:
@@ -424,8 +426,8 @@ class RunManager:
             )
             if cancelled:
                 manifest["cancel_message"] = (
-                    "用户手动停止：已完成模块的成果已保留，"
-                    "可作为后续追问的父运行"
+                    "user stopped the run: results of completed modules are preserved "
+                    "and can be used as the parent for a follow-up"
                 )
             recorder.write_manifest(manifest)
         except BaseException as exc:
@@ -434,7 +436,7 @@ class RunManager:
             recorder.emit(
                 "run_failed",
                 status="failed",
-                message=f"流程异常终止：{error}",
+                message=f"pipeline terminated abnormally: {error}",
                 details={"traceback": traceback.format_exc()},
             )
             with self._lock:
@@ -494,19 +496,21 @@ class RunManager:
         """Set a display name for a run (sidebar only; question untouched)."""
 
         if not re.fullmatch(r"[A-Za-z0-9._-]+", run_id):
-            raise ValueError("run_id 含非法字符")
+            raise ValueError("run_id contains invalid characters")
         display_name = " ".join(str(display_name or "").split())
         if not display_name:
-            raise ValueError("名称不能为空")
+            raise ValueError("name cannot be empty")
         if len(display_name) > 200:
-            raise ValueError("名称过长，请控制在 200 字以内")
+            raise ValueError("name too long; please keep it within 200 characters")
         manifest_path = self.output_root / run_id / "manifest.json"
         if not manifest_path.exists():
-            raise LookupError(f"运行 {run_id} 不存在")
+            raise LookupError(f"Run {run_id} does not exist")
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(f"运行 {run_id} 的 manifest 损坏，无法重命名：{exc}") from exc
+            raise ValueError(
+                f"Run {run_id} manifest is corrupted; cannot rename: {exc}"
+            ) from exc
         manifest["display_name"] = display_name
         manifest_path.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -528,14 +532,14 @@ class RunManager:
         """
 
         if not re.fullmatch(r"ui-[A-Za-z0-9._-]+", run_id):
-            raise ValueError("run_id 非法，仅允许 ui- 开头的运行目录名")
+            raise ValueError("invalid run_id: only run directories starting with 'ui-' are allowed")
         run_dir = (self.output_root / run_id).resolve()
         try:
             run_dir.relative_to(self.output_root)
         except ValueError as exc:
-            raise ValueError("run_id 指向的路径不在运行目录内") from exc
+            raise ValueError("run_id points outside the runs directory") from exc
         if not run_dir.is_dir():
-            raise LookupError(f"运行 {run_id} 不存在")
+            raise LookupError(f"Run {run_id} does not exist")
 
         # parent → children map built from persisted manifests plus the
         # in-memory records of live runs.
@@ -575,8 +579,8 @@ class RunManager:
         busy = running & seen
         if busy:
             raise RuntimeError(
-                f"运行 {'、'.join(sorted(busy))} 正在执行中，"
-                "请等待其结束后再删除"
+                f"Run(s) {', '.join(sorted(busy))} still running; "
+                "wait for them to finish before deleting"
             )
 
         deleted: list[str] = []
@@ -1010,7 +1014,7 @@ class HypoForgeRequestHandler(BaseHTTPRequestHandler):
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 if length > 4096:
-                    raise ValueError("请求内容过大")
+                    raise ValueError("request content too large")
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
                 info = self.server.manager.rename(
                     route[0], payload.get("name", "")
@@ -1022,7 +1026,7 @@ class HypoForgeRequestHandler(BaseHTTPRequestHandler):
                 self._json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
                 return
             except (json.JSONDecodeError, UnicodeDecodeError):
-                self._json({"error": "请求 JSON 无效"}, HTTPStatus.BAD_REQUEST)
+                self._json({"error": "invalid request JSON"}, HTTPStatus.BAD_REQUEST)
                 return
             self._json({"run": info}, HTTPStatus.OK)
             return
@@ -1032,7 +1036,7 @@ class HypoForgeRequestHandler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length > 16_384:
-                raise ValueError("请求内容过大")
+                raise ValueError("request content too large")
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             run = self.server.manager.start(
                 payload.get("question", ""),
@@ -1058,7 +1062,7 @@ class HypoForgeRequestHandler(BaseHTTPRequestHandler):
             self._json({"error": str(exc)}, HTTPStatus.CONFLICT)
             return
         except (json.JSONDecodeError, UnicodeDecodeError):
-            self._json({"error": "请求 JSON 无效"}, HTTPStatus.BAD_REQUEST)
+            self._json({"error": "invalid request JSON"}, HTTPStatus.BAD_REQUEST)
             return
         self._json({"run": run}, HTTPStatus.ACCEPTED)
 

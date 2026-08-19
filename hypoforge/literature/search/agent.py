@@ -411,7 +411,7 @@ class IterativeSearchAgent:
                 module="m2",
                 tool=stage,
                 status="running",
-                message=f"M2 Tool 开始：{stage}",
+                message=f"M2 tool started: {stage}",
                 details={"round": state.round_index + 1},
             )
             try:
@@ -434,7 +434,7 @@ class IterativeSearchAgent:
                         module="m2",
                         tool=stage,
                         status="completed",
-                        message=f"M2 Tool 完成：{stage}",
+                        message=f"M2 tool completed: {stage}",
                         elapsed_seconds=max(
                             0.0, self.stage_clock() - stage_started_at
                         ),
@@ -451,7 +451,7 @@ class IterativeSearchAgent:
                     module="m2",
                     tool=stage,
                     status="failed",
-                    message=f"M2 Tool 失败：{stage}：{type(exc).__name__}: {exc}",
+                    message=f"M2 tool failed: {stage}: {type(exc).__name__}: {exc}",
                     elapsed_seconds=max(0.0, self.stage_clock() - stage_started_at),
                     details={"round": state.round_index + 1},
                 )
@@ -572,9 +572,12 @@ class IterativeSearchAgent:
                 tool="coverage_evaluator",
                 status="completed",
                 message=(
-                    "证据覆盖充分"
+                    "Evidence coverage is sufficient"
                     if ctx.coverage.sufficient
-                    else "证据覆盖仍有缺口，将按预算决定是否迭代"
+                    else (
+                        "Evidence coverage still has gaps; iteration will "
+                        "depend on the budget"
+                    )
                 ),
                 details={
                     "round": state.round_index,
@@ -630,7 +633,10 @@ class IterativeSearchAgent:
                 module="m2",
                 tool="m2_round_plan",
                 status="warning",
-                message="子问题没有可用实体，实体分组轮次策略降级为单轮普通检索",
+                message=(
+                    "Sub-question has no usable entities; entity-group "
+                    "round strategy degrades to a single plain search round"
+                ),
                 details={"sub_question": sub_question},
             )
             planner_kwargs: dict = {}
@@ -751,8 +757,9 @@ class IterativeSearchAgent:
                         tool="m2_zero_result_rescue",
                         status="warning",
                         message=(
-                            f"第 {state.round_index} 轮检索结果不佳（{poor}），"
-                            "触发零结果补救：追加仅必须实体轮"
+                            f"Round {state.round_index} produced poor "
+                            f"results ({poor}); triggering zero-result "
+                            "rescue: appending a must-entities-only round"
                         ),
                         details={
                             "sub_question": sub_question,
@@ -769,8 +776,10 @@ class IterativeSearchAgent:
                         tool="m2_zero_result_rescue",
                         status="warning",
                         message=(
-                            f"第 {state.round_index} 轮检索结果不佳（{poor}），"
-                            "但无必须实体可用于补救，跳过补救轮"
+                            f"Round {state.round_index} produced poor "
+                            f"results ({poor}), but no must entities are "
+                            "available for the rescue; skipping the rescue "
+                            "round"
                         ),
                         details={
                             "sub_question": sub_question,
@@ -860,7 +869,10 @@ class IterativeSearchAgent:
             module="m2",
             tool="query_planner",
             status="completed",
-            message=f"第 {round_index} 轮生成 {len(queries)} 条检索式",
+            message=(
+                f"Round {round_index} generated {len(queries)} "
+                f"search query(ies)"
+            ),
             details={
                 "round": round_index,
                 "queries": [
@@ -940,7 +952,10 @@ class IterativeSearchAgent:
             module="m2",
             tool="source_search",
             status="completed",
-            message=f"第 {round_index} 轮检索获得 {len(raw_papers)} 篇记录",
+            message=(
+                f"Round {round_index} search returned {len(raw_papers)} "
+                f"record(s)"
+            ),
             details={
                 "round": round_index,
                 "source_result_counts": dict(ctx.source_result_counts),
@@ -982,7 +997,10 @@ class IterativeSearchAgent:
             module="m2",
             tool="paper_deduplicator",
             status="completed",
-            message=f"去重后累计 {len(ctx.canonical_history)} 篇论文",
+            message=(
+                f"Deduplication complete: {len(ctx.canonical_history)} "
+                f"unique paper(s) accumulated"
+            ),
             details={"round": round_index, "papers": len(ctx.canonical_history)},
         )
 
@@ -1006,7 +1024,9 @@ class IterativeSearchAgent:
             module="m2",
             tool="paper_ranker",
             status="completed",
-            message=f"排序后保留 {len(ranked)} 篇候选论文",
+            message=(
+                f"Ranking kept {len(ranked)} candidate paper(s)"
+            ),
             details={
                 "round": round_index,
                 "top_titles": [paper.title for paper in ranked[:5]],
@@ -1059,7 +1079,10 @@ class IterativeSearchAgent:
                 module="m2",
                 tool="scout_reader",
                 status="warning",
-                message=f"快速阅读失败，已跳过 {len(skipped_scout_ids)} 篇论文",
+                message=(
+                    f"Scout reading failed; skipped {len(skipped_scout_ids)} "
+                    f"paper(s)"
+                ),
                 details={"paper_ids": skipped_scout_ids, "round": round_index},
             )
         emit_event(
@@ -1067,7 +1090,9 @@ class IterativeSearchAgent:
             module="m2",
             tool="scout_reader",
             status="completed",
-            message=f"快速阅读新增 {len(new_scout_notes)} 篇论文",
+            message=(
+                f"Scout reading produced {len(new_scout_notes)} new note(s)"
+            ),
             details={"round": round_index, "notes": len(new_scout_notes)},
         )
         scout_notes = [
@@ -1192,8 +1217,9 @@ class IterativeSearchAgent:
                 tool="retention_fallback",
                 status="warning",
                 message=(
-                    f"未找到直接命中文献，保留 {len(final_papers)} 篇最相关的"
-                    "方法/背景论文"
+                    f"No directly matching literature found; retained "
+                    f"{len(final_papers)} most relevant method/background "
+                    f"paper(s)"
                 ),
                 details={
                     "papers": len(final_papers),
@@ -1342,7 +1368,7 @@ class IterativeSearchAgent:
             module="m2",
             tool="retention_judge",
             status="running",
-            message="M2 开始进行 LLM 论文保留裁决",
+            message="M2 LLM paper retention adjudication started",
             details={"candidates": len(boundary_papers), "window_size": window_size},
         )
         try:
@@ -1370,7 +1396,10 @@ class IterativeSearchAgent:
                 module="m2",
                 tool="retention_judge",
                 status="failed",
-                message=f"LLM 论文保留裁决失败: {type(exc).__name__}: {exc}",
+                message=(
+                    f"LLM paper retention adjudication failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
                 details={"candidates": len(boundary_papers)},
             )
             raise RuntimeError(
@@ -1419,7 +1448,7 @@ class IterativeSearchAgent:
             module="m2",
             tool="retention_judge",
             status="completed",
-            message="LLM 论文保留裁决完成",
+            message="LLM paper retention adjudication completed",
             details={
                 "candidates": len(boundary_papers),
                 "retained": len(retained),
@@ -1445,7 +1474,10 @@ class IterativeSearchAgent:
                 module="m2",
                 tool=f"source:{query.target_source}",
                 status="completed",
-                message=f"复用 {query.target_source} 检索缓存 ({len(cached)} 篇)",
+                message=(
+                    f"Reusing {query.target_source} search cache "
+                    f"({len(cached)} paper(s))"
+                ),
                 details={"query": query.text, "cache_hit": True},
             )
             return [paper.model_copy(deep=True) for paper in cached]
@@ -1455,7 +1487,7 @@ class IterativeSearchAgent:
             module="m2",
             tool=tool,
             status="running",
-            message=f"检索 {query.target_source}",
+            message=f"Searching {query.target_source}",
             details={
                 "query": query.text,
                 "round": query.round_index,
@@ -1473,7 +1505,10 @@ class IterativeSearchAgent:
                 module="m2",
                 tool=tool,
                 status="failed",
-                message=f"{query.target_source} 检索失败：{type(exc).__name__}: {exc}",
+                message=(
+                    f"{query.target_source} search failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
                 elapsed_seconds=max(0.0, self.stage_clock() - started_at),
                 details={"query": query.text, "round": query.round_index},
             )
@@ -1483,7 +1518,9 @@ class IterativeSearchAgent:
             module="m2",
             tool=tool,
             status="completed",
-            message=f"{query.target_source} 返回 {len(result)} 篇记录",
+            message=(
+                f"{query.target_source} returned {len(result)} record(s)"
+            ),
             elapsed_seconds=max(0.0, self.stage_clock() - started_at),
             details={
                 "query": query.text,
