@@ -3372,7 +3372,7 @@ def test_followup_text_is_injected_into_m4_and_m5_context() -> None:
 
     for context in (m4_context, m5_context):
         assert "请用中文输出方案" in context
-        assert "用户追问要求" in context
+        assert "User follow-up" in context
 
 
 def test_followup_block_coexists_with_m4_revision_context() -> None:
@@ -3782,6 +3782,7 @@ async def test_m4_repairs_contract_diagnostics_once_without_weakening_gate() -> 
     }
     client = HypothesisRepairClient([
         [invalid],
+        [invalid],  # the D1 retry also fails → the flow reaches the repair
         [repaired],
         [{
             "hypothesis_id": "H1",
@@ -3794,11 +3795,15 @@ async def test_m4_repairs_contract_diagnostics_once_without_weakening_gate() -> 
 
     result = await module._run_llm(state)
 
-    assert len(client.calls) == 3
-    assert client.calls[1]["temperature"] == 0.0
-    assert "missing required task entities" in client.calls[1]["user_prompt"]
-    assert "hypothesis_contract_auditor" not in client.calls[1]["user_prompt"]
-    assert "Primary task objects" in client.calls[2]["user_prompt"]
+    assert len(client.calls) == 4
+    # calls[1] is the D1 retry: carries the contract-failure feedback
+    assert "Contract validation rejected some candidates" in client.calls[1]["user_prompt"]
+    # calls[2] is the deterministic repair: carries the diagnostics
+    assert client.calls[2]["temperature"] == 0.0
+    assert "missing required task entities" in client.calls[2]["user_prompt"]
+    assert "hypothesis_contract_auditor" not in client.calls[2]["user_prompt"]
+    # calls[3] is the semantic contract audit
+    assert "Primary task objects" in client.calls[3]["user_prompt"]
     assert result["top_hypotheses"][0].statement == valid_statement
 
 
@@ -3893,6 +3898,7 @@ async def test_m4_repair_prompt_carries_literal_contract_names() -> None:
     }
     client = HypothesisRepairClient([
         [invalid],
+        [invalid],  # the D1 retry also fails → the flow reaches the repair
         [valid],
         [{
             "hypothesis_id": "H1",
@@ -3905,7 +3911,7 @@ async def test_m4_repair_prompt_carries_literal_contract_names() -> None:
 
     result = await module._run_llm(state)
 
-    repair_prompt = client.calls[1]["user_prompt"]
+    repair_prompt = client.calls[2]["user_prompt"]
     assert "锂金属电池" in repair_prompt
     assert "lithium-metal battery" in repair_prompt
     assert "Binding task contract" in repair_prompt
@@ -4043,14 +4049,16 @@ async def test_m4_repair_does_not_admit_a_second_invalid_result() -> None:
         "falsification_conditions": ["The output does not change."],
         "task_trace": {},
     }
-    client = HypothesisRepairClient([[invalid], [invalid]])
+    # generator → D1 retry → repair all fail: the repair must not admit the
+    # third invalid result either
+    client = HypothesisRepairClient([[invalid], [invalid], [invalid]])
     module = M4HypothesisGeneration(num_candidates=1, top_k=1, mode="direct")
     module.client = client
 
     with pytest.raises(ValueError, match="one deterministic repair attempt"):
         await module._run_llm(state)
 
-    assert len(client.calls) == 2
+    assert len(client.calls) == 3
 
 
 def test_m1_atomic_validator_flags_parallel_questions() -> None:
@@ -5690,6 +5698,8 @@ async def test_m4_critic_all_rejected_runs_gate_recovery() -> None:
     assert len(client.calls) == 5
     # the critic's critique text fed the regeneration prompt
     assert "missing mechanism" in client.calls[1]["user_prompt"]
+    # gate recovery regeneration is capped at a small batch (C-3)
+    assert "Generate 3 candidate hypotheses" in client.calls[1]["user_prompt"]
 
 
 @pytest.mark.asyncio
@@ -7706,7 +7716,7 @@ def test_request_cancel_marks_cancelled_and_retains_knowledge(
         )
     )
     assert manifest["status"] == "cancelled"
-    assert "停止" in manifest["cancel_message"]
+    assert "user stopped the run" in manifest["cancel_message"]
 
     events = RunEventRecorder(
         tmp_path / "runs" / run_id, run_id
@@ -7745,21 +7755,21 @@ def test_request_cancel_rejects_finished_unknown_and_malformed(
     manager._run_pipeline(run_id, "原问题")  # finishes (no cancel requested)
     assert manager.get(run_id)["status"] == "completed"
 
-    with pytest.raises(RuntimeError, match="已结束"):
+    with pytest.raises(RuntimeError, match="already finished"):
         manager.request_cancel(run_id)
-    with pytest.raises(LookupError, match="不存在"):
+    with pytest.raises(LookupError, match="does not exist"):
         manager.request_cancel("ui-ghost-run")
-    with pytest.raises(ValueError, match="非法字符"):
+    with pytest.raises(ValueError, match="invalid characters"):
         manager.request_cancel("../escape")
 
-    # Persisted-only run (server restarted) → "已结束", not 404.
+    # Persisted-only run (server restarted) → "already finished", not 404.
     finished_dir = tmp_path / "runs" / "ui-old-finished"
     finished_dir.mkdir(parents=True)
     (finished_dir / "manifest.json").write_text(
         json.dumps({"run_id": "ui-old-finished", "status": "completed"}),
         encoding="utf-8",
     )
-    with pytest.raises(RuntimeError, match="已结束"):
+    with pytest.raises(RuntimeError, match="already finished"):
         manager.request_cancel("ui-old-finished")
 
 
@@ -7828,18 +7838,18 @@ def test_http_cancel_endpoint_statuses(tmp_path: Path) -> None:
         conn.request("POST", "/api/runs/ui-done/cancel")
         response = conn.getresponse()
         assert response.status == 409
-        assert "已结束" in json.loads(response.read())["error"]
+        assert "already finished" in json.loads(response.read())["error"]
 
         conn.request("POST", "/api/runs/ui-disk-done/cancel")
         response = conn.getresponse()
         assert response.status == 409
-        assert "已结束" in json.loads(response.read())["error"]
+        assert "already finished" in json.loads(response.read())["error"]
 
         # 不存在 → 404。
         conn.request("POST", "/api/runs/ui-ghost/cancel")
         response = conn.getresponse()
         assert response.status == 404
-        assert "不存在" in json.loads(response.read())["error"]
+        assert "does not exist" in json.loads(response.read())["error"]
 
         # 非法 run_id → 400。
         conn.request("POST", "/api/runs/..%2Fxxx/cancel")
@@ -8028,13 +8038,13 @@ def test_run_manager_rejects_malformed_openalex_credentials(
     manager = RunManager(
         config_path=_write_config(tmp_path), output_root=tmp_path / "runs"
     )
-    with pytest.raises(ValueError, match="API Key 长度异常"):
+    with pytest.raises(ValueError, match="API key length is invalid"):
         manager.start("q", openalex_api_key="x" * 4097)
-    with pytest.raises(ValueError, match="邮箱地址长度异常"):
+    with pytest.raises(ValueError, match="email address length is invalid"):
         manager.start("q", openalex_mailto="a" * 321)
-    with pytest.raises(ValueError, match="API Key 长度异常"):
+    with pytest.raises(ValueError, match="API key length is invalid"):
         manager.start("q", serper_api_key="x" * 4097)
-    with pytest.raises(ValueError, match="邮箱地址长度异常"):
+    with pytest.raises(ValueError, match="email address length is invalid"):
         manager.start("q", unpaywall_email="a" * 321)
 
 
@@ -8135,11 +8145,11 @@ def test_followup_missing_parent_returns_error(tmp_path: Path) -> None:
     manager = RunManager(
         config_path=_write_config(tmp_path), output_root=tmp_path / "runs"
     )
-    with pytest.raises(ValueError, match="不存在"):
+    with pytest.raises(ValueError, match="has no final state"):
         manager.start("追问", parent_run_id="ghost-run", followup="再细化一下")
     with pytest.raises(ValueError):
         manager.start("追问", followup="只有追问没有父运行")
-    with pytest.raises(ValueError, match="非法字符"):
+    with pytest.raises(ValueError, match="invalid characters"):
         manager.start("追问", parent_run_id="../escape", followup="x")
 
 
@@ -8150,7 +8160,7 @@ def test_followup_corrupt_parent_state_returns_error(tmp_path: Path) -> None:
     parent_dir = tmp_path / "runs" / "ui-corrupt"
     parent_dir.mkdir(parents=True)
     (parent_dir / "ui-corrupt.json").write_text("{not json", encoding="utf-8")
-    with pytest.raises(ValueError, match="损坏"):
+    with pytest.raises(ValueError, match="corrupted"):
         manager.start("追问", parent_run_id="ui-corrupt", followup="x")
 
 
@@ -8246,7 +8256,7 @@ def test_resume_rejects_running_parent(tmp_path: Path) -> None:
         config_path=_write_config(tmp_path), output_root=tmp_path / "runs"
     )
     manager._runs["ui-live"] = {"run_id": "ui-live", "status": "running"}
-    with pytest.raises(ValueError, match="仍在运行"):
+    with pytest.raises(ValueError, match="still running"):
         manager.start("q", resume_of="ui-live")
 
 
@@ -8255,7 +8265,7 @@ def test_resume_missing_checkpoint_returns_error(tmp_path: Path) -> None:
         config_path=_write_config(tmp_path), output_root=tmp_path / "runs"
     )
     (tmp_path / "runs" / "ui-ghost").mkdir(parents=True)
-    with pytest.raises(ValueError, match="没有可用的断点"):
+    with pytest.raises(ValueError, match="no usable checkpoint"):
         manager.start("q", resume_of="ui-ghost")
 
 
@@ -8265,9 +8275,9 @@ def test_resume_rejects_illegal_parent_id_and_followup_conflict(
     manager = RunManager(
         config_path=_write_config(tmp_path), output_root=tmp_path / "runs"
     )
-    with pytest.raises(ValueError, match="非法字符"):
+    with pytest.raises(ValueError, match="invalid characters"):
         manager.start("q", resume_of="../escape")
-    with pytest.raises(ValueError, match="不能与"):
+    with pytest.raises(ValueError, match="cannot be combined with"):
         manager.start(
             "q",
             parent_run_id="ui-parent",
@@ -8305,13 +8315,13 @@ def test_rename_run_validations(tmp_path: Path) -> None:
     manager = RunManager(
         config_path=_write_config(tmp_path), output_root=tmp_path / "runs"
     )
-    with pytest.raises(ValueError, match="非法字符"):
+    with pytest.raises(ValueError, match="invalid characters"):
         manager.rename("../escape", "x")
-    with pytest.raises(ValueError, match="不能为空"):
+    with pytest.raises(ValueError, match="cannot be empty"):
         manager.rename("ui-x", "   ")
-    with pytest.raises(ValueError, match="过长"):
+    with pytest.raises(ValueError, match="too long"):
         manager.rename("ui-x", "长" * 201)
-    with pytest.raises(LookupError, match="不存在"):
+    with pytest.raises(LookupError, match="does not exist"):
         manager.rename("ui-ghost", "新名字")
 
 
@@ -8323,7 +8333,7 @@ def test_single_run_mutex_error_message_mentions_waiting(
     )
     monkeypatch.setattr(threading, "Thread", DeferredThread)
     manager.start("第一条")
-    with pytest.raises(RuntimeError, match="当前运行结束后才能提交"):
+    with pytest.raises(RuntimeError, match="after the current run finishes"):
         manager.start("第二条")
 
 
@@ -8338,7 +8348,7 @@ def test_followup_rejected_with_409_while_run_in_progress(
     _make_parent_run(tmp_path)
     monkeypatch.setattr(threading, "Thread", DeferredThread)
     manager.start("第一条")
-    with pytest.raises(RuntimeError, match="当前运行结束后才能提交"):
+    with pytest.raises(RuntimeError, match="after the current run finishes"):
         manager.start("追问", parent_run_id="ui-parent", followup="细化对照组")
 
 
@@ -8529,7 +8539,7 @@ def test_delete_missing_run_raises_lookup_error(tmp_path: Path) -> None:
     manager = RunManager(
         config_path=_write_config(tmp_path), output_root=tmp_path / "runs"
     )
-    with pytest.raises(LookupError, match="不存在"):
+    with pytest.raises(LookupError, match="does not exist"):
         manager.delete("ui-ghost")
 
 
@@ -8558,7 +8568,7 @@ def test_delete_running_run_rejected_with_conflict(tmp_path: Path) -> None:
     )
     run_dir = _make_run(tmp_path, "ui-busy", status="running")
     manager._runs["ui-busy"] = {"run_id": "ui-busy", "status": "running"}
-    with pytest.raises(RuntimeError, match="正在执行中"):
+    with pytest.raises(RuntimeError, match="still running"):
         manager.delete("ui-busy")
     assert run_dir.exists()
 
@@ -8570,7 +8580,7 @@ def test_delete_rejected_when_descendant_is_running(tmp_path: Path) -> None:
     root_dir = _make_run(tmp_path, "ui-root")
     child_dir = _make_run(tmp_path, "ui-child", parent="ui-root", status="running")
     manager._runs["ui-child"] = {"run_id": "ui-child", "status": "running"}
-    with pytest.raises(RuntimeError, match="正在执行中"):
+    with pytest.raises(RuntimeError, match="still running"):
         manager.delete("ui-root")
     assert root_dir.exists()
     assert child_dir.exists()
@@ -8619,7 +8629,7 @@ def test_http_delete_endpoint_statuses(tmp_path: Path) -> None:
         conn.request("DELETE", "/api/runs/ui-ghost")
         response = conn.getresponse()
         assert response.status == 404
-        assert "不存在" in json.loads(response.read())["error"]
+        assert "does not exist" in json.loads(response.read())["error"]
 
         # 非法 run_id → 400，且不删除任何目录。
         conn.request("DELETE", "/api/runs/..%2Fxxx")
@@ -8631,7 +8641,7 @@ def test_http_delete_endpoint_statuses(tmp_path: Path) -> None:
         conn.request("DELETE", "/api/runs/ui-http-busy")
         response = conn.getresponse()
         assert response.status == 409
-        assert "正在执行中" in json.loads(response.read())["error"]
+        assert "still running" in json.loads(response.read())["error"]
     finally:
         server.shutdown()
         server.server_close()
@@ -8679,7 +8689,7 @@ def test_http_endpoints_rounds_versions_and_followup_error(
         )
         response = conn.getresponse()
         assert response.status == 400
-        assert "不存在" in json.loads(response.read())["error"]
+        assert "has no final state" in json.loads(response.read())["error"]
 
         # Followup submitted while a run is in progress → 409 (mutex, no queue).
         server.manager._runs["busy-run"] = {"run_id": "busy-run", "status": "running"}
@@ -8698,7 +8708,7 @@ def test_http_endpoints_rounds_versions_and_followup_error(
         )
         response = conn.getresponse()
         assert response.status == 409
-        assert "当前运行结束后才能提交" in json.loads(response.read())["error"]
+        assert "after the current run finishes" in json.loads(response.read())["error"]
     finally:
         server.shutdown()
         server.server_close()
@@ -9565,6 +9575,391 @@ async def test_high_citation_ranker_prioritizes_absolute_impact() -> None:
         current_year=2026, prefer_high_citation=True
     ).rank("protein folding mechanism", papers, limit=2)
     assert ranked[0].paper_id == "classic"
+
+
+# ==================== M4 gate format-retry + entity defer 回归 ====================
+
+
+class _FakeAIMessage:
+    def __init__(self, content: str) -> None:
+        self.content = content
+        self.response_metadata = {}
+
+
+class _FakeLLM:
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+    async def ainvoke(self, messages):
+        return _FakeAIMessage(self.content)
+
+
+@pytest.mark.asyncio
+async def test_qwen_structured_chat_unwraps_alternate_array_key() -> None:
+    """A2: array schema wrapped under a non-"entries" key still unwraps."""
+    from hypoforge.tools.qwen_client import QwenClient
+
+    client = QwenClient(
+        model="qwen3.7-max", api_key="test-key", api_base="https://example.invalid/v1"
+    )
+    client._build_llm = lambda **kwargs: _FakeLLM(
+        '{"verdicts": [{"hypothesis_id": "H1", "pass": true}]}'
+    )
+
+    result = await client.structured_chat(
+        user_prompt="judge",
+        output_schema={
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"hypothesis_id": {"type": "string"}},
+            },
+        },
+    )
+
+    assert result == [{"hypothesis_id": "H1", "pass": True}]
+
+
+@pytest.mark.asyncio
+async def test_qwen_structured_chat_parse_error_dict_not_unwrapped() -> None:
+    """A2: a dict with no list value (parse error) is not silently unwrapped."""
+    from hypoforge.tools.qwen_client import QwenClient
+
+    client = QwenClient(
+        model="qwen3.7-max", api_key="test-key", api_base="https://example.invalid/v1"
+    )
+    client._build_llm = lambda **kwargs: _FakeLLM('{"broken": true}')
+
+    result = await client.structured_chat(
+        user_prompt="judge",
+        output_schema={"type": "array", "items": {"type": "object"}},
+    )
+
+    assert result == {"broken": True}
+
+
+@pytest.mark.asyncio
+async def test_qwen_structured_chat_salvaged_list_key_not_unwrapped() -> None:
+    """A2: salvage-style list keys (e.g. "issues") are not unwrapped."""
+    from hypoforge.tools.qwen_client import QwenClient
+
+    client = QwenClient(
+        model="qwen3.7-max", api_key="test-key", api_base="https://example.invalid/v1"
+    )
+    client._build_llm = lambda **kwargs: _FakeLLM(
+        '{"issues": ["missing mechanism", "no evidence link"]}'
+    )
+
+    result = await client.structured_chat(
+        user_prompt="judge",
+        output_schema={"type": "array", "items": {"type": "object"}},
+    )
+
+    assert result == {"issues": ["missing mechanism", "no evidence link"]}
+
+
+@pytest.mark.asyncio
+async def test_m4_critic_retries_once_on_non_list_payload() -> None:
+    """A1+A3: non-list payload retries once with raw feedback and max_tokens."""
+    module = StrictM4HypothesisGeneration(mode="multi_agent")
+    candidates = [
+        HypothesisCard(hypothesis_id="H1", statement="hypothesis one"),
+        HypothesisCard(hypothesis_id="H2", statement="hypothesis two"),
+    ]
+    client = _M4SequenceClient([
+        # 1. truncated JSON → parse-error dict, not a list
+        {"_parse_error": True, "raw_response": '{"entries": [{"hypothesis_id": "H1"'},
+        # 2. retry returns the full verdict array
+        [
+            {"hypothesis_id": "H1", "pass": True, "critique": "ok", "issues": []},
+            {"hypothesis_id": "H2", "pass": True, "critique": "ok", "issues": []},
+        ],
+    ])
+    module.client = client
+
+    survivors = await module._run_critic(PipelineState(input_question="Q"), candidates)
+
+    assert [card.hypothesis_id for card in survivors] == ["H1", "H2"]
+    assert len(client.calls) == 2
+    assert client.calls[0]["max_tokens"] == 8192
+    assert "Raw response received" in client.calls[1]["user_prompt"]
+    assert '{"entries": [{"hypothesis_id": "H1"' in client.calls[1]["user_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_m4_critic_retries_once_for_missing_verdict() -> None:
+    """A3: incomplete verdict coverage retries once listing the missing IDs."""
+    module = StrictM4HypothesisGeneration(mode="multi_agent")
+    candidates = [
+        HypothesisCard(hypothesis_id="H1", statement="hypothesis one"),
+        HypothesisCard(hypothesis_id="H2", statement="hypothesis two"),
+    ]
+    client = _M4SequenceClient([
+        [{"hypothesis_id": "H1", "pass": True, "critique": "ok", "issues": []}],
+        [
+            {"hypothesis_id": "H1", "pass": True, "critique": "ok", "issues": []},
+            {"hypothesis_id": "H2", "pass": True, "critique": "ok", "issues": []},
+        ],
+    ])
+    module.client = client
+
+    survivors = await module._run_critic(PipelineState(input_question="Q"), candidates)
+
+    assert [card.hypothesis_id for card in survivors] == ["H1", "H2"]
+    assert len(client.calls) == 2
+    assert "'H2'" in client.calls[1]["user_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_m4_critic_non_list_twice_still_fails() -> None:
+    """A3: two consecutive non-list payloads still raise (no silent pass)."""
+    module = StrictM4HypothesisGeneration(mode="multi_agent")
+    candidates = [
+        HypothesisCard(hypothesis_id="H1", statement="hypothesis one"),
+        HypothesisCard(hypothesis_id="H2", statement="hypothesis two"),
+    ]
+    client = _M4SequenceClient([
+        {"_parse_error": True, "raw_response": "garbage"},
+        {"_parse_error": True, "raw_response": "garbage"},
+    ])
+    module.client = client
+
+    with pytest.raises(RuntimeError, match="non-list verdict payload"):
+        await module._run_critic(PipelineState(input_question="Q"), candidates)
+    assert len(client.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_m4_falsifiability_retries_once_on_non_list_payload() -> None:
+    """A1+A3: falsifiability gate gets the same format retry and max_tokens."""
+    module = StrictM4HypothesisGeneration(mode="multi_agent")
+    candidates = [
+        HypothesisCard(hypothesis_id="H1", statement="hypothesis one"),
+        HypothesisCard(hypothesis_id="H2", statement="hypothesis two"),
+    ]
+    client = _M4SequenceClient([
+        {"_parse_error": True, "raw_response": "not json"},
+        [
+            {"hypothesis_id": "H1", "is_falsifiable": True, "assessment": "testable"},
+            {"hypothesis_id": "H2", "is_falsifiable": True, "assessment": "testable"},
+        ],
+    ])
+    module.client = client
+
+    survivors = await module._run_falsifiability(
+        PipelineState(input_question="Q"), candidates
+    )
+
+    assert [card.hypothesis_id for card in survivors] == ["H1", "H2"]
+    assert len(client.calls) == 2
+    assert client.calls[0]["max_tokens"] == 8192
+    assert "Raw response received" in client.calls[1]["user_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_entity_ambiguous_merge_defers_instead_of_aborting(tmp_path) -> None:
+    """D9: multiple identity matches defer to unresolved instead of raising."""
+    service = StrictEntityNormalizationService(
+        cache_dir=tmp_path,
+        client=ProgrammableIdentityClient({
+            ("crispr/cas9", "crispr-cas9"): True,
+            ("crispr/cas9", "crispr/cas9 system"): True,
+        }),
+        embedding_backend=EqualEmbeddings(),
+    )
+    service.register_alias_group("crispr-cas9", [])
+    service.register_alias_group("crispr/cas9 system", [])
+
+    result = await service.resolve_batch(["crispr/cas9"])
+
+    assert result["crispr/cas9"].canonical_name == "crispr/cas9"
+    assert result["crispr/cas9"].decision_source == "unresolved_identity"
+    assert "crispr/cas9" not in service.alias_to_id
+    # the ambiguous pair decisions are deliberately not cached
+    assert service.pair_decisions == {}
+
+
+# ==================== D1/D2/B/C 回归 ====================
+
+
+@pytest.mark.asyncio
+async def test_m4_zero_valid_candidates_get_retry_with_contract_feedback() -> None:
+    """D1: a fully-discarded batch still gets one retry carrying the
+    contract-failure reasons; a still-empty result keeps the hard error."""
+    module = StrictM4HypothesisGeneration(mode="multi_agent")
+    module.client = object()  # satisfies the client guard; LLM calls are stubbed
+    batches = []
+
+    async def fake_generate(
+        state, *, question, graph_context, feedback_context,
+        tool_name, attempt, requested_count=None,
+    ):
+        batches.append((tool_name, feedback_context))
+        if attempt == 1:
+            return [], [], [{
+                "hypothesis_id": "H1",
+                "rationale": "missing required task entities in their required "
+                             "output scope: disease",
+            }]
+        return [], [], []
+
+    async def fake_repair(*, state, context, candidates, failures, feedback_context):
+        return [], []
+
+    module._generate_hypothesis_batch = fake_generate
+    module._repair_context_contract = fake_repair
+
+    with pytest.raises(ValueError, match="no task-contract-compliant hypotheses"):
+        await module._run_llm(
+            PipelineState(input_question="Q", problem_card=make_problem_card())
+        )
+
+    assert [tool for tool, _ in batches] == [
+        "hypothesis_generator", "hypothesis_generator_retry",
+    ]
+    assert "missing required task entities in their required output scope: disease" \
+        in batches[1][1]
+
+
+@pytest.mark.asyncio
+async def test_m4_iteration_feedback_includes_task_contract_reminder() -> None:
+    """D2: iteration feedback is prefixed with a task-contract reminder so
+    novelty pressure cannot push the generator off the required scope."""
+    from hypoforge.state import (
+        ProblemCard,
+        TaskContract,
+        TaskEntity,
+        TaskRequirement,
+    )
+
+    module = StrictM4HypothesisGeneration(mode="multi_agent")
+    module.client = object()
+    batches = []
+    card = ProblemCard(
+        original_question="Q",
+        sub_questions=["sq1"],
+        key_entities=["microbiome", "health", "disease"],
+        domain=["biology"],
+        task_contract=TaskContract(
+            entities=[
+                TaskEntity(entity_id="E1", name="microbiome",
+                           role="primary_object", required=True),
+                TaskEntity(entity_id="E2", name="health",
+                           role="outcome", required=True),
+                TaskEntity(entity_id="E3", name="disease",
+                           role="outcome", required=True),
+            ],
+            requirements=[
+                TaskRequirement(requirement_id="R1", sub_question="sq1",
+                                primary_entity_id="E1", relation="causes"),
+            ],
+        ),
+    )
+
+    async def fake_generate(
+        state, *, question, graph_context, feedback_context,
+        tool_name, attempt, requested_count=None,
+    ):
+        batches.append((tool_name, feedback_context))
+        return [
+            {"hypothesis_id": "H1",
+             "statement": "microbiome dysbiosis causes health and disease."}
+        ], [
+            HypothesisCard(hypothesis_id="H1",
+                           statement="microbiome dysbiosis causes health and disease.")
+        ], []
+
+    async def fake_gates(state, candidates, **kwargs):
+        return candidates
+
+    module._generate_hypothesis_batch = fake_generate
+    module._run_quality_gates = fake_gates
+    module._attach_rankings = lambda candidates, payload, context=None: candidates
+
+    await module._run_llm(
+        PipelineState(input_question="Q", problem_card=card),
+        feedback_context="Improve novelty: the hypothesis is not novel enough.",
+    )
+
+    feedback = batches[0][1]
+    assert feedback.startswith("Task-contract reminder")
+    assert "microbiome, health, disease" in feedback
+    assert "R1" in feedback
+    assert "not novel enough" in feedback
+
+
+@pytest.mark.asyncio
+async def test_m4_recovery_rerun_format_failure_raises_clean_error() -> None:
+    """B: a format failure while re-running the gate after recovery surfaces
+    as one clean error naming the recovery step, not a chained exception."""
+    module = StrictM4HypothesisGeneration(mode="multi_agent")
+    candidates = [
+        HypothesisCard(hypothesis_id="H1", statement="hypothesis one"),
+        HypothesisCard(hypothesis_id="H2", statement="hypothesis two"),
+    ]
+    client = _M4SequenceClient([
+        [  # 1. critic: every candidate rejected
+            {"hypothesis_id": "H1", "pass": False, "critique": "bad", "issues": []},
+            {"hypothesis_id": "H2", "pass": False, "critique": "bad", "issues": []},
+        ],
+        [  # 2. gate-recovery regeneration pass
+            {"hypothesis_id": "H3",
+             "statement": "Hsp70 co-chaperone binding improves client protein folding"},
+        ],
+        [  # 3. semantic contract audit on the regenerated batch
+            {"hypothesis_id": "H3", "consistent": True, "rationale": "same object"},
+        ],
+        {"_parse_error": True, "raw_response": "garbage"},  # 4. critic re-run, attempt 1
+        {"_parse_error": True, "raw_response": "garbage"},  # 5. critic re-run, attempt 2
+    ])
+    module.client = client
+
+    with pytest.raises(RuntimeError, match="could not be re-run after gate recovery"):
+        await module._run_quality_gates(
+            PipelineState(input_question="Q", problem_card=make_problem_card()),
+            candidates,
+            generation_shortfall=False,
+            question="Q",
+        )
+    assert len(client.calls) == 5
+
+
+@pytest.mark.asyncio
+async def test_m4_observe_tool_timeout_caps_slow_calls() -> None:
+    """C-2: M4 LLM tool calls run under the module's per-call timeout."""
+    from hypoforge.modules.m4_hypothesis_generation import M4HypothesisGeneration
+
+    async def slow():
+        await asyncio.sleep(10)
+
+    with pytest.raises(TimeoutError):
+        await M4HypothesisGeneration._observe_tool("x", slow(), timeout=0.05)
+
+    module = M4HypothesisGeneration(mode="multi_agent")
+    module.llm_call_timeout = 0.05
+    with pytest.raises(TimeoutError):
+        await module._tool_call("x", slow())
+
+
+@pytest.mark.asyncio
+async def test_pipeline_node_timeout_fires_with_budget_error() -> None:
+    """C-1: a module that exceeds its node budget fails with the stage named."""
+    runner = PipelineRunner(PipelineConfig())
+    runner.config.node_timeouts = {"m1": 0.2}
+
+    async def slow_module():
+        await asyncio.sleep(10)
+        return {}
+
+    with pytest.raises(RuntimeError, match="exceeded its.*node budget"):
+        await runner._await_module_or_cancel(slow_module(), "m1")
+
+
+def test_pipeline_node_timeout_defaults_cover_core_modules() -> None:
+    """C-1: default budgets exist for every core module."""
+    runner = PipelineRunner(PipelineConfig())
+    for module_name in ("m1", "m2", "m3", "m4", "m5", "m6"):
+        assert runner._node_timeout(module_name) > 0
 
 
 if __name__ == "__main__":
