@@ -39,6 +39,7 @@ from .search.search_tool import LiteratureSearchTool
 def build_integrated_search_adapter(
     *,
     client: QwenClient,
+    query_client: QwenClient | None = None,
     search_tool: LiteratureSearchTool | None = None,
     final_k: int = 5,
     per_query_limit: int | None = None,
@@ -69,6 +70,9 @@ def build_integrated_search_adapter(
     reading_workflow_timeout_seconds: float = 600.0,
     entity_embedding_model: str = "",
     round_strategy: str = "entity_group",
+    subquestion_concurrency: int = 2,
+    source_concurrency_limit: int = 2,
+    fresh_run_timeout_seconds: float = 840.0,
 ) -> AgenticM2Adapter:
     if final_k <= 0:
         raise ValueError("final_k must be positive")
@@ -88,6 +92,15 @@ def build_integrated_search_adapter(
         raise ValueError("fulltext_backfill_max_attempts must be positive")
     if fulltext_target_per_subquestion <= 0:
         raise ValueError("fulltext_target_per_subquestion must be positive")
+    if fulltext_target_per_subquestion > final_k:
+        raise ValueError(
+            "fulltext_target_per_subquestion cannot exceed final_k; otherwise "
+            "every sub-question is forced into backfill/expansion"
+        )
+    if subquestion_concurrency <= 0 or source_concurrency_limit <= 0:
+        raise ValueError("M2 concurrency limits must be positive")
+    if fresh_run_timeout_seconds <= 0:
+        raise ValueError("fresh_run_timeout_seconds must be positive")
 
     tool = search_tool or LiteratureSearchTool(
         enabled_sources=enabled_sources,
@@ -107,8 +120,9 @@ def build_integrated_search_adapter(
             max_queries=12,
             max_papers=max(100, final_k),
         )
+    query_client = query_client or client
     base_planner = QueryPlanner(
-        client=client,
+        client=query_client,
         tool_definitions=tool.tool_definitions,
         max_rounds=resolved_budget.max_rounds,
         strict=True,
@@ -142,6 +156,7 @@ def build_integrated_search_adapter(
         # strategy (reuses the shared Qwen client; failures degrade to a
         # deterministic fallback inside the search agent).
         entity_classifier=client,
+        source_concurrency_limit=source_concurrency_limit,
     )
     store = InMemoryChunkStore()
     pmc_resolver = PMCFulltextResolver(
@@ -183,9 +198,11 @@ def build_integrated_search_adapter(
         budget=resolved_budget,
         entity_judge_client=client,
         entity_embedding_model=entity_embedding_model,
-        subquestion_entity_client=client,
+        subquestion_entity_client=query_client,
         round_strategy=round_strategy,
         fulltext_backfill_enabled=domain_routing_enabled,
         fulltext_backfill_target=fulltext_target_per_subquestion,
         fulltext_backfill_max_attempts=fulltext_backfill_max_attempts,
+        subquestion_concurrency=subquestion_concurrency,
+        fresh_run_timeout_seconds=fresh_run_timeout_seconds,
     )

@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlparse
 from dotenv import dotenv_values
 
 from .config import ModuleOverride, PipelineConfig
+from .literature.search.search_tool import literature_credential_warnings
 from .observability import RunEventRecorder
 from .pipeline import PipelineRunner
 
@@ -134,6 +135,59 @@ class RunManager:
             # question text, so the caller cannot drift from the failed run.
             seed_state = self._load_checkpoint_state(resume_of)
             question = str(seed_state.get("input_question") or question)
+
+        # Resolve capability status before starting the worker so the first
+        # API response can immediately tell the browser about degraded search
+        # sources.  Only booleans and warning messages are exposed; credential
+        # values remain in the memory-only credential store below.
+        preview_config = PipelineConfig.from_yaml(self.config_path)
+        m2_override = preview_config.module_overrides.get("m2")
+        m2_kwargs = dict(m2_override.kwargs) if m2_override is not None else {}
+        effective_serper = str(
+            serper_api_key
+            or m2_kwargs.get("serper_api_key", "")
+            or os.environ.get("SERPER_API_KEY", "")
+        ).strip()
+        effective_ads = str(
+            ads_api_token
+            or m2_kwargs.get("ads_api_token", "")
+            or os.environ.get("ADS_API_TOKEN", "")
+        ).strip()
+        enabled_sources = list(preview_config.search.tools)
+        credential_warnings = (
+            literature_credential_warnings(
+                enabled_sources,
+                serper_api_key=effective_serper,
+                ads_api_token=effective_ads,
+            )
+            if "m2" in preview_config.enabled_modules
+            else []
+        )
+        credential_status = {
+            "llm_configured": bool(
+                qwen_api_key or preview_config.qwen.base.api_key
+            ),
+            "semantic_scholar_configured": bool(
+                semantic_scholar_api_key
+                or m2_kwargs.get("semantic_scholar_api_key", "")
+                or os.environ.get("SEMANTIC_SCHOLAR_API_KEY")
+            ),
+            "openalex_configured": bool(
+                openalex_api_key
+                or m2_kwargs.get("openalex_api_key", "")
+                or os.environ.get("OPENALEX_API_KEY")
+            ),
+            "serper_configured": bool(effective_serper),
+            "ads_configured": bool(effective_ads),
+            "unpaywall_configured": bool(
+                unpaywall_email
+                or openalex_mailto
+                or m2_kwargs.get("unpaywall_email", "")
+                or m2_kwargs.get("openalex_mailto", "")
+                or os.environ.get("UNPAYWALL_EMAIL")
+                or os.environ.get("OPENALEX_MAILTO")
+            ),
+        }
         with self._lock:
             if any(item.get("status") == "running" for item in self._runs.values()):
                 raise RuntimeError(
@@ -155,6 +209,8 @@ class RunManager:
                 "run_dir": str(run_dir),
                 "error": "",
                 "cancel_requested": False,
+                "credential_status": credential_status,
+                "credential_warnings": credential_warnings,
             }
             if parent_run_id:
                 record["parent_run_id"] = parent_run_id
@@ -370,11 +426,12 @@ class RunManager:
                     "turbo": config.qwen.turbo.model,
                 },
                 "enabled_modules": list(config.enabled_modules),
-                "credential_status": {
-                    "llm_configured": bool(config.qwen.base.api_key),
-                    "semantic_scholar_configured": bool(semantic_scholar_api_key),
-                    "openalex_configured": bool(os.environ.get("OPENALEX_API_KEY")),
-                },
+                "credential_status": dict(
+                    self._runs[run_id].get("credential_status", {})
+                ),
+                "credential_warnings": list(
+                    self._runs[run_id].get("credential_warnings", [])
+                ),
                 "output_dir": str(run_dir),
             }
             if followup_info:
@@ -383,6 +440,18 @@ class RunManager:
             if resume_info:
                 manifest["resume_of"] = resume_info.get("resume_of", "")
             recorder.write_manifest(manifest)
+            for notice in manifest["credential_warnings"]:
+                recorder.emit(
+                    "credential_warning",
+                    module="m2",
+                    tool=str(notice.get("source") or "credential"),
+                    status="warning",
+                    message=str(notice.get("message") or "检索凭证未配置"),
+                    details={
+                        "code": str(notice.get("code") or ""),
+                        "source": str(notice.get("source") or ""),
+                    },
+                )
             run_kwargs: dict[str, Any] = {}
             if followup_info:
                 run_kwargs = {
@@ -455,6 +524,12 @@ class RunManager:
                 "completed_at": completed_at,
                 "error": error,
                 "config_path": str(self.config_path),
+                "credential_status": dict(
+                    self._runs[run_id].get("credential_status", {})
+                ),
+                "credential_warnings": list(
+                    self._runs[run_id].get("credential_warnings", [])
+                ),
                 "output_dir": str(run_dir),
             }
             if followup_info:

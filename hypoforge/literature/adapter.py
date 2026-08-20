@@ -38,6 +38,8 @@ unchanged.
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import dataclass
 import logging
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -93,6 +95,17 @@ _KNOWLEDGE_RETENTION_ROLES = frozenset({
     "contradicting_evidence",
     "fulltext_backfill",
 })
+
+
+@dataclass(frozen=True)
+class _SubquestionOutcome:
+    """One independently executed fresh-M2 sub-question result."""
+
+    index: int
+    sub_question: str
+    literature_result: LiteratureResult
+    export_run: M2KnowledgeRun
+    executed_queries: tuple[str, ...]
 
 
 # ============================================================================
@@ -159,6 +172,8 @@ class AgenticM2Adapter(ModuleProtocol):
         fulltext_backfill_max_attempts: int = 8,
         fulltext_backfill_min_relevance: float = 0.70,
         fulltext_backfill_min_directness: float = 0.45,
+        subquestion_concurrency: int = 2,
+        fresh_run_timeout_seconds: float = 840.0,
     ) -> None:
         self.search_agent = search_agent
         self.reading_workflow = reading_workflow
@@ -180,11 +195,21 @@ class AgenticM2Adapter(ModuleProtocol):
             raise ValueError("fulltext_backfill_min_relevance must be in [0, 1]")
         if not 0 <= fulltext_backfill_min_directness <= 1:
             raise ValueError("fulltext_backfill_min_directness must be in [0, 1]")
+        if subquestion_concurrency <= 0:
+            raise ValueError("subquestion_concurrency must be positive")
+        if fresh_run_timeout_seconds <= 0:
+            raise ValueError("fresh_run_timeout_seconds must be positive")
         self.fulltext_backfill_enabled = bool(fulltext_backfill_enabled)
         self.fulltext_backfill_target = int(fulltext_backfill_target)
         self.fulltext_backfill_max_attempts = int(fulltext_backfill_max_attempts)
         self.fulltext_backfill_min_relevance = float(fulltext_backfill_min_relevance)
         self.fulltext_backfill_min_directness = float(fulltext_backfill_min_directness)
+        self.subquestion_concurrency = int(subquestion_concurrency)
+        self.fresh_run_timeout_seconds = float(fresh_run_timeout_seconds)
+        self._subquestion_semaphore = asyncio.Semaphore(self.subquestion_concurrency)
+        # Entity normalization persists one run-scoped cache file.  Keep that
+        # small merge phase serialized while search and reading remain parallel.
+        self._entity_normalization_lock = asyncio.Lock()
 
     @staticmethod
     def _is_parsed_fulltext(reading: Any) -> bool:
@@ -479,40 +504,17 @@ class AgenticM2Adapter(ModuleProtocol):
             )
         return False
 
-    async def __call__(
+    async def _run_fresh_subquestion(
         self,
         state: PipelineState,
-        config: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        # ---- supplement round: cache-first incremental search -------------
-        # Re-entry on a supplement_m2 route (search_round already advanced by
-        # a previous M2 execution) with at least one open evidence gap.
-        open_gaps = [gap for gap in state.evidence_gaps if gap.status == "open"]
-        if open_gaps and state.search_round > 0:
-            return await self._run_supplement(state, open_gaps)
+        domains: Sequence[str],
+        index: int,
+        sub_question: str,
+    ) -> _SubquestionOutcome:
+        """Run one fresh-search unit under the shared M2 concurrency limit."""
 
-        # ---- fresh round: full search flow (unchanged) ---------------------
-        problem_card = state.problem_card
-        pending_gaps = [
-            gap for gap in state.evidence_gap_requests if gap.status == "pending"
-        ]
-        sub_questions = list(dict.fromkeys(
-            gap.sub_question for gap in pending_gaps
-        )) if pending_gaps else (
-            problem_card.sub_questions
-            if problem_card and problem_card.sub_questions
-            else [state.input_question]
-        )
-        domains = problem_card.domain if problem_card else []
-        literature_results: list[LiteratureResult] = []
-        export_runs = []
-        executed_queries: dict[str, list[str]] = {}
-        for sub_question in sub_questions:
+        async with self._subquestion_semaphore:
             key_entities = search_entities_for_sub_question(state, sub_question)
-            # M2-local entity generation: the LLM sees this sub-question's
-            # M1 entities and may add uncovered search concepts.  Results
-            # are search-scoped only — never written back to the problem
-            # card / task contract.
             supplement_entities = await generate_subquestion_entities(
                 self.subquestion_entity_client,
                 sub_question,
@@ -526,8 +528,6 @@ class AgenticM2Adapter(ModuleProtocol):
                 sub_question,
                 key_entities=key_entities,
                 domains=domains,
-                # The validated benchmark used one compact discovery round,
-                # then expanded only when parsed full text was insufficient.
                 budget=(
                     self._one_round_budget()
                     if self.fulltext_backfill_enabled else self.budget
@@ -538,9 +538,6 @@ class AgenticM2Adapter(ModuleProtocol):
             if search_result.stop_reason is StopReason.ERROR:
                 detail = "; ".join(search_result.errors) or "unrecoverable search error"
                 raise RuntimeError(f"Agentic M2 search failed: {detail}")
-            executed_queries[sub_question] = [
-                query.text for query in search_result.queries
-            ]
 
             if not search_result.final_papers:
                 emit_event(
@@ -569,11 +566,13 @@ class AgenticM2Adapter(ModuleProtocol):
                 search_context=search_result,
             )
             attempted_backfill_ids: set[str] = set()
+            # Relevance/directness already form the hard admission gate.  A
+            # citation floor excluded new frontier work from the first OA pass.
             search_result, reading_results = await self._backfill_fulltext(
                 sub_question,
                 search_result,
                 list(reading_results),
-                citation_floor=100,
+                citation_floor=0,
                 attempted_ids=attempted_backfill_ids,
             )
             target = self.fulltext_backfill_target or int(
@@ -597,21 +596,13 @@ class AgenticM2Adapter(ModuleProtocol):
                     search_result = await self._merge_search_phases(
                         search_result, expanded
                     )
-                    for citation_floor in (100, 20, 0):
-                        search_result, reading_results = (
-                            await self._backfill_fulltext(
-                                sub_question,
-                                search_result,
-                                list(reading_results),
-                                citation_floor=citation_floor,
-                                attempted_ids=attempted_backfill_ids,
-                            )
-                        )
-                        if sum(
-                            self._is_parsed_fulltext(item)
-                            for item in reading_results
-                        ) >= target:
-                            break
+                    search_result, reading_results = await self._backfill_fulltext(
+                        sub_question,
+                        search_result,
+                        list(reading_results),
+                        citation_floor=0,
+                        attempted_ids=attempted_backfill_ids,
+                    )
                 else:
                     emit_event(
                         "tool_result",
@@ -627,12 +618,13 @@ class AgenticM2Adapter(ModuleProtocol):
                             "errors": list(expanded.errors),
                         },
                     )
-            executed_queries[sub_question] = [
-                query.text for query in search_result.queries
-            ]
-            reading_results = await self._normalise_reading_entities(
-                state, list(reading_results)
-            )
+
+            # The run-scoped entity cache has one on-disk target.  Serialize
+            # normalization to avoid competing temporary-file replacements.
+            async with self._entity_normalization_lock:
+                reading_results = await self._normalise_reading_entities(
+                    state, list(reading_results)
+                )
             self._validate_reading_contract(
                 sub_question, search_result, list(reading_results),
             )
@@ -652,16 +644,149 @@ class AgenticM2Adapter(ModuleProtocol):
                     "papers": len(export_run.papers),
                     "evidence": len(export_run.evidence),
                     "knowledge_entries": len(export_run.knowledge_entries),
+                    "parsed_fulltexts": sum(
+                        paper.content_level in {
+                            "structured_fulltext", "pdf", "html", "ocr",
+                        } and paper.chunks_parsed > 0
+                        for paper in export_run.papers
+                    ),
+                    "abstract_only": sum(
+                        paper.content_level == "abstract"
+                        for paper in export_run.papers
+                    ),
                 },
             )
-            export_runs.append(export_run)
-            literature_results.append(
-                LiteratureResult(
+            return _SubquestionOutcome(
+                index=index,
+                sub_question=sub_question,
+                export_run=export_run,
+                literature_result=LiteratureResult(
                     sub_question=sub_question,
                     papers_retrieved=len(export_run.papers),
                     knowledge_entries=list(export_run.knowledge_entries),
-                )
+                ),
+                executed_queries=tuple(
+                    query.text for query in search_result.queries
+                ),
             )
+
+    async def __call__(
+        self,
+        state: PipelineState,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        # ---- supplement round: cache-first incremental search -------------
+        # Re-entry on a supplement_m2 route (search_round already advanced by
+        # a previous M2 execution) with at least one open evidence gap.
+        open_gaps = [gap for gap in state.evidence_gaps if gap.status == "open"]
+        if open_gaps and state.search_round > 0:
+            return await self._run_supplement(state, open_gaps)
+
+        # ---- fresh round: full search flow (unchanged) ---------------------
+        problem_card = state.problem_card
+        pending_gaps = [
+            gap for gap in state.evidence_gap_requests if gap.status == "pending"
+        ]
+        sub_questions = list(dict.fromkeys(
+            gap.sub_question for gap in pending_gaps
+        )) if pending_gaps else (
+            problem_card.sub_questions
+            if problem_card and problem_card.sub_questions
+            else [state.input_question]
+        )
+        domains = problem_card.domain if problem_card else []
+        literature_results: list[LiteratureResult] = []
+        export_runs: list[M2KnowledgeRun] = []
+        executed_queries: dict[str, list[str]] = {}
+        tasks = {
+            asyncio.create_task(
+                self._run_fresh_subquestion(state, domains, index, sub_question)
+            ): (index, sub_question)
+            for index, sub_question in enumerate(sub_questions)
+        }
+        try:
+            done, pending = await asyncio.wait(
+                tasks,
+                timeout=self.fresh_run_timeout_seconds,
+            )
+        except BaseException:
+            # Child tasks created for bounded parallelism are independent of
+            # their parent unless explicitly cancelled.  Do not leave searches
+            # or downloads running after a pipeline stop/node timeout.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        outcomes: dict[int, _SubquestionOutcome] = {}
+        failures: dict[int, tuple[str, str]] = {}
+        for task in done:
+            index, sub_question = tasks[task]
+            if task.cancelled():
+                failures[index] = (sub_question, "M2 sub-question task was cancelled")
+                continue
+            try:
+                outcome = task.result()
+            except Exception as exc:
+                detail = " ".join(f"{type(exc).__name__}: {exc}".split())[:500]
+                failures[index] = (sub_question, detail)
+            else:
+                outcomes[index] = outcome
+
+        if pending:
+            for task in pending:
+                index, sub_question = tasks[task]
+                failures[index] = (
+                    sub_question,
+                    "M2 fresh-run shared deadline expired after "
+                    f"{self.fresh_run_timeout_seconds:g} seconds",
+                )
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        if failures and not outcomes:
+            summary = "; ".join(
+                f"{question!r}: {detail}"
+                for _, (question, detail) in sorted(failures.items())
+            )
+            raise RuntimeError(
+                "Every M2 sub-question failed within the shared fresh-run "
+                f"budget: {summary}"
+            )
+
+        for index, sub_question in enumerate(sub_questions):
+            outcome = outcomes.get(index)
+            if outcome is not None:
+                export_runs.append(outcome.export_run)
+                literature_results.append(outcome.literature_result)
+                executed_queries[sub_question] = list(outcome.executed_queries)
+                continue
+
+            _, detail = failures[index]
+            emit_event(
+                "tool_failed",
+                module="m2",
+                tool="subquestion_worker",
+                status="failed",
+                message=(
+                    "M2 sub-question failed; preserving successful sibling "
+                    f"results: {sub_question}"
+                ),
+                details={"sub_question": sub_question, "error": detail},
+            )
+            export_runs.append(M2KnowledgeRun(
+                sub_question=sub_question,
+                search_provenance=M2SearchProvenance(
+                    stop_reason="error",
+                    errors=[detail],
+                ),
+            ))
+            literature_results.append(LiteratureResult(
+                sub_question=sub_question,
+                papers_retrieved=0,
+                knowledge_entries=[],
+            ))
+            executed_queries[sub_question] = []
 
         # Seed the paper cache (side effect only; never affects the return
         # patch) so later supplement rounds can hit it.
@@ -696,6 +821,14 @@ class AgenticM2Adapter(ModuleProtocol):
                 runs=[*historical_runs, *export_runs]
             ),
         }
+        if failures:
+            result["errors"] = [
+                *state.errors,
+                *(
+                    f"[m2:{question}] {detail}"
+                    for _, (question, detail) in sorted(failures.items())
+                ),
+            ]
         if pending_gaps:
             pending_ids = {gap.gap_id for gap in pending_gaps}
             result["evidence_gap_requests"] = [
@@ -1211,16 +1344,17 @@ class AgenticM2Module(ModuleProtocol):
     def __init__(
         self,
         llm_config: Optional[Any] = None,
+        query_llm_config: Optional[Any] = None,
         variant: str = "integrated",
         **kwargs,
     ) -> None:
         # ModuleRegistry injects these orchestration-only values, while the
         # Track A factories accept only concrete adapter construction args.
         kwargs.pop("implementation", None)
-        kwargs.pop("query_llm_config", None)
         supplement_paper_budget = kwargs.pop("supplement_paper_budget", None)
         self.adapter = build_adapter_from_config(
             llm_config=llm_config,
+            query_llm_config=query_llm_config,
             variant=variant,
             **kwargs,
         )
@@ -1253,6 +1387,7 @@ class AgenticM2Module(ModuleProtocol):
 def build_adapter_from_config(
     *,
     llm_config: Optional[Any] = None,
+    query_llm_config: Optional[Any] = None,
     variant: str = "integrated",
     **kwargs,
 ) -> AgenticM2Adapter:
@@ -1279,8 +1414,13 @@ def build_adapter_from_config(
         from .integrated import build_integrated_search_adapter
 
         client = QwenClient.from_config(llm_config)
+        query_client = QwenClient.from_config(query_llm_config or llm_config)
         return _build_or_explain(
-            build_integrated_search_adapter, variant, client=client, **kwargs
+            build_integrated_search_adapter,
+            variant,
+            client=client,
+            query_client=query_client,
+            **kwargs,
         )
 
     if variant == "minimal":

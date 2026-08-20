@@ -323,15 +323,31 @@ class PipelineRunner:
         timeout = self._node_timeout(module_name)
         deadline = None if timeout <= 0 else time.monotonic() + timeout
         task = asyncio.create_task(operation)
+
+        async def cancel_with_grace() -> bool:
+            """Request cancellation without letting a stubborn task hang us."""
+
+            task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=5.0)
+            if task in done:
+                with suppress(BaseException):
+                    task.result()
+                return True
+            task.add_done_callback(
+                lambda completed: (
+                    completed.exception()
+                    if not completed.cancelled() else None
+                )
+            )
+            return False
+
         try:
             while True:
                 done, _ = await asyncio.wait({task}, timeout=0.2)
                 if task in done:
                     return task.result()
                 if deadline is not None and time.monotonic() >= deadline:
-                    task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await task
+                    cancelled_cleanly = await cancel_with_grace()
                     self._record_event(
                         "module_timed_out",
                         module=module_name,
@@ -340,7 +356,10 @@ class PipelineRunner:
                             f"{module_name.upper()} exceeded its "
                             f"{timeout:.0f}s node budget"
                         ),
-                        details={"budget_seconds": timeout},
+                        details={
+                            "budget_seconds": timeout,
+                            "cancelled_cleanly": cancelled_cleanly,
+                        },
                     )
                     raise RuntimeError(
                         f"{module_name.upper()} exceeded its {timeout:.0f}s node "
@@ -349,9 +368,7 @@ class PipelineRunner:
                     )
                 if not self._cancel_requested():
                     continue
-                task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await task
+                cancelled_cleanly = await cancel_with_grace()
                 self._record_event(
                     "module_cancelled",
                     module=module_name,
@@ -363,6 +380,7 @@ class PipelineRunner:
                     details={
                         "tools": self._MODULE_TOOLS.get(module_name, []),
                         "during_module": True,
+                        "cancelled_cleanly": cancelled_cleanly,
                     },
                 )
                 raise PipelineCancelled(module_name)

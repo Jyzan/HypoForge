@@ -70,6 +70,8 @@ class LLMConfig(BaseModel):
     api_key: str = ""
     max_tokens: int = 4096
     temperature: float = 0.1
+    request_timeout_seconds: float = Field(default=120.0, ge=1.0)
+    max_retries: int = Field(default=1, ge=0, le=5)
 
     @model_validator(mode="after")
     def _resolve_env(self) -> "LLMConfig":
@@ -113,6 +115,8 @@ class QwenModelsConfig(BaseModel):
 
 class SearchConfig(BaseModel):
     """Literature-search related settings."""
+
+    model_config = ConfigDict(extra="forbid")
 
     implementation: Literal["agentic"] = "agentic"
     tools: List[str] = Field(default_factory=lambda: ["semantic_scholar", "pubmed"])

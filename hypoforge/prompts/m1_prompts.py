@@ -15,11 +15,19 @@ For the given question, you must:
 1. **Identify domains** — which scientific or engineering fields does this question span?
    (e.g. structural biology, robotics, control, materials science, genomics, …)
 
-2. **Decompose into atomic sub-questions** — target 3–5 and never exceed 5.
-Each must contain exactly one
+2. **Decompose into atomic sub-questions** — use the smallest sufficient set:
+normally 1–3, and never exceed 5 even for genuinely multi-part questions.
+Do not manufacture extra mechanism or implementation questions merely to hit
+a target count. Each must contain exactly one
 research object and one relation/action. Split mechanism, method, modification,
 environment, or evaluation tasks into separate questions. Do not use semicolons,
 parenthesized enumerations, parallel requests, or more than one question mark.
+
+For an unfamiliar named artifact, coined term, model, instrument, or method
+whose existence/source is not established by the user's text, make the first
+atomic task determine whether it has an identifiable primary scholarly source.
+Do not assume that it has a particular mathematical structure or mechanism
+until that premise has been verified by retrieval; M2 will handle aliases.
 
 3. At least one sub-question must directly preserve the original core action.
 If the user asks how to implement something, a background or influencing-factor

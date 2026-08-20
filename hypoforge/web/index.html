@@ -391,6 +391,14 @@
     border:1px solid #fecaca;color:#7f1d1d;font-size:13px;overflow-wrap:anywhere;
     white-space:pre-wrap;word-break:break-word;max-height:180px;overflow:auto;
   }
+  .credential-warning-banner{
+    margin-bottom:16px;padding:12px 16px;border-radius:12px;background:#fffbeb;
+    border:1px solid #f59e0b;color:#78350f;font-size:13px;line-height:1.6;
+    overflow-wrap:anywhere;
+  }
+  .credential-warning-banner strong{display:block;color:#92400e;margin-bottom:3px}
+  .credential-warning-banner ul{margin:4px 0 0;padding-left:20px}
+  .credential-warning-banner li+li{margin-top:3px}
   .plan-sec .error-banner{max-height:140px;margin-bottom:8px}
   .retry-row{
     display:flex;align-items:center;gap:12px;margin-bottom:16px;padding:10px 16px;
@@ -691,6 +699,7 @@
           <div class="run-meta"><span id="runId"></span> · <span id="elapsed">00:00</span> · <span id="runStatus">准备中</span></div>
           <div id="parentPill" class="followup hidden"></div>
         </div>
+        <div id="credentialWarningBanner" class="credential-warning-banner hidden" role="status" aria-live="polite"></div>
         <div id="runErrorBanner" class="error-banner hidden"></div>
         <div class="retry-row hidden" id="retryRow">
           <button class="retry-btn" id="retryBtn" type="button">↻ 从断点重试</button>
@@ -2069,6 +2078,7 @@ async function openOverallView(rootId){
   $("runId").textContent = String(rootId);
   $("runStatus").textContent = `追问链 · 共 ${members.length} 轮`;
   $("runErrorBanner").classList.add("hidden");
+  $("credentialWarningBanner").classList.add("hidden");
   $("retryRow").classList.add("hidden");
   $("roundsCard").classList.add("hidden");
   $("parentPill").classList.add("hidden");
@@ -2269,6 +2279,7 @@ async function poll(){
     }
     const run = data.run || {};
     runRecord = run;
+    renderCredentialWarnings(run);
     $("runStatus").textContent = statusLabel(run.status || "running");
     updateIterInfo();
     if(TERMINAL.includes(run.status)) endRun(run);
@@ -2314,6 +2325,7 @@ async function attachRun(run){
   $("runId").textContent = currentRun;
   $("runStatus").textContent = statusLabel(run.status || "running");
   $("runErrorBanner").classList.add("hidden");
+  renderCredentialWarnings(run);
   $("retryRow").classList.add("hidden");
   $("roundsCard").classList.add("hidden");
   $("planCard").classList.add("hidden");
@@ -2777,6 +2789,20 @@ function showInputError(text){
   hint.textContent = text;
   hint.classList.add("error");
 }
+function renderCredentialWarnings(run){
+  const banner = $("credentialWarningBanner");
+  const warnings = Array.isArray(run?.credential_warnings)
+    ? run.credential_warnings.filter(item => item && item.message)
+    : [];
+  if(!warnings.length){
+    banner.textContent = "";
+    banner.classList.add("hidden");
+    return;
+  }
+  banner.innerHTML = `<strong>⚠ 当前运行的检索能力已降级</strong><ul>${warnings
+    .map(item => `<li>${esc(item.message)}</li>`).join("")}</ul>`;
+  banner.classList.remove("hidden");
+}
 /* ---------- 从断点重试 ---------- */
 function showRetryIfPossible(run){
   const row = $("retryRow");
@@ -2854,6 +2880,10 @@ async function submit(){
     semantic_scholar_api_key: $("semanticApiKey").value.trim(),
     openalex_api_key: $("openalexApiKey").value.trim(),
     openalex_mailto: $("openalexMailto").value.trim(),
+    serper_api_key: $("serperApiKey").value.trim(),
+    ads_api_token: $("adsApiToken").value.trim(),
+    unpaywall_email: $("unpaywallEmail").value.trim(),
+    crossref_mailto: $("crossrefMailto").value.trim(),
   };
   if(isFollowup){ payload.parent_run_id = currentRun; payload.followup = text; }
   try{
@@ -2947,6 +2977,7 @@ function resetToInitial(){
   $("credCard").classList.remove("hidden");
   $("inputBar").classList.remove("hidden");
   $("emptyHero").classList.remove("hidden");
+  $("credentialWarningBanner").classList.add("hidden");
   setSendBtn("submit");
   document.querySelectorAll(".h-item").forEach(el => el.classList.remove("active"));
   updateHint();

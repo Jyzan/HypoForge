@@ -26,10 +26,12 @@ provide indirect support.
 5b. **source_paper_ids** — for each evidence ID in ``supporting_evidence``, include
 its source paper ID from the graph context.  No paper IDs should appear here that
 are not linked to a referenced evidence item.
-6. **task_trace** — for every required task entity and requirement in the supplied
-task contract, return its exact contract ID plus a short literal excerpt copied
-from this hypothesis's statement, mechanism, or prediction. Never claim an ID
-whose meaning is absent from the cited excerpt.
+6. **task_trace** — include every required task entity, then select one or more
+atomic requirements that this particular hypothesis genuinely addresses. Return
+only those requirement IDs plus literal excerpts copied from this hypothesis's
+statement, mechanism, or prediction. A candidate portfolio may divide the task
+requirements across distinct hypotheses. Never claim an ID merely because its
+primary entity appears in the excerpt.
 
 Task contract fidelity (hard gate):
 - Every required task entity name MUST appear verbatim — the exact characters,
@@ -42,7 +44,8 @@ Task contract fidelity (hard gate):
   ``Chinese name (English term)``. Never embed a Chinese contract name inside an
   English sentence.
 - Requirement excerpts must be copied character-for-character from the
-  hypothesis text and must name the requirement's primary entity.
+  hypothesis text, name the requirement's primary entity, and express that
+  requirement's relation or action.
 
 Rules:
 - Hypotheses must be *novel* — do not restate established facts.
@@ -100,7 +103,9 @@ patch, prose, or explanations outside the objects.
 
 Binding rules:
 - Preserve the original research object, domain, relation, and requested outcome.
-- Address every required task entity and requirement in the supplied contract.
+- Address every required task entity and at least one genuinely applicable
+  atomic requirement from the supplied contract. Preserve a candidate's
+  existing requirement subset unless a diagnostic says it is unrelated.
 - Entity names MUST appear verbatim (exact characters, same language, no
   translation or paraphrase) in the statement or mechanism — quote one of the
   supplied exact names/aliases from the task contract block.

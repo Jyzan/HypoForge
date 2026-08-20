@@ -129,6 +129,8 @@ class QwenClient:
         model: str = "qwen3.7-max",
         api_key: str = "",
         api_base: str = "",
+        request_timeout_seconds: float = 120.0,
+        max_retries: int = 1,
     ):
         self.model = model
         self.api_key = api_key or os.environ.get("QWEN_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
@@ -137,6 +139,8 @@ class QwenClient:
             or os.environ.get("OPENAI_BASE_URL")
             or "https://dashscope.aliyuncs.com/compatible-mode/v1"
         )
+        self.request_timeout_seconds = max(1.0, float(request_timeout_seconds))
+        self.max_retries = max(0, int(max_retries))
 
     @classmethod
     def get_token_totals(cls) -> tuple[int, int]:
@@ -156,6 +160,10 @@ class QwenClient:
             model=getattr(llm_config, "model", "qwen3.7-max"),
             api_key=getattr(llm_config, "api_key", ""),
             api_base=getattr(llm_config, "api_base", ""),
+            request_timeout_seconds=getattr(
+                llm_config, "request_timeout_seconds", 120.0
+            ),
+            max_retries=getattr(llm_config, "max_retries", 1),
         )
 
     def list_models(self) -> list[str]:
@@ -226,6 +234,8 @@ class QwenClient:
             api_key=self.api_key,
             max_tokens=max_tokens,
             temperature=temperature,
+            timeout=self.request_timeout_seconds,
+            max_retries=self.max_retries,
             **chat_kwargs,
         )
 

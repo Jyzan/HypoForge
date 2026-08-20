@@ -10,6 +10,7 @@ implementations in ``hypoforge.literature.sources``.
 from __future__ import annotations
 
 from collections.abc import Sequence
+import os
 from typing import Any, Dict, List, Optional
 
 from hypoforge.literature.models import PaperRecord, SearchQuery
@@ -33,6 +34,65 @@ from hypoforge.literature.sources.specialist_sources import (
     OstiSource,
     ZbMathSource,
 )
+
+
+def literature_credential_warnings(
+    enabled_sources: Sequence[str],
+    *,
+    serper_api_key: str = "",
+    ads_api_token: str = "",
+) -> list[dict[str, str]]:
+    """Describe credential-bound sources that will be disabled.
+
+    The returned dictionaries are deliberately safe to expose in run
+    manifests and the web UI: they contain capability status only, never
+    credential values.
+    """
+
+    requested = {str(name).strip().casefold() for name in enabled_sources}
+    warnings: list[dict[str, str]] = []
+    resolved_serper = str(
+        serper_api_key or os.environ.get("SERPER_API_KEY", "")
+    ).strip()
+    resolved_ads = str(ads_api_token or os.environ.get("ADS_API_TOKEN", "")).strip()
+    if "serper_openalex" in requested and not resolved_serper:
+        warnings.append(
+            {
+                "code": "serper_not_configured",
+                "severity": "warning",
+                "source": "serper_openalex",
+                "message": (
+                    "未配置 SERPER_API_KEY：Serper Scholar 已禁用；M2 将回退到 "
+                    "OpenAlex/Crossref，通用学术检索的召回范围可能下降。"
+                ),
+            }
+        )
+    if "ads" in requested and not resolved_ads:
+        warnings.append(
+            {
+                "code": "ads_not_configured",
+                "severity": "warning",
+                "source": "ads",
+                "message": (
+                    "未配置 ADS_API_TOKEN：NASA ADS 已禁用；天文与天体物理问题将"
+                    "使用 arXiv/INSPIRE 等可用来源，领域召回范围可能下降。"
+                ),
+            }
+        )
+    return warnings
+
+
+def _emit_terminal_credential_warning(message: str) -> None:
+    """Render a visible amber warning without exposing credential values."""
+
+    from hypoforge.display import COLORS, Text, console
+
+    console.print(
+        Text(
+            f"⚠ 检索能力降级：{message}",
+            style=f"bold {COLORS['warning']}",
+        )
+    )
 from hypoforge.tools.semantic_scholar import SemanticScholarTool
 
 
@@ -149,6 +209,24 @@ class LiteratureSearchTool:
             raise ValueError(f"Unknown literature sources: {sorted(unknown)}")
         if not requested:
             raise ValueError("At least one literature source must be enabled")
+        resolved_serper_api_key = str(
+            serper_api_key or os.environ.get("SERPER_API_KEY", "")
+        ).strip()
+        resolved_ads_api_token = str(
+            ads_api_token or os.environ.get("ADS_API_TOKEN", "")
+        ).strip()
+        self._credential_warnings = literature_credential_warnings(
+            requested,
+            serper_api_key=resolved_serper_api_key,
+            ads_api_token=resolved_ads_api_token,
+        )
+        for notice in self._credential_warnings:
+            requested.discard(notice["source"])
+            _emit_terminal_credential_warning(notice["message"])
+        if not requested:
+            raise ValueError(
+                "No usable literature source remains after credential validation"
+            )
         self._enabled_sources = requested
         self._pubmed_source = (
             pubmed
@@ -183,7 +261,7 @@ class LiteratureSearchTool:
             )
         if "serper_openalex" in requested:
             self._source_map["serper_openalex"] = OpenAlexEnrichedScholarSource(
-                serper_api_key=serper_api_key,
+                serper_api_key=resolved_serper_api_key,
                 openalex_api_key=openalex_api_key,
                 openalex_mailto=openalex_mailto,
             )
@@ -192,7 +270,7 @@ class LiteratureSearchTool:
             "europe_pmc": EuropePMCSource,
             "zbmath": ZbMathSource,
             "inspire": InspireSource,
-            "ads": lambda: AdsSource(api_token=ads_api_token),
+            "ads": lambda: AdsSource(api_token=resolved_ads_api_token),
             "dblp": DblpSource,
             "osti": OstiSource,
             "ntrs": NtrsSource,
@@ -208,6 +286,12 @@ class LiteratureSearchTool:
             for definition in self.TOOL_DEFINITIONS
             if definition["name"] in self._enabled_sources
         ]
+
+    @property
+    def credential_warnings(self) -> list[dict[str, str]]:
+        """Safe capability warnings produced while validating sources."""
+
+        return [dict(item) for item in self._credential_warnings]
 
     @classmethod
     def is_valid_backend(cls, name: str) -> bool:

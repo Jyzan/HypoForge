@@ -200,6 +200,7 @@ class M5ResearchPlan(ModuleProtocol):
     def _canonicalize_task_trace(
         state: PipelineState,
         plan: ResearchPlan,
+        requirement_ids: set[str] | None = None,
     ) -> ResearchPlan:
         """Derive literal trace excerpts from plan content without inventing text."""
 
@@ -231,6 +232,11 @@ class M5ResearchPlan(ModuleProtocol):
 
         requirement_mentions: List[TaskTraceReference] = []
         for requirement in contract.requirements:
+            if (
+                requirement_ids is not None
+                and requirement.requirement_id not in requirement_ids
+            ):
+                continue
             primary = entity_by_id.get(requirement.primary_entity_id)
             if primary is None:
                 continue
@@ -403,7 +409,15 @@ class M5ResearchPlan(ModuleProtocol):
                     update={"hypothesis_id": h.hypothesis_id}
                 )
                 plan = self._sanitize_evidence_links(plan, graph_context)
-                plan = self._canonicalize_task_trace(state, plan)
+                hypothesis_requirement_ids = {
+                    reference.contract_id
+                    for reference in h.task_trace.requirement_mentions
+                }
+                plan = self._canonicalize_task_trace(
+                    state,
+                    plan,
+                    requirement_ids=(hypothesis_requirement_ids or None),
+                )
                 plan_text = self._plan_alignment_text(plan)
                 alignment = assess_task_alignment(
                     state,
@@ -411,6 +425,7 @@ class M5ResearchPlan(ModuleProtocol):
                     subject_text=plan.study_subjects,
                     trace=plan.task_trace,
                     semantic_client=None,
+                    required_requirement_ids=(hypothesis_requirement_ids or None),
                 )
                 if alignment.passed:
                     semantic_consistent, semantic_rationale = (

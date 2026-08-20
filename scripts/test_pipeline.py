@@ -1368,6 +1368,173 @@ async def test_first_round_runs_full_flow() -> None:
     assert set(output) == {"literature_results", "m2_knowledge_export"}
 
 
+class _ConcurrentFreshSearchAgent:
+    final_k = 1
+
+    def __init__(self, *, failing_questions: set[str] | None = None) -> None:
+        self.failing_questions = failing_questions or set()
+        self.active = 0
+        self.max_active = 0
+
+    async def run(self, sub_question, **kwargs):
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            await asyncio.sleep(0.04)
+            if sub_question in self.failing_questions:
+                raise RuntimeError("simulated source failure")
+            paper_id = "p-" + sub_question[-1]
+            paper = PaperRecord(
+                paper_id=paper_id,
+                title=f"Paper for {sub_question}",
+                sources=["fake"],
+            )
+            return SearchRunResult(
+                sub_question=sub_question,
+                final_papers=[paper],
+                candidates=[paper],
+                stop_reason=StopReason.COVERAGE_SATISFIED,
+            )
+        finally:
+            self.active -= 1
+
+
+@pytest.mark.asyncio
+async def test_fresh_m2_runs_subquestions_with_bounded_parallelism() -> None:
+    questions = ["atomic question 1", "atomic question 2", "atomic question 3"]
+    agent = _ConcurrentFreshSearchAgent()
+    adapter = AgenticM2Adapter(
+        search_agent=agent,
+        reading_workflow=EchoReadingWorkflow(with_evidence=True),
+        subquestion_concurrency=2,
+        fresh_run_timeout_seconds=2,
+    )
+    state = PipelineState(
+        input_question="Q",
+        problem_card=ProblemCard(
+            original_question="Q",
+            sub_questions=questions,
+            key_entities=["object"],
+            domain=["science"],
+        ),
+        entity_cache_dir="",
+        memory_cache_dir="",
+    )
+
+    output = await adapter(state)
+
+    assert agent.max_active == 2
+    assert [
+        run.sub_question for run in output["m2_knowledge_export"].runs
+    ] == questions
+    assert [
+        result.sub_question for result in output["literature_results"]
+    ] == questions
+
+
+@pytest.mark.asyncio
+async def test_fresh_m2_preserves_siblings_when_one_subquestion_fails() -> None:
+    questions = ["atomic question 1", "atomic question 2"]
+    agent = _ConcurrentFreshSearchAgent(failing_questions={questions[1]})
+    adapter = AgenticM2Adapter(
+        search_agent=agent,
+        reading_workflow=EchoReadingWorkflow(with_evidence=True),
+        subquestion_concurrency=2,
+        fresh_run_timeout_seconds=2,
+    )
+    state = PipelineState(
+        input_question="Q",
+        problem_card=ProblemCard(
+            original_question="Q",
+            sub_questions=questions,
+            key_entities=["object"],
+            domain=["science"],
+        ),
+        entity_cache_dir="",
+        memory_cache_dir="",
+    )
+
+    output = await adapter(state)
+
+    assert output["literature_results"][0].papers_retrieved == 1
+    assert output["literature_results"][1].papers_retrieved == 0
+    failed_run = output["m2_knowledge_export"].runs[1]
+    assert failed_run.search_provenance.stop_reason == "error"
+    assert "simulated source failure" in failed_run.search_provenance.errors[0]
+    assert output["errors"]
+
+
+@pytest.mark.asyncio
+async def test_fresh_m2_still_fails_closed_when_every_subquestion_fails() -> None:
+    questions = ["atomic question 1", "atomic question 2"]
+    adapter = AgenticM2Adapter(
+        search_agent=_ConcurrentFreshSearchAgent(
+            failing_questions=set(questions),
+        ),
+        reading_workflow=EchoReadingWorkflow(with_evidence=True),
+        subquestion_concurrency=2,
+        fresh_run_timeout_seconds=2,
+    )
+    state = PipelineState(
+        input_question="Q",
+        problem_card=ProblemCard(
+            original_question="Q",
+            sub_questions=questions,
+            key_entities=["object"],
+            domain=["science"],
+        ),
+        entity_cache_dir="",
+        memory_cache_dir="",
+    )
+
+    with pytest.raises(RuntimeError, match="Every M2 sub-question failed"):
+        await adapter(state)
+
+
+@pytest.mark.asyncio
+async def test_cancelling_parallel_m2_cancels_all_subquestion_workers() -> None:
+    class BlockingSearchAgent:
+        final_k = 1
+
+        def __init__(self) -> None:
+            self.active = 0
+
+        async def run(self, *args, **kwargs):
+            self.active += 1
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.active -= 1
+
+    agent = BlockingSearchAgent()
+    adapter = AgenticM2Adapter(
+        search_agent=agent,
+        reading_workflow=EchoReadingWorkflow(with_evidence=True),
+        subquestion_concurrency=2,
+        fresh_run_timeout_seconds=2,
+    )
+    state = PipelineState(
+        input_question="Q",
+        problem_card=ProblemCard(
+            original_question="Q",
+            sub_questions=["atomic question 1", "atomic question 2"],
+            key_entities=["object"],
+            domain=["science"],
+        ),
+        entity_cache_dir="",
+        memory_cache_dir="",
+    )
+    task = asyncio.create_task(adapter(state))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert agent.active == 0
+
+
 @pytest.mark.asyncio
 async def test_no_open_gap_runs_full_flow_even_on_later_round() -> None:
     paper = PaperRecord(paper_id="p1", title="T", sources=["pubmed"])
@@ -3169,6 +3336,30 @@ async def test_semantic_contract_audit_has_a_hard_timeout() -> None:
 
 
 @pytest.mark.asyncio
+async def test_m4_shared_time_budget_caps_the_whole_llm_run() -> None:
+    module = M4HypothesisGeneration(
+        num_candidates=1,
+        top_k=1,
+        mode="direct",
+        llm_call_timeout=1.0,
+        total_time_budget_seconds=0.03,
+    )
+    module.client = _BlockingClient()
+    state = PipelineState(
+        input_question="q",
+        problem_card=ProblemCard(
+            original_question="q",
+            sub_questions=["q"],
+            key_entities=["object"],
+            domain=[],
+        ),
+    )
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(module(state), timeout=0.25)
+
+
+@pytest.mark.asyncio
 async def test_observed_m4_tool_cancellation_is_not_reported_as_failure(
     tmp_path,
 ) -> None:
@@ -3324,6 +3515,31 @@ async def test_multi_agent_round_preserves_generator_statements_end_to_end() -> 
         h2.statement,
     ]
     assert result["top_hypotheses"][0].statement == h1.statement
+
+
+@pytest.mark.asyncio
+async def test_m4_does_not_retry_optional_candidate_shortfall_after_top_k() -> None:
+    hypothesis = _card("H1", "PBK activation sustains persister survival.")
+    client = _SequenceClient([
+        [hypothesis.model_dump()],
+        [{"hypothesis_id": "H1", "consistent": True, "rationale": "same object"}],
+    ])
+    module = M4HypothesisGeneration(num_candidates=3, top_k=1, mode="direct")
+    module.client = client
+    state = PipelineState(
+        input_question="q",
+        problem_card=ProblemCard(
+            original_question="q",
+            sub_questions=["q"],
+            key_entities=["PBK"],
+            domain=[],
+        ),
+    )
+
+    result = await module._run_llm(state)
+
+    assert [card.hypothesis_id for card in result["top_hypotheses"]] == ["H1"]
+    assert client.responses == []
 
 
 def test_method_feedback_is_routed_to_m5_not_m4() -> None:
@@ -3788,6 +4004,7 @@ async def test_m4_repairs_contract_diagnostics_once_without_weakening_gate() -> 
             "hypothesis_id": "H1",
             "consistent": True,
             "rationale": "same lithium-metal battery research object",
+            "covered_requirement_ids": ["R1"],
         }],
     ])
     module = M4HypothesisGeneration(num_candidates=1, top_k=1, mode="direct")
@@ -3843,6 +4060,7 @@ async def test_m4_generator_prompt_carries_literal_contract_names() -> None:
             "hypothesis_id": "H1",
             "consistent": True,
             "rationale": "same research object",
+            "covered_requirement_ids": ["R1"],
         }],
     ])
     module = M4HypothesisGeneration(num_candidates=1, top_k=1, mode="direct")
@@ -3904,6 +4122,7 @@ async def test_m4_repair_prompt_carries_literal_contract_names() -> None:
             "hypothesis_id": "H1",
             "consistent": True,
             "rationale": "same research object",
+            "covered_requirement_ids": ["R1"],
         }],
     ])
     module = M4HypothesisGeneration(num_candidates=1, top_k=1, mode="direct")
@@ -4006,6 +4225,68 @@ def test_m4_canonicalizes_wrong_trace_excerpts_from_literal_content() -> None:
     assert {
         ref.contract_id for ref in canonical[0].task_trace.requirement_mentions
     } == {"R1", "R2"}
+
+
+def test_m4_requirement_scope_does_not_expand_from_shared_primary_entity() -> None:
+    state = _pose_estimation_contract_state()
+    statement = "训练模型从单张图片联合预测物体的位置和旋转。"
+    candidate = HypothesisCard(
+        hypothesis_id="H1",
+        statement=statement,
+        mechanism="模型用共享视觉特征同时回归物体的位置与旋转。",
+        observable_predictions=["模型的位置和旋转误差均低于基线。"],
+        falsification_conditions=["模型在单张图片上的误差不下降。"],
+        task_trace=TaskTrace(requirement_mentions=[TaskTraceReference(
+            contract_id="R1", output_excerpt="错误摘录",
+        )]),
+    )
+
+    canonical = M4HypothesisGeneration._canonicalize_task_traces(
+        state, [candidate],
+    )
+    accepted, failures = M4HypothesisGeneration._check_context_contract(
+        state, build_graph_context(state), canonical,
+    )
+
+    assert failures == []
+    assert [card.hypothesis_id for card in accepted] == ["H1"]
+    assert [
+        ref.contract_id for ref in canonical[0].task_trace.requirement_mentions
+    ] == ["R1"]
+
+
+@pytest.mark.asyncio
+async def test_m4_semantic_audit_rejects_entity_only_requirement_trace() -> None:
+    state = _pose_estimation_contract_state()
+    candidate = HypothesisCard(
+        hypothesis_id="H1",
+        statement="训练模型从单张图片联合预测物体的位置和旋转。",
+        mechanism="模型用共享视觉特征同时回归物体的位置与旋转。",
+        observable_predictions=["模型的位置和旋转误差均低于基线。"],
+        falsification_conditions=["模型在单张图片上的误差不下降。"],
+        task_trace=TaskTrace(requirement_mentions=[TaskTraceReference(
+            contract_id="R1",
+            output_excerpt="训练模型从单张图片联合预测物体的位置和旋转。",
+        )]),
+    )
+    canonical = M4HypothesisGeneration._canonicalize_task_traces(
+        state, [candidate],
+    )
+    client = _RecordingClient([{
+        "hypothesis_id": "H1",
+        "consistent": True,
+        "rationale": "same primary object but relation is not established",
+        "covered_requirement_ids": [],
+    }])
+    module = M4HypothesisGeneration(semantic_alignment_timeout_seconds=0.5)
+    module.client = client
+
+    accepted, failures = await module._audit_context_contract_semantics(
+        state, canonical,
+    )
+
+    assert accepted == []
+    assert failures[0]["semantic_requirement_mismatch"] is True
 
 
 def test_m4_trace_canonicalization_does_not_invent_missing_content() -> None:
@@ -4593,7 +4874,7 @@ import json
 import pytest
 
 from hypoforge.graph_context import GraphContext
-from hypoforge.config import PipelineConfig, SearchConfig
+from hypoforge.config import LLMConfig, PipelineConfig, SearchConfig
 from hypoforge.registry import ModuleRegistry
 from hypoforge.literature.models import (
     EvidenceChunk,
@@ -5190,6 +5471,32 @@ def test_registry_selects_strict_builtin_contracts() -> None:
     assert adapter.fulltext_backfill_max_attempts == 8
     assert adapter.fulltext_backfill_min_relevance == 0.70
     assert adapter.fulltext_backfill_min_directness == 0.45
+
+
+def test_m2_query_llm_config_is_wired_to_query_planner() -> None:
+    from hypoforge.literature.adapter import AgenticM2Module
+
+    primary = LLMConfig(
+        model="primary-model", api_key="test", api_base="https://example.invalid/v1",
+    )
+    query = LLMConfig(
+        model="query-model", api_key="test", api_base="https://example.invalid/v1",
+    )
+    module = AgenticM2Module(
+        llm_config=primary,
+        query_llm_config=query,
+        enabled_sources=["pubmed"],
+        final_k=3,
+        fulltext_target_per_subquestion=3,
+    )
+
+    assert module.adapter.search_agent.query_planner._client.model == "query-model"
+    assert module.adapter.subquestion_entity_client.model == "query-model"
+
+
+def test_search_config_rejects_silent_unknown_budget_keys() -> None:
+    with pytest.raises(ValueError, match="max_papers"):
+        SearchConfig(max_papers=20)
 
     # Default config (no entity_embedding_model) → empty string, no embedding.
     config_nonembed = PipelineConfig(search=SearchConfig(implementation="agentic"))
@@ -8048,6 +8355,62 @@ def test_run_manager_rejects_malformed_openalex_credentials(
         manager.start("q", unpaywall_email="a" * 321)
 
 
+def test_run_manager_exposes_and_persists_search_credential_warnings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+enabled_modules: [m2]
+search:
+  tools: [serper_openalex, ads, openalex, crossref]
+module_overrides:
+  m2:
+    kwargs: {}
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("SERPER_API_KEY", raising=False)
+    monkeypatch.delenv("ADS_API_TOKEN", raising=False)
+    monkeypatch.setattr(threading, "Thread", DeferredThread)
+
+    class FakeRunner:
+        def __init__(self, config, event_recorder=None):
+            pass
+
+        async def run(self, question: str, run_id: str):
+            return PipelineState(input_question=question, run_id=run_id)
+
+    monkeypatch.setattr("hypoforge.webapp.PipelineRunner", FakeRunner)
+    manager = RunManager(config_path=config_path, output_root=tmp_path / "runs")
+    run = manager.start("q")
+
+    assert {item["code"] for item in run["credential_warnings"]} == {
+        "serper_not_configured",
+        "ads_not_configured",
+    }
+    assert run["credential_status"]["serper_configured"] is False
+    assert run["credential_status"]["ads_configured"] is False
+
+    manager._run_pipeline(run["run_id"], "q")
+    manifest = json.loads(
+        (tmp_path / "runs" / run["run_id"] / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["credential_warnings"] == run["credential_warnings"]
+    warning_events = [
+        event
+        for event in manager.events(run["run_id"])
+        if event["event_type"] == "credential_warning"
+    ]
+    assert {event["tool"] for event in warning_events} == {
+        "serper_openalex",
+        "ads",
+    }
+
+
 def test_web_ui_preserves_open_event_details_and_has_ephemeral_key_fields() -> None:
     html_path = (
         Path(__file__).resolve().parent.parent
@@ -8062,6 +8425,12 @@ def test_web_ui_preserves_open_event_details_and_has_ephemeral_key_fields() -> N
     assert 'id="semanticApiKey"' in html
     assert 'id="openalexApiKey"' in html
     assert 'id="openalexMailto"' in html
+    assert 'id="serperApiKey"' in html
+    assert 'id="adsApiToken"' in html
+    assert 'id="unpaywallEmail"' in html
+    assert 'id="crossrefMailto"' in html
+    assert 'id="credentialWarningBanner"' in html
+    assert "renderCredentialWarnings(run)" in html
     # Ephemeral keys: never echoed back, persisted, or sent in plaintext.
     # localStorage is allowed only for non-sensitive UI state (history order);
     # credential fields must never appear in any storage read/write path.
@@ -8071,11 +8440,14 @@ def test_web_ui_preserves_open_event_details_and_has_ephemeral_key_fields() -> N
     )
     credential_ids = {
         "modelName", "qwenApiKey", "semanticApiKey",
-        "openalexApiKey", "openalexMailto",
+        "openalexApiKey", "openalexMailto", "serperApiKey", "adsApiToken",
+        "unpaywallEmail", "crossrefMailto",
     }
     assert not (set(storage_keys) & credential_ids)
     assert "hypoforge_order" in storage_keys  # the only non-sensitive persistence
     assert 'id="openalexApiKey" type="password"' in html
+    assert "serper_api_key: $(\"serperApiKey\").value.trim()" in html
+    assert "ads_api_token: $(\"adsApiToken\").value.trim()" in html
     assert "openSequences" in html
     assert "data-event-sequence" in html
 
@@ -9254,6 +9626,84 @@ async def test_domain_routed_planner_enforces_serper_and_filters_irrelevant_sour
     assert targets[:2] == ["serper_openalex", "serper_openalex"]
     assert {"zbmath", "arxiv", "crossref"}.issubset(targets)
     assert "europe_pmc" not in targets
+
+
+@pytest.mark.asyncio
+async def test_domain_routed_planner_uses_openalex_when_serper_is_unavailable(
+    monkeypatch,
+) -> None:
+    from hypoforge.literature.search.domain_routing import DomainRoutedQueryPlanner
+    from hypoforge.literature.search.search_tool import LiteratureSearchTool
+
+    monkeypatch.delenv("SERPER_API_KEY", raising=False)
+    tool = LiteratureSearchTool(
+        enabled_sources=["serper_openalex", "openalex", "crossref"],
+        serper_api_key="",
+    )
+
+    class EmptyDelegate:
+        async def plan(self, *args, **kwargs):
+            return []
+
+    planner = DomainRoutedQueryPlanner(
+        EmptyDelegate(),
+        [definition["name"] for definition in tool.tool_definitions],
+    )
+    queries = await planner.plan(
+        "How does a named scientific object behave?",
+        key_entities=["named scientific object"],
+        domains=["science"],
+    )
+
+    assert "serper_openalex" not in {
+        definition["name"] for definition in tool.tool_definitions
+    }
+    assert {query.target_source for query in queries} == {"openalex", "crossref"}
+
+
+def test_literature_search_tool_warns_and_disables_missing_credential_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hypoforge.literature.search import search_tool as search_tool_module
+
+    monkeypatch.delenv("SERPER_API_KEY", raising=False)
+    monkeypatch.delenv("ADS_API_TOKEN", raising=False)
+    rendered: list[str] = []
+    monkeypatch.setattr(
+        search_tool_module,
+        "_emit_terminal_credential_warning",
+        rendered.append,
+    )
+
+    tool = search_tool_module.LiteratureSearchTool(
+        enabled_sources=["serper_openalex", "ads", "openalex", "crossref"],
+    )
+
+    enabled = {item["name"] for item in tool.tool_definitions}
+    assert enabled == {"openalex", "crossref"}
+    assert {item["code"] for item in tool.credential_warnings} == {
+        "serper_not_configured",
+        "ads_not_configured",
+    }
+    assert len(rendered) == 2
+    assert all("已禁用" in message for message in rendered)
+
+
+def test_terminal_credential_warning_uses_amber_style(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hypoforge.display import COLORS, console
+    from hypoforge.literature.search.search_tool import (
+        _emit_terminal_credential_warning,
+    )
+
+    rendered = []
+    monkeypatch.setattr(console, "print", rendered.append)
+    _emit_terminal_credential_warning("测试数据源已禁用")
+
+    assert len(rendered) == 1
+    assert str(rendered[0]) == "⚠ 检索能力降级：测试数据源已禁用"
+    assert str(rendered[0].style) == f"bold {COLORS['warning']}"
 
 
 @pytest.mark.asyncio

@@ -100,6 +100,12 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
         self.store = store
         self.fetch_concurrency = fetch_concurrency
         self.read_concurrency = read_concurrency
+        # These limits are workflow-wide.  Creating semaphores inside ``run``
+        # multiplies the effective concurrency when M2 processes several
+        # sub-questions concurrently (for example, four calls would turn a
+        # fetch limit of three into twelve simultaneous downloads).
+        self._fetch_semaphore = asyncio.Semaphore(self.fetch_concurrency)
+        self._read_semaphore = asyncio.Semaphore(self.read_concurrency)
         self.resolver_timeout_seconds = resolver_timeout_seconds
         self.reader_timeout_seconds = reader_timeout_seconds
         self.workflow_timeout_seconds = workflow_timeout_seconds
@@ -509,8 +515,8 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
             ),
             details={"papers": len(papers), "sub_question": sub_question},
         )
-        fetch_semaphore = asyncio.Semaphore(self.fetch_concurrency)
-        read_semaphore = asyncio.Semaphore(self.read_concurrency)
+        fetch_semaphore = self._fetch_semaphore
+        read_semaphore = self._read_semaphore
 
         async def run_all() -> list[PaperReadingResult]:
             async def cached_read(paper: PaperRecord) -> PaperReadingResult:

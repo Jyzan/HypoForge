@@ -181,6 +181,7 @@ def assess_task_alignment(
     trace: TaskTrace | None = None,
     semantic_client: object | None = None,
     require_contract: bool = True,
+    required_requirement_ids: Iterable[str] | None = None,
 ) -> AlignmentAssessment:
     """Validate an output against the task-local M1 contract.
 
@@ -199,6 +200,11 @@ def assess_task_alignment(
     cannot be verified without a binding contract.  Legacy callers (e.g.
     scorer, historical snapshots) may set it to ``False`` to get a permissive
     ``passed=True, score=0.5`` instead.
+
+    ``required_requirement_ids`` narrows requirement validation to the atomic
+    task scope explicitly selected by a hypothesis.  ``None`` preserves the
+    legacy whole-contract check used by outputs that are meant to answer the
+    complete question.
     """
 
     card = state.problem_card
@@ -245,8 +251,17 @@ def assess_task_alignment(
         entity for entity in required_entities
         if entity.entity_id not in matched_entity_ids
     ]
+    requirement_scope = (
+        None
+        if required_requirement_ids is None
+        else {str(item) for item in required_requirement_ids if str(item)}
+    )
     required_requirements = [
-        requirement for requirement in contract.requirements if requirement.required
+        requirement for requirement in contract.requirements
+        if requirement.required and (
+            requirement_scope is None
+            or requirement.requirement_id in requirement_scope
+        )
     ]
     # Old snapshots did not produce task traces.  Their derived contracts retain
     # lexical object protection while M6 performs the semantic requirement check.

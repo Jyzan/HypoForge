@@ -264,12 +264,17 @@ class M6ReviewIteration(ModuleProtocol):
         graph_context = build_graph_context(state)
         rendered_graph_context = graph_context.render()
         valid_evidence_ids = set(graph_context.available_evidence_ids)
+        hypothesis_requirement_ids = {
+            reference.contract_id
+            for reference in hypothesis.task_trace.requirement_mentions
+        }
         hypothesis_alignment = assess_task_alignment(
             state,
             hypothesis.model_dump_json(exclude={"task_trace"}),
             subject_text="\n".join([hypothesis.statement, hypothesis.mechanism]),
             trace=hypothesis.task_trace,
             semantic_client=None,
+            required_requirement_ids=(hypothesis_requirement_ids or None),
         )
         plan_alignment = assess_task_alignment(
             state,
@@ -277,6 +282,7 @@ class M6ReviewIteration(ModuleProtocol):
             subject_text=plan.study_subjects,
             trace=plan.task_trace,
             semantic_client=None,
+            required_requirement_ids=(hypothesis_requirement_ids or None),
         )
         semantic_alignment_passed, semantic_alignment_rationale = (
             await self._audit_pair_semantics(state, hypothesis, plan)

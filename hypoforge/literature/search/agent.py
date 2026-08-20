@@ -296,6 +296,7 @@ class IterativeSearchAgent:
         token_estimator: Callable[[str], int] = estimate_tokens,
         retention_judge_client: object | None = None,
         entity_classifier: object | None = None,
+        source_concurrency_limit: int = 2,
     ) -> None:
         for name, value in (
             ("final_k", final_k),
@@ -306,6 +307,7 @@ class IterativeSearchAgent:
             ("min_new_papers", min_new_papers),
             ("no_result_round_limit", no_result_round_limit),
             ("low_gain_round_limit", low_gain_round_limit),
+            ("source_concurrency_limit", source_concurrency_limit),
         ):
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
@@ -347,6 +349,14 @@ class IterativeSearchAgent:
         # entity-group round strategy (None → deterministic fallback).
         self.entity_classifier = entity_classifier
         self._search_cache: dict[tuple[str, str, int], list[PaperRecord]] = {}
+        # Bound each backend across all concurrently running sub-questions.
+        # Source adapters may provide their own rate limiter, but a shared
+        # semaphore prevents a burst of planner variants from reaching that
+        # limiter at once and amplifying HTTP 429 responses.
+        self._source_semaphores = {
+            source_name: asyncio.Semaphore(int(source_concurrency_limit))
+            for source_name in self.sources
+        }
 
     async def run(
         self,
@@ -1495,10 +1505,12 @@ class IterativeSearchAgent:
             },
         )
         try:
-            result = await asyncio.wait_for(
-                source.search(query, limit=self.per_query_limit),
-                timeout=self.source_timeout_seconds,
-            )
+            semaphore = self._source_semaphores[query.target_source.casefold()]
+            async with semaphore:
+                result = await asyncio.wait_for(
+                    source.search(query, limit=self.per_query_limit),
+                    timeout=self.source_timeout_seconds,
+                )
         except BaseException as exc:
             emit_event(
                 "tool_failed",

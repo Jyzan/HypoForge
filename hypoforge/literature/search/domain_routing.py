@@ -11,6 +11,7 @@ from ..protocols import QueryPlannerProtocol
 
 
 GENERAL_SOURCE = "serper_openalex"
+GENERAL_SOURCE_FALLBACKS = (GENERAL_SOURCE, "openalex", "crossref")
 OPEN_ACCESS_RESCUE_SOURCE = "openalex_oa"
 
 
@@ -84,9 +85,10 @@ class DomainRoutedQueryPlanner(QueryPlannerProtocol):
     """Filter Qwen output to the M1 route and enforce mandatory discovery.
 
     Qwen still chooses domain-aware query wording.  This wrapper makes source
-    selection deterministic: Serper→OpenAlex is always attempted, while only
-    relevant specialist APIs are exposed to execution.  Later rounds add an
-    independent OpenAlex query as an open-access rescue.
+    selection deterministic: Serper→OpenAlex is preferred, with OpenAlex or
+    Crossref as credential-free general fallbacks.  Only relevant specialist
+    APIs are exposed to execution.  Later rounds add an independent OpenAlex
+    query as an open-access rescue.
     """
 
     tool_name = "domain_routed_query_planner"
@@ -102,9 +104,10 @@ class DomainRoutedQueryPlanner(QueryPlannerProtocol):
             str(source).strip().casefold() for source in enabled_sources
             if str(source).strip()
         }
-        if GENERAL_SOURCE not in self.enabled_sources:
+        if not self.enabled_sources.intersection(GENERAL_SOURCE_FALLBACKS):
             raise ValueError(
-                "domain-routed search requires the serper_openalex source"
+                "domain-routed search requires at least one general source: "
+                + ", ".join(GENERAL_SOURCE_FALLBACKS)
             )
         if planner_timeout_seconds <= 0:
             raise ValueError("planner_timeout_seconds must be positive")
@@ -117,7 +120,11 @@ class DomainRoutedQueryPlanner(QueryPlannerProtocol):
         *,
         expanded: bool,
     ) -> list[str]:
-        ordered = [GENERAL_SOURCE]
+        general_source = next(
+            source for source in GENERAL_SOURCE_FALLBACKS
+            if source in self.enabled_sources
+        )
+        ordered = [general_source]
         ordered.extend(route_specialist_sources(domains, sub_question))
         if expanded:
             ordered.append(OPEN_ACCESS_RESCUE_SOURCE)
@@ -185,8 +192,23 @@ class DomainRoutedQueryPlanner(QueryPlannerProtocol):
             )
             if source not in unavailable
         ]
+        general_source = next(
+            (
+                source for source in GENERAL_SOURCE_FALLBACKS
+                if source in self.enabled_sources and source not in unavailable
+            ),
+            "",
+        )
+        if general_source:
+            active = [
+                general_source,
+                *(
+                    source for source in active
+                    if source != general_source
+                ),
+            ]
         # The successful Science-125 benchmark used two complementary query
-        # variants per phase and sent the same portfolio to the mandatory
+        # variants per phase and sent the same portfolio to the selected
         # general source and every routed specialist source.  Preserve that
         # call shape here instead of letting a source-selecting LLM silently
         # omit a backend.
@@ -231,20 +253,23 @@ class DomainRoutedQueryPlanner(QueryPlannerProtocol):
         variants = variants[:2]
 
         ordered: list[SearchQuery] = []
-        # Serper is first for every variant, matching the benchmark and
+        # The best available general source is first for every variant,
         # protecting universal discovery when a global query budget is tight.
-        for index, text in enumerate(variants, 1):
-            ordered.append(self._query(
-                source=GENERAL_SOURCE,
-                text=text,
-                round_index=round_index,
-                suffix=f"portfolio-{index}",
-                purpose=(
-                    "expanded_open_fulltext_discovery" if expanded
-                    else "compact_high_citation_discovery"
-                ),
-            ))
-        specialist_order = [source for source in active if source != GENERAL_SOURCE]
+        if general_source:
+            for index, text in enumerate(variants, 1):
+                ordered.append(self._query(
+                    source=general_source,
+                    text=text,
+                    round_index=round_index,
+                    suffix=f"portfolio-{index}",
+                    purpose=(
+                        "expanded_open_fulltext_discovery" if expanded
+                        else "compact_high_citation_discovery"
+                    ),
+                ))
+        specialist_order = [
+            source for source in active if source != general_source
+        ]
         if expanded and OPEN_ACCESS_RESCUE_SOURCE in specialist_order:
             specialist_order.remove(OPEN_ACCESS_RESCUE_SOURCE)
             specialist_order.insert(0, OPEN_ACCESS_RESCUE_SOURCE)

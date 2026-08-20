@@ -72,6 +72,12 @@ _EDITORIAL_STATEMENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+_TRACE_STOPWORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "by", "does", "for",
+    "from", "how", "in", "is", "of", "on", "or", "the", "to", "use",
+    "uses", "via", "what", "which", "with",
+})
+
 
 def _followup_requirement_block(state: PipelineState) -> str:
     """Format ``state.followup.text`` as a priority requirement block.
@@ -109,6 +115,7 @@ class M4HypothesisGeneration(ModuleProtocol):
         weights: Optional[Dict[str, float]] = None,
         interactive: bool = False,
         llm_call_timeout: float = 240.0,
+        total_time_budget_seconds: float = 540.0,
         semantic_alignment_timeout_seconds: float = 60.0,
         **kwargs,
     ):
@@ -130,6 +137,10 @@ class M4HypothesisGeneration(ModuleProtocol):
         # Per-LLM-call ceiling: a single hung or queued call must not silently
         # consume the whole node budget (mirrors m3's llm_call_timeout).
         self.llm_call_timeout = max(10.0, float(llm_call_timeout))
+        if total_time_budget_seconds <= 0:
+            raise ValueError("total_time_budget_seconds must be positive")
+        self.total_time_budget_seconds = float(total_time_budget_seconds)
+        self._run_deadline: float | None = None
         self.client = QwenClient.from_config(llm_config) if llm_config else None
         # Ranker uses a separate model tier to reduce self-scoring bias.
         # Falls back to the main client when no separate config is provided.
@@ -148,11 +159,20 @@ class M4HypothesisGeneration(ModuleProtocol):
         details: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """Observe one LLM tool call under the module's per-call timeout."""
+        timeout = self.llm_call_timeout
+        if self._run_deadline is not None:
+            remaining = self._run_deadline - time.monotonic()
+            if remaining <= 0:
+                close = getattr(operation, "close", None)
+                if callable(close):
+                    close()
+                raise RuntimeError("M4 exhausted its shared LLM time budget")
+            timeout = min(timeout, remaining)
         return self._observe_tool(
             tool,
             operation,
             details=details,
-            timeout=self.llm_call_timeout,
+            timeout=timeout,
         )
 
     @staticmethod
@@ -234,6 +254,20 @@ class M4HypothesisGeneration(ModuleProtocol):
         return "\n".join(lines) if lines else "- None available"
 
     @staticmethod
+    def _requirement_match_score(segment: str, requirement: Any) -> int:
+        """Domain-neutral lexical evidence for a requirement/segment pair."""
+
+        requirement_tokens = {
+            token for token in re.findall(
+                r"[a-z0-9]+",
+                f"{requirement.relation} {requirement.sub_question}".casefold(),
+            )
+            if len(token) > 2 and token not in _TRACE_STOPWORDS
+        }
+        segment_tokens = set(re.findall(r"[a-z0-9]+", segment.casefold()))
+        return len(requirement_tokens.intersection(segment_tokens))
+
+    @staticmethod
     def _canonicalize_task_traces(
         state: PipelineState,
         cards: List[HypothesisCard],
@@ -286,8 +320,42 @@ class M4HypothesisGeneration(ModuleProtocol):
                         output_excerpt=excerpt,
                     ))
 
+            declared_requirement_ids = list(dict.fromkeys(
+                reference.contract_id
+                for reference in card.task_trace.requirement_mentions
+                if any(
+                    requirement.requirement_id == reference.contract_id
+                    for requirement in contract.requirements
+                )
+            ))
+            if not declared_requirement_ids and contract.requirements:
+                # Recover at most one omitted trace from actual relation words.
+                # The previous implementation assigned every requirement that
+                # shared a primary entity, allowing one generic sentence to
+                # masquerade as R1…Rn.
+                scored = [
+                    (
+                        max(
+                            (
+                                M4HypothesisGeneration._requirement_match_score(
+                                    segment, requirement
+                                )
+                                for segment in segments
+                            ),
+                            default=0,
+                        ),
+                        requirement.requirement_id,
+                    )
+                    for requirement in contract.requirements
+                ]
+                best_score, best_id = max(scored, default=(0, ""))
+                if best_score > 0:
+                    declared_requirement_ids = [best_id]
+
             requirement_mentions: List[TaskTraceReference] = []
             for requirement in contract.requirements:
+                if requirement.requirement_id not in declared_requirement_ids:
+                    continue
                 primary = entity_by_id.get(requirement.primary_entity_id)
                 if primary is None:
                     continue
@@ -308,6 +376,9 @@ class M4HypothesisGeneration(ModuleProtocol):
                 excerpt = max(
                     candidates,
                     key=lambda segment: (
+                        M4HypothesisGeneration._requirement_match_score(
+                            segment, requirement
+                        ),
                         sum(
                             _mentions_entity(segment, entity)
                             for entity in requirement_entities
@@ -362,8 +433,10 @@ class M4HypothesisGeneration(ModuleProtocol):
             lines.append(rendered)
         if contract.requirements:
             lines.append(
-                "Required auditable requirements — each must be traceable via "
-                "a literal excerpt that names its primary entity:"
+                "Atomic auditable requirements — each hypothesis must select "
+                "one or more that it genuinely addresses and trace only those "
+                "via a literal excerpt; do not claim every ID merely because "
+                "the primary entity is mentioned:"
             )
             for requirement in contract.requirements:
                 lines.append(
@@ -406,7 +479,9 @@ class M4HypothesisGeneration(ModuleProtocol):
         ]
         if requirements:
             lines.append(
-                "Required auditable requirement traces: " + ", ".join(requirements) + "."
+                "Available atomic requirement IDs: " + ", ".join(requirements)
+                + ". Preserve the current hypothesis's selected subset; do not "
+                "attach unrelated IDs."
             )
         return "\n".join(lines) + "\n\n"
 
@@ -423,6 +498,12 @@ class M4HypothesisGeneration(ModuleProtocol):
         valid_references = set(context.available_evidence_ids)
         accepted: List[HypothesisCard] = []
         failures: List[Dict[str, Any]] = []
+        contract = state.problem_card.task_contract if state.problem_card else None
+        known_required_ids = {
+            requirement.requirement_id
+            for requirement in (contract.requirements if contract else [])
+            if requirement.required
+        } if contract is not None and contract.source == "m1" else set()
         for card in cards:
             candidate_text = "\n".join([
                 card.statement,
@@ -430,12 +511,18 @@ class M4HypothesisGeneration(ModuleProtocol):
                 *card.observable_predictions,
                 *card.falsification_conditions,
             ])
+            scoped_requirement_ids = {
+                reference.contract_id
+                for reference in card.task_trace.requirement_mentions
+                if reference.contract_id in known_required_ids
+            }
             alignment = assess_task_alignment(
                 state,
                 candidate_text,
                 subject_text="\n".join([card.statement, card.mechanism]),
                 trace=card.task_trace,
                 semantic_client=semantic_client,
+                required_requirement_ids=scoped_requirement_ids,
             )
             if not alignment.passed:
                 failures.append({
@@ -454,6 +541,18 @@ class M4HypothesisGeneration(ModuleProtocol):
                     card.hypothesis_id,
                     alignment.rationale,
                 )
+                continue
+            if known_required_ids and not scoped_requirement_ids:
+                failures.append({
+                    "hypothesis_id": card.hypothesis_id,
+                    "rationale": (
+                        "hypothesis does not declare any auditable atomic "
+                        "requirement scope"
+                    ),
+                    "missing_task_entities": [],
+                    "missing_requirement_ids": sorted(known_required_ids),
+                    "invalid_task_trace_references": [],
+                })
                 continue
             references = list(dict.fromkeys(
                 reference
@@ -500,6 +599,28 @@ class M4HypothesisGeneration(ModuleProtocol):
             for entity in (contract.entities if contract is not None else [])
             if entity.role == "primary_object" and entity.required
         ]
+        entity_by_id = {
+            entity.entity_id: entity
+            for entity in (contract.entities if contract is not None else [])
+        }
+        requirements = [
+            {
+                "requirement_id": requirement.requirement_id,
+                "sub_question": requirement.sub_question,
+                "relation": requirement.relation,
+                "primary_entity": (
+                    entity_by_id[requirement.primary_entity_id].name
+                    if requirement.primary_entity_id in entity_by_id else ""
+                ),
+                "related_entities": [
+                    entity_by_id[entity_id].name
+                    for entity_id in requirement.related_entity_ids
+                    if entity_id in entity_by_id
+                ],
+            }
+            for requirement in (contract.requirements if contract is not None else [])
+            if requirement.required
+        ] if contract is not None and contract.source == "m1" else []
         if not primary_objects:
             return list(candidates), []
 
@@ -511,8 +632,14 @@ class M4HypothesisGeneration(ModuleProtocol):
                     "hypothesis_id": {"type": "string"},
                     "consistent": {"type": "boolean"},
                     "rationale": {"type": "string"},
+                    "covered_requirement_ids": {
+                        "type": "array", "items": {"type": "string"},
+                    },
                 },
-                "required": ["hypothesis_id", "consistent", "rationale"],
+                "required": [
+                    "hypothesis_id", "consistent", "rationale",
+                    "covered_requirement_ids",
+                ],
             },
         }
         user_prompt = (
@@ -521,6 +648,8 @@ class M4HypothesisGeneration(ModuleProtocol):
             "mere word overlap. Return exactly one verdict per hypothesis_id.\n\n"
             "Primary task objects:\n"
             + json.dumps(primary_objects, ensure_ascii=False, indent=2)
+            + "\n\nAtomic task requirements:\n"
+            + json.dumps(requirements, ensure_ascii=False, indent=2)
             + "\n\nCandidate hypotheses:\n"
             + json.dumps(
                 [
@@ -528,6 +657,10 @@ class M4HypothesisGeneration(ModuleProtocol):
                         "hypothesis_id": card.hypothesis_id,
                         "statement": card.statement,
                         "mechanism": card.mechanism,
+                        "declared_requirement_ids": [
+                            reference.contract_id
+                            for reference in card.task_trace.requirement_mentions
+                        ],
                     }
                     for card in candidates
                 ],
@@ -543,7 +676,10 @@ class M4HypothesisGeneration(ModuleProtocol):
                         system_prompt=(
                             "You are a strict task-alignment auditor. Fail a "
                             "candidate when its research object drifts from the "
-                            "task's required primary object."
+                            "required primary object. For each candidate, return "
+                            "only requirement IDs whose stated relation is "
+                            "actually expressed; entity mention alone is not "
+                            "requirement coverage."
                         ),
                         user_prompt=user_prompt,
                         output_schema=schema,
@@ -580,7 +716,39 @@ class M4HypothesisGeneration(ModuleProtocol):
                 continue
             seen.add(hypothesis_id)
             if consistent:
-                accepted.append(by_id[hypothesis_id])
+                card = by_id[hypothesis_id]
+                declared = {
+                    reference.contract_id
+                    for reference in card.task_trace.requirement_mentions
+                }
+                raw_covered = verdict.get("covered_requirement_ids")
+                covered = (
+                    {
+                        str(item) for item in raw_covered
+                        if str(item) in declared
+                    }
+                    if isinstance(raw_covered, list)
+                    else (set() if requirements else declared)
+                )
+                if requirements and not covered:
+                    failures.append({
+                        "hypothesis_id": hypothesis_id,
+                        "rationale": (
+                            "semantic task-contract auditor found no covered "
+                            "atomic requirement"
+                        ),
+                        "semantic_requirement_mismatch": True,
+                    })
+                    continue
+                accepted.append(card.model_copy(update={
+                    "task_trace": card.task_trace.model_copy(update={
+                        "requirement_mentions": [
+                            reference
+                            for reference in card.task_trace.requirement_mentions
+                            if reference.contract_id in covered
+                        ],
+                    }),
+                }))
             else:
                 failures.append({
                     "hypothesis_id": hypothesis_id,
@@ -661,7 +829,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                     "type": "array",
                     "items": HypothesisCard.model_json_schema(),
                 },
-                max_tokens=16384,
+                max_tokens=8192,
                 temperature=0.0,
             ),
             details={
@@ -1034,7 +1202,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                     "type": "array",
                     "items": HypothesisCard.model_json_schema(),
                 },
-                max_tokens=16384,
+                max_tokens=8192,
                 temperature=max(getattr(self.llm_config, "temperature", 0.1), 0.4),
             ),
             details={
@@ -1084,7 +1252,11 @@ class M4HypothesisGeneration(ModuleProtocol):
         # contract validation discarded candidates, their reasons are fed back
         # so the retry can fix task alignment.  An empty set that survives the
         # retry still falls through to the deterministic repair path below.
-        if len(candidates) < self.num_candidates:
+        # A smaller-than-requested portfolio is usable once it can satisfy the
+        # configured output cardinality.  Retrying merely to fill the optional
+        # candidate pool consumed a second generator + semantic-audit pass and
+        # was a major source of M4 timeouts.
+        if len(candidates) < self.top_k:
             retry_feedback = (
                 f"The previous pass produced only {len(candidates)} valid hypotheses, "
                 f"but {self.num_candidates} were requested. Generate additional "
@@ -1118,7 +1290,7 @@ class M4HypothesisGeneration(ModuleProtocol):
             all_generated.extend(self._normalise_hypotheses(retry_generated))
             candidates = self._merge_generation_candidates(candidates, retry_candidates)
             contract_failures.extend(retry_failures)
-        generation_shortfall = bool(candidates) and len(candidates) < self.num_candidates
+        generation_shortfall = bool(candidates) and len(candidates) < self.top_k
 
         if not candidates:
             candidates, contract_failures = await self._repair_context_contract(
@@ -1202,7 +1374,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                         top_k=self.top_k,
                     ),
                     output_schema=ranker_schema,
-                    max_tokens=8192,
+                    max_tokens=4096,
                     temperature=getattr(self.llm_config, "temperature", 0.1),
                 ),
                 details={"candidates": len(candidates), "top_k": self.top_k},
@@ -1315,7 +1487,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                         ),
                     ),
                     output_schema=critic_schema,
-                    max_tokens=8192,
+                    max_tokens=4096,
                     temperature=getattr(self.llm_config, "temperature", 0.1),
                 ),
                 details={"candidates": len(candidates)},
@@ -1384,7 +1556,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                         ),
                     ),
                     output_schema=falsifiability_schema,
-                    max_tokens=8192,
+                    max_tokens=4096,
                     temperature=getattr(self.llm_config, "temperature", 0.1),
                 ),
                 details={"candidates": len(candidates)},
@@ -1439,7 +1611,11 @@ class M4HypothesisGeneration(ModuleProtocol):
         guidance = list(state.user_guidance)
         feedback_context = self._build_feedback_context(state, guidance)
 
-        result = await self._run_llm(state, feedback_context)
+        self._run_deadline = time.monotonic() + self.total_time_budget_seconds
+        try:
+            result = await self._run_llm(state, feedback_context)
+        finally:
+            self._run_deadline = None
         result["user_guidance"] = guidance
         result["best_hypotheses"] = self._update_best(state, result.get("top_hypotheses", []))
         graph_context = build_graph_context(state)
