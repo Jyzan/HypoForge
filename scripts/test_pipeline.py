@@ -9253,6 +9253,22 @@ def test_yaml_config_loads():
         assert config.enabled_modules, f"{yaml_file.name}: no modules enabled"
 
 
+def test_web_ui_timeout_budgets_cover_observed_llm_long_tail() -> None:
+    """Live timeouts must not cut off the observed 171-172s P90 calls."""
+
+    config_path = Path(__file__).resolve().parent.parent / "configs" / "web_ui.yaml"
+    config = PipelineConfig.from_yaml(str(config_path))
+    m4_kwargs = config.get_module_kwargs("m4")
+
+    assert config.qwen.base.request_timeout_seconds >= 210.0
+    assert config.qwen.plus.request_timeout_seconds >= 330.0
+    assert config.node_timeouts["m1"] >= 240.0
+    assert m4_kwargs["llm_call_timeout"] >= 360.0
+    assert m4_kwargs["llm_call_timeout"] > config.qwen.plus.request_timeout_seconds
+    assert m4_kwargs["total_time_budget_seconds"] >= 840.0
+    assert config.node_timeouts["m4"] > m4_kwargs["total_time_budget_seconds"]
+
+
 # --------------------------------------------------------------------------- #
 # Rubric — single source of truth for weights / composite
 # --------------------------------------------------------------------------- #

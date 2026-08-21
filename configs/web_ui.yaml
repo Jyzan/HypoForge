@@ -17,23 +17,38 @@ pipeline:
   supplement_paper_budget: 6
   gap_no_improvement_limit: 3
 
+# Calibrated from live-run latency and a no-timeout replay.  M1 had a 172s P90;
+# the reasoning-enabled M4 generator completed naturally in 282.35s, so its
+# layered ceilings need additional headroom while still bounding stuck calls.
+node_timeouts:
+  m1: 240.0
+  m2: 900.0
+  m3: 480.0
+  m4: 900.0
+  m5: 180.0
+  m6: 180.0
+
 qwen:
   base:
     model: qwen3.7-plus
     max_tokens: 4096
     temperature: 0.1
+    request_timeout_seconds: 210.0
   max:
     model: qwen3.7-plus
     max_tokens: 4096
     temperature: 0.1
+    request_timeout_seconds: 210.0
   plus:
     model: qwen3.7-plus
     max_tokens: 4096
     temperature: 0.1
+    request_timeout_seconds: 330.0
   turbo:
     model: qwen3.7-plus
     max_tokens: 4096
     temperature: 0.1
+    request_timeout_seconds: 210.0
 
 search:
   implementation: agentic
@@ -100,8 +115,8 @@ module_overrides:
       top_k: 1
       mode: "multi_agent"
       llm_tier: "plus"
-      llm_call_timeout: 120.0
-      total_time_budget_seconds: 540.0
+      llm_call_timeout: 360.0
+      total_time_budget_seconds: 840.0
       semantic_alignment_timeout_seconds: 45.0
   m5:
     kwargs:
