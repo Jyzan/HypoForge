@@ -545,41 +545,37 @@ class StrictEntityNormalizationService(EntityNormalizationService):
         surfaces: list[str],
         canonical_names: list[str],
     ) -> dict[str, list[str]]:
+        # Resolve the shared endpoint once for both M2 and M3.  Qwen is the
+        # final compatibility fallback because the UI's local .env uses the
+        # formal QWEN_* names for its OpenAI-compatible MaaS connection.
+        base_url = (
+            self.embedding_base_url
+            or os.getenv("ENTITY_EMBEDDING_BASE_URL", "")
+            or os.getenv("OPENAI_BASE_URL", "")
+            or os.getenv("QWEN_BASE_URL", "")
+        )
+        key_env = self.embedding_key_env or ""
+        credential = (
+            (os.getenv(key_env, "") if key_env else "")
+            or os.getenv("ENTITY_EMBEDDING_API_KEY", "")
+            or os.getenv("OPENAI_API_KEY", "")
+            or os.getenv("QWEN_API_KEY", "")
+        )
         # Ensure the configured endpoint is valid before delegating.
         if self.embedding_backend is None and self.embedding_model:
-            base_url = (
-                self.embedding_base_url
-                or os.getenv("ENTITY_EMBEDDING_BASE_URL", "")
-                or os.getenv("OPENAI_BASE_URL", "")
-            )
             if not base_url:
                 raise RuntimeError(
                     "Entity embedding is configured but no shared embedding endpoint is set. "
-                    "Set ENTITY_EMBEDDING_BASE_URL or OPENAI_BASE_URL (or entity_embedding_base_url in the config)."
+                    "Set ENTITY_EMBEDDING_BASE_URL, OPENAI_BASE_URL, or QWEN_BASE_URL "
+                    "(or entity_embedding_base_url in the config)."
                 )
-            key_env = self.embedding_key_env or ""
-            credential = (
-                (os.getenv(key_env, "") or os.getenv("OPENAI_API_KEY", ""))
-                if key_env
-                else os.getenv("ENTITY_EMBEDDING_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
-            )
-            if key_env and not credential:
+            if not credential:
+                requested = f" {key_env!r}," if key_env else ""
                 raise RuntimeError(
-                    "Entity embedding is configured but its credential environment "
-                    f"variable {key_env!r} is not set."
+                    "Entity embedding is configured but no shared embedding credential "
+                    f"is set. Checked{requested} ENTITY_EMBEDDING_API_KEY, "
+                    "OPENAI_API_KEY, and QWEN_API_KEY."
                 )
-        else:
-            base_url = (
-                self.embedding_base_url
-                or os.getenv("ENTITY_EMBEDDING_BASE_URL", "")
-                or os.getenv("OPENAI_BASE_URL", "")
-            )
-            key_env = self.embedding_key_env or ""
-            credential = (
-                (os.getenv(key_env, "") or os.getenv("OPENAI_API_KEY", ""))
-                if key_env
-                else os.getenv("ENTITY_EMBEDDING_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
-            )
         # Pass resolved endpoint and key directly to _embed_raw so we never
         # mutate the process environment with os.environ.setdefault.
         return await super()._embedding_candidates(
@@ -764,7 +760,7 @@ class StrictEntityNormalizationService(EntityNormalizationService):
 
 
 class StrictAgenticM2Adapter(AgenticM2Adapter):
-    """Agentic supplement cache hits are read before they become evidence."""
+    """Strict full-flow M2 with a legacy explicit cache-supplement helper."""
 
     def __init__(
         self,

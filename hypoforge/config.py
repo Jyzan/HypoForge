@@ -163,15 +163,15 @@ class EmbeddingConfig(BaseModel):
     """Embedding endpoint used by evidence-consistency evaluation and entity normalization.
 
     ``base_url`` should point to the embedding endpoint.  When unset, the
-    code falls back to ``ENTITY_EMBEDDING_BASE_URL`` → ``OPENAI_BASE_URL``
-    environment variables.  ``api_key_env_var`` names the env-var that holds
-    the credential (defaults to ``ENTITY_EMBEDDING_API_KEY``, then
-    ``OPENAI_API_KEY``).
+    code falls back to ``ENTITY_EMBEDDING_BASE_URL`` → ``OPENAI_BASE_URL`` →
+    ``QWEN_BASE_URL`` environment variables.  ``api_key_env_var`` names the
+    preferred env-var that holds the credential; shared fallbacks are
+    ``ENTITY_EMBEDDING_API_KEY`` → ``OPENAI_API_KEY`` → ``QWEN_API_KEY``.
     """
 
     model_name: str = "text-embedding-v3"
     api_key_env_var: str = "ENTITY_EMBEDDING_API_KEY"
-    base_url: str = ""  # empty → read from ENTITY_EMBEDDING_BASE_URL / OPENAI_BASE_URL
+    base_url: str = ""  # empty → read from ENTITY / OPENAI / QWEN base URL env vars
 
 
 class ConsistencyConfig(BaseModel):

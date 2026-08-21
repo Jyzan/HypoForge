@@ -1368,6 +1368,45 @@ async def test_first_round_runs_full_flow() -> None:
     assert set(output) == {"literature_results", "m2_knowledge_export"}
 
 
+@pytest.mark.asyncio
+async def test_revisit_turns_open_gap_into_subquestion_and_reuses_full_flow() -> None:
+    """An M6 evidence gap must receive the same search pipeline as an M1 sub-question."""
+
+    gap_question = "Missing Hsp70 co-chaperone data"
+    paper = PaperRecord(
+        paper_id="new-1",
+        title="New co-chaperone evidence",
+        doi="10.1000/new",
+        sources=["pubmed"],
+    )
+    agent = RecordingSearchAgent([
+        SearchRunResult(
+            sub_question=gap_question,
+            candidates=[paper],
+            final_papers=[paper],
+            stop_reason=StopReason.COVERAGE_SATISFIED,
+        )
+    ])
+    adapter = AgenticM2Adapter(
+        search_agent=agent,
+        reading_workflow=EchoReadingWorkflow(with_evidence=True),
+        round_strategy="entity_group",
+    )
+    state = make_supplement_state(evidence_gaps=[make_gap()])
+
+    output = await adapter(state)
+
+    assert len(agent.calls) == 1
+    searched_question, search_kwargs = agent.calls[0]
+    assert searched_question == gap_question
+    assert search_kwargs["round_strategy"] == "entity_group"
+    assert search_kwargs["supplement_entities"] == []
+    assert output["evidence_gaps"][0].status == "pending_grounding"
+    assert [
+        run.sub_question for run in output["m2_knowledge_export"].runs
+    ] == [SUB_QUESTION, gap_question]
+
+
 class _ConcurrentFreshSearchAgent:
     final_k = 1
 
@@ -1575,7 +1614,7 @@ async def test_no_open_gap_runs_full_flow_even_on_later_round() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Cache-hit path
+# Legacy supplement helper (kept for explicit compatibility, not automatic re-entry)
 # ---------------------------------------------------------------------------
 
 
@@ -1603,7 +1642,7 @@ async def test_supplement_cache_hit_rebuilds_paper_level_increment(
     recorder = RunEventRecorder(tmp_path / "run", "run-1")
 
     with bind_recorder(recorder):
-        output = await adapter(state)
+        output = await adapter._run_supplement(state, state.evidence_gaps)
 
     # gap attempted → pending_grounding
     gaps = output["evidence_gaps"]
@@ -1647,7 +1686,7 @@ async def test_supplement_cache_hit_rebuilds_paper_level_increment(
 
 
 # ---------------------------------------------------------------------------
-# Live gap search path
+# Legacy one-shot gap-search helper
 # ---------------------------------------------------------------------------
 
 
@@ -1662,7 +1701,7 @@ async def test_supplement_search_merges_and_updates_ledger() -> None:
     )
     state = make_supplement_state(evidence_gaps=[make_gap()])
 
-    output = await adapter(state)
+    output = await adapter._run_supplement(state, state.evidence_gaps)
 
     # exactly the suggested query hit the source (no cache dir → no lookup)
     assert [query.text for query in source.calls] == ["Hsp70 co-chaperone binding"]
@@ -1711,7 +1750,7 @@ async def test_supplement_dedups_queries_already_in_ledger() -> None:
         ),
     )
 
-    output = await adapter(state)
+    output = await adapter._run_supplement(state, state.evidence_gaps)
 
     assert source.calls == []  # duplicate query dropped before any search
     assert len(output["m2_knowledge_export"].runs) == 1  # no new run
@@ -1733,7 +1772,7 @@ async def test_supplement_skips_papers_already_in_prior_export() -> None:
     )
     state = make_supplement_state(evidence_gaps=[make_gap()])
 
-    output = await adapter(state)
+    output = await adapter._run_supplement(state, state.evidence_gaps)
 
     assert len(source.calls) == 1
     assert len(output["m2_knowledge_export"].runs) == 1  # duplicate discarded
@@ -1761,7 +1800,7 @@ async def test_supplement_paper_budget_caps_new_papers() -> None:
     )
     state = make_supplement_state(evidence_gaps=[make_gap()])
 
-    output = await adapter(state)
+    output = await adapter._run_supplement(state, state.evidence_gaps)
 
     new_keys = [
         key
@@ -1785,7 +1824,7 @@ async def test_supplement_without_cache_dir_still_searches(tmp_path) -> None:
     # memory_cache_dir left empty → degraded but functional
     state = make_supplement_state(evidence_gaps=[make_gap()])
 
-    output = await adapter(state)
+    output = await adapter._run_supplement(state, state.evidence_gaps)
 
     assert len(source.calls) == 1
     assert output["literature_results"][0].papers_retrieved == 2
@@ -4960,6 +4999,49 @@ async def test_entity_pair_decisions_do_not_overwrite_each_other(tmp_path) -> No
     assert negative.same_concept is False
 
 
+@pytest.mark.asyncio
+async def test_strict_entity_embedding_falls_back_to_qwen_environment(
+    tmp_path, monkeypatch,
+) -> None:
+    """The shared M2/M3 normalizer may reuse the configured Qwen endpoint."""
+    for name in (
+        "ENTITY_EMBEDDING_BASE_URL",
+        "OPENAI_BASE_URL",
+        "ENTITY_EMBEDDING_API_KEY",
+        "OPENAI_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("QWEN_BASE_URL", "https://qwen.example/v1")
+    monkeypatch.setenv("QWEN_API_KEY", "qwen-test-key")
+
+    captured: dict[str, str] = {}
+
+    async def capture_parent(
+        self, surfaces, canonical_names, _base_url="", _api_key="",
+    ):
+        captured["base_url"] = _base_url
+        captured["api_key"] = _api_key
+        return {}
+
+    monkeypatch.setattr(
+        EntityNormalizationService,
+        "_embedding_candidates",
+        capture_parent,
+    )
+    service = StrictEntityNormalizationService(
+        cache_dir=tmp_path,
+        embedding_model="text-embedding-v3",
+        embedding_key_env="ENTITY_EMBEDDING_API_KEY",
+    )
+
+    await service._embedding_candidates(["hydrogen"], ["hydrogen energy"])
+
+    assert captured == {
+        "base_url": "https://qwen.example/v1",
+        "api_key": "qwen-test-key",
+    }
+
+
 class PartialDecisionClient:
     async def structured_chat(self, **kwargs):
         request = json.loads(kwargs["user_prompt"])[0]
@@ -5284,7 +5366,7 @@ async def test_agentic_cache_hit_is_read_before_pending_grounding(tmp_path) -> N
         reading_workflow=reader,
     )
 
-    result = await adapter(state)
+    result = await adapter._run_supplement(state, state.evidence_gaps)
 
     assert reader.calls == 1
     assert result["evidence_gaps"][0].status == "pending_grounding"
@@ -5333,7 +5415,7 @@ class _ContextOnlySearchAgent:
 
 
 @pytest.mark.asyncio
-async def test_strict_m2_supplement_context_only_fallback_keeps_gap_open() -> None:
+async def test_strict_m2_revisit_context_only_fallback_keeps_gap_open() -> None:
     adapter = StrictAgenticM2Adapter(
         search_agent=_ContextOnlySearchAgent(),
         reading_workflow=EchoReadingWorkflow(with_evidence=False),
@@ -5344,18 +5426,18 @@ async def test_strict_m2_supplement_context_only_fallback_keeps_gap_open() -> No
 
     result = await adapter(state)
 
-    # context-only fallback batch with zero knowledge: no crash, gap stays
-    # open, no empty run exported.
+    # Context-only papers remain auditable, but without extracted knowledge
+    # they do not advance the evidence gap to grounding.
     assert result["evidence_gaps"][0].status == "open"
-    assert len(result["m2_knowledge_export"].runs) == 1  # prior run only
-    assert result["search_ledger"].queries_issued == [
-        "initial query",
-        "context query",
-    ]
+    assert len(result["m2_knowledge_export"].runs) == 2
+    assert result["m2_knowledge_export"].runs[1].sub_question == (
+        "Missing Hsp70 co-chaperone data"
+    )
+    assert result["m2_knowledge_export"].runs[1].knowledge_entries == []
 
 
 @pytest.mark.asyncio
-async def test_strict_m2_supplement_knowledge_role_reading_failure_still_fails() -> None:
+async def test_strict_m2_revisit_knowledge_role_reading_failure_still_fails() -> None:
     decisions = [
         PaperRetentionDecision(
             paper_id="ctx-1",
@@ -5385,7 +5467,7 @@ async def test_strict_m2_supplement_knowledge_role_reading_failure_still_fails()
 
 
 @pytest.mark.asyncio
-async def test_strict_m2_supplement_empty_retention_decisions_keeps_legacy_contract() -> None:
+async def test_strict_m2_revisit_empty_retention_decisions_keeps_legacy_contract() -> None:
     adapter = StrictAgenticM2Adapter(
         search_agent=_ContextOnlySearchAgent(decisions=[]),
         reading_workflow=EchoReadingWorkflow(with_evidence=False),
@@ -5400,7 +5482,7 @@ async def test_strict_m2_supplement_empty_retention_decisions_keeps_legacy_contr
 
 
 @pytest.mark.asyncio
-async def test_strict_m2_supplement_context_only_with_knowledge_exports_and_grounds() -> None:
+async def test_strict_m2_revisit_context_only_with_knowledge_exports_and_grounds() -> None:
     adapter = StrictAgenticM2Adapter(
         search_agent=_ContextOnlySearchAgent(),
         reading_workflow=EchoReadingWorkflow(with_evidence=True),
@@ -5419,7 +5501,7 @@ async def test_strict_m2_supplement_context_only_with_knowledge_exports_and_grou
 
 
 @pytest.mark.asyncio
-async def test_base_m2_supplement_context_only_fallback_keeps_gap_open() -> None:
+async def test_base_m2_revisit_context_only_fallback_keeps_gap_open() -> None:
     adapter = AgenticM2Adapter(
         search_agent=_ContextOnlySearchAgent(),
         reading_workflow=EchoReadingWorkflow(with_evidence=False),
@@ -5431,7 +5513,10 @@ async def test_base_m2_supplement_context_only_fallback_keeps_gap_open() -> None
     result = await adapter(state)
 
     assert result["evidence_gaps"][0].status == "open"
-    assert len(result["m2_knowledge_export"].runs) == 1  # prior run only
+    assert len(result["m2_knowledge_export"].runs) == 2
+    assert result["m2_knowledge_export"].runs[1].sub_question == (
+        "Missing Hsp70 co-chaperone data"
+    )
 
 
 def test_registry_selects_strict_builtin_contracts() -> None:

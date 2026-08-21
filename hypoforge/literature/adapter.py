@@ -11,29 +11,9 @@ Track A delivers two classes:
   Accepts ``llm_config`` + ``variant`` and builds the internal adapter
   via ``build_adapter_from_config()``.
 
-Supplement rounds (cache-first incremental search)
---------------------------------------------------
-When the pipeline re-enters M2 on a ``supplement_m2`` route
-(``state.search_round > 0`` with at least one ``open`` evidence gap), the
-adapter switches to an incremental flow instead of re-running the full
-search:
-
-1. **Cache hit first** — open gaps are probed against the persistent
-   ``PaperStore`` (``memory_cache_dir``); hits are re-packaged as a
-   paper-level export run (no fabricated knowledge entries — cached metadata
-   carries no full-text evidence) and the gap moves to ``pending_grounding``.
-2. **Gap search** — remaining gaps issue their ``suggested_queries`` through
-   a one-shot ``IterativeSearchAgent`` built from the same components, with
-   queries deduplicated against ``state.search_ledger`` and bounded by
-   ``supplement_paper_budget``.
-3. **Incremental merge** — new papers are merged into the existing
-   ``literature_results`` / ``m2_knowledge_export`` (a *new* export run is
-   appended so per-run provenance stays self-consistent), and the updated
-   ``evidence_gaps`` / ``search_ledger`` are returned in full (LangGraph
-   list fields have no reducer — the whole list must be re-emitted).
-
-With no open gaps (or on round 0) the original full-flow path runs
-unchanged.
+Revisit rounds use the same full search-and-reading flow as the first M2
+round.  Each open evidence gap is converted into a new sub-question, while
+historical literature and export runs are retained additively.
 """
 
 from __future__ import annotations
@@ -187,7 +167,8 @@ class AgenticM2Adapter(ModuleProtocol):
         # Round organisation for the primary search flow.  "entity_group"
         # uses the must/unmust grouping strategy + zero-result rescue;
         # "coverage" keeps the legacy coverage-driven iteration.  The
-        # supplement (gap) path always stays on the legacy one-shot flow.
+        # explicitly-invoked legacy supplement helper stays on its historical
+        # one-shot flow; normal pipeline revisits use this primary strategy.
         self.round_strategy = round_strategy
         if fulltext_backfill_target < 0 or fulltext_backfill_max_attempts <= 0:
             raise ValueError("full-text backfill limits are invalid")
@@ -675,25 +656,31 @@ class AgenticM2Adapter(ModuleProtocol):
         state: PipelineState,
         config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        # ---- supplement round: cache-first incremental search -------------
-        # Re-entry on a supplement_m2 route (search_round already advanced by
-        # a previous M2 execution) with at least one open evidence gap.
+        # Re-entry converts each open M6 evidence gap into a sub-question, but
+        # deliberately reuses the exact same full M2 worker as the first run.
         open_gaps = [gap for gap in state.evidence_gaps if gap.status == "open"]
-        if open_gaps and state.search_round > 0:
-            return await self._run_supplement(state, open_gaps)
+        revisit_gaps = open_gaps if state.search_round > 0 else []
 
-        # ---- fresh round: full search flow (unchanged) ---------------------
+        # ---- full search flow shared by first and revisit rounds -----------
         problem_card = state.problem_card
         pending_gaps = [
             gap for gap in state.evidence_gap_requests if gap.status == "pending"
         ]
-        sub_questions = list(dict.fromkeys(
-            gap.sub_question for gap in pending_gaps
-        )) if pending_gaps else (
-            problem_card.sub_questions
-            if problem_card and problem_card.sub_questions
-            else [state.input_question]
-        )
+        if revisit_gaps:
+            sub_questions = list(dict.fromkeys(
+                self._gap_as_sub_question(gap, state.input_question)
+                for gap in revisit_gaps
+            ))
+        elif pending_gaps:
+            sub_questions = list(dict.fromkeys(
+                gap.sub_question for gap in pending_gaps
+            ))
+        else:
+            sub_questions = (
+                problem_card.sub_questions
+                if problem_card and problem_card.sub_questions
+                else [state.input_question]
+            )
         domains = problem_card.domain if problem_card else []
         literature_results: list[LiteratureResult] = []
         export_runs: list[M2KnowledgeRun] = []
@@ -845,7 +832,43 @@ class AgenticM2Adapter(ModuleProtocol):
             result["evidence_gap_search_rounds"] = (
                 state.evidence_gap_search_rounds + 1
             )
+        if revisit_gaps:
+            grounded_questions = {
+                outcome.sub_question
+                for outcome in outcomes.values()
+                if outcome.export_run.evidence
+                or outcome.export_run.knowledge_entries
+            }
+            result["evidence_gaps"] = [
+                gap.model_copy(update={"status": "pending_grounding"})
+                if (
+                    gap.status == "open"
+                    and self._gap_as_sub_question(gap, state.input_question)
+                    in grounded_questions
+                )
+                else gap.model_copy(deep=True)
+                for gap in state.evidence_gaps
+            ]
         return result
+
+    @staticmethod
+    def _gap_as_sub_question(gap: EvidenceGap, original_question: str) -> str:
+        """Turn an M6 evidence gap into the next full-M2 sub-question."""
+
+        description = " ".join(str(gap.description or "").split())
+        if description:
+            return description
+        target = " ".join(str(gap.target_sub_question or "").split())
+        if target:
+            return target
+        entities = " ".join(
+            str(entity).strip()
+            for entity in gap.canonical_entities
+            if str(entity).strip()
+        )
+        if entities:
+            return f"What evidence is missing about {entities}?"
+        return f"What evidence is missing for: {original_question}"
 
     @classmethod
     def get_input_fields(cls) -> list[str]:
@@ -856,7 +879,7 @@ class AgenticM2Adapter(ModuleProtocol):
         return ["literature_results", "m2_knowledge_export"]
 
     # ------------------------------------------------------------------
-    # Supplement round (cache-first incremental search)
+    # Legacy explicit supplement helper (not used by automatic M2 revisits)
     # ------------------------------------------------------------------
 
     async def _run_supplement(
