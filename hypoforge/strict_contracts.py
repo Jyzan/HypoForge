@@ -1030,6 +1030,8 @@ class StrictM2LiteratureSearch(M2LiteratureSearch):
             fulltext_backfill_max_attempts=base.fulltext_backfill_max_attempts,
             fulltext_backfill_min_relevance=base.fulltext_backfill_min_relevance,
             fulltext_backfill_min_directness=base.fulltext_backfill_min_directness,
+            preprint_supplementer=base.preprint_supplementer,
+            preprint_supplement_max_attempts=base.preprint_supplement_max_attempts,
             subquestion_concurrency=base.subquestion_concurrency,
             fresh_run_timeout_seconds=base.fresh_run_timeout_seconds,
         )

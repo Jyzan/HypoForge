@@ -92,6 +92,15 @@ module_overrides:
       access_enrichment_timeout_seconds: 12.0
       fulltext_target_per_subquestion: 2
       fulltext_backfill_max_attempts: 4
+      # Last-resort additive discovery for Science-125 domain preprint
+      # servers. Existing discovery/OA/full-text paths always run first.
+      preprint_supplement_enabled: true
+      preprint_supplement_max_sources: 2
+      preprint_supplement_per_source_limit: 2
+      preprint_supplement_max_candidates: 4
+      preprint_supplement_max_attempts: 2
+      preprint_supplement_timeout_seconds: 15.0
+      preprint_supplement_scout_timeout_seconds: 60.0
       final_k: 2
       subquestion_concurrency: 2
       source_concurrency_limit: 2

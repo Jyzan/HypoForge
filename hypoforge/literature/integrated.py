@@ -34,6 +34,10 @@ from .search import (
 from .search.query_planner import QueryPlanner
 from .search.domain_routing import DomainRoutedQueryPlanner
 from .search.search_tool import LiteratureSearchTool
+from .preprint_supplement import (
+    Science125PreprintSupplementer,
+    build_science125_preprint_sources,
+)
 
 
 def build_integrated_search_adapter(
@@ -55,6 +59,13 @@ def build_integrated_search_adapter(
     access_enrichment_timeout_seconds: float = 12.0,
     fulltext_target_per_subquestion: int = 3,
     fulltext_backfill_max_attempts: int = 8,
+    preprint_supplement_enabled: bool = False,
+    preprint_supplement_max_sources: int = 2,
+    preprint_supplement_per_source_limit: int = 2,
+    preprint_supplement_max_candidates: int = 4,
+    preprint_supplement_max_attempts: int = 2,
+    preprint_supplement_timeout_seconds: float = 15.0,
+    preprint_supplement_scout_timeout_seconds: float = 60.0,
     zero_result_relaxation: bool = True,
     source_timeout_seconds: float = 30.0,
     scout_timeout_seconds: float = 90.0,
@@ -90,6 +101,18 @@ def build_integrated_search_adapter(
         raise ValueError("access_enrichment_timeout_seconds must be positive")
     if fulltext_backfill_max_attempts <= 0:
         raise ValueError("fulltext_backfill_max_attempts must be positive")
+    if min(
+        preprint_supplement_max_sources,
+        preprint_supplement_per_source_limit,
+        preprint_supplement_max_candidates,
+        preprint_supplement_max_attempts,
+    ) <= 0:
+        raise ValueError("preprint supplement limits must be positive")
+    if min(
+        preprint_supplement_timeout_seconds,
+        preprint_supplement_scout_timeout_seconds,
+    ) <= 0:
+        raise ValueError("preprint supplement timeouts must be positive")
     if fulltext_target_per_subquestion <= 0:
         raise ValueError("fulltext_target_per_subquestion must be positive")
     if fulltext_target_per_subquestion > final_k:
@@ -134,12 +157,15 @@ def build_integrated_search_adapter(
         )
         if domain_routing_enabled else base_planner
     )
+    deduplicator = PaperDeduplicator()
+    ranker = PaperRanker(prefer_high_citation=domain_routing_enabled)
+    scout_reader = ScoutReader(client)
     agent = IterativeSearchAgent(
         query_planner=planner,
         sources=tool.as_source_list(),
-        deduplicator=PaperDeduplicator(),
-        ranker=PaperRanker(prefer_high_citation=domain_routing_enabled),
-        scout_reader=ScoutReader(client),
+        deduplicator=deduplicator,
+        ranker=ranker,
+        scout_reader=scout_reader,
         # Coverage must be satisfied by the same leading papers that the
         # agent will hand to the reading workflow, not by discarded tail
         # candidates. This remains internal wiring; Protocol signatures stay
@@ -192,6 +218,24 @@ def build_integrated_search_adapter(
         reader_timeout_seconds=reader_timeout_seconds,
         workflow_timeout_seconds=reading_workflow_timeout_seconds,
     )
+    preprint_supplementer = None
+    if preprint_supplement_enabled:
+        preprint_supplementer = Science125PreprintSupplementer(
+            sources=build_science125_preprint_sources(
+                crossref_mailto=(
+                    crossref_mailto or unpaywall_email or openalex_mailto
+                ),
+                timeout_seconds=preprint_supplement_timeout_seconds,
+            ),
+            deduplicator=deduplicator,
+            ranker=ranker,
+            scout_reader=scout_reader,
+            max_sources=preprint_supplement_max_sources,
+            per_source_limit=preprint_supplement_per_source_limit,
+            max_candidates=preprint_supplement_max_candidates,
+            source_timeout_seconds=preprint_supplement_timeout_seconds,
+            scout_timeout_seconds=preprint_supplement_scout_timeout_seconds,
+        )
     return AgenticM2Adapter(
         search_agent=agent,
         reading_workflow=reading_workflow,
@@ -203,6 +247,8 @@ def build_integrated_search_adapter(
         fulltext_backfill_enabled=domain_routing_enabled,
         fulltext_backfill_target=fulltext_target_per_subquestion,
         fulltext_backfill_max_attempts=fulltext_backfill_max_attempts,
+        preprint_supplementer=preprint_supplementer,
+        preprint_supplement_max_attempts=preprint_supplement_max_attempts,
         subquestion_concurrency=subquestion_concurrency,
         fresh_run_timeout_seconds=fresh_run_timeout_seconds,
     )

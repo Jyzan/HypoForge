@@ -152,6 +152,8 @@ class AgenticM2Adapter(ModuleProtocol):
         fulltext_backfill_max_attempts: int = 8,
         fulltext_backfill_min_relevance: float = 0.70,
         fulltext_backfill_min_directness: float = 0.45,
+        preprint_supplementer: Any = None,
+        preprint_supplement_max_attempts: int = 2,
         subquestion_concurrency: int = 2,
         fresh_run_timeout_seconds: float = 840.0,
     ) -> None:
@@ -172,6 +174,8 @@ class AgenticM2Adapter(ModuleProtocol):
         self.round_strategy = round_strategy
         if fulltext_backfill_target < 0 or fulltext_backfill_max_attempts <= 0:
             raise ValueError("full-text backfill limits are invalid")
+        if preprint_supplement_max_attempts <= 0:
+            raise ValueError("preprint_supplement_max_attempts must be positive")
         if not 0 <= fulltext_backfill_min_relevance <= 1:
             raise ValueError("fulltext_backfill_min_relevance must be in [0, 1]")
         if not 0 <= fulltext_backfill_min_directness <= 1:
@@ -185,6 +189,10 @@ class AgenticM2Adapter(ModuleProtocol):
         self.fulltext_backfill_max_attempts = int(fulltext_backfill_max_attempts)
         self.fulltext_backfill_min_relevance = float(fulltext_backfill_min_relevance)
         self.fulltext_backfill_min_directness = float(fulltext_backfill_min_directness)
+        self.preprint_supplementer = preprint_supplementer
+        self.preprint_supplement_max_attempts = int(
+            preprint_supplement_max_attempts
+        )
         self.subquestion_concurrency = int(subquestion_concurrency)
         self.fresh_run_timeout_seconds = float(fresh_run_timeout_seconds)
         self._subquestion_semaphore = asyncio.Semaphore(self.subquestion_concurrency)
@@ -207,6 +215,8 @@ class AgenticM2Adapter(ModuleProtocol):
         *,
         citation_floor: int = 0,
         attempted_ids: set[str] | None = None,
+        allowed_candidate_ids: set[str] | None = None,
+        max_attempts: int | None = None,
     ) -> tuple[Any, list]:
         """Try lower-ranked strict candidates until the parsed-text target is met."""
 
@@ -222,6 +232,11 @@ class AgenticM2Adapter(ModuleProtocol):
         note_by_id = {note.paper_id: note for note in search_result.scout_notes}
         candidates = []
         for paper in search_result.candidates:
+            if (
+                allowed_candidate_ids is not None
+                and paper.paper_id not in allowed_candidate_ids
+            ):
+                continue
             if paper.paper_id in selected_ids:
                 continue
             if paper.paper_id in attempted:
@@ -253,9 +268,13 @@ class AgenticM2Adapter(ModuleProtocol):
         retained = list(search_result.final_papers)
         readings = list(reading_results)
         attempts = 0
+        attempt_limit = (
+            self.fulltext_backfill_max_attempts
+            if max_attempts is None else max(1, int(max_attempts))
+        )
         decisions = list(search_result.retention_decisions)
         for paper in candidates:
-            if fulltext_count >= target or attempts >= self.fulltext_backfill_max_attempts:
+            if fulltext_count >= target or attempts >= attempt_limit:
                 break
             attempts += 1
             attempted.add(paper.paper_id)
@@ -317,9 +336,32 @@ class AgenticM2Adapter(ModuleProtocol):
         base = self.budget or SearchBudget()
         return base.model_copy(update={"max_rounds": 1})
 
+    @staticmethod
+    def _merge_search_provenance(compact: Any, expanded: Any) -> Any:
+        """Append one search phase's audit data without changing candidates."""
+
+        counts = dict(compact.source_result_counts)
+        for source, count in expanded.source_result_counts.items():
+            counts[source] = counts.get(source, 0) + count
+        timings = dict(compact.stage_elapsed_seconds)
+        for stage, elapsed in expanded.stage_elapsed_seconds.items():
+            timings[stage] = timings.get(stage, 0.0) + elapsed
+        return compact.model_copy(update={
+            "queries": [*compact.queries, *expanded.queries],
+            "papers_found": compact.papers_found + expanded.papers_found,
+            "failed_sources": list(dict.fromkeys([
+                *compact.failed_sources, *expanded.failed_sources,
+            ])),
+            "iterations": compact.iterations + expanded.iterations,
+            "errors": [*compact.errors, *expanded.errors],
+            "source_result_counts": counts,
+            "stage_elapsed_seconds": timings,
+        })
+
     async def _merge_search_phases(self, compact: Any, expanded: Any) -> Any:
         """Merge compact and conditional expansion results without double counts."""
 
+        merged = self._merge_search_provenance(compact, expanded)
         papers = await self.search_agent.deduplicator.deduplicate([
             *compact.candidates,
             *expanded.candidates,
@@ -342,22 +384,99 @@ class AgenticM2Adapter(ModuleProtocol):
             notes,
             selection_limit=self.search_agent.final_k,
         )
-        counts = dict(compact.source_result_counts)
-        for source, count in expanded.source_result_counts.items():
-            counts[source] = counts.get(source, 0) + count
-        return compact.model_copy(update={
-            "queries": [*compact.queries, *expanded.queries],
-            "papers_found": compact.papers_found + expanded.papers_found,
+        return merged.model_copy(update={
             "papers_after_dedup": len(papers),
             "candidates": ranked,
-            "failed_sources": list(dict.fromkeys([
-                *compact.failed_sources, *expanded.failed_sources,
-            ])),
-            "iterations": compact.iterations + expanded.iterations,
-            "errors": [*compact.errors, *expanded.errors],
-            "source_result_counts": counts,
             "scout_notes": list(note_by_id.values()),
         })
+
+    async def _supplement_preprint_fulltext(
+        self,
+        sub_question: str,
+        domains: Sequence[str],
+        key_entities: Sequence[str],
+        search_result: Any,
+        reading_results: list,
+        attempted_ids: set[str],
+        target: int,
+    ) -> tuple[Any, list]:
+        """Run the optional final preprint phase and preserve prior results."""
+
+        parsed_before = sum(
+            self._is_parsed_fulltext(item) for item in reading_results
+        )
+        if self.preprint_supplementer is None or parsed_before >= target:
+            return search_result, reading_results
+        try:
+            preprint_result = await self.preprint_supplementer.search(
+                sub_question,
+                domains=domains,
+                key_entities=key_entities,
+                existing_queries=search_result.queries,
+                existing_papers=search_result.candidates,
+            )
+            if preprint_result.candidates:
+                preprint_ids = {
+                    paper.paper_id for paper in preprint_result.candidates
+                }
+                search_result = await self._merge_search_phases(
+                    search_result, preprint_result
+                )
+                search_result, reading_results = await self._backfill_fulltext(
+                    sub_question,
+                    search_result,
+                    list(reading_results),
+                    citation_floor=0,
+                    attempted_ids=attempted_ids,
+                    allowed_candidate_ids=preprint_ids,
+                    max_attempts=self.preprint_supplement_max_attempts,
+                )
+            else:
+                # Rejected/empty results still belong in exported provenance;
+                # preserving the compact candidate order avoids changing the
+                # original M2 outcome when the additive phase contributes none.
+                search_result = self._merge_search_provenance(
+                    search_result, preprint_result
+                )
+            parsed_after = sum(
+                self._is_parsed_fulltext(item) for item in reading_results
+            )
+            emit_event(
+                "tool_result",
+                module="m2",
+                tool="conditional_preprint_supplement",
+                status="completed" if parsed_after >= target else "warning",
+                message="Conditional disciplinary-preprint supplement finished",
+                details={
+                    "sub_question": sub_question,
+                    "sources": list(preprint_result.source_result_counts),
+                    "candidates": len(preprint_result.candidates),
+                    "parsed_before": parsed_before,
+                    "parsed_after": parsed_after,
+                    "parsed_added": parsed_after - parsed_before,
+                    "errors": list(preprint_result.errors),
+                },
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # This is a last-resort additive path.  A source outage must not
+            # discard the valid results produced by the primary M2 flow.
+            emit_event(
+                "tool_result",
+                module="m2",
+                tool="conditional_preprint_supplement",
+                status="warning",
+                message=(
+                    "Conditional preprint supplement failed; preserving "
+                    "prior results"
+                ),
+                details={
+                    "sub_question": sub_question,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+        return search_result, reading_results
 
     async def _normalise_reading_entities(
         self,
@@ -599,6 +718,22 @@ class AgenticM2Adapter(ModuleProtocol):
                             "errors": list(expanded.errors),
                         },
                     )
+
+            # The additive Science-125 preprint phase runs only after every
+            # existing discovery, OA enrichment and backfill path remains
+            # below target.  Its independent attempt budget prevents older,
+            # citation-heavy unresolved papers from starving open preprints.
+            search_result, reading_results = (
+                await self._supplement_preprint_fulltext(
+                    sub_question,
+                    domains,
+                    key_entities,
+                    search_result,
+                    list(reading_results),
+                    attempted_backfill_ids,
+                    target,
+                )
+            )
 
             # The run-scoped entity cache has one on-disk target.  Serialize
             # normalization to avoid competing temporary-file replacements.

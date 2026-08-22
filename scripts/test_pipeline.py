@@ -5556,6 +5556,8 @@ def test_registry_selects_strict_builtin_contracts() -> None:
     assert adapter.fulltext_backfill_max_attempts == 8
     assert adapter.fulltext_backfill_min_relevance == 0.70
     assert adapter.fulltext_backfill_min_directness == 0.45
+    assert adapter.preprint_supplementer is None
+    assert adapter.preprint_supplement_max_attempts == 2
 
 
 def test_m2_query_llm_config_is_wired_to_query_planner() -> None:
@@ -5602,6 +5604,8 @@ def test_strict_m2_facade_preserves_agentic_config_fields() -> None:
     assert adapter.fulltext_backfill_max_attempts == 8
     assert adapter.fulltext_backfill_min_relevance == 0.70
     assert adapter.fulltext_backfill_min_directness == 0.45
+    assert adapter.preprint_supplementer is None
+    assert adapter.preprint_supplement_max_attempts == 2
 
 
 def test_registry_respects_explicit_empty_entity_embedding_model() -> None:
@@ -10511,6 +10515,286 @@ def test_pipeline_node_timeout_defaults_cover_core_modules() -> None:
     runner = PipelineRunner(PipelineConfig())
     for module_name in ("m1", "m2", "m3", "m4", "m5", "m6"):
         assert runner._node_timeout(module_name) > 0
+
+
+def test_science125_preprint_routing_covers_additive_domain_sources() -> None:
+    from hypoforge.literature.preprint_supplement import (
+        route_science125_preprint_sources,
+    )
+
+    cases = {
+        "Mathematical Sciences": [],  # arXiv remains in the primary route
+        "Physics": [],
+        "Astronomy": [],
+        "Chemistry": ["chemrxiv"],
+        "Medicine and Health": ["medrxiv"],
+        "Biology": ["biorxiv"],
+        "Engineering and Materials": ["mechanicsarxiv", "engrxiv"],
+        "Information Science": ["techrxiv"],
+        "Neuroscience": ["biorxiv", "medrxiv"],
+        "Ecology": ["ecoevorxiv", "biorxiv"],
+        "Energy": ["ecsarxiv", "engrxiv"],
+    }
+    for domain, expected in cases.items():
+        assert route_science125_preprint_sources([domain], "neutral question") == expected
+    assert route_science125_preprint_sources(
+        ["Earth Science"], "earthquake and climate hazards"
+    ) == ["eartharxiv"]
+    assert route_science125_preprint_sources(
+        ["Ecology"],
+        "Can earthquakes, tsunamis, and hurricanes be predicted?",
+    )[0] == "eartharxiv"
+
+
+def test_preprint_queries_reuse_and_sanitize_primary_m2_portfolio() -> None:
+    from hypoforge.literature.models import SearchQuery
+    from hypoforge.literature.preprint_supplement import preprint_query_variants
+
+    query = SearchQuery(
+        query_id="q", text="protein folding [review] site:example.org",
+        target_source="openalex", purpose="core",
+        relation_to_question="test",
+    )
+    assert preprint_query_variants(
+        "How do proteins fold?", ["protein", "folding"], [query]
+    ) == ["protein folding", "How do proteins fold?"]
+
+
+def test_strict_m2_preserves_enabled_preprint_supplement() -> None:
+    from hypoforge.config import LLMConfig
+    from hypoforge.strict_contracts import StrictAgenticM2Module
+
+    module = StrictAgenticM2Module(
+        llm_config=LLMConfig(
+            model="test", api_key="test",
+            api_base="https://example.invalid/v1",
+        ),
+        enabled_sources=["openalex", "crossref"],
+        domain_routing_enabled=True,
+        final_k=2,
+        fulltext_target_per_subquestion=2,
+        preprint_supplement_enabled=True,
+    )
+    supplementer = module.adapter.preprint_supplementer
+    assert supplementer is not None
+    assert set(supplementer.sources) == {
+        "biorxiv", "medrxiv", "chemrxiv", "mechanicsarxiv", "engrxiv",
+        "techrxiv", "ecoevorxiv", "eartharxiv", "ecsarxiv",
+    }
+
+
+@pytest.mark.asyncio
+async def test_osf_preprint_search_relaxes_phrase_and_preserves_doi() -> None:
+    from urllib.parse import parse_qs, urlparse
+    from hypoforge.literature.models import SearchQuery
+    from hypoforge.literature.preprint_supplement import OSFPreprintSource
+
+    calls = []
+
+    async def backend(url, timeout):
+        calls.append(url)
+        filters = parse_qs(urlparse(url).query)
+        if filters.get("filter[title]") == ["earthquake"]:
+            return {"data": [{
+                "id": "abc_v1",
+                "attributes": {
+                    "title": "Earthquake rupture mechanics",
+                    "description": "Direct evidence",
+                    "date_published": "2025-01-02",
+                    "doi": "10.1000/journal",
+                },
+                "links": {
+                    "html": "https://osf.io/preprints/eartharxiv/abc_v1/",
+                    "preprint_doi": "https://doi.org/10.31223/osf.io/abc",
+                },
+                "relationships": {"primary_file": {"data": None}},
+            }]}
+        return {"data": []}
+
+    source = OSFPreprintSource("eartharxiv", backend=backend)
+    papers = await source.search(SearchQuery(
+        query_id="q", text="earthquake disaster prediction",
+        target_source="eartharxiv", purpose="test",
+        relation_to_question="test",
+    ), limit=1)
+    assert len(calls) >= 2
+    assert papers[0].doi == "10.31223/osf.io/abc"
+    assert papers[0].external_ids["landing_url"].startswith("https://osf.io/")
+
+
+@pytest.mark.asyncio
+async def test_preprint_supplement_scout_gate_rejects_weak_candidates() -> None:
+    from hypoforge.literature.models import PaperRecord, ScoutNote, SearchQuery
+    from hypoforge.literature.preprint_supplement import Science125PreprintSupplementer
+    from hypoforge.literature.search import PaperDeduplicator, PaperRanker
+
+    papers = [
+        PaperRecord(paper_id="good", title="Protein folding mechanism",
+                    abstract="protein folding chaperone mechanism",
+                    sources=["biorxiv"]),
+        PaperRecord(paper_id="weak", title="Unrelated protein catalog",
+                    abstract="catalog", sources=["biorxiv"]),
+    ]
+
+    class Source:
+        source_name = "biorxiv"
+
+        async def search(self, query, limit=20):
+            return papers
+
+    class Scout:
+        async def read(self, question, ranked):
+            return [ScoutNote(
+                paper_id=paper.paper_id,
+                relevance_to_question=0.9 if paper.paper_id == "good" else 0.4,
+                directness_to_question=0.8 if paper.paper_id == "good" else 0.2,
+            ) for paper in ranked]
+
+    supplementer = Science125PreprintSupplementer(
+        sources={"biorxiv": Source()},
+        deduplicator=PaperDeduplicator(), ranker=PaperRanker(),
+        scout_reader=Scout(), max_sources=1, per_source_limit=2,
+    )
+    result = await supplementer.search(
+        "How do proteins fold?", domains=["Biology"],
+        key_entities=["protein folding"],
+        existing_queries=[SearchQuery(
+            query_id="q", text="protein folding mechanism",
+            target_source="openalex", purpose="test",
+            relation_to_question="test",
+        )],
+        existing_papers=[],
+    )
+    assert [paper.paper_id for paper in result.candidates] == ["good"]
+    assert result.stage_elapsed_seconds["conditional_preprint_search"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_preprint_backfill_has_independent_candidate_attempt_slot() -> None:
+    from types import SimpleNamespace
+    from hypoforge.literature.adapter import AgenticM2Adapter
+    from hypoforge.literature.models import PaperRecord, ScoutNote, SearchRunResult
+
+    old = PaperRecord(paper_id="old", title="Old unresolved paper",
+                      sources=["openalex"])
+    preprint = PaperRecord(paper_id="preprint", title="Open preprint",
+                           sources=["biorxiv"])
+
+    class Workflow:
+        def __init__(self):
+            self.probed = []
+
+        async def probe_parsed_fulltext(self, paper):
+            self.probed.append(paper.paper_id)
+            return True
+
+        async def run(self, question, papers, search_context=None):
+            return [SimpleNamespace(
+                content_level=SimpleNamespace(value="pdf"), chunks_parsed=1,
+            )]
+
+    workflow = Workflow()
+    adapter = AgenticM2Adapter(
+        search_agent=SimpleNamespace(final_k=1), reading_workflow=workflow,
+        fulltext_backfill_enabled=True, fulltext_backfill_target=1,
+    )
+    result = SearchRunResult(
+        sub_question="question", candidates=[old, preprint],
+        scout_notes=[
+            ScoutNote(paper_id="old", relevance_to_question=0.9,
+                      directness_to_question=0.9),
+            ScoutNote(paper_id="preprint", relevance_to_question=0.9,
+                      directness_to_question=0.9),
+        ],
+    )
+    updated, readings = await adapter._backfill_fulltext(
+        "question", result, [], allowed_candidate_ids={"preprint"},
+        max_attempts=1,
+    )
+    assert workflow.probed == ["preprint"]
+    assert [paper.paper_id for paper in updated.final_papers] == ["preprint"]
+    assert len(readings) == 1
+
+
+@pytest.mark.asyncio
+async def test_empty_preprint_phase_is_exported_without_reordering_candidates() -> None:
+    from types import SimpleNamespace
+    from hypoforge.literature.adapter import AgenticM2Adapter
+    from hypoforge.literature.models import (
+        PaperRecord, SearchQuery, SearchRunResult, StopReason,
+    )
+
+    old = PaperRecord(paper_id="old", title="Existing paper", sources=["openalex"])
+    base_query = SearchQuery(
+        query_id="base", text="base query", target_source="openalex",
+        purpose="base", relation_to_question="test",
+    )
+    preprint_query = SearchQuery(
+        query_id="preprint", text="preprint query", target_source="eartharxiv",
+        purpose="supplement", relation_to_question="test",
+    )
+
+    class EmptySupplementer:
+        async def search(self, *args, **kwargs):
+            return SearchRunResult(
+                sub_question="question", queries=[preprint_query],
+                papers_found=4, papers_after_dedup=4,
+                source_result_counts={"eartharxiv": 4},
+                stage_elapsed_seconds={"conditional_preprint_search": 1.5},
+                stop_reason=StopReason.NO_RESULTS,
+            )
+
+    adapter = AgenticM2Adapter(
+        search_agent=SimpleNamespace(final_k=2),
+        reading_workflow=SimpleNamespace(),
+        fulltext_backfill_enabled=True,
+        fulltext_backfill_target=2,
+        preprint_supplementer=EmptySupplementer(),
+    )
+    result = SearchRunResult(
+        sub_question="question", queries=[base_query], candidates=[old],
+        papers_found=3, papers_after_dedup=1,
+        source_result_counts={"openalex": 3},
+    )
+    updated, readings = await adapter._supplement_preprint_fulltext(
+        "question", ["Ecology"], [], result, [], set(), 2,
+    )
+
+    assert [paper.paper_id for paper in updated.candidates] == ["old"]
+    assert [query.query_id for query in updated.queries] == ["base", "preprint"]
+    assert updated.papers_found == 7
+    assert updated.papers_after_dedup == 1
+    assert updated.source_result_counts == {"openalex": 3, "eartharxiv": 4}
+    assert updated.stage_elapsed_seconds["conditional_preprint_search"] == 1.5
+    assert readings == []
+
+
+@pytest.mark.asyncio
+async def test_preprint_phase_is_skipped_after_fulltext_target_is_met() -> None:
+    from types import SimpleNamespace
+    from hypoforge.literature.adapter import AgenticM2Adapter
+    from hypoforge.literature.models import SearchRunResult
+
+    class MustNotRun:
+        async def search(self, *args, **kwargs):
+            raise AssertionError("preprint supplement must be conditional")
+
+    adapter = AgenticM2Adapter(
+        search_agent=SimpleNamespace(final_k=1),
+        reading_workflow=SimpleNamespace(),
+        fulltext_backfill_enabled=True,
+        fulltext_backfill_target=1,
+        preprint_supplementer=MustNotRun(),
+    )
+    fulltext = SimpleNamespace(
+        content_level=SimpleNamespace(value="pdf"), chunks_parsed=1,
+    )
+    result = SearchRunResult(sub_question="question")
+    updated, readings = await adapter._supplement_preprint_fulltext(
+        "question", ["Biology"], [], result, [fulltext], set(), 1,
+    )
+    assert updated is result
+    assert readings == [fulltext]
 
 
 if __name__ == "__main__":
