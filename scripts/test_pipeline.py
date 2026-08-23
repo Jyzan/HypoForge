@@ -4048,6 +4048,159 @@ def test_graph_context_resolves_export_history_to_text_and_quote() -> None:
     assert context.unresolved_entry_ids == []
 
 
+@pytest.mark.asyncio
+async def test_m4_generator_uses_one_audited_context_pack(tmp_path) -> None:
+    """A graph fact must not be repeated in legacy bucket prompt fields."""
+
+    client = _RecordingClient([hypothesis().model_dump(mode="json")])
+    module = M4HypothesisGeneration(
+        mode="direct",
+        num_candidates=1,
+        top_k=1,
+        fast_mode=True,
+    )
+    module.client = client
+    recorder = RunEventRecorder(tmp_path / "m4-context", "m4-context")
+
+    with bind_recorder(recorder):
+        await module._run_llm(robot_state())
+
+    prompt = client.calls[0]["user_prompt"]
+    marker = "Domain randomization improves robotic-arm transfer success."
+    assert prompt.count(marker) == 1
+    context_events = [
+        event for event in recorder.read_events()
+        if event["event_type"] == "llm_context_built"
+    ]
+    assert context_events[0]["details"]["purpose"] == "m4_generate"
+    assert context_events[0]["details"]["included_ids"] == ["fact-arm-1"]
+
+
+@pytest.mark.asyncio
+async def test_m5_builds_a_focused_context_for_each_hypothesis(tmp_path) -> None:
+    """Two hypotheses with disjoint evidence must not share one context pack."""
+
+    state = robot_state()
+    run = state.m2_knowledge_export.runs[0]
+    run.evidence.append(M2EvidenceExport(
+        evidence_id="ev-arm-2",
+        paper_id="S2:p2",
+        chunk_id="chunk-2",
+        quote="Calibration reduces reality-gap error.",
+        normalized_claim="Calibration reduces reality-gap error.",
+        relevance_score=0.9,
+    ))
+    run.knowledge_entries.append(KnowledgeEntry(
+        id="fact-arm-2",
+        type="established_fact",
+        content="Calibration reduces reality-gap error.",
+        source_paper_id="S2:p2",
+        evidence_ids=["ev-arm-2"],
+    ))
+    run.papers.append(M2PaperExport(paper_id="S2:p2", title="Calibration"))
+    state.evidence_graph.established_facts.append("fact-arm-2")
+    first_hypothesis = hypothesis()
+    second_hypothesis = hypothesis().model_copy(update={
+        "hypothesis_id": "H2",
+        "statement": "校准可降低机械臂 sim-to-real 现实差距。",
+        "supporting_evidence": ["ev-arm-2"],
+    })
+    state.top_hypotheses = [first_hypothesis, second_hypothesis]
+
+    class RecordingSequenceClient:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def structured_chat(self, **kwargs):
+            self.calls.append(kwargs)
+            index = len(self.calls) - 1
+            card = state.top_hypotheses[index]
+            return ResearchPlan(
+                hypothesis_id=card.hypothesis_id,
+                study_subjects="机械臂 sim-to-real 操控",
+                procedures=["在仿真和现实环境中执行对照实验。"],
+                measurement_metrics=["迁移成功率"],
+                task_trace=card.task_trace,
+            ).model_dump(mode="json")
+
+    client = RecordingSequenceClient()
+    module = M5ResearchPlan(fast_mode=True)
+    module.client = client
+    recorder = RunEventRecorder(tmp_path / "m5-context", "m5-context")
+
+    with bind_recorder(recorder):
+        await module(state)
+
+    assert len(client.calls) == 2
+    first_prompt = client.calls[0]["user_prompt"]
+    second_prompt = client.calls[1]["user_prompt"]
+    assert first_prompt.index("fact-arm-1") < first_prompt.index("fact-arm-2")
+    assert second_prompt.index("fact-arm-2") < second_prompt.index("fact-arm-1")
+    events = [
+        event for event in recorder.read_events()
+        if event["event_type"] == "llm_context_built"
+        and event["module"] == "m5"
+    ]
+    assert [event["details"]["purpose"] for event in events] == [
+        "m5_plan", "m5_plan",
+    ]
+    assert events[0]["details"]["render_hash"] != events[1]["details"]["render_hash"]
+
+
+@pytest.mark.asyncio
+async def test_m6_uses_reviewer_specific_context_purposes(tmp_path) -> None:
+    """Logic and method reviewers must receive independently planned context."""
+
+    state = robot_state()
+    card = hypothesis()
+    state.top_hypotheses = [card]
+    state.research_plans = [ResearchPlan(
+        hypothesis_id=card.hypothesis_id,
+        study_subjects="机械臂 sim-to-real 操控",
+        procedures=["执行仿真与现实对照实验。"],
+        measurement_metrics=["迁移成功率"],
+        task_trace=card.task_trace,
+    )]
+
+    class ReviewerClient:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def structured_chat(self, **kwargs):
+            self.calls.append(kwargs)
+            return {
+                "reasoning": "The hypothesis-plan pair is auditable.",
+                "score": 4.0,
+                "comments": "acceptable",
+                "suggestions": "retain canonical evidence links",
+                "evidence_ids": ["ev-arm-1"],
+            }
+
+    client = ReviewerClient()
+    module = M6ReviewIteration(
+        reviewers=["scientific_logic", "method_feasibility"],
+        fast_mode=True,
+    )
+    module.client = client
+    recorder = RunEventRecorder(tmp_path / "m6-context", "m6-context")
+
+    with bind_recorder(recorder):
+        await module(state)
+
+    assert len(client.calls) == 2
+    events = [
+        event for event in recorder.read_events()
+        if event["event_type"] == "llm_context_built"
+        and event["module"] == "m6"
+    ]
+    assert [event["details"]["purpose"] for event in events] == [
+        "m6_logic", "m6_feasibility",
+    ]
+    assert events[0]["details"]["render_hash"] != events[1]["details"]["render_hash"]
+    assert "Context purpose: m6_logic" in client.calls[0]["user_prompt"]
+    assert "Context purpose: m6_feasibility" in client.calls[1]["user_prompt"]
+
+
 def test_task_alignment_rejects_legged_robot_substitution() -> None:
     assessment = assess_task_alignment(
         robot_state(),
@@ -5535,6 +5688,69 @@ def test_m5_requires_every_evidence_item_to_match_declared_paper() -> None:
     assert cleaned.evidence_links[0].support_status == "hypothesis_to_validate"
     assert cleaned.supporting_evidence_ids == []
     assert cleaned.source_paper_ids == []
+
+
+def test_context_planner_is_deterministic_budgeted_and_card_complete() -> None:
+    """Budgeting must drop complete cards, never silently slice their text."""
+
+    from hypoforge.context import ContextPlanner, ContextRequest
+    from hypoforge.graph_context import GraphContextItem
+
+    def items(kind: str) -> list[GraphContextItem]:
+        return [GraphContextItem(
+            entry_id=f"{kind}-{index}",
+            kind=kind,
+            text=(f"BEGIN-{kind}-{index} " + ("evidence " * 80)
+                  + f"END-{kind}-{index}"),
+            evidence_ids=[f"ev-{kind}-{index}"],
+            quotes=[f"quote for {kind}-{index} " + ("detail " * 40)],
+        ) for index in range(6)]
+
+    context = GraphContext(
+        original_question="How does the mechanism work?",
+        established_facts=items("established_fact"),
+        conflicts=items("conflict"),
+        knowledge_gaps=items("knowledge_gap"),
+        relations=[f"relation-{index} " + ("edge " * 30) for index in range(8)],
+    )
+    request = ContextRequest(
+        purpose="m4_generate",
+        max_input_tokens=900,
+        reserve_tokens=180,
+        focus_entry_ids=("knowledge_gap-5",),
+    )
+
+    first = ContextPlanner().plan(context, request)
+    second = ContextPlanner().plan(context, request)
+
+    all_ids = {
+        item.entry_id
+        for bucket in (
+            context.established_facts,
+            context.conflicts,
+            context.knowledge_gaps,
+        )
+        for item in bucket
+    }
+    assert first == second
+    assert first.manifest.estimated_tokens <= 720
+    assert set(first.manifest.included_ids) | set(first.manifest.dropped_ids) == all_ids
+    assert "knowledge_gap-5" in first.manifest.included_ids
+    for entry_id in first.manifest.included_ids:
+        assert f"END-{entry_id}" in first.rendered
+    for entry_id in first.manifest.dropped_ids:
+        assert f"BEGIN-{entry_id}" not in first.rendered
+    assert len(first.manifest.render_hash) == 64
+
+
+def test_purpose_context_mix_reduces_estimated_tokens_by_half() -> None:
+    from scripts.measure_context_budget import measure_context_budget
+
+    report = measure_context_budget()
+
+    assert report["reduction_ratio"] >= 0.50
+    assert report["current_estimated_tokens"] < report["legacy_estimated_tokens"]
+    assert report["missing_focused_ids"] == []
 
 
 class CacheReadingWorkflow:

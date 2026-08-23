@@ -17,6 +17,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from ..observability import emit_event
+from ..context import ContextPlanner, ContextRequest, emit_context_built
 from ..graph_context import GraphContext, build_graph_context
 from ..protocol import ModuleProtocol
 from ..prompts.m5_prompts import M5_SYSTEM_PROMPT, M5_USER_TEMPLATE
@@ -393,13 +394,25 @@ class M5ResearchPlan(ModuleProtocol):
 
         plans: List[ResearchPlan] = []
         graph_context = build_graph_context(state)
-        rendered_graph_context = graph_context.render()
         problem_card_json = (
             state.problem_card.model_dump_json(indent=2)
             if state.problem_card
             else "{}"
         )
         for h in state.top_hypotheses:
+            context_pack = ContextPlanner().plan(
+                graph_context,
+                ContextRequest(
+                    purpose="m5_plan",
+                    focus_evidence_ids=tuple(h.supporting_evidence),
+                ),
+            )
+            emit_context_built(
+                "m5",
+                "research_plan_designer",
+                context_pack,
+            )
+            rendered_graph_context = context_pack.rendered
             started_at = time.monotonic()
             emit_event(
                 "tool_started",

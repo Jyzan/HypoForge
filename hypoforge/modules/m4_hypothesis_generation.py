@@ -20,6 +20,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from ..observability import emit_event
+from ..context import ContextPlanner, ContextRequest, emit_context_built
 from ..graph_context import GraphContext, build_graph_context
 from ..protocol import ModuleProtocol
 from ..prompts.m4_prompts import (
@@ -801,6 +802,22 @@ class M4HypothesisGeneration(ModuleProtocol):
             state.problem_card.original_question
             if state.problem_card else state.input_question
         )
+        context_pack = ContextPlanner().plan(
+            context,
+            ContextRequest(
+                purpose="m4_generate",
+                focus_evidence_ids=tuple(
+                    evidence_id
+                    for candidate in candidates
+                    for evidence_id in candidate.supporting_evidence
+                ),
+            ),
+        )
+        emit_context_built(
+            "m4",
+            "hypothesis_contract_repair",
+            context_pack,
+        )
         repaired = await self._tool_call(
             "hypothesis_contract_repair",
             self.client.structured_chat(
@@ -808,7 +825,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                     num_candidates=self.num_candidates,
                 ),
                 user_prompt=M4_CONTRACT_REPAIR_USER_TEMPLATE.format(
-                    graph_context=context.render(),
+                    graph_context=context_pack.rendered,
                     candidate_json=json.dumps(
                         [card.model_dump(mode="json") for card in candidates],
                         ensure_ascii=False,
@@ -1183,6 +1200,11 @@ class M4HypothesisGeneration(ModuleProtocol):
         requested = (
             self.num_candidates if requested_count is None else int(requested_count)
         )
+        context_pack = ContextPlanner().plan(
+            graph_context,
+            ContextRequest(purpose="m4_generate"),
+        )
+        emit_context_built("m4", tool_name, context_pack)
         generated = await self._tool_call(
             tool_name,
             self.client.structured_chat(
@@ -1191,10 +1213,10 @@ class M4HypothesisGeneration(ModuleProtocol):
                     rubric_block=hypothesis_rubric_block(),
                 ),
                 user_prompt=M4_GENERATOR_USER_TEMPLATE.format(
-                    graph_context=graph_context.render(),
-                    knowledge_gaps=self._graph_bucket_text(state, "knowledge_gaps"),
-                    established_facts=self._graph_bucket_text(state, "established_facts"),
-                    conflicts=self._graph_bucket_text(state, "conflicts"),
+                    graph_context=context_pack.rendered,
+                    knowledge_gaps="(included in the audited context pack above)",
+                    established_facts="(included in the audited context pack above)",
+                    conflicts="(included in the audited context pack above)",
                     original_question=question,
                     num_candidates=requested,
                     feedback_context=feedback_context,
@@ -1288,7 +1310,6 @@ class M4HypothesisGeneration(ModuleProtocol):
         assert self.client is not None
         question = state.problem_card.original_question if state.problem_card else state.input_question
         graph_context = build_graph_context(state)
-        rendered_graph_context = graph_context.render()
 
         # Iteration feedback (e.g. "be more novel") must not push the
         # generator away from task alignment: re-anchor it to the required
@@ -1462,6 +1483,18 @@ class M4HypothesisGeneration(ModuleProtocol):
             "required": ["hypothesis_id", "ranking_rationale", "scores"],
         }
         ranker_schema = {"type": "array", "items": ranker_item_schema}
+        rank_context = ContextPlanner().plan(
+            graph_context,
+            ContextRequest(
+                purpose="m4_rank",
+                focus_evidence_ids=tuple(
+                    evidence_id
+                    for candidate in candidates
+                    for evidence_id in candidate.supporting_evidence
+                ),
+            ),
+        )
+        emit_context_built("m4", "hypothesis_ranker", rank_context)
         try:
             ranked = await self._tool_call(
                 "hypothesis_ranker",
@@ -1472,7 +1505,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                         rubric_block=hypothesis_rubric_block(),
                     ),
                     user_prompt=M4_RANKER_USER_TEMPLATE.format(
-                        graph_context=rendered_graph_context,
+                        graph_context=rank_context.rendered,
                         hypotheses_json=json.dumps(
                             [h.model_dump(mode="json") for h in candidates],
                             ensure_ascii=False,
@@ -1579,14 +1612,27 @@ class M4HypothesisGeneration(ModuleProtocol):
                 "required": ["hypothesis_id", "pass", "critique", "issues"],
             },
         }
+        graph_context = build_graph_context(state)
+        context_pack = ContextPlanner().plan(
+            graph_context,
+            ContextRequest(
+                purpose="m4_critic",
+                focus_evidence_ids=tuple(
+                    evidence_id
+                    for candidate in candidates
+                    for evidence_id in candidate.supporting_evidence
+                ),
+            ),
+        )
+        emit_context_built("m4", "hypothesis_critic", context_pack)
         try:
             result = await self._tool_call(
                 "hypothesis_critic",
                 self.client.structured_chat(
                     system_prompt=M4_CRITIC_SYSTEM_PROMPT,
                     user_prompt=M4_CRITIC_USER_TEMPLATE.format(
-                        graph_context=build_graph_context(state).render(),
-                        established_facts=self._graph_bucket_text(state, "established_facts"),
+                        graph_context=context_pack.rendered,
+                        established_facts="(included in the audited context pack above)",
                         hypotheses_json=json.dumps(
                             [h.model_dump(mode="json") for h in candidates],
                             ensure_ascii=False,
@@ -1649,13 +1695,25 @@ class M4HypothesisGeneration(ModuleProtocol):
                 "required": ["hypothesis_id", "is_falsifiable", "assessment"],
             },
         }
+        context_pack = ContextPlanner().plan(
+            build_graph_context(state),
+            ContextRequest(
+                purpose="m4_critic",
+                focus_evidence_ids=tuple(
+                    evidence_id
+                    for candidate in candidates
+                    for evidence_id in candidate.supporting_evidence
+                ),
+            ),
+        )
+        emit_context_built("m4", "falsifiability_checker", context_pack)
         try:
             result = await self._tool_call(
                 "falsifiability_checker",
                 self.client.structured_chat(
                     system_prompt=M4_FALSIFIABILITY_SYSTEM_PROMPT,
                     user_prompt=M4_FALSIFIABILITY_USER_TEMPLATE.format(
-                        graph_context=build_graph_context(state).render(),
+                        graph_context=context_pack.rendered,
                         hypotheses_json=json.dumps(
                             [h.model_dump(mode="json") for h in candidates],
                             ensure_ascii=False,

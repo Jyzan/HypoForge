@@ -19,6 +19,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from ..observability import emit_event
+from ..context import ContextPlanner, ContextRequest, emit_context_built
 from ..graph_context import build_graph_context
 from ..protocol import ModuleProtocol
 from ..prompts.m6_prompts import (
@@ -264,7 +265,6 @@ class M6ReviewIteration(ModuleProtocol):
             )
         graph = state.evidence_graph
         graph_context = build_graph_context(state)
-        rendered_graph_context = graph_context.render()
         valid_evidence_ids = set(graph_context.available_evidence_ids)
         hypothesis_requirement_ids = {
             reference.contract_id
@@ -344,6 +344,26 @@ class M6ReviewIteration(ModuleProtocol):
         ]
 
         for dim in specialist_dims:
+            context_purpose = (
+                "m6_feasibility"
+                if dim == "method_feasibility"
+                else "m6_logic"
+            )
+            context_pack = ContextPlanner().plan(
+                graph_context,
+                ContextRequest(
+                    purpose=context_purpose,
+                    focus_evidence_ids=tuple(dict.fromkeys([
+                        *hypothesis.supporting_evidence,
+                        *plan.supporting_evidence_ids,
+                    ])),
+                ),
+            )
+            emit_context_built(
+                "m6",
+                f"reviewer:{dim}",
+                context_pack,
+            )
             # Anchor the score (rubric) and force reason-before-score, both
             # sourced from the single rubric definition.
             system_prompt = "\n\n".join(
@@ -375,7 +395,7 @@ class M6ReviewIteration(ModuleProtocol):
                             ),
                             hypothesis_json=json.dumps(hypothesis.model_dump(mode="json"), ensure_ascii=False, indent=2),
                             plan_json=json.dumps(plan.model_dump(mode="json"), ensure_ascii=False, indent=2),
-                            graph_context=rendered_graph_context,
+                            graph_context=context_pack.rendered,
                             facts_count=len(graph.established_facts) if graph else 0,
                             conflicts_count=len(graph.conflicts) if graph else 0,
                             gaps_count=len(graph.knowledge_gaps) if graph else 0,
@@ -631,6 +651,21 @@ class M6ReviewIteration(ModuleProtocol):
         """
         graph = state.evidence_graph
         graph_context = build_graph_context(state)
+        context_pack = ContextPlanner().plan(
+            graph_context,
+            ContextRequest(
+                purpose="m6_sufficiency",
+                focus_evidence_ids=tuple(dict.fromkeys([
+                    *hypothesis.supporting_evidence,
+                    *plan.supporting_evidence_ids,
+                ])),
+            ),
+        )
+        emit_context_built(
+            "m6",
+            "evidence_sufficiency_judge",
+            context_pack,
+        )
         started_at = time.monotonic()
         emit_event(
             "tool_started",
@@ -655,7 +690,7 @@ class M6ReviewIteration(ModuleProtocol):
                         facts_count=len(graph.established_facts) if graph else 0,
                         conflicts_count=len(graph.conflicts) if graph else 0,
                         gaps_count=len(graph.knowledge_gaps) if graph else 0,
-                        graph_context=graph_context.render(),
+                        graph_context=context_pack.rendered,
                         hypothesis_json=json.dumps(
                             hypothesis.model_dump(mode="json"), ensure_ascii=False, indent=2
                         ),
