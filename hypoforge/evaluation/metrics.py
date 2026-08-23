@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import asyncio
+import json
 import math
 import numpy as np
 import yaml
@@ -734,13 +735,14 @@ class EvidenceConsistencyMetric(GraphMetricBase):
                 logger.warning(f"Embedding failed, falling back: {e}")
                 
         system_prompt = """You are a strict scientific reviewer.
-Determine if the 'Target Claim' directly violates or ignores the provided 'Threat Context' (known conflicts/limitations from literature).
+For every indexed Target Claim, determine whether it directly violates or ignores its Threat Context (known conflicts/limitations from literature).
 If the threat context is irrelevant to the claim, or if the claim successfully resolves the threat, there is no conflict.
-Output JSON: {"is_conflict": true/false, "rationale": "..."}"""
+Return exactly one verdict for every supplied claim_index."""
 
         consistent_count = 0
         trace_data = {"atomic_claims": []}
-        for claim_obj in claims:
+        pending_evaluations: List[Dict[str, Any]] = []
+        for claim_index, claim_obj in enumerate(claims):
             claim_text = claim_obj.get("claim", "")
             valid_anchors = []
             
@@ -773,24 +775,96 @@ Output JSON: {"is_conflict": true/false, "rationale": "..."}"""
                 consistent_count += 1
                 trace_data["atomic_claims"].append({"claim": claim_text, "matched_anchors": [n.id for n in valid_anchors], "threat_context": [], "conflict_evaluation": None})
                 continue
-                
-            threat_context_str = "\n".join(f"- {n.label}" for n in threat_nodes)
-            schema = {"type": "object", "properties": {"is_conflict": {"type": "boolean"}, "rationale": {"type": "string"}}}
-            
+
+            trace_index = len(trace_data["atomic_claims"])
+            trace_data["atomic_claims"].append({
+                "claim": claim_text,
+                "matched_anchors": [n.id for n in valid_anchors],
+                "threat_context": [n.id for n in threat_nodes],
+                "conflict_evaluation": None,
+            })
+            pending_evaluations.append({
+                "claim_index": claim_index,
+                "trace_index": trace_index,
+                "target_claim": claim_text,
+                "threat_context": [n.label for n in threat_nodes],
+            })
+
+        if pending_evaluations:
+            schema = {
+                "type": "object",
+                "properties": {
+                    "verdicts": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "claim_index": {"type": "integer"},
+                                "is_conflict": {"type": "boolean"},
+                                "rationale": {"type": "string"},
+                            },
+                            "required": [
+                                "claim_index", "is_conflict", "rationale",
+                            ],
+                        },
+                    },
+                },
+                "required": ["verdicts"],
+            }
+            public_batch = [
+                {
+                    "claim_index": item["claim_index"],
+                    "target_claim": item["target_claim"],
+                    "threat_context": item["threat_context"],
+                }
+                for item in pending_evaluations
+            ]
             try:
                 res = await self._client.structured_chat(
                     system_prompt=system_prompt,
-                    user_prompt=f"Target Claim: {claim_text}\nThreat Context:\n{threat_context_str}",
+                    user_prompt=(
+                        "Evaluate this JSON batch:\n"
+                        + json.dumps(public_batch, ensure_ascii=False, indent=2)
+                    ),
                     output_schema=schema,
-                    max_tokens=2048,
+                    max_tokens=4096,
                     temperature=0.1,
+                    disable_thinking=True,
                 )
-                if isinstance(res, dict) and not res.get("is_conflict", True):
-                    consistent_count += 1
-                trace_data["atomic_claims"].append({"claim": claim_text, "matched_anchors": [n.id for n in valid_anchors], "threat_context": [n.id for n in threat_nodes], "conflict_evaluation": res})
+                raw_verdicts = (
+                    res.get("verdicts", []) if isinstance(res, dict) else []
+                )
+                verdict_by_index: Dict[int, Dict[str, Any]] = {}
+                expected_indices = {
+                    item["claim_index"] for item in pending_evaluations
+                }
+                for verdict in raw_verdicts if isinstance(raw_verdicts, list) else []:
+                    if not isinstance(verdict, dict):
+                        continue
+                    claim_index = verdict.get("claim_index")
+                    if (
+                        isinstance(claim_index, int)
+                        and claim_index in expected_indices
+                        and claim_index not in verdict_by_index
+                        and isinstance(verdict.get("is_conflict"), bool)
+                    ):
+                        verdict_by_index[claim_index] = verdict
+                for item in pending_evaluations:
+                    trace = trace_data["atomic_claims"][item["trace_index"]]
+                    verdict = verdict_by_index.get(item["claim_index"])
+                    if verdict is None:
+                        trace["error"] = (
+                            "conflict evaluator returned no valid verdict"
+                        )
+                        continue
+                    trace["conflict_evaluation"] = verdict
+                    if not verdict["is_conflict"]:
+                        consistent_count += 1
             except Exception as e:
-                consistent_count += 1
-                trace_data["atomic_claims"].append({"claim": claim_text, "error": str(e)})
+                # Evaluation failures are auditable and conservative: do not
+                # award consistency when the judge never produced a verdict.
+                for item in pending_evaluations:
+                    trace_data["atomic_claims"][item["trace_index"]]["error"] = str(e)
                 
         return round(consistent_count / len(claims), 4), trace_data
 

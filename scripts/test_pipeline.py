@@ -11623,6 +11623,75 @@ async def test_independent_metric_emits_progress_and_token_usage(
 
 
 @pytest.mark.asyncio
+async def test_evidence_consistency_batches_atomic_conflict_verdicts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All threat-bearing claims should share one structured judge call."""
+
+    from types import MethodType
+
+    from hypoforge.evaluation.metrics import EvidenceConsistencyMetric
+    from hypoforge.state import EvidenceEdge, EvidenceEdgeRelation
+
+    class BatchJudge:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def structured_chat(self, **kwargs: Any) -> dict[str, Any]:
+            self.calls.append(kwargs)
+            return {
+                "verdicts": [
+                    {"claim_index": 0, "is_conflict": False, "rationale": "ok"},
+                    {"claim_index": 1, "is_conflict": True, "rationale": "conflict"},
+                    {"claim_index": 2, "is_conflict": False, "rationale": "ok"},
+                ]
+            }
+
+    metric = EvidenceConsistencyMetric()
+    metric._client = BatchJudge()
+
+    async def fake_decompose(self, hypothesis):
+        return [
+            {"claim": "claim zero", "subject": "a", "object": "b"},
+            {"claim": "claim one", "subject": "a", "object": "b"},
+            {"claim": "claim two", "subject": "a", "object": "b"},
+        ]
+
+    monkeypatch.setattr(
+        metric,
+        "_decompose_hypothesis",
+        MethodType(fake_decompose, metric),
+    )
+    anchor = EvidenceNode(id="A", type=EvidenceNodeType.CLAIM, label="anchor")
+    threat = EvidenceNode(id="T", type=EvidenceNodeType.CONFLICT, label="threat")
+    graph = EvidenceGraph(
+        nodes=[anchor, threat],
+        edges=[EvidenceEdge(
+            source="A",
+            target="T",
+            relation=EvidenceEdgeRelation.CONTRADICTS,
+        )],
+    )
+    monkeypatch.setattr(metric, "_keyword_search", lambda *args, **kwargs: [anchor])
+    monkeypatch.setattr(metric, "_build_threat_context", lambda *args: [threat])
+
+    result = await metric.compute(
+        HypothesisCard(hypothesis_id="H-batch", statement="batch claims"),
+        [],
+        evidence_graph=graph,
+    )
+
+    score, trace = result
+    assert score == pytest.approx(2 / 3, abs=1e-4)
+    assert len(metric._client.calls) == 1
+    assert len(trace["atomic_claims"]) == 3
+    assert [
+        item["conflict_evaluation"]["is_conflict"]
+        for item in trace["atomic_claims"]
+    ] == [False, True, False]
+
+
+@pytest.mark.asyncio
 async def test_qwen_structured_chat_unwraps_alternate_array_key() -> None:
     """A2: array schema wrapped under a non-"entries" key still unwraps."""
     from hypoforge.tools.qwen_client import QwenClient
