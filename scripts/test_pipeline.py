@@ -7910,6 +7910,8 @@ def test_build_followup_seed_inherits_only_whitelist_fields():
     assert state.metrics == {}
     assert state.total_input_tokens == 0
     assert state.total_output_tokens == 0
+    assert state.token_usage_by_module == {}
+    assert state.scoring_token_usage == {}
     assert state.routing_history == []
     assert state.evidence_verdict is None
     assert state.evidence_gaps == []
@@ -7921,6 +7923,29 @@ def test_build_followup_seed_memory_cache_falls_back_to_config():
     state = build_followup_seed(seed, followup_text="追问", run_id="f", config=config)
     assert state.memory_cache_dir == "default-cache"
     assert state.parent_run_id == "p"
+
+
+def test_public_result_exposes_pipeline_and_scoring_token_breakdown() -> None:
+    payload = RunManager._public_state_payload(
+        "run-token",
+        {
+            "input_question": "Q",
+            "total_input_tokens": 100,
+            "total_output_tokens": 20,
+            "token_usage_by_module": {
+                "m1": {"input": 25, "output": 5, "calls": 1},
+                "m4": {"input": 75, "output": 15, "calls": 3},
+            },
+            "scoring_token_usage": {"input": 30, "output": 4, "calls": 2},
+        },
+        is_final=True,
+    )
+
+    assert payload["token_usage"] == {"input": 100, "output": 20}
+    assert payload["token_usage_by_module"]["m4"]["calls"] == 3
+    assert payload["scoring_token_usage"] == {
+        "input": 30, "output": 4, "calls": 2,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -8742,6 +8767,97 @@ async def test_no_cancel_runs_to_completion(tmp_path: Path, monkeypatch):
     types = [event["event_type"] for event in recorder.read_events()]
     assert "run_completed" in types
     assert "run_cancelled" not in types
+
+
+@pytest.mark.asyncio
+async def test_runner_attributes_token_usage_to_each_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The persisted run must explain which module consumed each token."""
+    from types import SimpleNamespace
+
+    from hypoforge.registry import ModuleRegistry
+    from hypoforge.tools.qwen_client import QwenClient
+
+    class TokenModule(ModuleProtocol):
+        module_version = "test"
+        description = "token attribution module"
+
+        def __init__(self, name: str, prompt: int, completion: int) -> None:
+            self.module_name = name
+            self.prompt = prompt
+            self.completion = completion
+
+        async def __call__(self, state, config=None):
+            QwenClient._record_tokens(SimpleNamespace(response_metadata={
+                "token_usage": {
+                    "prompt_tokens": self.prompt,
+                    "completion_tokens": self.completion,
+                }
+            }))
+            if self.module_name == "m1":
+                return {"problem_card": ProblemCard(
+                    original_question=state.input_question,
+                    sub_questions=["token attribution question"],
+                )}
+            return {
+                "candidate_hypotheses": [HypothesisCard(
+                    hypothesis_id="H-token",
+                    statement="Track usage per module.",
+                )],
+                "top_hypotheses": [HypothesisCard(
+                    hypothesis_id="H-token",
+                    statement="Track usage per module.",
+                )],
+            }
+
+        @classmethod
+        def get_input_fields(cls):
+            return []
+
+        def get_output_fields(self):
+            return ["problem_card"] if self.module_name == "m1" else [
+                "candidate_hypotheses", "top_hypotheses"
+            ]
+
+    modules = {
+        "m1": TokenModule("m1", 10, 2),
+        "m4": TokenModule("m4", 30, 6),
+    }
+    config = PipelineConfig(
+        verbose=False,
+        enabled_modules=["m1", "m4"],
+        enable_iteration=False,
+    )
+    config.output_dir = str(tmp_path)
+    config.scoring.auto_score = False
+    recorder = RunEventRecorder(tmp_path, "token-run")
+    runner = PipelineRunner(config, event_recorder=recorder)
+    monkeypatch.setattr(
+        ModuleRegistry, "build_all", staticmethod(lambda cfg: modules)
+    )
+
+    state = await runner.run("Q", run_id="token-run")
+
+    assert state.total_input_tokens == 40
+    assert state.total_output_tokens == 8
+    assert state.token_usage_by_module == {
+        "m1": {"input": 10, "output": 2, "calls": 1},
+        "m4": {"input": 30, "output": 6, "calls": 1},
+    }
+    persisted = json.loads((tmp_path / "token-run.json").read_text(encoding="utf-8"))
+    assert persisted["token_usage_by_module"] == state.token_usage_by_module
+    completed = {
+        event["module"]: event
+        for event in recorder.read_events()
+        if event["event_type"] == "module_completed"
+    }
+    assert completed["m1"]["details"]["token_usage"] == {
+        "input": 10, "output": 2, "calls": 1,
+    }
+    assert completed["m4"]["details"]["token_usage"] == {
+        "input": 30, "output": 6, "calls": 1,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -10045,6 +10161,21 @@ def test_web_ui_exposes_context_budget_metrics_and_collapses_credentials() -> No
     assert 'id="eventsList"' in html
 
 
+def test_web_ui_exposes_per_module_token_attribution() -> None:
+    html = _read_index_html()
+
+    for element_id in (
+        "tokenPipelineTotal",
+        "tokenScoringTotal",
+        "tokenCallCount",
+        "tokenDistribution",
+    ):
+        assert f'id="{element_id}"' in html
+    assert "token_usage_by_module" in html
+    assert "scoring_token_usage" in html
+    assert "renderTokenAttribution" in html
+
+
 # ==================== test_pipeline ====================
 
 import asyncio
@@ -11035,6 +11166,152 @@ class _FakeLLM:
 
 
 @pytest.mark.asyncio
+async def test_qwen_token_tracker_isolates_concurrent_runs() -> None:
+    """Per-run counters must not mix concurrent web requests."""
+    from types import SimpleNamespace
+
+    from hypoforge.tools.qwen_client import QwenClient, track_token_usage
+
+    QwenClient.reset_token_totals()
+
+    async def record(prompt_tokens: int, completion_tokens: int) -> dict:
+        with track_token_usage() as tracker:
+            await asyncio.sleep(0)
+            QwenClient._record_tokens(SimpleNamespace(response_metadata={
+                "token_usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                }
+            }))
+            await asyncio.sleep(0)
+            return tracker.snapshot()
+
+    first, second = await asyncio.gather(record(11, 3), record(29, 7))
+
+    assert first == {"input": 11, "output": 3, "calls": 1}
+    assert second == {"input": 29, "output": 7, "calls": 1}
+    assert QwenClient.get_token_totals() == (40, 10)
+    QwenClient.reset_token_totals()
+
+
+@pytest.mark.asyncio
+async def test_qwen_token_scopes_isolate_concurrent_tools_within_one_run() -> None:
+    from types import SimpleNamespace
+
+    from hypoforge.tools.qwen_client import (
+        QwenClient,
+        track_token_scope,
+        track_token_usage,
+    )
+
+    async def tool_call(prompt_tokens: int, completion_tokens: int) -> dict:
+        with track_token_scope() as scope:
+            await asyncio.sleep(0)
+            QwenClient._record_tokens(SimpleNamespace(response_metadata={
+                "token_usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                }
+            }))
+            await asyncio.sleep(0)
+            return scope.snapshot()
+
+    with track_token_usage() as run:
+        first, second = await asyncio.gather(tool_call(13, 2), tool_call(31, 5))
+
+    assert first == {"input": 13, "output": 2, "calls": 1}
+    assert second == {"input": 31, "output": 5, "calls": 1}
+    assert run.snapshot() == {"input": 44, "output": 7, "calls": 2}
+
+
+@pytest.mark.asyncio
+async def test_m2_reading_tool_event_records_isolated_token_usage(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from hypoforge.modules.m2_literature.reading.workflow import FullTextReadingWorkflow
+    from hypoforge.tools.qwen_client import QwenClient, track_token_usage
+
+    async def operation() -> str:
+        QwenClient._record_tokens(SimpleNamespace(response_metadata={
+            "token_usage": {"prompt_tokens": 19, "completion_tokens": 6}
+        }))
+        return "ok"
+
+    recorder = RunEventRecorder(tmp_path, "m2-tool-token")
+    timings: dict[str, float] = {}
+    with bind_recorder(recorder), track_token_usage():
+        result = await FullTextReadingWorkflow._measure(
+            timings,
+            "paper_reader",
+            operation,
+            details={"paper_id": "P1"},
+        )
+
+    assert result == "ok"
+    completed = next(
+        event for event in recorder.read_events()
+        if event["event_type"] == "tool_completed"
+    )
+    assert completed["details"]["paper_id"] == "P1"
+    assert completed["details"]["token_usage"] == {
+        "input": 19, "output": 6, "calls": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_independent_metric_emits_progress_and_token_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Long posthoc scoring must identify the active metric and its cost."""
+    from types import SimpleNamespace
+
+    from hypoforge.evaluation.metrics import MetricRegistry
+    from hypoforge.evaluation.scorer import score_hypothesis_async
+    from hypoforge.tools.qwen_client import QwenClient, track_token_usage
+
+    class FakeMetric:
+        implemented = True
+        independent = True
+
+        def __init__(self, **kwargs):
+            pass
+
+        async def compute(self, hypothesis, knowledge_entries, evidence_graph=None):
+            QwenClient._record_tokens(SimpleNamespace(response_metadata={
+                "token_usage": {"prompt_tokens": 17, "completion_tokens": 4}
+            }))
+            return 0.75
+
+    monkeypatch.setattr(MetricRegistry, "list_all", classmethod(lambda cls: ["fake_metric"]))
+    monkeypatch.setattr(
+        MetricRegistry, "get", classmethod(lambda cls, name: FakeMetric)
+    )
+    recorder = RunEventRecorder(tmp_path, "score-token-run")
+    hypothesis = HypothesisCard(
+        hypothesis_id="H-score",
+        statement="Independent scoring should be observable.",
+    )
+
+    with bind_recorder(recorder), track_token_usage() as tracker:
+        result = await score_hypothesis_async(hypothesis, [])
+
+    assert result["independent"]["fake_metric"] == 0.75
+    assert tracker.snapshot() == {"input": 17, "output": 4, "calls": 1}
+    metric_events = [
+        event for event in recorder.read_events()
+        if event["tool"] == "metric:fake_metric"
+    ]
+    assert [event["event_type"] for event in metric_events] == [
+        "scoring_metric_started", "scoring_metric_completed"
+    ]
+    assert metric_events[-1]["details"]["token_usage"] == {
+        "input": 17, "output": 4, "calls": 1,
+    }
+
+
+@pytest.mark.asyncio
 async def test_qwen_structured_chat_unwraps_alternate_array_key() -> None:
     """A2: array schema wrapped under a non-"entries" key still unwraps."""
     from hypoforge.tools.qwen_client import QwenClient
@@ -11784,6 +12061,10 @@ def test_fast_preset_disables_iteration_and_sets_quick_switches() -> None:
     assert config.module_overrides["m2"].kwargs["fulltext_target_per_subquestion"] == 0
     assert config.module_overrides["m2"].kwargs["preprint_supplement_enabled"] is False
     assert config.module_overrides["m2"].kwargs["source_timeout_seconds"] == 15.0
+    assert config.module_overrides["m2"].kwargs["fast_mode"] is True
+    assert config.module_overrides["m2"].kwargs["scout_candidate_limit"] == 8
+    assert config.module_overrides["m2"].kwargs["scout_abstract_char_limit"] == 1800
+    assert config.module_overrides["m2"].kwargs["scout_max_tokens"] == 3072
 
 
 def test_fast_mode_keeps_user_followup_routes_but_disables_internal_loops() -> None:
@@ -11830,6 +12111,17 @@ def test_fast_preset_reaches_the_strict_runtime_modules() -> None:
     assert modules["m1"].fast_mode is True
     assert modules["m2"].adapter.fresh_run_timeout_seconds == 0.0
     assert modules["m2"].adapter.allow_empty_results is True
+    # Fast mode keeps the two quality-critical LLM steps (Scout + PaperReader)
+    # but drops auxiliary entity/grouping/retention judge calls.
+    assert modules["m2"].adapter.entity_judge_client is None
+    assert modules["m2"].adapter.subquestion_entity_client is None
+    assert modules["m2"].adapter.search_agent.entity_classifier is None
+    assert modules["m2"].adapter.search_agent.retention_judge_client is None
+    assert modules["m2"].adapter.search_agent.scout_candidate_limit == 8
+    assert modules["m2"].adapter.search_agent.scout_reader.client is not None
+    assert modules["m2"].adapter.search_agent.scout_reader.abstract_char_limit == 1800
+    assert modules["m2"].adapter.search_agent.scout_reader.max_tokens == 3072
+    assert modules["m2"].adapter.reading_workflow.reader.client is not None
     assert modules["m3"].mode == "rule"
     assert modules["m3"].allow_empty_graph is True
 

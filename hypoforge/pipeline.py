@@ -709,6 +709,11 @@ class PipelineRunner:
 
             try:
                 module_started_at = time.perf_counter()
+                from .tools.qwen_client import (
+                    get_current_token_usage,
+                    token_usage_delta,
+                )
+                module_usage_before = get_current_token_usage()
                 self._record_event(
                     "module_started",
                     module=name,
@@ -804,6 +809,26 @@ class PipelineRunner:
                     **after_patches,
                 }
 
+                # Attribute all LLM responses produced by the module itself,
+                # including its before/after hooks and M2 child asyncio tasks.
+                # Repeated visits are accumulated under one stable M1-M6 key.
+                module_usage = token_usage_delta(
+                    module_usage_before, get_current_token_usage()
+                )
+                usage_by_module = {
+                    module_name: {
+                        metric: int(values.get(metric, 0))
+                        for metric in ("input", "output", "calls")
+                    }
+                    for module_name, values in state.token_usage_by_module.items()
+                }
+                prior_usage = usage_by_module.setdefault(
+                    name, {"input": 0, "output": 0, "calls": 0}
+                )
+                for metric, amount in module_usage.items():
+                    prior_usage[metric] += amount
+                final["token_usage_by_module"] = usage_by_module
+
                 # --- search-round bookkeeping: every *actual* M2 execution is
                 # one round (independent of iteration_count).  M2 itself may
                 # override by returning its own ``search_round``. ---
@@ -865,6 +890,7 @@ class PipelineRunner:
                         merged_snapshot,
                     )
                 details = self._summarize_result(name, final)
+                details["token_usage"] = module_usage
                 if snapshot_path is not None:
                     details["snapshot"] = str(snapshot_path)
                 self._record_event(
@@ -885,12 +911,22 @@ class PipelineRunner:
                     if "module_started_at" in locals()
                     else None
                 )
+                failure_details = {}
+                if "module_usage_before" in locals():
+                    from .tools.qwen_client import (
+                        get_current_token_usage,
+                        token_usage_delta,
+                    )
+                    failure_details["token_usage"] = token_usage_delta(
+                        module_usage_before, get_current_token_usage()
+                    )
                 self._record_event(
                     "module_failed",
                     module=name,
                     status="failed",
                     message=f"{name.upper()} execution failed: {type(exc).__name__}: {exc}",
                     elapsed_seconds=elapsed,
+                    details=failure_details,
                 )
                 if self.config.verbose:
                     from .display import console, COLORS
@@ -1417,7 +1453,12 @@ class PipelineRunner:
                 enabled=bool(self.config.verbose),
                 run_id=run_id,
             )
-            with bind_event_sink(progress_sink), bind_recorder(self.event_recorder):
+            from .tools.qwen_client import track_token_usage
+            with (
+                track_token_usage() as run_usage,
+                bind_event_sink(progress_sink),
+                bind_recorder(self.event_recorder),
+            ):
                 try:
                     async for chunk in graph.astream(
                         initial_state,
@@ -1442,9 +1483,13 @@ class PipelineRunner:
         # Reconstruct PipelineState from the final dict
         final_state = PipelineState(**final_state_dict)
 
-        # ---- populate token stats from QwenClient ----
+        # ---- populate concurrency-isolated pipeline token stats ----
         from .tools.qwen_client import QwenClient
-        final_state.total_input_tokens, final_state.total_output_tokens = QwenClient.get_token_totals()
+        run_usage_snapshot = run_usage.snapshot()
+        final_state.total_input_tokens = run_usage_snapshot["input"]
+        final_state.total_output_tokens = run_usage_snapshot["output"]
+        # Keep the legacy process-wide counter behaviour for callers that use
+        # it directly, but never use it as the authoritative per-run total.
         QwenClient.reset_token_totals()
 
         if self.cancelled:
@@ -1481,51 +1526,66 @@ class PipelineRunner:
         # ---- automated scoring report (single source: config.scoring) ----
         if self.config.scoring.auto_score:
             from .evaluation.scorer import save_scoring_report_async
+            from .tools.qwen_client import track_token_usage
             # The independent metrics use a lightweight model for LLM-as-judge
             # evaluations so they don't add meaningful latency.
             metric_llm_config = self.config.get_llm_for_tier(
                 self.config.evaluation_model_tier
             )
-            try:
-                score_started_at = time.perf_counter()
-                self._record_event(
-                    "scoring_started",
-                    module="m6",
-                    tool="posthoc_scorer",
-                    status="running",
-                    message="Independent scoring started",
-                )
-                scores_path = await save_scoring_report_async(
-                    final_state,
-                    self.config.output_dir,
-                    self.config.scoring.hypothesis_weights,
-                    llm_config=metric_llm_config,
-                    embed_config=self.config.evaluation.model_dump(),
-                )
-                self._record_event(
-                    "scoring_completed",
-                    module="m6",
-                    tool="posthoc_scorer",
-                    status="completed",
-                    message="Independent scoring completed",
-                    elapsed_seconds=time.perf_counter() - score_started_at,
-                    details={"scores_path": str(scores_path)},
-                )
-                if self.config.verbose:
-                    from .display import console, COLORS
-                    console.print(
-                        f"  [{COLORS['muted']}]Scores saved to {scores_path}[/{COLORS['muted']}]"
+            with (
+                track_token_usage() as scoring_usage,
+                bind_event_sink(progress_sink),
+                bind_recorder(self.event_recorder),
+            ):
+                try:
+                    score_started_at = time.perf_counter()
+                    self._record_event(
+                        "scoring_started",
+                        module="m6",
+                        tool="posthoc_scorer",
+                        status="running",
+                        message="Independent scoring started",
                     )
-            except Exception as exc:
-                import logging
-                logging.getLogger(__name__).warning("Scoring report failed: %s", exc)
-                self._record_event(
-                    "scoring_failed",
-                    module="m6",
-                    tool="posthoc_scorer",
-                    status="failed",
-                    message=f"Independent scoring failed: {type(exc).__name__}: {exc}",
-                )
+                    scores_path = await save_scoring_report_async(
+                        final_state,
+                        self.config.output_dir,
+                        self.config.scoring.hypothesis_weights,
+                        llm_config=metric_llm_config,
+                        embed_config=self.config.evaluation.model_dump(),
+                    )
+                    self._record_event(
+                        "scoring_completed",
+                        module="m6",
+                        tool="posthoc_scorer",
+                        status="completed",
+                        message="Independent scoring completed",
+                        elapsed_seconds=time.perf_counter() - score_started_at,
+                        details={
+                            "scores_path": str(scores_path),
+                            "token_usage": scoring_usage.snapshot(),
+                        },
+                    )
+                    if self.config.verbose:
+                        from .display import console, COLORS
+                        console.print(
+                            f"  [{COLORS['muted']}]Scores saved to {scores_path}[/{COLORS['muted']}]"
+                        )
+                except Exception as exc:
+                    import logging
+                    logging.getLogger(__name__).warning("Scoring report failed: %s", exc)
+                    self._record_event(
+                        "scoring_failed",
+                        module="m6",
+                        tool="posthoc_scorer",
+                        status="failed",
+                        message=f"Independent scoring failed: {type(exc).__name__}: {exc}",
+                        details={"token_usage": scoring_usage.snapshot()},
+                    )
+            final_state.scoring_token_usage = scoring_usage.snapshot()
+            QwenClient.reset_token_totals()
+            # The pre-scoring save keeps the result available immediately;
+            # this second atomic save adds the separately attributed scorer use.
+            self._save_output(final_state)
 
         self._record_event(
             "run_completed",
@@ -1536,6 +1596,8 @@ class PipelineRunner:
                 "errors": len(final_state.errors),
                 "input_tokens": final_state.total_input_tokens,
                 "output_tokens": final_state.total_output_tokens,
+                "token_usage_by_module": final_state.token_usage_by_module,
+                "scoring_token_usage": final_state.scoring_token_usage,
             },
         )
 

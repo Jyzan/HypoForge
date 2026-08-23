@@ -20,12 +20,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 from ..state import KnowledgeEntry, PipelineState, ResearchPlan
 from ..graph_context import build_graph_context
+from ..observability import emit_event
 from ..task_alignment import assess_task_alignment
+from ..tools.qwen_client import get_current_token_usage, token_usage_delta
 from .metrics import MetricRegistry
 from .rubric import (
     HYPOTHESIS_RUBRIC,
@@ -83,6 +86,15 @@ async def score_hypothesis_async(
             continue
         if not getattr(metric_cls, "independent", True):
             continue
+        metric_started_at = time.perf_counter()
+        usage_before = get_current_token_usage()
+        emit_event(
+            "scoring_metric_started",
+            module="m6",
+            tool=f"metric:{name}",
+            status="running",
+            message=f"Independent metric started: {name}",
+        )
         try:
             # Metrics that accept an LLM client receive one so they can
             # evaluate quality with a lightweight model rather than just
@@ -102,9 +114,38 @@ async def score_hypothesis_async(
             else:
                 independent[name] = float(result)
                 traces[name] = None
+            emit_event(
+                "scoring_metric_completed",
+                module="m6",
+                tool=f"metric:{name}",
+                status="completed",
+                message=f"Independent metric completed: {name}",
+                elapsed_seconds=time.perf_counter() - metric_started_at,
+                details={
+                    "token_usage": token_usage_delta(
+                        usage_before, get_current_token_usage()
+                    )
+                },
+            )
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning(f"Metric {name} failed during computation: {e}")
+            emit_event(
+                "scoring_metric_failed",
+                module="m6",
+                tool=f"metric:{name}",
+                status="failed",
+                message=(
+                    f"Independent metric failed: {name}: "
+                    f"{type(e).__name__}: {e}"
+                ),
+                elapsed_seconds=time.perf_counter() - metric_started_at,
+                details={
+                    "token_usage": token_usage_delta(
+                        usage_before, get_current_token_usage()
+                    )
+                },
+            )
             continue
 
     return {

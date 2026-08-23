@@ -752,6 +752,8 @@ class RunManager:
                 "input": state.get("total_input_tokens", 0),
                 "output": state.get("total_output_tokens", 0),
             },
+            "token_usage_by_module": state.get("token_usage_by_module", {}),
+            "scoring_token_usage": state.get("scoring_token_usage", {}),
             "scores": scores,
             "last_module": state.get("_last_module", ""),
             "is_final": is_final,

@@ -186,17 +186,29 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
         *,
         details: dict[str, object] | None = None,
     ) -> T:
+        from ....tools.qwen_client import track_token_scope
+
         started = time.monotonic()
+        tool_usage = {"input": 0, "output": 0, "calls": 0}
+        event_details = dict(details or {})
+
+        async def tracked_operation() -> T:
+            with track_token_scope() as scope:
+                try:
+                    return await operation()
+                finally:
+                    tool_usage.update(scope.snapshot())
+
         emit_event(
             "tool_started",
             module="m2",
             tool=stage,
             status="running",
             message=f"M2 reading tool started: {stage}",
-            details=details,
+            details=event_details,
         )
         try:
-            result = await operation()
+            result = await tracked_operation()
         except BaseException as exc:
             emit_event(
                 "tool_failed",
@@ -205,7 +217,7 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
                 status="failed",
                 message=f"M2 reading tool failed: {stage}: {type(exc).__name__}: {exc}",
                 elapsed_seconds=time.monotonic() - started,
-                details=details,
+                details={**event_details, "token_usage": dict(tool_usage)},
             )
             raise
         else:
@@ -216,7 +228,7 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
                 status="completed",
                 message=f"M2 reading tool completed: {stage}",
                 elapsed_seconds=time.monotonic() - started,
-                details=details,
+                details={**event_details, "token_usage": dict(tool_usage)},
             )
             return result
         finally:

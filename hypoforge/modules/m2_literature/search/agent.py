@@ -439,7 +439,18 @@ class IterativeSearchAgent:
         )
 
         async def measure(stage: str, operation):
+            from ....tools.qwen_client import track_token_scope
+
             stage_started_at = self.stage_clock()
+            tool_usage = {"input": 0, "output": 0, "calls": 0}
+
+            async def tracked_operation():
+                with track_token_scope() as scope:
+                    try:
+                        return await operation
+                    finally:
+                        tool_usage.update(scope.snapshot())
+
             emit_event(
                 "tool_started",
                 module="m2",
@@ -460,7 +471,7 @@ class IterativeSearchAgent:
                     if callable(cancel):
                         cancel()
                     raise _SearchTimeBudgetExpired(stage)
-                task = asyncio.ensure_future(operation)
+                task = asyncio.ensure_future(tracked_operation())
                 try:
                     result = await asyncio.wait_for(task, timeout=remaining_seconds)
                     emit_event(
@@ -472,7 +483,10 @@ class IterativeSearchAgent:
                         elapsed_seconds=max(
                             0.0, self.stage_clock() - stage_started_at
                         ),
-                        details={"round": state.round_index + 1},
+                        details={
+                            "round": state.round_index + 1,
+                            "token_usage": dict(tool_usage),
+                        },
                     )
                     return result
                 except asyncio.TimeoutError as exc:
@@ -487,7 +501,10 @@ class IterativeSearchAgent:
                     status="failed",
                     message=f"M2 tool failed: {stage}: {type(exc).__name__}: {exc}",
                     elapsed_seconds=max(0.0, self.stage_clock() - stage_started_at),
-                    details={"round": state.round_index + 1},
+                    details={
+                        "round": state.round_index + 1,
+                        "token_usage": dict(tool_usage),
+                    },
                 )
                 raise
             finally:

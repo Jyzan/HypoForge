@@ -442,10 +442,14 @@ class PipelineConfig(BaseModel):
             "subquestion_concurrency": 4,
             "source_concurrency_limit": 3,
             "source_timeout_seconds": 15.0,
+            "scout_candidate_limit": 8,
+            "scout_abstract_char_limit": 1800,
+            "scout_max_tokens": 3072,
             "fresh_run_timeout_seconds": 0.0,
             "allow_empty_results": True,
             "abstract_only": True,
             "entity_embedding_model": "",
+            "fast_mode": True,
         })
         self.module_overrides.setdefault("m3", ModuleOverride()).kwargs.update({
             "mode": "rule",

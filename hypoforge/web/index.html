@@ -753,6 +753,18 @@
               <div class="context-metric"><b id="contextIncludedCount">0</b><span>纳入证据卡</span></div>
               <div class="context-metric"><b id="contextDroppedCount">0</b><span>预算裁剪记录</span></div>
             </div>
+            <div class="token-attribution">
+              <div class="token-attribution-head">
+                <div><span class="context-kicker">ACTUAL LLM USAGE</span><h3>真实 Token 归因</h3></div>
+                <span class="token-live-note">按模块累计 · 评分单列</span>
+              </div>
+              <div class="token-summary">
+                <div><b id="tokenPipelineTotal">0</b><span>Pipeline token</span></div>
+                <div><b id="tokenScoringTotal">0</b><span>独立评分 token</span></div>
+                <div><b id="tokenCallCount">0</b><span>成功 LLM 响应</span></div>
+              </div>
+              <div id="tokenDistribution" class="token-distribution" aria-label="M1 到 M6 Token 分布"></div>
+            </div>
           </div>
           <div class="state-sub">
             <h3>证据缺口</h3>
@@ -1165,6 +1177,79 @@ function updateStats(){
   $("contextTokenCount").textContent = sumContextMetric("estimated_tokens").toLocaleString();
   $("contextIncludedCount").textContent = sumContextMetric("included_count").toLocaleString();
   $("contextDroppedCount").textContent = sumContextMetric("dropped_count").toLocaleString();
+  renderTokenAttribution();
+}
+
+function normaliseTokenRow(row){
+  const value = row || {};
+  return {
+    input:Number(value.input || 0),
+    output:Number(value.output || 0),
+    calls:Number(value.calls || 0),
+  };
+}
+function addTokenRows(left, right){
+  const a = normaliseTokenRow(left), b = normaliseTokenRow(right);
+  return { input:a.input+b.input, output:a.output+b.output, calls:a.calls+b.calls };
+}
+function tokenUsageFromEvents(){
+  const byModule = {};
+  for(const event of allEvents){
+    if(event.event_type !== "module_completed" || !/^m[1-6]$/.test(event.module || "")) continue;
+    const usage = (event.details || {}).token_usage;
+    if(!usage) continue;
+    byModule[event.module] = addTokenRows(byModule[event.module], usage);
+  }
+  const scoringEvents = allEvents.filter(event =>
+    (event.event_type === "scoring_completed" || event.event_type === "scoring_failed") &&
+    (event.details || {}).token_usage
+  );
+  const scoring = scoringEvents.length
+    ? normaliseTokenRow(scoringEvents[scoringEvents.length - 1].details.token_usage)
+    : normaliseTokenRow(null);
+  return { byModule, scoring };
+}
+function renderTokenAttribution(){
+  const persisted = resultData || stateData || {};
+  const eventUsage = tokenUsageFromEvents();
+  const persistedModules = persisted.token_usage_by_module || {};
+  const byModule = Object.keys(persistedModules).length ? persistedModules : eventUsage.byModule;
+  const persistedScoring = persisted.scoring_token_usage || {};
+  const scoring = Object.keys(persistedScoring).length
+    ? normaliseTokenRow(persistedScoring) : eventUsage.scoring;
+  const moduleRows = MODULES.map(module => {
+    const usage = normaliseTokenRow(byModule[module.id]);
+    return { id:module.id, label:module.name, ...usage, total:usage.input+usage.output };
+  });
+  const moduleTotal = moduleRows.reduce((sum, row) => sum + row.total, 0);
+  const persistedPipeline = normaliseTokenRow(persisted.token_usage);
+  const pipelineTotal = (persistedPipeline.input + persistedPipeline.output) || moduleTotal;
+  const scoringTotal = scoring.input + scoring.output;
+  const calls = moduleRows.reduce((sum, row) => sum + row.calls, 0) + scoring.calls;
+  $("tokenPipelineTotal").textContent = pipelineTotal.toLocaleString();
+  $("tokenScoringTotal").textContent = scoringTotal.toLocaleString();
+  $("tokenCallCount").textContent = calls.toLocaleString();
+
+  const maxTotal = Math.max(1, ...moduleRows.map(row => row.total), scoringTotal);
+  const rows = [
+    ...moduleRows.map(row => ({...row, css:"module"})),
+    { id:"score", label:"独立评分", total:scoringTotal, input:scoring.input,
+      output:scoring.output, calls:scoring.calls, css:"scoring" },
+  ];
+  const hasDetailedUsage = moduleRows.some(row => row.total || row.calls) || scoringTotal || scoring.calls;
+  if(!hasDetailedUsage && pipelineTotal){
+    $("tokenDistribution").innerHTML = `<div class="token-legacy-note">该历史运行只保存了总 Token；模块级归因从新版运行开始记录。</div>`;
+    return;
+  }
+  $("tokenDistribution").innerHTML = rows.map(row => {
+    const width = row.total ? Math.max(2, row.total / maxTotal * 100) : 0;
+    const title = `${row.label}: input ${row.input.toLocaleString()} · output ${row.output.toLocaleString()} · ${row.calls} calls`;
+    return `<div class="token-row ${row.css}" title="${esc(title)}">
+      <span class="token-label">${esc(row.id.toUpperCase())}</span>
+      <span class="token-track"><i style="width:${width.toFixed(2)}%"></i></span>
+      <b>${row.total.toLocaleString()}</b>
+    </div>`;
+  }).join("");
 }
 
 /* ---------- 轮次时间线（事件驱动增量） ---------- */
@@ -1236,7 +1321,7 @@ async function refreshIterationState(){
   if(!currentRun) return;
   try{
     const { result } = await fetch(`/api/runs/${currentRun}/result`).then(r => r.json());
-    if(result){ stateData = result; renderIterationPanels(); }
+    if(result){ stateData = result; renderIterationPanels(); renderTokenAttribution(); }
   }catch{}
 }
 
@@ -2126,7 +2211,8 @@ async function openOverallView(rootId){
   $("pipelineGrid").innerHTML = "";
   $("eventsList").innerHTML = `<div class="empty">整体方案视图 · 请在右上角切换版本</div>`;
   $("eventCount").textContent = "overall";
-  ["doneModules","toolCalls","failedCalls","artifactCount","contextPackCount","contextTokenCount","contextIncludedCount","contextDroppedCount"].forEach(id => $(id).textContent = "0");
+  ["doneModules","toolCalls","failedCalls","artifactCount","contextPackCount","contextTokenCount","contextIncludedCount","contextDroppedCount","tokenPipelineTotal","tokenScoringTotal","tokenCallCount"].forEach(id => $(id).textContent = "0");
+  $("tokenDistribution").innerHTML = "";
   $("artifactCount").textContent = "0";
   $("artifactsList").innerHTML = `<div class="empty">整体方案视图</div>`;
   $("counterIteration").textContent = "0";
@@ -2167,7 +2253,7 @@ async function finishRun(){
     if(response.status === 200){
       const { result } = await response.json();
       resultData = result;
-      if(result){ stateData = result; renderIterationPanels(); }
+      if(result){ stateData = result; renderIterationPanels(); renderTokenAttribution(); }
     }
     const roundsData = await fetch(`/api/runs/${currentRun}/rounds`).then(r => r.json()).catch(() => null);
     if(roundsData && (roundsData.routing_history || []).length){

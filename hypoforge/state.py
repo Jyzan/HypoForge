@@ -930,3 +930,9 @@ class PipelineState(BaseModel):
     # ---- token tracking (populated by LLM-calling modules) ----
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    # Aggregated across repeated visits (for example M6 -> M2 -> M3 -> M4).
+    # Each row has ``input``, ``output`` and successful response ``calls``.
+    token_usage_by_module: Dict[str, Dict[str, int]] = Field(default_factory=dict)
+    # Post-pipeline independent evaluation is intentionally separate: it runs
+    # after M6 and must not make M6 appear more expensive than it is.
+    scoring_token_usage: Dict[str, int] = Field(default_factory=dict)

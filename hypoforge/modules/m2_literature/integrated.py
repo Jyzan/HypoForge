@@ -71,6 +71,8 @@ def build_integrated_search_adapter(
     source_timeout_seconds: float = 30.0,
     scout_timeout_seconds: float = 90.0,
     scout_candidate_limit: int = 24,
+    scout_abstract_char_limit: int = 6000,
+    scout_max_tokens: int = 4096,
     budget: SearchBudget | Mapping[str, Any] | None = None,
     reading_cache_dir: str | Path = ".cache/hypoforge/literature/documents",
     pmc_backend: FetchBackend | None = None,
@@ -86,12 +88,18 @@ def build_integrated_search_adapter(
     source_concurrency_limit: int = 2,
     fresh_run_timeout_seconds: float = 840.0,
     allow_empty_results: bool = False,
+    fast_mode: bool = False,
 ) -> AgenticM2Adapter:
     if final_k <= 0:
         raise ValueError("final_k must be positive")
     if source_timeout_seconds <= 0:
         raise ValueError("source_timeout_seconds must be positive")
-    if scout_timeout_seconds <= 0 or scout_candidate_limit <= 0:
+    if (
+        scout_timeout_seconds <= 0
+        or scout_candidate_limit <= 0
+        or scout_abstract_char_limit <= 0
+        or scout_max_tokens <= 0
+    ):
         raise ValueError("Scout limits must be positive")
     if per_query_limit is not None and per_query_limit <= 0:
         raise ValueError("per_query_limit must be positive")
@@ -161,7 +169,11 @@ def build_integrated_search_adapter(
     )
     deduplicator = PaperDeduplicator()
     ranker = PaperRanker(prefer_high_citation=domain_routing_enabled)
-    scout_reader = ScoutReader(client)
+    scout_reader = ScoutReader(
+        client,
+        max_tokens=scout_max_tokens,
+        abstract_char_limit=scout_abstract_char_limit,
+    )
     agent = IterativeSearchAgent(
         query_planner=planner,
         sources=tool.as_source_list(),
@@ -179,11 +191,15 @@ def build_integrated_search_adapter(
         scout_candidate_limit=scout_candidate_limit,
         scout_timeout_seconds=scout_timeout_seconds,
         source_timeout_seconds=source_timeout_seconds,
-        retention_judge_client=client,
+        # Quick runs preserve the semantic Scout and PaperReader but use the
+        # existing deterministic fallbacks for auxiliary adjudication.  This
+        # removes several calls per sub-question without weakening the two
+        # steps that decide what evidence is read and extracted.
+        retention_judge_client=None if fast_mode else client,
         # Must/unmust entity classification for the entity-group round
         # strategy (reuses the shared Qwen client; failures degrade to a
         # deterministic fallback inside the search agent).
-        entity_classifier=client,
+        entity_classifier=None if fast_mode else client,
         source_concurrency_limit=source_concurrency_limit,
     )
     store = InMemoryChunkStore()
@@ -243,9 +259,9 @@ def build_integrated_search_adapter(
         search_agent=agent,
         reading_workflow=reading_workflow,
         budget=resolved_budget,
-        entity_judge_client=client,
+        entity_judge_client=None if fast_mode else client,
         entity_embedding_model=entity_embedding_model,
-        subquestion_entity_client=query_client,
+        subquestion_entity_client=None if fast_mode else query_client,
         round_strategy=round_strategy,
         fulltext_backfill_enabled=domain_routing_enabled,
         fulltext_backfill_target=fulltext_target_per_subquestion,
