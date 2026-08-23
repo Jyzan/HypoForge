@@ -437,6 +437,7 @@ class PipelineConfig(BaseModel):
             "domain_routing_enabled": False,
             "fulltext_target_per_subquestion": 0,
             "fulltext_backfill_max_attempts": 1,
+            "preprint_supplement_enabled": False,
             "final_k": 2,
             "subquestion_concurrency": 4,
             "source_concurrency_limit": 3,

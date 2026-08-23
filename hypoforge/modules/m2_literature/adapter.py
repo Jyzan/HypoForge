@@ -687,9 +687,9 @@ class AgenticM2Adapter(ModuleProtocol):
                 citation_floor=0,
                 attempted_ids=attempted_backfill_ids,
             )
-            target = self.fulltext_backfill_target or int(
-                getattr(self.search_agent, "final_k", 1)
-            )
+            # Zero is an explicit disable switch (fast/abstract-only mode),
+            # not a falsy request to fall back to ``final_k``.
+            target = self.fulltext_backfill_target
             parsed_count = sum(
                 self._is_parsed_fulltext(item) for item in reading_results
             )

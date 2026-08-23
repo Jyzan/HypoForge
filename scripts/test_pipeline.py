@@ -11518,6 +11518,57 @@ async def test_preprint_phase_is_skipped_after_fulltext_target_is_met() -> None:
     assert readings == [fulltext]
 
 
+@pytest.mark.asyncio
+async def test_zero_fulltext_target_never_invokes_preprint_supplement() -> None:
+    """An explicit zero is a disable switch, not a request for final_k."""
+
+    from types import MethodType, SimpleNamespace
+    from hypoforge.literature.adapter import AgenticM2Adapter
+    from hypoforge.literature.models import SearchRunResult
+
+    class EmptySearchAgent:
+        final_k = 2
+
+        async def run(self, sub_question, **kwargs):
+            return SearchRunResult(sub_question=sub_question)
+
+    class EmptyReadingWorkflow:
+        async def run(self, sub_question, papers, search_context=None):
+            return []
+
+    observed_targets: list[int] = []
+    adapter = AgenticM2Adapter(
+        search_agent=EmptySearchAgent(),
+        reading_workflow=EmptyReadingWorkflow(),
+        fulltext_backfill_enabled=False,
+        fulltext_backfill_target=0,
+        allow_empty_results=True,
+    )
+
+    async def record_supplement(
+        self, sub_question, domains, key_entities, search_result,
+        reading_results, attempted_ids, target,
+    ):
+        observed_targets.append(target)
+        return search_result, reading_results
+
+    adapter._supplement_preprint_fulltext = MethodType(
+        record_supplement, adapter
+    )
+    question = "How can retrieval improve scientific question answering?"
+    state = PipelineState(
+        input_question=question,
+        problem_card=ProblemCard(
+            original_question=question,
+            sub_questions=[question],
+        ),
+    )
+
+    await adapter._run_fresh_subquestion(state, [], 0, question)
+
+    assert observed_targets == [0]
+
+
 if __name__ == "__main__":
     # Allow running directly: python tests/test_pipeline.py
     async def _run_all():
@@ -11567,6 +11618,7 @@ def test_fast_preset_disables_iteration_and_sets_quick_switches() -> None:
     assert config.module_overrides["m6"].kwargs["reviewers"] == ["overall"]
     assert config.module_overrides["m2"].kwargs["abstract_only"] is True
     assert config.module_overrides["m2"].kwargs["fulltext_target_per_subquestion"] == 0
+    assert config.module_overrides["m2"].kwargs["preprint_supplement_enabled"] is False
 
 
 def test_fast_mode_keeps_user_followup_routes_but_disables_internal_loops() -> None:
