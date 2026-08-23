@@ -4237,6 +4237,33 @@ def test_graph_context_does_not_pretruncate_late_focused_evidence() -> None:
     assert "Late graph fact 12." in pack.rendered
 
 
+@pytest.mark.asyncio
+async def test_standard_m4_revision_generator_disables_extended_thinking() -> None:
+    """Later rounds already have evidence/review feedback and avoid the 360s tail."""
+    candidate = hypothesis()
+    client = _SequenceClient([
+        [candidate.model_dump(mode="json")],
+        [{
+            "hypothesis_id": candidate.hypothesis_id,
+            "consistent": True,
+            "rationale": "same task object and requirement",
+            "covered_requirement_ids": ["R1"],
+        }],
+    ])
+    module = M4HypothesisGeneration(
+        num_candidates=1,
+        top_k=1,
+        mode="direct",
+        fast_mode=False,
+    )
+    module.client = client
+    state = robot_state().model_copy(update={"iteration_count": 1})
+
+    await module._run_llm(state, feedback_context="Address the review feedback.")
+
+    assert client.calls[0]["disable_thinking"] is True
+
+
 def test_graph_context_does_not_pretruncate_late_focused_relation() -> None:
     from hypoforge.context import ContextPlanner, ContextRequest
     from hypoforge.state import (

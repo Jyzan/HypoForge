@@ -1257,7 +1257,11 @@ class M4HypothesisGeneration(ModuleProtocol):
                 max_tokens=8192,
                 temperature=max(getattr(self.llm_config, "temperature", 0.1), 0.4),
                 disable_thinking=(
-                    self.fast_mode
+                    # The first standard pass keeps open-ended reasoning.
+                    # Later passes already have prior hypotheses, reviewer
+                    # feedback, and an updated graph; avoid repeating the
+                    # observed 360-second reasoning tail.
+                    (self.fast_mode or state.iteration_count > 0)
                     if disable_thinking is None
                     else bool(disable_thinking)
                 ),
