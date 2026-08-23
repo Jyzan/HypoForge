@@ -82,7 +82,9 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
         reader_timeout_seconds: float = 120.0,
         workflow_timeout_seconds: float = 600.0,
         top_k: int = 8,
+        abstract_only: bool = False,
     ) -> None:
+        self.abstract_only = bool(abstract_only)
         if fetch_concurrency <= 0 or read_concurrency <= 0:
             raise ValueError("reading concurrency limits must be positive")
         if (
@@ -230,6 +232,136 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
             "fulltext_failure_detail": document.retrieval_failure_detail,
         }
 
+    async def _read_abstract_only(
+        self,
+        sub_question: str,
+        retrieval_query: str,
+        paper: PaperRecord,
+    ) -> PaperReadingResult:
+        """Read only the paper abstract (fast mode), never resolving fulltext."""
+        timings: dict[str, float] = {}
+        errors: list[str] = []
+        try:
+            resolver = getattr(self.resolver, "resolve_abstract", None)
+            if not callable(resolver):
+                message = "abstract-only mode requires resolver.resolve_abstract"
+                return PaperReadingResult(
+                    paper_id=paper.paper_id,
+                    stage_elapsed_seconds=timings,
+                    fulltext_failure_category=attribute_error_text(message),
+                    fulltext_failure_detail=message,
+                    errors=[*errors, message],
+                )
+            document = await self._measure(
+                timings,
+                "abstract_fallback",
+                lambda: resolver(paper),
+                details={
+                    "paper_id": paper.paper_id,
+                    "title": paper.title,
+                    "abstract_only": True,
+                },
+            )
+            if (
+                document.content_level is not ContentLevel.ABSTRACT
+                or not document.local_path
+            ):
+                message = "abstract-only mode produced no readable abstract"
+                return PaperReadingResult(
+                    paper_id=paper.paper_id,
+                    content_level=document.content_level,
+                    **self._document_result_fields(document),
+                    stage_elapsed_seconds=timings,
+                    errors=[*errors, message],
+                )
+
+            chunks = await self._measure(
+                timings,
+                "document_parser",
+                lambda: self.parser.parse(document),
+                details={
+                    "paper_id": paper.paper_id,
+                    "title": paper.title,
+                    "abstract_only": True,
+                },
+            )
+            self.store.replace(paper.paper_id, chunks)
+            evidence = await self._measure(
+                timings,
+                "evidence_retriever",
+                lambda: self.retriever.retrieve(
+                    retrieval_query,
+                    [paper.paper_id],
+                    top_k=self.top_k,
+                ),
+                details={
+                    "paper_id": paper.paper_id,
+                    "title": paper.title,
+                    "top_k": self.top_k,
+                },
+            )
+            reading = await self._measure(
+                timings,
+                "paper_reader",
+                lambda: asyncio.wait_for(
+                    self.reader.read(sub_question, paper, evidence),
+                    timeout=self.reader_timeout_seconds,
+                ),
+                details={
+                    "paper_id": paper.paper_id,
+                    "title": paper.title,
+                    "evidence_chunks": len(evidence),
+                    "abstract_only": True,
+                },
+            )
+            if reading.paper_id != paper.paper_id:
+                message = "paper_reader returned a mismatched paper_id"
+                return PaperReadingResult(
+                    paper_id=paper.paper_id,
+                    content_level=document.content_level,
+                    **self._document_result_fields(document),
+                    chunks_parsed=len(chunks),
+                    chunks_retrieved=len(evidence),
+                    evidence=list(evidence),
+                    degraded_to_abstract=True,
+                    stage_elapsed_seconds=timings,
+                    errors=[*errors, message],
+                )
+            reader_evidence = {item.evidence_id: item for item in reading.evidence}
+            merged_evidence = [
+                item.model_copy(update={
+                    "normalized_claim": (
+                        reader_evidence[item.evidence_id].normalized_claim
+                    )
+                })
+                if item.evidence_id in reader_evidence
+                else item
+                for item in evidence
+            ]
+            return reading.model_copy(
+                update={
+                    "content_level": document.content_level,
+                    **self._document_result_fields(document),
+                    "chunks_parsed": len(chunks),
+                    "chunks_retrieved": len(evidence),
+                    "evidence": merged_evidence,
+                    "degraded_to_abstract": True,
+                    "stage_elapsed_seconds": timings,
+                    "errors": [*errors, *reading.errors],
+                }
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            message = _error("abstract_only", exc)
+            return PaperReadingResult(
+                paper_id=paper.paper_id,
+                stage_elapsed_seconds=timings,
+                fulltext_failure_category=attribute_error_text(message),
+                fulltext_failure_detail=message,
+                errors=[*errors, message],
+            )
+
     async def _read_one(
         self,
         sub_question: str,
@@ -240,6 +372,12 @@ class FullTextReadingWorkflow(ReadingExtractionWorkflowProtocol):
     ) -> PaperReadingResult:
         timings: dict[str, float] = {}
         resolver_errors: list[str] = []
+        if self.abstract_only:
+            return await self._read_abstract_only(
+                sub_question,
+                retrieval_query,
+                paper,
+            )
         try:
             async with fetch_semaphore:
                 document = await self._measure(

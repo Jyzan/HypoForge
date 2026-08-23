@@ -248,6 +248,7 @@ class M3EvidenceGraph(ModuleProtocol):
         entity_merge_enabled: bool = True,
         entity_merge_similarity_threshold: float = 0.92,
         entity_merge_embedding_backend: Optional[EmbedTexts] = None,
+        allow_empty_graph: bool = False,
         # ---- grounding settings ----
         grounding_enabled: bool = False,
         grounding_mode: str = "rule",
@@ -287,6 +288,7 @@ class M3EvidenceGraph(ModuleProtocol):
             entity_embedding_model or grounding_embedding_model
         )
         self.entity_merge_enabled = bool(entity_merge_enabled)
+        self.allow_empty_graph = bool(allow_empty_graph)
         self.entity_merge_similarity_threshold = float(
             entity_merge_similarity_threshold
         )
@@ -393,6 +395,7 @@ class M3EvidenceGraph(ModuleProtocol):
                 ])),
             )
 
+        degraded_empty_graph = False
         if not all_entries:
             if not (existing_graph and existing_graph.nodes):
                 existing_graph = self._load_persisted_graph(state)
@@ -402,6 +405,24 @@ class M3EvidenceGraph(ModuleProtocol):
                     "M3: no knowledge entries; reusing existing graph "
                     "(%d nodes, %d edges)",
                     len(graph.nodes), len(graph.edges),
+                )
+            elif self.allow_empty_graph:
+                graph = EvidenceGraph()
+                degraded_empty_graph = True
+                logger.warning(
+                    "M3 fast fallback: no knowledge entries or reusable graph; "
+                    "continuing with an explicit empty evidence graph."
+                )
+                emit_event(
+                    "tool_result",
+                    module="m3",
+                    tool="rule_graph_builder",
+                    status="warning",
+                    message=(
+                        "No usable M2 knowledge; continuing with an explicit "
+                        "empty evidence graph"
+                    ),
+                    details={"degraded_empty_graph": True},
                 )
             else:
                 raise RuntimeError(
@@ -534,6 +555,9 @@ class M3EvidenceGraph(ModuleProtocol):
         # supports checkpoint resume: a previously-built rule-only graph can
         # be grounded on resume if M2 evidence is now available.
         result: Dict[str, Any] = {"evidence_graph": graph}
+        result_metrics = dict(state.metrics)
+        if degraded_empty_graph:
+            result_metrics["m3_degraded_empty_graph"] = True
         if correction_updates != state.graph_correction_requests:
             result["graph_correction_requests"] = correction_updates
         should_ground = (
@@ -591,7 +615,9 @@ class M3EvidenceGraph(ModuleProtocol):
         # travel inside the existing ``metrics`` dict under ``m3_gap_gain``.
         # P2 consumers read ``state.metrics["m3_gap_gain"]``.
         if state.evidence_gaps:
-            result["metrics"] = {**state.metrics, "m3_gap_gain": gap_gain}
+            result_metrics["m3_gap_gain"] = gap_gain
+        if result_metrics != state.metrics:
+            result["metrics"] = result_metrics
 
         # --- Step 6: final-graph entity similarity merge ---
         graph = await self._merge_final_entities(graph, state)

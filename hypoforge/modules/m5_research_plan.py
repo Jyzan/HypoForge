@@ -65,8 +65,10 @@ class M5ResearchPlan(ModuleProtocol):
         llm_config: Optional[Any] = None,
         generation_timeout_seconds: float = 180.0,
         semantic_alignment_timeout_seconds: float = 60.0,
+        fast_mode: bool = False,
         **kwargs,
     ):
+        self.fast_mode = bool(fast_mode)
         if generation_timeout_seconds <= 0:
             raise ValueError("generation_timeout_seconds must be positive")
         if semantic_alignment_timeout_seconds <= 0:
@@ -324,6 +326,61 @@ class M5ResearchPlan(ModuleProtocol):
         answer = str(response or "").strip()
         return answer.casefold().startswith("yes"), answer
 
+    @staticmethod
+    def _fast_fallback_plan(
+        state: PipelineState,
+        hypothesis: Any,
+        rationale: str = "",
+    ) -> ResearchPlan:
+        """Minimal research plan used by fast mode when plan generation cannot
+        pass alignment; keeps the pipeline able to always return a plan."""
+        q = (
+            state.problem_card.original_question
+            if state.problem_card and state.problem_card.original_question
+            else state.input_question
+        )
+        return ResearchPlan(
+            hypothesis_id=hypothesis.hypothesis_id,
+            study_subjects=(
+                "Target system(s) relevant to: " + (q or "the original question")
+            ),
+            independent_variables=[
+                "Candidate mechanism/feature proposed by the hypothesis",
+            ],
+            dependent_variables=[
+                "Primary measurable outcome(s) expected by the hypothesis",
+            ],
+            control_groups=[
+                "Baseline/control condition without the proposed intervention",
+            ],
+            procedures=[
+                "Define the target system and baseline; apply the proposed intervention; "
+                "measure the primary outcome under controlled conditions; "
+                "compare against baseline and replicate."
+            ],
+            measurement_metrics=[
+                "Quantitative outcome metric; statistical effect size; reproducibility measure",
+            ],
+            analysis_methods=[
+                "Descriptive statistics and hypothesis test; pre-registered analysis",
+            ],
+            expected_results_if_supported=(
+                "If the hypothesis is supported, the proposed intervention produces "
+                "a measurable improvement over baseline."
+            ),
+            expected_results_if_refuted=(
+                "If the hypothesis is refuted, no reliable difference is observed "
+                "across replicated runs."
+            ),
+            timeline="4-8 weeks: setup, intervention, measurement, analysis.",
+            risks_and_alternatives=(
+                "Risk: limited prior evidence; Alternative: use a simpler pilot "
+                "or a larger-scale observational comparison."
+            ),
+            evidence_links=[],
+            task_trace=TaskTrace(),
+        )
+
     async def __call__(
         self,
         state: PipelineState,
@@ -401,36 +458,96 @@ class M5ResearchPlan(ModuleProtocol):
                             },
                         )
                         continue
+                    if self.fast_mode:
+                        emit_event(
+                            "tool_failed",
+                            module="m5",
+                            tool="research_plan_designer",
+                            status="failed",
+                            message=(
+                                f"Plan generation for hypothesis {h.hypothesis_id} "
+                                "timed out in fast mode; using fallback plan"
+                            ),
+                            details={
+                                "hypothesis_id": h.hypothesis_id,
+                                "timeout_seconds": self.generation_timeout_seconds,
+                            },
+                        )
+                        break
                     raise RuntimeError(
                         "M5 research-plan generation timed out after "
                         f"{self.generation_timeout_seconds:g} seconds"
                     ) from exc
-                plan = ResearchPlan.model_validate(payload).model_copy(
-                    update={"hypothesis_id": h.hypothesis_id}
-                )
-                plan = self._sanitize_evidence_links(plan, graph_context)
-                hypothesis_requirement_ids = {
-                    reference.contract_id
-                    for reference in h.task_trace.requirement_mentions
-                }
-                plan = self._canonicalize_task_trace(
-                    state,
-                    plan,
-                    requirement_ids=(hypothesis_requirement_ids or None),
-                )
-                plan_text = self._plan_alignment_text(plan)
-                alignment = assess_task_alignment(
-                    state,
-                    plan_text,
-                    subject_text=plan.study_subjects,
-                    trace=plan.task_trace,
-                    semantic_client=None,
-                    required_requirement_ids=(hypothesis_requirement_ids or None),
-                )
-                if alignment.passed:
-                    semantic_consistent, semantic_rationale = (
-                        await self._audit_plan_semantics(state, plan)
+                except Exception as exc:
+                    if not self.fast_mode:
+                        raise
+                    emit_event(
+                        "tool_failed",
+                        module="m5",
+                        tool="research_plan_designer",
+                        status="failed",
+                        message=(
+                            f"Plan generation for hypothesis {h.hypothesis_id} "
+                            f"failed in fast mode: {type(exc).__name__}"
+                        ),
+                        details={
+                            "hypothesis_id": h.hypothesis_id,
+                            "error": type(exc).__name__,
+                        },
                     )
+                    break
+                try:
+                    plan = ResearchPlan.model_validate(payload).model_copy(
+                        update={"hypothesis_id": h.hypothesis_id}
+                    )
+                    plan = self._sanitize_evidence_links(plan, graph_context)
+                    hypothesis_requirement_ids = {
+                        reference.contract_id
+                        for reference in h.task_trace.requirement_mentions
+                    }
+                    plan = self._canonicalize_task_trace(
+                        state,
+                        plan,
+                        requirement_ids=(hypothesis_requirement_ids or None),
+                    )
+                    plan_text = self._plan_alignment_text(plan)
+                    alignment = assess_task_alignment(
+                        state,
+                        plan_text,
+                        subject_text=plan.study_subjects,
+                        trace=plan.task_trace,
+                        semantic_client=None,
+                        required_requirement_ids=(hypothesis_requirement_ids or None),
+                    )
+                except Exception as exc:
+                    if not self.fast_mode:
+                        raise
+                    emit_event(
+                        "tool_failed",
+                        module="m5",
+                        tool="research_plan_designer",
+                        status="failed",
+                        message=(
+                            f"Plan output for hypothesis {h.hypothesis_id} could "
+                            f"not be validated in fast mode: {type(exc).__name__}"
+                        ),
+                        details={
+                            "hypothesis_id": h.hypothesis_id,
+                            "error": type(exc).__name__,
+                        },
+                    )
+                    plan = None
+                    break
+                if alignment.passed:
+                    if self.fast_mode:
+                        semantic_consistent = True
+                        semantic_rationale = (
+                            "fast mode: semantic audit skipped"
+                        )
+                    else:
+                        semantic_consistent, semantic_rationale = (
+                            await self._audit_plan_semantics(state, plan)
+                        )
                     if semantic_consistent:
                         plan_accepted = True
                         break
@@ -445,8 +562,16 @@ class M5ResearchPlan(ModuleProtocol):
                     "and return valid task-entity and requirement traces from the "
                     "binding M1 task contract.\n"
                 )
+            if plan is None and self.fast_mode:
+                plan = self._fast_fallback_plan(
+                    state,
+                    h,
+                    "fast-mode plan generation timed out",
+                )
             assert plan is not None
-            if not plan_accepted:
+            if not plan_accepted and self.fast_mode:
+                plan = self._fast_fallback_plan(state, h, last_alignment_rationale)
+            if not plan_accepted and not self.fast_mode:
                 raise ValueError(
                     f"M5 blocked task-misaligned plan for {h.hypothesis_id}: "
                     f"{last_alignment_rationale}"

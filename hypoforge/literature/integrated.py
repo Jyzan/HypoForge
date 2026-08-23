@@ -55,6 +55,7 @@ def build_integrated_search_adapter(
     access_enrichment_timeout_seconds: float = 12.0,
     fulltext_target_per_subquestion: int = 3,
     fulltext_backfill_max_attempts: int = 8,
+    abstract_only: bool = False,
     zero_result_relaxation: bool = True,
     source_timeout_seconds: float = 30.0,
     scout_timeout_seconds: float = 90.0,
@@ -73,6 +74,7 @@ def build_integrated_search_adapter(
     subquestion_concurrency: int = 2,
     source_concurrency_limit: int = 2,
     fresh_run_timeout_seconds: float = 840.0,
+    allow_empty_results: bool = False,
 ) -> AgenticM2Adapter:
     if final_k <= 0:
         raise ValueError("final_k must be positive")
@@ -90,8 +92,8 @@ def build_integrated_search_adapter(
         raise ValueError("access_enrichment_timeout_seconds must be positive")
     if fulltext_backfill_max_attempts <= 0:
         raise ValueError("fulltext_backfill_max_attempts must be positive")
-    if fulltext_target_per_subquestion <= 0:
-        raise ValueError("fulltext_target_per_subquestion must be positive")
+    if fulltext_target_per_subquestion < 0:
+        raise ValueError("fulltext_target_per_subquestion cannot be negative")
     if fulltext_target_per_subquestion > final_k:
         raise ValueError(
             "fulltext_target_per_subquestion cannot exceed final_k; otherwise "
@@ -99,8 +101,8 @@ def build_integrated_search_adapter(
         )
     if subquestion_concurrency <= 0 or source_concurrency_limit <= 0:
         raise ValueError("M2 concurrency limits must be positive")
-    if fresh_run_timeout_seconds <= 0:
-        raise ValueError("fresh_run_timeout_seconds must be positive")
+    if fresh_run_timeout_seconds < 0:
+        raise ValueError("fresh_run_timeout_seconds cannot be negative")
 
     tool = search_tool or LiteratureSearchTool(
         enabled_sources=enabled_sources,
@@ -191,6 +193,7 @@ def build_integrated_search_adapter(
         resolver_timeout_seconds=resolver_timeout_seconds,
         reader_timeout_seconds=reader_timeout_seconds,
         workflow_timeout_seconds=reading_workflow_timeout_seconds,
+        abstract_only=abstract_only,
     )
     return AgenticM2Adapter(
         search_agent=agent,
@@ -205,4 +208,5 @@ def build_integrated_search_adapter(
         fulltext_backfill_max_attempts=fulltext_backfill_max_attempts,
         subquestion_concurrency=subquestion_concurrency,
         fresh_run_timeout_seconds=fresh_run_timeout_seconds,
+        allow_empty_results=allow_empty_results,
     )

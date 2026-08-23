@@ -98,6 +98,7 @@
   @keyframes blink{50%{opacity:.3}}
   .iter-tag{background:var(--accent-soft);color:var(--accent);padding:1px 7px;border-radius:999px;font-weight:600}
   .iter-tag.follow{background:var(--amber-soft);color:var(--amber)}
+  .iter-tag.fast{background:var(--green-soft);color:var(--green)}
   /* 追问链（文件夹式分组） */
   .h-chain{margin-bottom:4px}
   .chain-head{border:1px solid var(--line);border-radius:12px;background:var(--card);box-shadow:var(--shadow)}
@@ -420,6 +421,19 @@
   .input-box{
     flex:1;background:var(--card);border:1.5px solid var(--line);border-radius:16px;
     padding:12px 16px;display:flex;align-items:center;transition:border-color .2s;
+  }
+  .mode-toggle{
+    flex:none;display:flex;align-items:center;gap:2px;background:var(--card);
+    border:1.5px solid var(--line);border-radius:16px;padding:4px;margin-bottom:2px;
+  }
+  .mode-btn{
+    border:0;background:transparent;color:var(--ink3);font-size:12px;font-weight:650;
+    padding:8px 14px;border-radius:12px;cursor:pointer;transition:all .15s;white-space:nowrap;
+  }
+  .mode-btn:hover{color:var(--ink)}
+  .mode-btn.active{
+    background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;
+    box-shadow:0 4px 12px -4px rgba(79,70,229,.55);
   }
   .input-box:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px rgba(99,102,241,.12)}
   .input-box textarea{flex:1;border:none;outline:none;resize:none;font:inherit;font-size:15px;color:var(--ink);background:transparent;max-height:120px;line-height:1.5}
@@ -800,6 +814,10 @@
 
     <div class="input-bar" id="inputBar">
       <div class="input-wrap">
+        <div class="mode-toggle" id="modeToggle" title="选择运行模式">
+          <button type="button" class="mode-btn active" data-mode="standard">标准</button>
+          <button type="button" class="mode-btn" data-mode="fast">快速</button>
+        </div>
         <div class="input-box">
           <textarea id="questionInput" rows="1" placeholder="输入一个科学问题，例如：蛋白质错误折叠如何导致神经退行性疾病？"></textarea>
         </div>
@@ -2430,6 +2448,7 @@ function historyItemHtml(run, round, topLevel = false){
         <div class="q">${roundTag}${esc(text)}</div>
         <div class="meta">
           <span class="status-dot ${statusDotClass(run.status)}"></span>${statusLabel(run.status || "")}
+          ${run.run_mode === "fast" ? '<span class="iter-tag fast">快速</span>' : ""}
           ${isFollowup && !round ? '<span class="iter-tag follow">追问</span>' : ""}
           ${time ? `<span>${esc(time)}</span>` : ""}
           <span>${esc(String(run.run_id).slice(-11))}</span>
@@ -2694,6 +2713,19 @@ async function loadHistory(){
 /* ---------- 提交 / followup / 停止 ---------- */
 // 提交按钮三态：submit（原样提交）/ stop（红色停止）/ stopping（正在停止…禁用）。
 const SEND_BTN_SUBMIT_HTML = $("sendBtn").innerHTML;
+function currentRunMode(){
+  const active = document.querySelector("#modeToggle .mode-btn.active");
+  return active ? active.dataset.mode : "standard";
+}
+function setRunMode(mode){
+  document.querySelectorAll("#modeToggle .mode-btn").forEach(btn =>
+    btn.classList.toggle("active", btn.dataset.mode === mode)
+  );
+}
+document.querySelectorAll("#modeToggle .mode-btn").forEach(btn =>
+  btn.addEventListener("click", () => setRunMode(btn.dataset.mode))
+);
+
 function setSendBtn(mode){
   const btn = $("sendBtn");
   if(mode === "stop"){
@@ -2758,6 +2790,7 @@ async function submitFollowup(){
         ads_api_token: $("adsApiToken").value.trim(),
         unpaywall_email: $("unpaywallEmail").value.trim(),
         crossref_mailto: $("crossrefMailto").value.trim(),
+        run_mode: currentRunMode(),
         parent_run_id: currentRun,
         followup: text,
       }),
@@ -2836,6 +2869,7 @@ async function retryFromCheckpoint(){
         ads_api_token: $("adsApiToken").value.trim(),
         unpaywall_email: $("unpaywallEmail").value.trim(),
         crossref_mailto: $("crossrefMailto").value.trim(),
+        run_mode: currentRunMode(),
         resume_of: currentRun,
       }),
     });
@@ -2876,6 +2910,7 @@ async function submit(){
   const payload = {
     question: text,
     model_name: $("modelName").value.trim(),
+    run_mode: currentRunMode(),
     qwen_api_key: $("qwenApiKey").value.trim(),
     semantic_scholar_api_key: $("semanticApiKey").value.trim(),
     openalex_api_key: $("openalexApiKey").value.trim(),

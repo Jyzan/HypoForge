@@ -154,6 +154,7 @@ class AgenticM2Adapter(ModuleProtocol):
         fulltext_backfill_min_directness: float = 0.45,
         subquestion_concurrency: int = 2,
         fresh_run_timeout_seconds: float = 840.0,
+        allow_empty_results: bool = False,
     ) -> None:
         self.search_agent = search_agent
         self.reading_workflow = reading_workflow
@@ -178,8 +179,8 @@ class AgenticM2Adapter(ModuleProtocol):
             raise ValueError("fulltext_backfill_min_directness must be in [0, 1]")
         if subquestion_concurrency <= 0:
             raise ValueError("subquestion_concurrency must be positive")
-        if fresh_run_timeout_seconds <= 0:
-            raise ValueError("fresh_run_timeout_seconds must be positive")
+        if fresh_run_timeout_seconds < 0:
+            raise ValueError("fresh_run_timeout_seconds cannot be negative")
         self.fulltext_backfill_enabled = bool(fulltext_backfill_enabled)
         self.fulltext_backfill_target = int(fulltext_backfill_target)
         self.fulltext_backfill_max_attempts = int(fulltext_backfill_max_attempts)
@@ -187,6 +188,7 @@ class AgenticM2Adapter(ModuleProtocol):
         self.fulltext_backfill_min_directness = float(fulltext_backfill_min_directness)
         self.subquestion_concurrency = int(subquestion_concurrency)
         self.fresh_run_timeout_seconds = float(fresh_run_timeout_seconds)
+        self.allow_empty_results = bool(allow_empty_results)
         self._subquestion_semaphore = asyncio.Semaphore(self.subquestion_concurrency)
         # Entity normalization persists one run-scoped cache file.  Keep that
         # small merge phase serialized while search and reading remain parallel.
@@ -694,7 +696,7 @@ class AgenticM2Adapter(ModuleProtocol):
         try:
             done, pending = await asyncio.wait(
                 tasks,
-                timeout=self.fresh_run_timeout_seconds,
+                timeout=(self.fresh_run_timeout_seconds or None),
             )
         except BaseException:
             # Child tasks created for bounded parallelism are independent of
@@ -731,7 +733,7 @@ class AgenticM2Adapter(ModuleProtocol):
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
 
-        if failures and not outcomes:
+        if failures and not outcomes and not self.allow_empty_results:
             summary = "; ".join(
                 f"{question!r}: {detail}"
                 for _, (question, detail) in sorted(failures.items())

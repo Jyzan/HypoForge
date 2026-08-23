@@ -540,12 +540,17 @@ class PipelineRunner:
         # m2+m4 as targets; the m6 three-way edge needs m2+m4.  If either
         # target is missing from enabled_modules we keep the legacy wiring so
         # behaviour is unchanged.
+        fast_mode = getattr(self.config, "run_mode", "standard") == "fast"
+        # Fast mode disables automatic M6/M4 loops, but user-driven followup
+        # triage still needs the M1→M2/M4 conditional routes.
         routing_enabled = bool(
-            self.config.followup_routing or self.config.m6_evidence_revisit
+            self.config.followup_routing
+            or (self.config.m6_evidence_revisit and not fast_mode)
         )
         routing_targets_available = routing_enabled and {"m2", "m4"} <= set(active)
         gap_route_enabled = (
-            all(name in enabled for name in ("m2", "m3", "m4"))
+            not fast_mode
+            and all(name in enabled for name in ("m2", "m3", "m4"))
             and enabled.index("m2") + 1 == enabled.index("m3")
             and enabled.index("m3") + 1 == enabled.index("m4")
         )
@@ -579,7 +584,11 @@ class PipelineRunner:
 
         # --- conditional iteration edge ---
         last_module = enabled[-1]
-        if self.config.enable_iteration and last_module == "m6":
+        if (
+            not fast_mode
+            and self.config.enable_iteration
+            and last_module == "m6"
+        ):
             if routing_targets_available:
                 iteration_target = self.config.iteration_module_target
                 workflow.add_conditional_edges(

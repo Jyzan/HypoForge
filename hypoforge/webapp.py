@@ -87,6 +87,7 @@ class RunManager:
         parent_run_id: str = "",
         followup: str = "",
         resume_of: str = "",
+        run_mode: str = "standard",
     ) -> dict[str, Any]:
         question = " ".join(str(question or "").split())
         model_name = " ".join(str(model_name or "").split())
@@ -101,6 +102,7 @@ class RunManager:
         parent_run_id = " ".join(str(parent_run_id or "").split())
         followup = " ".join(str(followup or "").split())
         resume_of = " ".join(str(resume_of or "").split())
+        run_mode = "fast" if str(run_mode or "standard").strip().casefold() == "fast" else "standard"
         if resume_of and (parent_run_id or followup):
             raise ValueError("resume_of cannot be combined with parent_run_id/followup")
         if not question:
@@ -141,6 +143,8 @@ class RunManager:
         # sources.  Only booleans and warning messages are exposed; credential
         # values remain in the memory-only credential store below.
         preview_config = PipelineConfig.from_yaml(self.config_path)
+        if run_mode == "fast":
+            preview_config.apply_fast_mode_preset()
         m2_override = preview_config.module_overrides.get("m2")
         m2_kwargs = dict(m2_override.kwargs) if m2_override is not None else {}
         effective_serper = str(
@@ -211,6 +215,7 @@ class RunManager:
                 "cancel_requested": False,
                 "credential_status": credential_status,
                 "credential_warnings": credential_warnings,
+                "run_mode": run_mode,
             }
             if parent_run_id:
                 record["parent_run_id"] = parent_run_id
@@ -230,6 +235,7 @@ class RunManager:
                 "ads_api_token": ads_api_token,
                 "unpaywall_email": unpaywall_email,
                 "crossref_mailto": crossref_mailto,
+                "run_mode": run_mode,
             }
             if seed_state is not None:
                 # Memory-only, consumed once by the worker (like credentials).
@@ -364,7 +370,16 @@ class RunManager:
             config.output_dir = str(run_dir)
             config.verbose = False
             config.interactive = False
+            run_mode = credentials.get("run_mode", "standard")
+            if run_mode == "fast":
+                config.apply_fast_mode_preset()
             model_name = credentials.get("model_name", "")
+            if run_mode == "fast" and str(model_name or "").strip() in (
+                "", "qwen3.7-plus"
+            ):
+                # Fast mode should use the fast preset model unless the user
+                # explicitly chose a different model in the UI.
+                model_name = ""
             qwen_api_key = credentials.get("qwen_api_key", "")
             semantic_scholar_api_key = credentials.get(
                 "semantic_scholar_api_key", ""
@@ -432,6 +447,7 @@ class RunManager:
                 "credential_warnings": list(
                     self._runs[run_id].get("credential_warnings", [])
                 ),
+                "run_mode": run_mode,
                 "output_dir": str(run_dir),
             }
             if followup_info:
@@ -530,6 +546,7 @@ class RunManager:
                 "credential_warnings": list(
                     self._runs[run_id].get("credential_warnings", [])
                 ),
+                "run_mode": run_mode,
                 "output_dir": str(run_dir),
             }
             if followup_info:
@@ -1129,6 +1146,7 @@ class HypoForgeRequestHandler(BaseHTTPRequestHandler):
                 parent_run_id=payload.get("parent_run_id", ""),
                 followup=payload.get("followup", ""),
                 resume_of=payload.get("resume_of", ""),
+                run_mode=payload.get("run_mode", "standard"),
             )
         except ValueError as exc:
             self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)

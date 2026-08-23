@@ -227,6 +227,8 @@ class PipelineConfig(BaseModel):
     log_level: str = "INFO"  # DEBUG / INFO / WARNING / ERROR
     interactive: bool = False  # solicit human guidance between iterations (the CLI enables this)
     advanced_model_tiers: bool = False
+    # Fast mode: a one-pass, fallback-friendly preset used by Web UI / CLI.
+    run_mode: Literal["standard", "fast"] = "standard"
 
     # ---- model tier assignment (used when advanced_model_tiers=False or as
     #      explicit overrides; "base" uses the primary model for everything) ----
@@ -367,6 +369,110 @@ class PipelineConfig(BaseModel):
     def from_defaults(cls) -> "PipelineConfig":
         """Return a config with all defaults (no YAML file needed)."""
         return cls()
+
+    def apply_fast_mode_preset(self) -> "PipelineConfig":
+        """Apply the fast/quick-run preset in-place.
+
+        Fast mode intentionally trades evidence depth and strict quality gates
+        for a bounded one-pass run that always produces a usable result.
+        """
+        self.run_mode = "fast"
+        # Fast mode has no module-wide wall-clock deadline. Individual
+        # transport/tool calls remain bounded so a broken network can degrade
+        # to a fallback instead of hanging forever.
+        self.node_timeouts = {
+            "m1": 0.0,
+            "m2": 0.0,
+            "m3": 0.0,
+            "m4": 0.0,
+            "m5": 0.0,
+            "m6": 0.0,
+        }
+        self.node_timeout_default = 0.0
+        self.max_iterations = 1
+        self.max_evidence_gap_rounds = 0
+        self.enable_iteration = False
+        self.iteration_module_target = "m4"
+        # User-driven followups still need LLM triage. Only automatic review
+        # loops are disabled in fast mode.
+        self.followup_routing = True
+        self.m6_evidence_revisit = False
+        self.max_plan_revisions = 0
+        self.max_search_rounds = 1
+        self.supplement_paper_budget = 3
+        self.gap_no_improvement_limit = 1
+        self.gap_no_gain_limit = 1
+
+        # Use the fastest tier and reduce token budgets / timeouts.
+        fast_model = "qwen3.6-flash"
+        for tier in (self.qwen.base, self.qwen.max, self.qwen.plus, self.qwen.turbo):
+            tier.model = fast_model
+            tier.max_tokens = min(tier.max_tokens, 4096)
+            tier.request_timeout_seconds = min(tier.request_timeout_seconds, 120.0)
+
+        # Thin literature search: two sources, one round, abstracts only.
+        self.search.implementation = "agentic"
+        self.search.tools = ["openalex", "arxiv"]
+        self.search.papers_per_sub_question = 3
+        self.search.max_papers_total = 15
+        self.search.max_rounds = 1
+        self.search.max_queries = 6
+        self.search.max_tokens = 8000
+        self.search.max_seconds = 90
+        self.entity_embedding_model = ""
+        self.scoring.auto_score = False
+        self.memory_cache_dir = ""
+
+        self.module_overrides.setdefault("m1", ModuleOverride()).kwargs.update({
+            "mode": "llm",
+            "llm_tier": "turbo",
+            "fast_mode": True,
+            "coverage_max_rounds": 0,
+            "entity_repair_attempts": 0,
+            "requirement_repair_attempts": 0,
+        })
+        self.module_overrides.setdefault("m2", ModuleOverride()).kwargs.update({
+            "variant": "integrated",
+            "llm_tier": "turbo",
+            "domain_routing_enabled": False,
+            "fulltext_target_per_subquestion": 0,
+            "fulltext_backfill_max_attempts": 1,
+            "final_k": 2,
+            "subquestion_concurrency": 4,
+            "source_concurrency_limit": 3,
+            "fresh_run_timeout_seconds": 0.0,
+            "allow_empty_results": True,
+            "abstract_only": True,
+            "entity_embedding_model": "",
+        })
+        self.module_overrides.setdefault("m3", ModuleOverride()).kwargs.update({
+            "mode": "rule",
+            "llm_tier": "turbo",
+            "entity_merge_enabled": False,
+            "allow_empty_graph": True,
+            "enable_cross_batch": False,
+        })
+        self.module_overrides.setdefault("m4", ModuleOverride()).kwargs.update({
+            "mode": "fast",
+            "llm_tier": "turbo",
+            "num_candidates": 3,
+            "top_k": 1,
+            "llm_call_timeout": 90.0,
+            "total_time_budget_seconds": 0.0,
+            "fast_mode": True,
+        })
+        self.module_overrides.setdefault("m5", ModuleOverride()).kwargs.update({
+            "mode": "llm",
+            "llm_tier": "turbo",
+            "fast_mode": True,
+        })
+        self.module_overrides.setdefault("m6", ModuleOverride()).kwargs.update({
+            "mode": "llm",
+            "llm_tier": "turbo",
+            "reviewers": ["overall"],
+            "fast_mode": True,
+        })
+        return self
 
     def get_llm_for_tier(self, tier: str) -> LLMConfig:
         """Convenience: return the LLMConfig for a named model tier."""
