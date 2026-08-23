@@ -6869,6 +6869,7 @@ async def test_m4_critic_all_rejected_runs_gate_recovery() -> None:
     assert [card.hypothesis_id for card in survivors] == ["H3", "H4"]
     assert len(client.calls) == 5
     assert client.calls[0]["disable_thinking"] is True
+    assert client.calls[1]["disable_thinking"] is True
     assert client.calls[2]["disable_thinking"] is True
     assert client.calls[3]["disable_thinking"] is True
     assert client.calls[4]["disable_thinking"] is True
@@ -6876,6 +6877,41 @@ async def test_m4_critic_all_rejected_runs_gate_recovery() -> None:
     assert "missing mechanism" in client.calls[1]["user_prompt"]
     # gate recovery regeneration is capped at a small batch (C-3)
     assert "Generate 3 candidate hypotheses" in client.calls[1]["user_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_standard_m4_generator_timeout_retries_without_thinking(monkeypatch) -> None:
+    """A reasoning long-tail must get one bounded recovery pass, not kill M1-M6."""
+    from hypoforge.modules.m4_hypothesis_generation import M4HypothesisGeneration
+
+    module = M4HypothesisGeneration(
+        mode="direct",
+        fast_mode=False,
+        top_k=1,
+    )
+    module.client = object()
+    calls = []
+    recovered = HypothesisCard(
+        hypothesis_id="H-recovered",
+        statement="A recovered scientific hypothesis improves the measured outcome.",
+    )
+
+    async def generation(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise TimeoutError("simulated reasoning timeout")
+        return [recovered], [recovered], []
+
+    monkeypatch.setattr(module, "_generate_hypothesis_batch", generation)
+
+    output = await module._run_llm(PipelineState(input_question="Q"))
+
+    assert [item.hypothesis_id for item in output["top_hypotheses"]] == [
+        "H-recovered"
+    ]
+    assert len(calls) == 2
+    assert calls[1]["tool_name"] == "hypothesis_generator_timeout_recovery"
+    assert calls[1]["disable_thinking"] is True
 
 
 @pytest.mark.asyncio

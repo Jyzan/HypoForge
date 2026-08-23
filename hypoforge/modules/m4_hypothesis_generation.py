@@ -1200,6 +1200,7 @@ class M4HypothesisGeneration(ModuleProtocol):
         tool_name: str,
         attempt: int,
         requested_count: Optional[int] = None,
+        disable_thinking: Optional[bool] = None,
     ) -> tuple[Any, List[HypothesisCard], List[Dict[str, Any]]]:
         """Run one generator pass and apply the normal context gates.
 
@@ -1239,7 +1240,11 @@ class M4HypothesisGeneration(ModuleProtocol):
                 },
                 max_tokens=8192,
                 temperature=max(getattr(self.llm_config, "temperature", 0.1), 0.4),
-                disable_thinking=self.fast_mode,
+                disable_thinking=(
+                    self.fast_mode
+                    if disable_thinking is None
+                    else bool(disable_thinking)
+                ),
             ),
             details={
                 "requested_candidates": requested,
@@ -1340,6 +1345,40 @@ class M4HypothesisGeneration(ModuleProtocol):
                     attempt=1,
                 )
             )
+        except TimeoutError as exc:
+            if self.fast_mode:
+                logger.warning(
+                    "M4 fast-mode generator timed out; using deterministic "
+                    "fallback hypotheses so the run can continue."
+                )
+                generated = []
+                candidates = self._fast_fallback_hypotheses(state, question)
+                contract_failures = []
+            else:
+                # A per-call timeout is recoverable; exhaustion of the module's
+                # shared budget is not.  Preserve the outer deadline contract
+                # instead of starting a recovery call with no time remaining.
+                if (
+                    self._run_deadline is not None
+                    and self._run_deadline <= time.monotonic()
+                ):
+                    raise
+                logger.warning(
+                    "M4 reasoning-enabled generator timed out (%s); retrying "
+                    "once without extended thinking.",
+                    exc,
+                )
+                generated, candidates, contract_failures = (
+                    await self._generate_hypothesis_batch(
+                        state,
+                        question=question,
+                        graph_context=graph_context,
+                        feedback_context=feedback_context,
+                        tool_name="hypothesis_generator_timeout_recovery",
+                        attempt=2,
+                        disable_thinking=True,
+                    )
+                )
         except Exception as exc:
             if not self.fast_mode:
                 raise

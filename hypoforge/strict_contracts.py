@@ -1685,6 +1685,10 @@ class StrictM4HypothesisGeneration(M4HypothesisGeneration):
                     # Recovery only needs a few fresh candidates to merge with
                     # the rejected set — keep the pass small to bound the time.
                     requested_count=min(self.num_candidates, 3),
+                    # The gate has already supplied explicit, actionable
+                    # feedback.  A second long reasoning pass adds latency but
+                    # little diagnostic value, so keep recovery bounded.
+                    disable_thinking=True,
                 )
             )
         except Exception as regen_exc:
