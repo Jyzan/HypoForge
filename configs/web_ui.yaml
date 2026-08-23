@@ -110,7 +110,10 @@ module_overrides:
       fresh_run_timeout_seconds: 840.0
       source_timeout_seconds: 30.0
       scout_timeout_seconds: 60.0
-      scout_candidate_limit: 24
+      # Semantic Scout reads at most two 8-paper batches.  Lower-ranked tail
+      # papers remain in the pool with the existing conservative lexical
+      # notes, so this bounds LLM cost without silently dropping candidates.
+      scout_candidate_limit: 16
       arxiv_download_timeout_seconds: 90.0
       resolver_timeout_seconds: 90.0
       reader_timeout_seconds: 75.0

@@ -12483,6 +12483,15 @@ def test_fast_preset_disables_iteration_and_sets_quick_switches() -> None:
     assert config.module_overrides["m2"].kwargs["scout_max_tokens"] == 3072
 
 
+def test_web_standard_mode_bounds_semantic_scout_pool() -> None:
+    """Standard web runs keep a wide pool but avoid a third 8-paper LLM batch."""
+    from hypoforge.config import PipelineConfig
+
+    config = PipelineConfig.from_yaml("configs/web_ui.yaml")
+
+    assert config.module_overrides["m2"].kwargs["scout_candidate_limit"] == 16
+
+
 def test_fast_mode_keeps_user_followup_routes_but_disables_internal_loops() -> None:
     """Fast followups still need M1→M4 and M1→M2 routing choices."""
     from hypoforge.config import PipelineConfig
