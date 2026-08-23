@@ -245,9 +245,11 @@ class M1ProblemUnderstanding(ModuleProtocol):
         requirement_repair_attempts: int = 1,
         followup_routing: bool = False,
         followup_triage_confidence_threshold: float = 0.75,
+        fast_mode: bool = False,
         **kwargs,
     ):
         self.mode = mode
+        self.fast_mode = bool(fast_mode)
         self.llm_config = llm_config
         self.coverage_max_rounds = max(0, int(coverage_max_rounds))
         self.entity_repair_attempts = max(0, int(entity_repair_attempts))
@@ -303,6 +305,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
         )
         try:
             payload = await self.client.structured_chat(
+                disable_thinking=self.fast_mode,
                 system_prompt=M1_SYSTEM_PROMPT,
                 user_prompt=M1_USER_TEMPLATE.format(question=question),
                 output_schema=_CandidateDecomposition.model_json_schema(),
@@ -329,6 +332,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
                 "Return corrected domains and sub-questions only.",
             ])
             retry_payload = await self.client.structured_chat(
+                disable_thinking=self.fast_mode,
                 system_prompt=M1_SYSTEM_PROMPT,
                 user_prompt=retry_prompt,
                 output_schema=_CandidateDecomposition.model_json_schema(),
@@ -405,7 +409,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
             for item in sub_questions
             if str(item or "").strip()
         ))
-        if not questions or self.coverage_max_rounds <= 0:
+        if not questions or self.fast_mode or self.coverage_max_rounds <= 0:
             return questions
 
         started_at = time.monotonic()
@@ -415,6 +419,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
 
         for round_index in range(1, self.coverage_max_rounds + 1):
             payload = await self.client.structured_chat(
+                disable_thinking=self.fast_mode,
                 system_prompt=M1_COVERAGE_CHECK_SYSTEM_PROMPT,
                 user_prompt=M1_COVERAGE_CHECK_USER_TEMPLATE.format(
                     question=question,
@@ -459,6 +464,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
 
             if audit.over_fragmented:
                 merged_payload = await self.client.structured_chat(
+                disable_thinking=self.fast_mode,
                     system_prompt=M1_COVERAGE_MERGE_SYSTEM_PROMPT,
                     user_prompt=M1_COVERAGE_MERGE_USER_TEMPLATE.format(
                         question=question,
@@ -480,6 +486,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
 
             if not audit.sufficient:
                 supplement_payload = await self.client.structured_chat(
+                disable_thinking=self.fast_mode,
                     system_prompt=M1_COVERAGE_SUPPLEMENT_SYSTEM_PROMPT,
                     user_prompt=M1_COVERAGE_SUPPLEMENT_USER_TEMPLATE.format(
                         question=question,
@@ -516,6 +523,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
                 )
 
         final_payload = await self.client.structured_chat(
+                disable_thinking=self.fast_mode,
             system_prompt=M1_COVERAGE_CHECK_SYSTEM_PROMPT,
             user_prompt=M1_COVERAGE_CHECK_USER_TEMPLATE.format(
                 question=question,
@@ -553,6 +561,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
 
         rendered = "\n".join(f"- {item}" for item in sub_questions)
         payload = await self.client.structured_chat(
+                disable_thinking=self.fast_mode,
             system_prompt=M1_COVERAGE_MERGE_SYSTEM_PROMPT,
             user_prompt=M1_COVERAGE_MERGE_USER_TEMPLATE.format(
                 question=question,
@@ -614,6 +623,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
                     audit_feedback=audit_feedback,
                 )
             candidate_payload = await self.client.structured_chat(
+                disable_thinking=self.fast_mode,
                 system_prompt=M1_ENTITY_EXTRACTION_SYSTEM_PROMPT,
                 user_prompt=extraction_prompt,
                 output_schema=_CandidateEntityList.model_json_schema(),
@@ -621,7 +631,36 @@ class M1ProblemUnderstanding(ModuleProtocol):
                 temperature=0.0,
             )
             candidate_list = _CandidateEntityList.model_validate(candidate_payload)
+            if self.fast_mode:
+                accepted: List[TaskEntity] = []
+                seen: set[str] = set()
+                for candidate in candidate_list.entities:
+                    name = self._normalize_source_text(candidate.name)
+                    mention = self._normalize_source_text(candidate.source_mention)
+                    if (
+                        not name
+                        or not self._is_english_output(candidate.name)
+                        or not mention
+                        or mention not in source
+                        or name in seen
+                    ):
+                        continue
+                    seen.add(name)
+                    accepted.append(TaskEntity(
+                        entity_id=f"E{len(accepted) + 1}",
+                        name=candidate.name,
+                        source_mention=candidate.source_mention,
+                        aliases=candidate.aliases,
+                        role=candidate.role,
+                        required=candidate.required,
+                    ))
+                if not accepted:
+                    raise ValueError(
+                        "fast M1 entity extraction returned no grounded entities"
+                    )
+                return accepted
             audit_payload = await self.client.structured_chat(
+                disable_thinking=self.fast_mode,
                 system_prompt=M1_ENTITY_AUDIT_SYSTEM_PROMPT,
                 user_prompt=M1_ENTITY_AUDIT_USER_TEMPLATE.format(
                     question=question,
@@ -762,6 +801,39 @@ class M1ProblemUnderstanding(ModuleProtocol):
     ) -> List[TaskRequirement]:
         """Map final questions onto immutable, audited entity IDs."""
 
+        if self.fast_mode:
+            primary = next(
+                (
+                    item
+                    for item in entities
+                    if item.role == "primary_object" and item.required
+                ),
+                next(
+                    (item for item in entities if item.role == "primary_object"),
+                    entities[0] if entities else None,
+                ),
+            )
+            if primary is None:
+                raise ValueError(
+                    "fast M1 requirement mapping has no extracted task entity"
+                )
+            related_ids = [
+                item.entity_id
+                for item in entities
+                if item.entity_id != primary.entity_id and item.required
+            ]
+            return [
+                TaskRequirement(
+                    requirement_id=f"R{index}",
+                    sub_question=question,
+                    primary_entity_id=primary.entity_id,
+                    related_entity_ids=list(related_ids),
+                    relation=" ".join(question.split()).rstrip("?"),
+                    required=True,
+                )
+                for index, question in enumerate(sub_questions, start=1)
+            ]
+
         questions_json = json.dumps(sub_questions, ensure_ascii=False, indent=2)
         entities_json = json.dumps(
             [item.model_dump(mode="json") for item in entities],
@@ -777,6 +849,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
                     "Rebuild it using exactly the listed questions and entity IDs."
                 )
             payload = await self.client.structured_chat(
+                disable_thinking=self.fast_mode,
                 system_prompt=M1_REQUIREMENT_SYSTEM_PROMPT,
                 user_prompt=M1_REQUIREMENT_USER_TEMPLATE.format(
                     sub_questions_json=questions_json,
@@ -840,6 +913,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
         )
         try:
             payload = await self.client.structured_chat(
+                disable_thinking=self.fast_mode,
                 system_prompt=M1_FOLLOWUP_SYSTEM_PROMPT,
                 user_prompt=M1_FOLLOWUP_USER_TEMPLATE.format(
                     problem_card_json=problem_card_json,

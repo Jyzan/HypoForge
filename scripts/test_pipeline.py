@@ -169,6 +169,29 @@ async def test_core_intent_missing_after_budget_fails_closed() -> None:
             "如何实现机械臂策略迁移？",
             ["What is the simulation environment?"],
         )
+
+
+@pytest.mark.asyncio
+async def test_fast_m1_skips_subquestion_coverage_audit() -> None:
+    """Fast mode must keep the initial decomposition without an audit call."""
+
+    questions = ["How can a non-multimodal model understand images?"]
+    module = M1ProblemUnderstanding(
+        mode="llm",
+        fast_mode=True,
+        coverage_max_rounds=2,
+    )
+    module.client = SequenceClient([])
+
+    result = await module._check_subquestion_coverage(
+        "如何让非多模态模型理解图片？",
+        questions,
+    )
+
+    assert result == questions
+    assert module.client.calls == []
+
+
 def test_atomic_validator_rejects_packed_parallel_question() -> None:
     violations = M1ProblemUnderstanding._sub_question_violations([
         "离线强化学习如何迁移；摩擦力变化又如何处理？？"
@@ -478,6 +501,34 @@ async def test_entity_audit_missing_term_triggers_one_repair_and_reaudit() -> No
 
 
 @pytest.mark.asyncio
+async def test_fast_m1_accepts_grounded_entities_without_source_audit() -> None:
+    """A missed secondary entity cannot terminate fast M1 during an audit."""
+
+    module = M1ProblemUnderstanding(
+        mode="llm",
+        fast_mode=True,
+        entity_repair_attempts=1,
+    )
+    module.client = EntityClient([{
+        "entities": [
+            candidate(
+                "non-multimodal model",
+                role="primary_object",
+                required=True,
+                mention="非多模态模型",
+            ),
+        ],
+    }])
+
+    entities = await module._extract_and_audit_entities(
+        "如何让非多模态模型理解图片？"
+    )
+
+    assert [entity.name for entity in entities] == ["non-multimodal model"]
+    assert len(module.client.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_entity_prompts_never_receive_generated_subquestions() -> None:
     module = entity_module([
         {"entities": [candidate("robot arm", role="primary_object", required=True, mention="机械臂")]},
@@ -546,6 +597,42 @@ async def test_requirement_builder_maps_each_final_question_exactly_once() -> No
     assert {item.primary_entity_id for item in requirements} == {"E1"}
     prompt = module.client.calls[0]["user_prompt"]
     assert "E1" in prompt and "E2" in prompt
+
+
+@pytest.mark.asyncio
+async def test_fast_m1_builds_requirements_without_llm_mapping_audit() -> None:
+    """Fast M1 deterministically maps questions so malformed LLM output cannot block it."""
+
+    questions = [
+        "How can a non-multimodal model understand images?",
+        "How should image understanding be evaluated?",
+    ]
+    entities = [
+        TaskEntity(
+            entity_id="E1",
+            name="non-multimodal model",
+            source_mention="非多模态模型",
+            role="primary_object",
+            required=True,
+        ),
+        TaskEntity(
+            entity_id="E2",
+            name="image",
+            source_mention="图片",
+            role="outcome",
+            required=True,
+        ),
+    ]
+    module = M1ProblemUnderstanding(mode="llm", fast_mode=True)
+    module.client = EntityClient([])
+
+    requirements = await module._build_requirements(questions, entities)
+
+    assert [item.requirement_id for item in requirements] == ["R1", "R2"]
+    assert [item.sub_question for item in requirements] == questions
+    assert {item.primary_entity_id for item in requirements} == {"E1"}
+    assert all(item.related_entity_ids == ["E2"] for item in requirements)
+    assert module.client.calls == []
 
 
 @pytest.mark.asyncio
@@ -10818,3 +10905,269 @@ if __name__ == "__main__":
         print("[PASS] Reason-before-score field order")
         print("\nAll offline unit tests passed!")
     asyncio.run(_run_all())
+
+
+# ---------------------------------------------------------------------------
+# Fast mode (new)
+# ---------------------------------------------------------------------------
+
+def test_fast_preset_disables_iteration_and_sets_quick_switches() -> None:
+    """Fast preset must be a one-pass config with reduced search and no review loops."""
+    from hypoforge.config import PipelineConfig
+
+    config = PipelineConfig()
+    config.apply_fast_mode_preset()
+
+    assert config.run_mode == "fast"
+    assert config.enable_iteration is False
+    assert config.m6_evidence_revisit is False
+    assert config.followup_routing is True
+    assert config.max_iterations == 1
+    assert config.max_search_rounds == 1
+    assert config.search.max_rounds == 1
+    assert config.search.max_queries == 6
+    assert config.scoring.auto_score is False
+    assert config.module_overrides["m4"].kwargs["mode"] == "fast"
+    assert config.module_overrides["m4"].kwargs["fast_mode"] is True
+    assert config.module_overrides["m6"].kwargs["fast_mode"] is True
+    assert config.module_overrides["m6"].kwargs["reviewers"] == ["overall"]
+    assert config.module_overrides["m2"].kwargs["abstract_only"] is True
+    assert config.module_overrides["m2"].kwargs["fulltext_target_per_subquestion"] == 0
+
+
+def test_fast_mode_keeps_user_followup_routes_but_disables_internal_loops() -> None:
+    """Fast followups still need M1→M4 and M1→M2 routing choices."""
+    from hypoforge.config import PipelineConfig
+
+    config = PipelineConfig(verbose=False)
+    config.apply_fast_mode_preset()
+    edges = _edges_of(config)
+
+    assert ("m1", "m4") in edges
+    assert ("m1", "m2") in edges
+    assert ("m6", "m2") not in edges
+    assert ("m6", "m4") not in edges
+
+
+def test_fast_preset_has_no_module_total_deadlines_and_uses_rule_m3() -> None:
+    """No outer/shared deadline may pre-empt fast-mode fallbacks."""
+    from hypoforge.config import PipelineConfig
+
+    config = PipelineConfig()
+    config.apply_fast_mode_preset()
+
+    assert config.node_timeout_default == 0.0
+    assert set(config.node_timeouts.values()) == {0.0}
+    assert config.module_overrides["m2"].kwargs["fresh_run_timeout_seconds"] == 0.0
+    assert config.module_overrides["m2"].kwargs["allow_empty_results"] is True
+    assert config.module_overrides["m3"].kwargs["mode"] == "rule"
+    assert config.module_overrides["m3"].kwargs["allow_empty_graph"] is True
+    assert config.module_overrides["m3"].kwargs["enable_cross_batch"] is False
+    assert config.module_overrides["m4"].kwargs["total_time_budget_seconds"] == 0.0
+
+
+def test_fast_preset_reaches_the_strict_runtime_modules() -> None:
+    """Strict facade replacement must preserve fast-mode resilience flags."""
+    from hypoforge import modules as _modules  # noqa: F401
+    from hypoforge.config import PipelineConfig
+    from hypoforge.registry import ModuleRegistry
+
+    config = PipelineConfig.from_yaml("configs/web_ui.yaml")
+    config.apply_fast_mode_preset()
+    modules = ModuleRegistry.build_all(config)
+
+    assert modules["m1"].fast_mode is True
+    assert modules["m2"].adapter.fresh_run_timeout_seconds == 0.0
+    assert modules["m2"].adapter.allow_empty_results is True
+    assert modules["m3"].mode == "rule"
+    assert modules["m3"].allow_empty_graph is True
+
+
+@pytest.mark.asyncio
+async def test_zero_fresh_m2_deadline_waits_for_workers_to_finish() -> None:
+    """A zero shared deadline means wait for completion, not immediate timeout."""
+    question = "atomic question 1"
+    adapter = AgenticM2Adapter(
+        search_agent=_ConcurrentFreshSearchAgent(),
+        reading_workflow=EchoReadingWorkflow(with_evidence=True),
+        fresh_run_timeout_seconds=0,
+    )
+    state = PipelineState(
+        input_question="Q",
+        problem_card=ProblemCard(
+            original_question="Q",
+            sub_questions=[question],
+            key_entities=["object"],
+            domain=["science"],
+        ),
+    )
+
+    output = await adapter(state)
+
+    assert output["literature_results"][0].papers_retrieved == 1
+
+
+@pytest.mark.asyncio
+async def test_fast_m2_exports_failures_when_every_subquestion_fails() -> None:
+    """Fast mode records real source failures and lets downstream fallbacks run."""
+    questions = ["atomic question 1", "atomic question 2"]
+    adapter = AgenticM2Adapter(
+        search_agent=_ConcurrentFreshSearchAgent(failing_questions=set(questions)),
+        reading_workflow=EchoReadingWorkflow(with_evidence=True),
+        fresh_run_timeout_seconds=0,
+        allow_empty_results=True,
+    )
+    state = PipelineState(
+        input_question="Q",
+        problem_card=ProblemCard(
+            original_question="Q",
+            sub_questions=questions,
+            key_entities=["object"],
+            domain=["science"],
+        ),
+    )
+
+    output = await adapter(state)
+
+    assert [item.papers_retrieved for item in output["literature_results"]] == [0, 0]
+    assert all(
+        run.search_provenance.stop_reason == "error"
+        for run in output["m2_knowledge_export"].runs
+    )
+    assert len(output["errors"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_fast_rule_m3_allows_an_auditable_empty_graph() -> None:
+    """A real zero-evidence M2 result must not block fast-mode scheme generation."""
+    from hypoforge.modules.m3_evidence_graph import M3EvidenceGraph
+
+    module = M3EvidenceGraph(
+        mode="rule",
+        allow_empty_graph=True,
+        entity_merge_enabled=False,
+    )
+
+    output = await module(PipelineState(input_question="Q"))
+
+    assert output["evidence_graph"].nodes == []
+    assert output["evidence_graph"].edges == []
+    assert output["metrics"]["m3_degraded_empty_graph"] is True
+
+
+@pytest.mark.asyncio
+async def test_fast_m4_second_generator_failure_uses_fallback(monkeypatch) -> None:
+    """The optional second generation attempt cannot terminate a fast run."""
+    from hypoforge.modules.m4_hypothesis_generation import M4HypothesisGeneration
+
+    module = M4HypothesisGeneration(mode="fast", fast_mode=True, top_k=1)
+    module.client = object()
+    calls = 0
+
+    async def generation(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return [], [], []
+        raise TimeoutError("simulated retry timeout")
+
+    monkeypatch.setattr(module, "_generate_hypothesis_batch", generation)
+
+    output = await module._run_llm(PipelineState(input_question="Q"))
+
+    assert len(output["candidate_hypotheses"]) == 3
+    assert len(output["top_hypotheses"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_fast_m4_contract_repair_failure_uses_fallback(monkeypatch) -> None:
+    """A failed final repair call cannot terminate a fast run."""
+    from hypoforge.modules.m4_hypothesis_generation import M4HypothesisGeneration
+
+    module = M4HypothesisGeneration(mode="fast", fast_mode=True, top_k=1)
+    module.client = object()
+
+    async def empty_generation(*args, **kwargs):
+        return [], [], []
+
+    async def failed_repair(*args, **kwargs):
+        raise TimeoutError("simulated repair timeout")
+
+    monkeypatch.setattr(module, "_generate_hypothesis_batch", empty_generation)
+    monkeypatch.setattr(module, "_repair_context_contract", failed_repair)
+
+    output = await module._run_llm(PipelineState(input_question="Q"))
+
+    assert len(output["candidate_hypotheses"]) == 3
+    assert len(output["top_hypotheses"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_fast_m5_malformed_model_payload_uses_fallback_plan() -> None:
+    """Schema-invalid model output must degrade to a usable plan in fast mode."""
+    from hypoforge.modules.m5_research_plan import M5ResearchPlan
+
+    class MalformedPlanClient:
+        async def structured_chat(self, **kwargs):
+            return {}
+
+    hypothesis = HypothesisCard(hypothesis_id="H-fast", statement="Test hypothesis")
+    module = M5ResearchPlan(fast_mode=True)
+    module.client = MalformedPlanClient()
+
+    output = await module(PipelineState(
+        input_question="Q",
+        top_hypotheses=[hypothesis],
+    ))
+
+    assert len(output["research_plans"]) == 1
+    assert output["research_plans"][0].hypothesis_id == "H-fast"
+    assert output["research_plans"][0].procedures
+
+
+def test_fast_m4_fallback_always_returns_three_hypotheses() -> None:
+    """Fast mode's deterministic fallback must never leave M4 empty."""
+    from hypoforge.modules.m4_hypothesis_generation import M4HypothesisGeneration
+    from hypoforge.state import PipelineState
+
+    module = M4HypothesisGeneration(mode="fast", fast_mode=True)
+    cards = module._fast_fallback_hypotheses(
+        PipelineState(input_question="How can an AI model develop sentience?"),
+        "How can an AI model develop sentience?",
+    )
+
+    assert len(cards) == 3
+    assert all(card.statement for card in cards)
+    assert all(card.hypothesis_id for card in cards)
+
+
+def test_fast_mode_pipeline_runner_exposes_fast_config() -> None:
+    """PipelineRunner uses fast config without standard routing edges."""
+    from hypoforge.config import PipelineConfig
+    from hypoforge.pipeline import PipelineRunner
+
+    config = PipelineConfig()
+    config.apply_fast_mode_preset()
+    runner = PipelineRunner(config)
+
+    assert runner.config.run_mode == "fast"
+    assert runner.config.enable_iteration is False
+    assert runner.config.m6_evidence_revisit is False
+
+
+def test_fast_m5_fallback_returns_plan() -> None:
+    """Fast mode M5 fallback always returns a research plan for a hypothesis."""
+    from hypoforge.modules.m5_research_plan import M5ResearchPlan
+    from hypoforge.state import PipelineState
+
+    class FakeH:
+        hypothesis_id = "H-fallback"
+
+    plan = M5ResearchPlan._fast_fallback_plan(
+        PipelineState(input_question="Test question"),
+        FakeH(),
+        rationale="fast fallback",
+    )
+    assert plan.hypothesis_id == "H-fallback"
+    assert plan.study_subjects
+    assert plan.procedures

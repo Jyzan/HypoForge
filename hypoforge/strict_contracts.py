@@ -1034,6 +1034,7 @@ class StrictM2LiteratureSearch(M2LiteratureSearch):
             preprint_supplement_max_attempts=base.preprint_supplement_max_attempts,
             subquestion_concurrency=base.subquestion_concurrency,
             fresh_run_timeout_seconds=base.fresh_run_timeout_seconds,
+            allow_empty_results=base.allow_empty_results,
         )
 
 

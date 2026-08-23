@@ -105,8 +105,10 @@ class M6ReviewIteration(ModuleProtocol):
         gap_no_gain_limit: int = 3,
         semantic_alignment_timeout_seconds: float = 60.0,
         reviewer_timeout_seconds: float = 180.0,
+        fast_mode: bool = False,
         **kwargs,
     ):
+        self.fast_mode = bool(fast_mode)
         if semantic_alignment_timeout_seconds <= 0:
             raise ValueError(
                 "semantic_alignment_timeout_seconds must be positive"
@@ -284,9 +286,18 @@ class M6ReviewIteration(ModuleProtocol):
             semantic_client=None,
             required_requirement_ids=(hypothesis_requirement_ids or None),
         )
-        semantic_alignment_passed, semantic_alignment_rationale = (
-            await self._audit_pair_semantics(state, hypothesis, plan)
-        )
+        if self.fast_mode:
+            # Fast mode skips the extra task-object semantic LLM call.  The
+            # deterministic lexical alignment above is sufficient for a
+            # quick review; the run always ends after this pass.
+            semantic_alignment_passed = True
+            semantic_alignment_rationale = (
+                "fast mode: semantic pair audit skipped for speed"
+            )
+        else:
+            semantic_alignment_passed, semantic_alignment_rationale = (
+                await self._audit_pair_semantics(state, hypothesis, plan)
+            )
         deterministic_alignment_passed = (
             hypothesis_alignment.passed
             and plan_alignment.passed
@@ -482,16 +493,18 @@ class M6ReviewIteration(ModuleProtocol):
             ))
 
             # 4. Metrics
-            knowledge_entries = _collect_knowledge_entries(state)
-            # score_hypothesis_async runs all implemented independent metrics
-            metric_report = await score_hypothesis_async(
-                hypothesis,
-                knowledge_entries,
-                llm_config=getattr(config, "llm", None),
-                embed_config=getattr(config, "embedding", None),
-                evidence_graph=state.evidence_graph
-            )
-            independent_metrics = metric_report.get("independent", {})
+            independent_metrics = {}
+            if not self.fast_mode:
+                knowledge_entries = _collect_knowledge_entries(state)
+                # score_hypothesis_async runs all implemented independent metrics
+                metric_report = await score_hypothesis_async(
+                    hypothesis,
+                    knowledge_entries,
+                    llm_config=getattr(config, "llm", None),
+                    embed_config=getattr(config, "embedding", None),
+                    evidence_graph=state.evidence_graph
+                )
+                independent_metrics = metric_report.get("independent", {})
             for m_name, m_score in independent_metrics.items():
                 m_score_scaled = m_score * 5.0
                 threshold = 1.5 if m_name == "novelty" else 2.5
@@ -578,7 +591,7 @@ class M6ReviewIteration(ModuleProtocol):
 
         # --- iteration core: evidence-sufficiency verdict (fail-closed) ---
         # Exactly ONE extra structured call, only when the switch is on.
-        if self.m6_evidence_revisit:
+        if self.m6_evidence_revisit and not self.fast_mode:
             verdict = await self._judge_evidence_sufficiency(
                 state, hypothesis, plan, version
             )

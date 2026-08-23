@@ -91,6 +91,13 @@ def main():
             "the follow-up question."
         ),
     )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="standard",
+        choices=["standard", "fast"],
+        help="Run mode: standard (full search/iteration) or fast (one-pass, ~5 min).",
+    )
 
     args = parser.parse_args()
 
@@ -117,6 +124,10 @@ def main():
     except Exception as exc:
         print(f"Error loading config: {exc}")
         sys.exit(1)
+
+    # ---- fast mode preset ----
+    if args.mode == "fast":
+        config.apply_fast_mode_preset()
 
     # ---- override enabled modules (subset reuse) ----
     if args.modules:

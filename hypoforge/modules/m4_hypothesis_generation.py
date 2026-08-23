@@ -117,11 +117,13 @@ class M4HypothesisGeneration(ModuleProtocol):
         llm_call_timeout: float = 240.0,
         total_time_budget_seconds: float = 540.0,
         semantic_alignment_timeout_seconds: float = 60.0,
+        fast_mode: bool = False,
         **kwargs,
     ):
         self.num_candidates = num_candidates
         self.top_k = top_k
         self.mode = mode
+        self.fast_mode = bool(fast_mode)
         self.llm_config = llm_config
         # Composite weights come from a single source (PipelineConfig.scoring →
         # rubric defaults); the ranker prompt and the recompute below share them.
@@ -137,8 +139,8 @@ class M4HypothesisGeneration(ModuleProtocol):
         # Per-LLM-call ceiling: a single hung or queued call must not silently
         # consume the whole node budget (mirrors m3's llm_call_timeout).
         self.llm_call_timeout = max(10.0, float(llm_call_timeout))
-        if total_time_budget_seconds <= 0:
-            raise ValueError("total_time_budget_seconds must be positive")
+        if total_time_budget_seconds < 0:
+            raise ValueError("total_time_budget_seconds cannot be negative")
         self.total_time_budget_seconds = float(total_time_budget_seconds)
         self._run_deadline: float | None = None
         self.client = QwenClient.from_config(llm_config) if llm_config else None
@@ -1204,6 +1206,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                 },
                 max_tokens=8192,
                 temperature=max(getattr(self.llm_config, "temperature", 0.1), 0.4),
+                disable_thinking=self.fast_mode,
             ),
             details={
                 "requested_candidates": requested,
@@ -1217,11 +1220,69 @@ class M4HypothesisGeneration(ModuleProtocol):
         candidates, contract_failures = self._check_context_contract(
             state, graph_context, candidates, semantic_client=None,
         )
-        candidates, semantic_failures = await self._audit_context_contract_semantics(
-            state, candidates
-        )
+        if self.fast_mode:
+            # Fast mode skips the extra semantic-object LLM audit; the
+            # deterministic contract check is enough to keep the run moving.
+            semantic_failures = []
+        else:
+            candidates, semantic_failures = (
+                await self._audit_context_contract_semantics(
+                    state, candidates
+                )
+            )
         contract_failures.extend(semantic_failures)
         return generated, candidates, contract_failures
+
+    def _fast_fallback_hypotheses(
+        self,
+        state: PipelineState,
+        question: str,
+    ) -> List[HypothesisCard]:
+        """Deterministic last-resort hypotheses so fast mode never stalls.
+
+        These are deliberately generic and marked as fast-mode fallback; they
+        are only used when the LLM/contract pipeline produced no usable
+        hypothesis at all.
+        """
+        q = " ".join(str(question or state.input_question or "").split())
+        if not q:
+            q = "the given scientific question"
+        statements = [
+            (
+                f"A systematic experimental investigation of '{q}' is needed to "
+                "identify the primary causal or mechanistic factors."
+            ),
+            (
+                f"A controlled multi-metric comparison of candidate approaches to "
+                "'{q}' can reveal which strategy yields the most robust improvement."
+            ),
+            (
+                f"An iterative model-building and validation cycle is the most "
+                "practical route to making progress on '{q}'."
+            ),
+        ]
+        return [
+            HypothesisCard(
+                hypothesis_id=f"FH{index}",
+                statement=statement,
+                mechanism=(
+                    "Fast-mode fallback: systematic investigation, controlled "
+                    "comparison, and iterative validation."
+                ),
+                observable_predictions=[
+                    "The proposed approach produces measurable, reproducible progress.",
+                    "Comparator baselines differ in at least one clearly defined metric.",
+                    "Iteration improves the primary outcome compared with a single-pass baseline.",
+                ],
+                falsification_conditions=[
+                    "No measurable difference is observed between intervention and control.",
+                    "The effect cannot be reproduced in an independent run.",
+                ],
+                scores={"composite": 0.5 - index * 0.01},
+                ranking_rationale="Fast-mode deterministic fallback hypothesis.",
+            )
+            for index, statement in enumerate(statements, start=1)
+        ]
 
     async def _run_llm(self, state: PipelineState, feedback_context: str = "") -> Dict[str, Any]:
         assert self.client is not None
@@ -1236,14 +1297,29 @@ class M4HypothesisGeneration(ModuleProtocol):
             feedback_context = self._task_contract_reminder(state) + feedback_context
 
         # ── Step 1: Generator ──────────────────────────────────────────
-        generated, candidates, contract_failures = await self._generate_hypothesis_batch(
-            state,
-            question=question,
-            graph_context=graph_context,
-            feedback_context=feedback_context,
-            tool_name="hypothesis_generator",
-            attempt=1,
-        )
+        try:
+            generated, candidates, contract_failures = (
+                await self._generate_hypothesis_batch(
+                    state,
+                    question=question,
+                    graph_context=graph_context,
+                    feedback_context=feedback_context,
+                    tool_name="hypothesis_generator",
+                    attempt=1,
+                )
+            )
+        except Exception as exc:
+            if not self.fast_mode:
+                raise
+            logger.warning(
+                "M4 fast-mode generator failed (%s: %s); using deterministic "
+                "fallback hypotheses so the run can continue.",
+                type(exc).__name__,
+                exc,
+            )
+            generated = []
+            candidates = self._fast_fallback_hypotheses(state, question)
+            contract_failures = []
         all_generated = list(self._normalise_hypotheses(generated))
 
         # A short — or empty — generator response is recoverable.  Give the
@@ -1275,33 +1351,63 @@ class M4HypothesisGeneration(ModuleProtocol):
                     "auditable requirement traces in scope):\n- "
                     + "\n- ".join(rationale_lines)
                 )
-            retry_generated, retry_candidates, retry_failures = (
-                await self._generate_hypothesis_batch(
-                    state,
-                    question=question,
-                    graph_context=graph_context,
-                    feedback_context="\n".join(
-                        item for item in [feedback_context, retry_feedback] if item
-                    ),
-                    tool_name="hypothesis_generator_retry",
-                    attempt=2,
+            try:
+                retry_generated, retry_candidates, retry_failures = (
+                    await self._generate_hypothesis_batch(
+                        state,
+                        question=question,
+                        graph_context=graph_context,
+                        feedback_context="\n".join(
+                            item for item in [feedback_context, retry_feedback] if item
+                        ),
+                        tool_name="hypothesis_generator_retry",
+                        attempt=2,
+                    )
                 )
-            )
-            all_generated.extend(self._normalise_hypotheses(retry_generated))
-            candidates = self._merge_generation_candidates(candidates, retry_candidates)
-            contract_failures.extend(retry_failures)
+            except Exception as exc:
+                if not self.fast_mode:
+                    raise
+                logger.warning(
+                    "M4 fast-mode generator retry failed (%s: %s); using "
+                    "deterministic fallback hypotheses.",
+                    type(exc).__name__,
+                    exc,
+                )
+                candidates = self._fast_fallback_hypotheses(state, question)
+            else:
+                all_generated.extend(self._normalise_hypotheses(retry_generated))
+                candidates = self._merge_generation_candidates(
+                    candidates, retry_candidates
+                )
+                contract_failures.extend(retry_failures)
         generation_shortfall = bool(candidates) and len(candidates) < self.top_k
 
         if not candidates:
-            candidates, contract_failures = await self._repair_context_contract(
-                state=state,
-                context=graph_context,
-                candidates=all_generated,
-                failures=contract_failures,
-                feedback_context=feedback_context,
-            )
+            try:
+                candidates, contract_failures = await self._repair_context_contract(
+                    state=state,
+                    context=graph_context,
+                    candidates=all_generated,
+                    failures=contract_failures,
+                    feedback_context=feedback_context,
+                )
+            except Exception as exc:
+                if not self.fast_mode:
+                    raise
+                logger.warning(
+                    "M4 fast-mode contract repair failed (%s); using "
+                    "deterministic fallback hypotheses.",
+                    type(exc).__name__,
+                )
+                candidates = self._fast_fallback_hypotheses(state, question)
         if not candidates:
-            if generation_shortfall:
+            if self.fast_mode:
+                logger.warning(
+                    "M4 fast mode found no contract-valid hypotheses; using "
+                    "deterministic fallback hypotheses so the run can continue."
+                )
+                candidates = self._fast_fallback_hypotheses(state, question)
+            elif generation_shortfall:
                 logger.warning(
                     "M4 produced no task-contract-compliant hypotheses after "
                     "one retry; continuing with an empty candidate set."
@@ -1310,14 +1416,15 @@ class M4HypothesisGeneration(ModuleProtocol):
                     "candidate_hypotheses": [],
                     "top_hypotheses": [],
                 }
-            diagnostics = "; ".join(
-                str(item.get("rationale") or "contract validation failed")
-                for item in contract_failures[:3]
-            )
-            raise ValueError(
-                "M4 generator and one deterministic repair attempt returned no "
-                f"task-contract-compliant hypotheses: {diagnostics}"
-            )
+            else:
+                diagnostics = "; ".join(
+                    str(item.get("rationale") or "contract validation failed")
+                    for item in contract_failures[:3]
+                )
+                raise ValueError(
+                    "M4 generator and one deterministic repair attempt returned no "
+                    f"task-contract-compliant hypotheses: {diagnostics}"
+                )
 
         if self.mode != "multi_agent":
             top = self._rank_top(candidates)
@@ -1611,7 +1718,11 @@ class M4HypothesisGeneration(ModuleProtocol):
         guidance = list(state.user_guidance)
         feedback_context = self._build_feedback_context(state, guidance)
 
-        self._run_deadline = time.monotonic() + self.total_time_budget_seconds
+        self._run_deadline = (
+            time.monotonic() + self.total_time_budget_seconds
+            if self.total_time_budget_seconds > 0
+            else None
+        )
         try:
             result = await self._run_llm(state, feedback_context)
         finally:
@@ -1619,11 +1730,15 @@ class M4HypothesisGeneration(ModuleProtocol):
         result["user_guidance"] = guidance
         result["best_hypotheses"] = self._update_best(state, result.get("top_hypotheses", []))
         graph_context = build_graph_context(state)
-        gaps = self._update_evidence_gaps(
-            state,
-            result.get("top_hypotheses", []),
-            graph_context,
-        )
+        if self.fast_mode:
+            # Fast mode never routes M4 -> M2; keep the audit field clean.
+            gaps = []
+        else:
+            gaps = self._update_evidence_gaps(
+                state,
+                result.get("top_hypotheses", []),
+                graph_context,
+            )
         result["evidence_gap_requests"] = gaps
         pending = [gap for gap in gaps if gap.status == "pending"]
         if pending:
