@@ -622,6 +622,9 @@ class AgenticM2Adapter(ModuleProtocol):
         domains: Sequence[str],
         index: int,
         sub_question: str,
+        *,
+        origin_gap_ids: Sequence[str] = (),
+        origin_gap_request_ids: Sequence[str] = (),
     ) -> _SubquestionOutcome:
         """Run one fresh-search unit under the shared M2 concurrency limit."""
 
@@ -761,6 +764,12 @@ class AgenticM2Adapter(ModuleProtocol):
                 search_result,
                 reading_results,
             )
+            export_run = export_run.model_copy(update={
+                "origin_gap_ids": list(dict.fromkeys(origin_gap_ids)),
+                "origin_gap_request_ids": list(dict.fromkeys(
+                    origin_gap_request_ids
+                )),
+            })
             emit_event(
                 "tool_result",
                 module="m2",
@@ -792,6 +801,10 @@ class AgenticM2Adapter(ModuleProtocol):
                     sub_question=sub_question,
                     papers_retrieved=len(export_run.papers),
                     knowledge_entries=list(export_run.knowledge_entries),
+                    origin_gap_ids=list(export_run.origin_gap_ids),
+                    origin_gap_request_ids=list(
+                        export_run.origin_gap_request_ids
+                    ),
                 ),
                 executed_queries=tuple(
                     query.text for query in search_result.queries
@@ -823,10 +836,15 @@ class AgenticM2Adapter(ModuleProtocol):
         literature_results: list[LiteratureResult] = []
         export_runs: list[M2KnowledgeRun] = []
         tasks = {
-            asyncio.create_task(
-                self._run_fresh_subquestion(state, domains, index, sub_question)
-            ): (index, sub_question)
-            for index, sub_question in enumerate(sub_questions)
+            asyncio.create_task(self._run_fresh_subquestion(
+                state,
+                domains,
+                index,
+                search_task.question,
+                origin_gap_ids=search_task.m6_gap_ids,
+                origin_gap_request_ids=search_task.m4_gap_ids,
+            )): (index, search_task.question)
+            for index, search_task in enumerate(search_tasks)
         }
         try:
             done, pending = await asyncio.wait(
@@ -885,6 +903,7 @@ class AgenticM2Adapter(ModuleProtocol):
                 literature_results.append(outcome.literature_result)
                 continue
 
+            search_task = search_tasks[index]
             _, detail = failures[index]
             emit_event(
                 "tool_failed",
@@ -899,6 +918,8 @@ class AgenticM2Adapter(ModuleProtocol):
             )
             export_runs.append(M2KnowledgeRun(
                 sub_question=sub_question,
+                origin_gap_ids=list(search_task.m6_gap_ids),
+                origin_gap_request_ids=list(search_task.m4_gap_ids),
                 search_provenance=M2SearchProvenance(
                     stop_reason="error",
                     errors=[detail],
@@ -908,6 +929,8 @@ class AgenticM2Adapter(ModuleProtocol):
                 sub_question=sub_question,
                 papers_retrieved=0,
                 knowledge_entries=[],
+                origin_gap_ids=list(search_task.m6_gap_ids),
+                origin_gap_request_ids=list(search_task.m4_gap_ids),
             ))
 
         # Seed the paper cache (side effect only; never affects the return
@@ -932,6 +955,14 @@ class AgenticM2Adapter(ModuleProtocol):
             existing.papers_retrieved = max(
                 existing.papers_retrieved, result.papers_retrieved
             )
+            existing.origin_gap_ids = list(dict.fromkeys([
+                *existing.origin_gap_ids,
+                *result.origin_gap_ids,
+            ]))
+            existing.origin_gap_request_ids = list(dict.fromkeys([
+                *existing.origin_gap_request_ids,
+                *result.origin_gap_request_ids,
+            ]))
 
         historical_runs = (
             list(state.m2_knowledge_export.runs)

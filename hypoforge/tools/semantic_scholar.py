@@ -260,6 +260,11 @@ def _normalize_openalex_query(query: str) -> str:
     text = re.sub(r"\[[^\]]+\]", " ", str(query or ""))
     text = re.sub(r"\b(?:title|abstract|author):", " ", text, flags=re.I)
     text = re.sub(r"\b(?:AND|OR|NOT)\b", " ", text, flags=re.I)
+    # OpenAlex interprets ``?`` and ``*`` as wildcard operators.  A normal
+    # question ending in ``?`` therefore produces HTTP 400 under its default
+    # stemmed search mode.  M2 sends free-text discovery queries, not exact
+    # wildcard expressions, so remove both operators before URL encoding.
+    text = re.sub(r"[?*]+", " ", text)
     text = re.sub(r'''[(){}\[\]"'“”‘’]+''', " ", text)
     return " ".join(text.split())
 

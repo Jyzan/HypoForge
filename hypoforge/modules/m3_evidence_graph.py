@@ -1564,18 +1564,30 @@ class M3EvidenceGraph(ModuleProtocol):
     ) -> GapGain:
         """Per-gap count of this round's new effective evidence entries.
 
-        Gain for a gap = number of entries in ``new_entry_ids`` that belong
-        to literature results whose sub-question matches the gap's
-        ``target_sub_question``.  Every gap in state gets an entry (0 when
-        nothing matched) so consumers can rely on total coverage.
+        Prefer the explicit M2 ``origin_gap_ids`` provenance.  Legacy states
+        without that field fall back to matching either the target
+        sub-question or the gap description.  Every gap in state gets an
+        entry (0 when nothing matched) so consumers can rely on total
+        coverage.
         """
         gain: GapGain = {}
         for gap in state.evidence_gaps:
             gain[gap.gap_id] = sum(
                 1
                 for lr in state.literature_results
-                if self._sub_question_matches(
-                    lr.sub_question, gap.target_sub_question
+                if (
+                    gap.gap_id in lr.origin_gap_ids
+                    or (
+                        not lr.origin_gap_ids
+                        and (
+                            self._sub_question_matches(
+                                lr.sub_question, gap.target_sub_question
+                            )
+                            or self._sub_question_matches(
+                                lr.sub_question, gap.description
+                            )
+                        )
+                    )
                 )
                 for entry in lr.knowledge_entries
                 if entry.id in new_entry_ids

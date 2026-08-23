@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import threading
@@ -24,10 +25,22 @@ from ..protocols import LiteratureSourceProtocol
 
 _CROSSREF_LOCK = threading.Lock()
 _CROSSREF_NEXT_START = 0.0
+logger = logging.getLogger(__name__)
 
 
 class SpecialistSourceError(OSError):
     """A specialist metadata API failed or is not configured."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
 
 
 def _json_get(
@@ -49,8 +62,18 @@ def _json_get(
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read(500).decode("utf-8", errors="replace")
+        retry_after: float | None = None
+        retry_after_raw = (
+            exc.headers.get("Retry-After", "") if exc.headers else ""
+        )
+        try:
+            retry_after = float(retry_after_raw)
+        except (TypeError, ValueError):
+            pass
         raise SpecialistSourceError(
-            f"HTTP {exc.code} from specialist source: {detail}"
+            f"HTTP {exc.code} from specialist source: {detail}",
+            status_code=exc.code,
+            retry_after_seconds=retry_after,
         ) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise SpecialistSourceError(str(exc)) from exc
@@ -145,11 +168,30 @@ class CrossrefSource(_BaseSpecialistSource):
         }
         if self.mailto:
             params["mailto"] = self.mailto
-        await asyncio.to_thread(self._wait_for_slot)
-        data = await _get(
-            "https://api.crossref.org/works?" + urllib.parse.urlencode(params),
-            self.timeout_seconds,
-        )
+        url = "https://api.crossref.org/works?" + urllib.parse.urlencode(params)
+
+        async def request_once() -> Any:
+            await asyncio.to_thread(self._wait_for_slot)
+            return await _get(url, self.timeout_seconds)
+
+        try:
+            data = await request_once()
+        except SpecialistSourceError as exc:
+            if exc.status_code != 429:
+                raise
+            delay = (
+                exc.retry_after_seconds
+                if exc.retry_after_seconds is not None
+                else 2.0
+            )
+            delay = min(10.0, max(0.0, delay))
+            logger.warning(
+                "Crossref rate-limited one query; retrying once after %.1fs",
+                delay,
+            )
+            if delay:
+                await asyncio.sleep(delay)
+            data = await request_once()
         output: list[PaperRecord] = []
         for row in (data.get("message") or {}).get("items") or []:
             title = _title(row.get("title"))

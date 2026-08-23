@@ -1516,6 +1516,24 @@ def make_base_agent(source_results):
     return agent, source
 
 
+def test_scout_timeout_scales_with_serial_batch_waves() -> None:
+    """A fixed per-wave limit must not cancel later semantic batches."""
+
+    from hypoforge.modules.m2_literature.search.scout import ScoutReader
+
+    agent, _ = make_base_agent({})
+    agent.scout_reader = ScoutReader(
+        None,
+        batch_size=8,
+        max_concurrency=2,
+    )
+    agent.scout_timeout_seconds = 60.0
+
+    assert agent._effective_scout_timeout(16) == 60.0
+    assert agent._effective_scout_timeout(24) == 120.0
+    assert agent._effective_scout_timeout(40) == 180.0
+
+
 def make_gap(**overrides) -> EvidenceGap:
     base = dict(
         description="Missing Hsp70 co-chaperone data",
@@ -1606,6 +1624,9 @@ async def test_revisit_turns_open_gap_into_subquestion_and_reuses_full_flow() ->
     assert [
         run.sub_question for run in output["m2_knowledge_export"].runs
     ] == [SUB_QUESTION, gap_question]
+    gap_id = state.evidence_gaps[0].gap_id
+    assert output["literature_results"][-1].origin_gap_ids == [gap_id]
+    assert output["m2_knowledge_export"].runs[-1].origin_gap_ids == [gap_id]
 
 
 @pytest.mark.asyncio
@@ -3340,6 +3361,49 @@ async def test_gap_with_gain_is_closed():
     # (PipelineState has no dedicated gap_gain field; pipeline.py rejects
     # unknown patch keys).
     assert result["metrics"]["m3_gap_gain"] == {gap.gap_id: 1}
+
+
+@pytest.mark.asyncio
+async def test_gap_gain_uses_explicit_m2_origin_when_question_text_differs():
+    """M6 gap descriptions must remain attributable after becoming M2 tasks."""
+
+    old_entry = _entry("KE_origin_old", "Baseline RAG evidence.")
+    new_entry = _entry(
+        "KE_origin_new",
+        "Dynamic retrieval changes the hallucination trade-off.",
+        "OA:W1",
+    )
+    module = M3EvidenceGraph(mode="rule")
+    initial = await module(PipelineState(
+        input_question="q",
+        literature_results=[LiteratureResult(
+            sub_question="How does RAG reduce hallucinations?",
+            papers_retrieved=1,
+            knowledge_entries=[old_entry],
+        )],
+    ))
+    gap = EvidenceGap(
+        description=(
+            "The proposed dynamic threshold lacks direct calibration evidence."
+        ),
+        target_sub_question="How does RAG reduce hallucinations?",
+        status="pending_grounding",
+    )
+
+    result = await module(PipelineState(
+        input_question="q",
+        evidence_graph=initial["evidence_graph"],
+        literature_results=[LiteratureResult(
+            sub_question=gap.description,
+            papers_retrieved=1,
+            knowledge_entries=[new_entry],
+            origin_gap_ids=[gap.gap_id],
+        )],
+        evidence_gaps=[gap],
+    ))
+
+    assert result["metrics"]["m3_gap_gain"] == {gap.gap_id: 1}
+    assert result["evidence_gaps"][0].status == "closed"
 
 
 @pytest.mark.asyncio
@@ -10694,6 +10758,69 @@ def test_openalex_oa_search_uses_filter_and_citation_sort(monkeypatch) -> None:
     )
     assert "filter=is_oa%3Atrue" in captured["url"]
     assert "sort=cited_by_count%3Adesc" in captured["url"]
+
+
+def test_openalex_query_normalization_removes_natural_language_wildcards() -> None:
+    """Question punctuation must not be interpreted as OpenAlex wildcards."""
+
+    from hypoforge.tools.semantic_scholar import _normalize_openalex_query
+
+    assert _normalize_openalex_query(
+        "How does RAG reduce hallucinations?"
+    ) == "How does RAG reduce hallucinations"
+    assert _normalize_openalex_query(
+        "retrieval* augmented? generation"
+    ) == "retrieval augmented generation"
+
+
+@pytest.mark.asyncio
+async def test_crossref_retries_one_transient_rate_limit(monkeypatch) -> None:
+    """A single public-pool 429 must not discard an otherwise valid query."""
+
+    from hypoforge.modules.m2_literature.sources import specialist_sources
+    from hypoforge.modules.m2_literature.sources.specialist_sources import (
+        CrossrefSource,
+        SpecialistSourceError,
+    )
+
+    calls = 0
+
+    async def fake_get(url, timeout, headers=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise SpecialistSourceError(
+                "HTTP 429 from specialist source",
+                status_code=429,
+                retry_after_seconds=0.0,
+            )
+        return {"message": {"items": [{
+            "DOI": "10.1000/retry",
+            "title": ["Recovered Crossref result"],
+            "author": [],
+            "published": {"date-parts": [[2025]]},
+            "container-title": ["Test Journal"],
+            "is-referenced-by-count": 1,
+            "type": "journal-article",
+        }]}}
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(specialist_sources, "_get", fake_get)
+    monkeypatch.setattr(specialist_sources.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(CrossrefSource, "_wait_for_slot", staticmethod(lambda: None))
+
+    papers = await CrossrefSource().search(SearchQuery(
+        query_id="q",
+        text="dynamic retrieval",
+        target_source="crossref",
+        purpose="test",
+        relation_to_question="test",
+    ), limit=1)
+
+    assert calls == 2
+    assert [paper.title for paper in papers] == ["Recovered Crossref result"]
 
 
 def test_m1_unknown_candidate_role_degrades_to_other() -> None:

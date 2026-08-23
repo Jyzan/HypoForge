@@ -358,6 +358,30 @@ class IterativeSearchAgent:
             for source_name in self.sources
         }
 
+    def _effective_scout_timeout(self, candidate_count: int) -> float:
+        """Scale the configured limit by semantic-reader batch waves.
+
+        ``ScoutReader`` executes batches concurrently, but a candidate set
+        larger than ``batch_size * max_concurrency`` necessarily needs more
+        than one serial wave.  Treat the configured value as a per-wave
+        ceiling so a healthy later wave is not cancelled merely because the
+        first wave used most of a fixed aggregate deadline.  Protocol
+        implementations that do not expose batching retain the legacy limit.
+        """
+
+        count = max(0, int(candidate_count))
+        batch_size = max(
+            1,
+            int(getattr(self.scout_reader, "batch_size", count or 1)),
+        )
+        concurrency = max(
+            1,
+            int(getattr(self.scout_reader, "max_concurrency", 1)),
+        )
+        batches = max(1, (count + batch_size - 1) // batch_size)
+        waves = max(1, (batches + concurrency - 1) // concurrency)
+        return self.scout_timeout_seconds * waves
+
     async def run(
         self,
         sub_question: str,
@@ -1048,16 +1072,20 @@ class IterativeSearchAgent:
         ]
         semantic_pool = papers_needing_scout[: self.scout_candidate_limit]
         lexical_tail = papers_needing_scout[self.scout_candidate_limit :]
+        effective_scout_timeout = self._effective_scout_timeout(
+            len(semantic_pool)
+        )
         try:
             new_scout_notes = await asyncio.wait_for(measure(
                 "scout_reader",
                 self.scout_reader.read(ctx.alignment_question, semantic_pool),
-            ), timeout=self.scout_timeout_seconds)
+            ), timeout=effective_scout_timeout)
         except asyncio.TimeoutError:
             from .scout import ScoutReader
 
             ctx.errors.append(
-                f"scout_reader timed out after {self.scout_timeout_seconds}s; "
+                f"scout_reader timed out after {effective_scout_timeout}s "
+                f"({len(semantic_pool)} candidates); "
                 "used lexical fallback"
             )
             new_scout_notes = await ScoutReader(None).read(

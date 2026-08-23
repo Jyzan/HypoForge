@@ -262,6 +262,10 @@ class LiteratureResult(BaseModel):
     sub_question: str
     papers_retrieved: int = 0
     knowledge_entries: List[KnowledgeEntry] = Field(default_factory=list)
+    # Explicit routing provenance.  Text matching is not reliable once an M6
+    # evidence-gap description is converted into a supplement sub-question.
+    origin_gap_ids: List[str] = Field(default_factory=list)
+    origin_gap_request_ids: List[str] = Field(default_factory=list)
 
 
 # ============================================================================
@@ -604,6 +608,8 @@ class M2KnowledgeRun(BaseModel):
     evidence: List[M2EvidenceExport] = Field(default_factory=list)
     knowledge_entries: List[KnowledgeEntry] = Field(default_factory=list)
     search_provenance: M2SearchProvenance = Field(default_factory=M2SearchProvenance)
+    origin_gap_ids: List[str] = Field(default_factory=list)
+    origin_gap_request_ids: List[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_provenance(self) -> "M2KnowledgeRun":
