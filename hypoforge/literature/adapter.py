@@ -30,6 +30,7 @@ from ..observability import emit_event
 from ..protocol import ModuleProtocol
 from ..state import (
     EvidenceGap,
+    EvidenceGapRequest,
     KnowledgeEntry,
     LiteratureResult,
     M2KnowledgeExport,
@@ -86,6 +87,15 @@ class _SubquestionOutcome:
     literature_result: LiteratureResult
     export_run: M2KnowledgeRun
     executed_queries: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _SearchTask:
+    """One deduplicated M2 question and the gap records that requested it."""
+
+    question: str
+    m4_gap_ids: tuple[str, ...] = ()
+    m6_gap_ids: tuple[str, ...] = ()
 
 
 # ============================================================================
@@ -803,25 +813,15 @@ class AgenticM2Adapter(ModuleProtocol):
         pending_gaps = [
             gap for gap in state.evidence_gap_requests if gap.status == "pending"
         ]
-        if revisit_gaps:
-            sub_questions = list(dict.fromkeys(
-                self._gap_as_sub_question(gap, state.input_question)
-                for gap in revisit_gaps
-            ))
-        elif pending_gaps:
-            sub_questions = list(dict.fromkeys(
-                gap.sub_question for gap in pending_gaps
-            ))
-        else:
-            sub_questions = (
-                problem_card.sub_questions
-                if problem_card and problem_card.sub_questions
-                else [state.input_question]
-            )
+        search_tasks = self._build_search_tasks(
+            state,
+            pending_gaps=pending_gaps,
+            revisit_gaps=revisit_gaps,
+        )
+        sub_questions = [task.question for task in search_tasks]
         domains = problem_card.domain if problem_card else []
         literature_results: list[LiteratureResult] = []
         export_runs: list[M2KnowledgeRun] = []
-        executed_queries: dict[str, list[str]] = {}
         tasks = {
             asyncio.create_task(
                 self._run_fresh_subquestion(state, domains, index, sub_question)
@@ -883,7 +883,6 @@ class AgenticM2Adapter(ModuleProtocol):
             if outcome is not None:
                 export_runs.append(outcome.export_run)
                 literature_results.append(outcome.literature_result)
-                executed_queries[sub_question] = list(outcome.executed_queries)
                 continue
 
             _, detail = failures[index]
@@ -910,7 +909,6 @@ class AgenticM2Adapter(ModuleProtocol):
                 papers_retrieved=0,
                 knowledge_entries=[],
             ))
-            executed_queries[sub_question] = []
 
         # Seed the paper cache (side effect only; never affects the return
         # patch) so later supplement rounds can hit it.
@@ -953,40 +951,103 @@ class AgenticM2Adapter(ModuleProtocol):
                     for _, (question, detail) in sorted(failures.items())
                 ),
             ]
+        searched_m4_ids: set[str] = set()
+        m4_queries_by_gap: dict[str, list[str]] = {}
+        grounded_m6_ids: set[str] = set()
+        for index, outcome in outcomes.items():
+            search_task = search_tasks[index]
+            searched_m4_ids.update(search_task.m4_gap_ids)
+            for gap_id in search_task.m4_gap_ids:
+                m4_queries_by_gap.setdefault(gap_id, []).extend(
+                    outcome.executed_queries
+                )
+            if outcome.export_run.evidence or outcome.export_run.knowledge_entries:
+                grounded_m6_ids.update(search_task.m6_gap_ids)
+
         if pending_gaps:
-            pending_ids = {gap.gap_id for gap in pending_gaps}
             result["evidence_gap_requests"] = [
                 gap.model_copy(update={
                     "status": "searched",
                     "attempts": gap.attempts + 1,
                     "executed_queries": list(dict.fromkeys([
                         *gap.executed_queries,
-                        *executed_queries.get(gap.sub_question, []),
+                        *m4_queries_by_gap.get(gap.gap_id, []),
                     ])),
-                }) if gap.gap_id in pending_ids else gap.model_copy(deep=True)
+                }) if gap.gap_id in searched_m4_ids else gap.model_copy(deep=True)
                 for gap in state.evidence_gap_requests
             ]
-            result["evidence_gap_search_rounds"] = (
-                state.evidence_gap_search_rounds + 1
-            )
+            if searched_m4_ids:
+                result["evidence_gap_search_rounds"] = (
+                    state.evidence_gap_search_rounds + 1
+                )
         if revisit_gaps:
-            grounded_questions = {
-                outcome.sub_question
-                for outcome in outcomes.values()
-                if outcome.export_run.evidence
-                or outcome.export_run.knowledge_entries
-            }
             result["evidence_gaps"] = [
                 gap.model_copy(update={"status": "pending_grounding"})
                 if (
                     gap.status == "open"
-                    and self._gap_as_sub_question(gap, state.input_question)
-                    in grounded_questions
+                    and gap.gap_id in grounded_m6_ids
                 )
                 else gap.model_copy(deep=True)
                 for gap in state.evidence_gaps
             ]
         return result
+
+    def _build_search_tasks(
+        self,
+        state: PipelineState,
+        *,
+        pending_gaps: Sequence[EvidenceGapRequest],
+        revisit_gaps: Sequence[EvidenceGap],
+    ) -> list[_SearchTask]:
+        """Build one search task per question without losing gap provenance."""
+
+        buckets: dict[str, dict[str, Any]] = {}
+
+        def add_task(
+            question: str,
+            *,
+            m4_gap_id: str = "",
+            m6_gap_id: str = "",
+        ) -> None:
+            normalized_question = " ".join(str(question or "").split())
+            if not normalized_question:
+                normalized_question = " ".join(state.input_question.split())
+            key = normalized_question.casefold()
+            bucket = buckets.setdefault(key, {
+                "question": normalized_question,
+                "m4_gap_ids": [],
+                "m6_gap_ids": [],
+            })
+            if m4_gap_id and m4_gap_id not in bucket["m4_gap_ids"]:
+                bucket["m4_gap_ids"].append(m4_gap_id)
+            if m6_gap_id and m6_gap_id not in bucket["m6_gap_ids"]:
+                bucket["m6_gap_ids"].append(m6_gap_id)
+
+        for gap in revisit_gaps:
+            add_task(
+                self._gap_as_sub_question(gap, state.input_question),
+                m6_gap_id=gap.gap_id,
+            )
+        for gap in pending_gaps:
+            add_task(gap.sub_question, m4_gap_id=gap.gap_id)
+
+        if not buckets:
+            questions = (
+                state.problem_card.sub_questions
+                if state.problem_card and state.problem_card.sub_questions
+                else [state.input_question]
+            )
+            for question in questions:
+                add_task(question)
+
+        return [
+            _SearchTask(
+                question=bucket["question"],
+                m4_gap_ids=tuple(bucket["m4_gap_ids"]),
+                m6_gap_ids=tuple(bucket["m6_gap_ids"]),
+            )
+            for bucket in buckets.values()
+        ]
 
     @staticmethod
     def _gap_as_sub_question(gap: EvidenceGap, original_question: str) -> str:

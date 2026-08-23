@@ -1083,6 +1083,7 @@ from hypoforge.observability import RunEventRecorder, bind_recorder
 from hypoforge.state import (
     ConfidenceLevel,
     EvidenceGap,
+    EvidenceGapRequest,
     KnowledgeEntry,
     KnowledgeEntryType,
     LiteratureResult,
@@ -1492,6 +1493,110 @@ async def test_revisit_turns_open_gap_into_subquestion_and_reuses_full_flow() ->
     assert [
         run.sub_question for run in output["m2_knowledge_export"].runs
     ] == [SUB_QUESTION, gap_question]
+
+
+@pytest.mark.asyncio
+async def test_coexisting_m4_and_m6_gaps_are_both_searched() -> None:
+    """A later M2 visit must not let the M6 branch mask an M4 request."""
+
+    m6_question = "missing deployment robustness evidence 1"
+    m4_question = "missing calibration evidence 2"
+    agent = _ConcurrentFreshSearchAgent()
+    adapter = AgenticM2Adapter(
+        search_agent=agent,
+        reading_workflow=EchoReadingWorkflow(with_evidence=True),
+        subquestion_concurrency=2,
+        fresh_run_timeout_seconds=2,
+    )
+    state = make_supplement_state(
+        evidence_gaps=[make_gap(
+            description=m6_question,
+            target_sub_question=m6_question,
+        )],
+        evidence_gap_requests=[EvidenceGapRequest(
+            gap_id="M4-GAP-1",
+            sub_question=m4_question,
+        )],
+    )
+
+    output = await adapter(state)
+
+    assert {
+        run.sub_question for run in output["m2_knowledge_export"].runs[1:]
+    } == {m6_question, m4_question}
+    assert output["evidence_gap_requests"][0].status == "searched"
+    assert output["evidence_gaps"][0].status == "pending_grounding"
+
+
+@pytest.mark.asyncio
+async def test_failed_m4_gap_task_stays_pending_when_m6_task_succeeds() -> None:
+    """A sibling success must not advance an M4 request that was not searched."""
+
+    m6_question = "missing deployment robustness evidence 1"
+    m4_question = "missing calibration evidence 2"
+    adapter = AgenticM2Adapter(
+        search_agent=_ConcurrentFreshSearchAgent(
+            failing_questions={m4_question},
+        ),
+        reading_workflow=EchoReadingWorkflow(with_evidence=True),
+        subquestion_concurrency=2,
+        fresh_run_timeout_seconds=2,
+    )
+    state = make_supplement_state(
+        evidence_gaps=[make_gap(
+            description=m6_question,
+            target_sub_question=m6_question,
+        )],
+        evidence_gap_requests=[EvidenceGapRequest(
+            gap_id="M4-GAP-1",
+            sub_question=m4_question,
+        )],
+    )
+
+    output = await adapter(state)
+
+    assert output["evidence_gaps"][0].status == "pending_grounding"
+    assert output["evidence_gap_requests"][0].status == "pending"
+    assert output["evidence_gap_requests"][0].attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_identical_m4_and_m6_gap_question_runs_once() -> None:
+    """Deduplication must retain both origins of one shared question."""
+
+    shared_question = "missing transfer calibration evidence"
+    paper = PaperRecord(
+        paper_id="shared-1",
+        title="Shared evidence",
+        sources=["fake"],
+    )
+    agent = RecordingSearchAgent([SearchRunResult(
+        sub_question=shared_question,
+        candidates=[paper],
+        final_papers=[paper],
+        stop_reason=StopReason.COVERAGE_SATISFIED,
+    )])
+    adapter = AgenticM2Adapter(
+        search_agent=agent,
+        reading_workflow=EchoReadingWorkflow(with_evidence=True),
+    )
+    state = make_supplement_state(
+        evidence_gaps=[make_gap(
+            description=shared_question,
+            target_sub_question=shared_question,
+        )],
+        evidence_gap_requests=[EvidenceGapRequest(
+            gap_id="M4-GAP-SHARED",
+            sub_question=shared_question,
+        )],
+    )
+
+    output = await adapter(state)
+
+    assert len(agent.calls) == 1
+    assert output["evidence_gap_requests"][0].status == "searched"
+    assert output["evidence_gaps"][0].status == "pending_grounding"
+    assert len(output["m2_knowledge_export"].runs) == 2
 
 
 class _ConcurrentFreshSearchAgent:
@@ -7932,6 +8037,115 @@ def _runner_with_fakes(tmp_path: Path, cancel_event, m1_hook=None, m4_hook=None)
         config, event_recorder=recorder, cancel_event=cancel_event
     )
     return runner, recorder, modules
+
+
+@pytest.mark.asyncio
+async def test_runner_executes_m4_m2_m3_m4_gap_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The compiled graph must execute a bounded M4 evidence-search loop."""
+
+    from hypoforge.registry import ModuleRegistry
+
+    calls: list[str] = []
+    gap = EvidenceGapRequest(
+        gap_id="M4-RUNNER-GAP",
+        sub_question="missing calibration evidence",
+    )
+    hypothesis_card = HypothesisCard(
+        hypothesis_id="H1",
+        statement="Calibration evidence improves transfer reliability.",
+    )
+
+    class StatefulModule(ModuleProtocol):
+        module_version = "test"
+        description = "stateful routing test module"
+
+        def __init__(self, name: str, output_fields: list[str]) -> None:
+            self.module_name = name
+            self._output_fields = output_fields
+            self.count = 0
+
+        async def __call__(self, state, config=None):
+            calls.append(self.module_name)
+            self.count += 1
+            if self.module_name == "m1":
+                return {"problem_card": ProblemCard(
+                    original_question="Q",
+                    sub_questions=["initial question"],
+                )}
+            if self.module_name == "m2":
+                patch = {"literature_results": [LiteratureResult(
+                    sub_question="initial question",
+                    papers_retrieved=self.count,
+                )]}
+                if state.evidence_gap_requests:
+                    patch["evidence_gap_requests"] = [
+                        item.model_copy(update={"status": "searched", "attempts": 1})
+                        if item.status == "pending" else item
+                        for item in state.evidence_gap_requests
+                    ]
+                return patch
+            if self.module_name == "m3":
+                patch = {"evidence_graph": EvidenceGraph()}
+                if state.evidence_gap_requests:
+                    patch["evidence_gap_requests"] = [
+                        item.model_copy(update={"status": "indexed"})
+                        if item.status == "searched" else item
+                        for item in state.evidence_gap_requests
+                    ]
+                return patch
+            if self.module_name == "m4":
+                current_gap = (
+                    gap if self.count == 1
+                    else gap.model_copy(update={"status": "exhausted", "attempts": 1})
+                )
+                return {
+                    "candidate_hypotheses": [hypothesis_card],
+                    "top_hypotheses": [hypothesis_card],
+                    "evidence_gap_requests": [current_gap],
+                }
+            if self.module_name == "m5":
+                return {"research_plans": [ResearchPlan(hypothesis_id="H1")]}
+            return {"iteration_count": 1}
+
+        @classmethod
+        def get_input_fields(cls):
+            return []
+
+        def get_output_fields(self):
+            return list(self._output_fields)
+
+    modules = {
+        "m1": StatefulModule("m1", ["problem_card"]),
+        "m2": StatefulModule(
+            "m2", ["literature_results", "evidence_gap_requests"]
+        ),
+        "m3": StatefulModule("m3", ["evidence_graph", "evidence_gap_requests"]),
+        "m4": StatefulModule(
+            "m4",
+            ["candidate_hypotheses", "top_hypotheses", "evidence_gap_requests"],
+        ),
+        "m5": StatefulModule("m5", ["research_plans"]),
+        "m6": StatefulModule("m6", ["iteration_count"]),
+    }
+    config = PipelineConfig(
+        verbose=False,
+        enabled_modules=["m1", "m2", "m3", "m4", "m5", "m6"],
+        enable_iteration=False,
+    )
+    config.output_dir = str(tmp_path)
+    config.scoring.auto_score = False
+    runner = PipelineRunner(config)
+    monkeypatch.setattr(
+        ModuleRegistry, "build_all", staticmethod(lambda cfg: modules)
+    )
+
+    state = await runner.run("Q", run_id="m4-gap-runner")
+
+    assert calls == ["m1", "m2", "m3", "m4", "m2", "m3", "m4", "m5", "m6"]
+    assert state.evidence_gap_requests[0].status == "exhausted"
 
 
 @pytest.mark.asyncio
