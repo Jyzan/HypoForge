@@ -982,6 +982,13 @@ class HypoForgeHTTPServer(ThreadingHTTPServer):
 class HypoForgeRequestHandler(BaseHTTPRequestHandler):
     server: HypoForgeHTTPServer
 
+    _STATIC_ASSETS = {
+        "/assets/ui-polish.css": (
+            "ui-polish.css",
+            "text/css; charset=utf-8",
+        ),
+    }
+
     def log_message(self, format: str, *args: Any) -> None:
         return
 
@@ -1004,6 +1011,24 @@ class HypoForgeRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _serve_static_asset(self, request_path: str) -> bool:
+        asset = self._STATIC_ASSETS.get(request_path)
+        if asset is None:
+            return False
+        filename, content_type = asset
+        path = self.server.static_dir / filename
+        if not path.is_file():
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return True
+        body = path.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+        return True
+
     @staticmethod
     def _run_route(path: str) -> tuple[str, str] | None:
         parts = [part for part in path.split("/") if part]
@@ -1015,6 +1040,11 @@ class HypoForgeRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/":
             self._serve_index()
+            return
+        if parsed.path.startswith("/assets/"):
+            if self._serve_static_asset(parsed.path):
+                return
+            self.send_error(HTTPStatus.NOT_FOUND)
             return
         if parsed.path == "/api/runs":
             self._json({"runs": self.server.manager.list_runs()})

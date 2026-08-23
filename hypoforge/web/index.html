@@ -27,7 +27,6 @@
   ::-webkit-scrollbar-track{background:transparent}
   ::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
   ::-webkit-scrollbar-thumb:hover{background:var(--ink3)}
-  }
   button,textarea,input,select{font:inherit}
   /* ---------- 顶栏 ---------- */
   header{
@@ -603,6 +602,7 @@
     body.sidebar-collapsed #sidebar{margin-left:-288px}
   }
 </style>
+<link rel="stylesheet" href="/assets/ui-polish.css">
 </head>
 <body>
 
@@ -662,7 +662,7 @@
         </div>
       </div>
 
-      <details class="cred-card" id="credCard" open>
+      <details class="cred-card" id="credCard">
         <summary>运行凭证（仅本次运行使用）</summary>
         <div class="cred-grid">
           <div class="config-field">
@@ -738,6 +738,21 @@
             <div class="counter"><b id="counterIteration">0</b><span>评审轮 · iteration</span></div>
             <div class="counter"><b id="counterRevision">0</b><span>修订轮 · revision</span></div>
             <div class="counter"><b id="counterSearchRound">0</b><span>检索轮 · search round</span></div>
+          </div>
+          <div class="context-budget-card" aria-label="上下文预算">
+            <div class="context-budget-head">
+              <div>
+                <span class="context-kicker">CONTEXT BUDGET</span>
+                <h3>用途感知上下文</h3>
+              </div>
+              <span class="context-trace">完整证据仍可追溯</span>
+            </div>
+            <div class="context-metrics">
+              <div class="context-metric"><b id="contextPackCount">0</b><span>已构建上下文包</span></div>
+              <div class="context-metric"><b id="contextTokenCount">0</b><span>累计估算 token</span></div>
+              <div class="context-metric"><b id="contextIncludedCount">0</b><span>纳入证据卡</span></div>
+              <div class="context-metric"><b id="contextDroppedCount">0</b><span>预算裁剪记录</span></div>
+            </div>
           </div>
           <div class="state-sub">
             <h3>证据缺口</h3>
@@ -1142,6 +1157,14 @@ function updateStats(){
   $("toolCalls").textContent = allEvents.filter(e => e.event_type === "tool_completed").length;
   $("failedCalls").textContent = allEvents.filter(e => /failed/.test(e.event_type) || e.status === "failed").length;
   $("doneModules").textContent = `${Object.values(moduleState).filter(v => v.status === "done" || v.status === "skipped").length}/6`;
+  const contextEvents = allEvents.filter(e => e.event_type === "llm_context_built");
+  const sumContextMetric = key => contextEvents.reduce(
+    (total, event) => total + Number((event.details || {})[key] || 0), 0
+  );
+  $("contextPackCount").textContent = contextEvents.length.toLocaleString();
+  $("contextTokenCount").textContent = sumContextMetric("estimated_tokens").toLocaleString();
+  $("contextIncludedCount").textContent = sumContextMetric("included_count").toLocaleString();
+  $("contextDroppedCount").textContent = sumContextMetric("dropped_count").toLocaleString();
 }
 
 /* ---------- 轮次时间线（事件驱动增量） ---------- */
@@ -2103,7 +2126,7 @@ async function openOverallView(rootId){
   $("pipelineGrid").innerHTML = "";
   $("eventsList").innerHTML = `<div class="empty">整体方案视图 · 请在右上角切换版本</div>`;
   $("eventCount").textContent = "overall";
-  ["doneModules","toolCalls","failedCalls","artifactCount"].forEach(id => $(id).textContent = "0");
+  ["doneModules","toolCalls","failedCalls","artifactCount","contextPackCount","contextTokenCount","contextIncludedCount","contextDroppedCount"].forEach(id => $(id).textContent = "0");
   $("artifactCount").textContent = "0";
   $("artifactsList").innerHTML = `<div class="empty">整体方案视图</div>`;
   $("counterIteration").textContent = "0";

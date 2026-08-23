@@ -8752,6 +8752,50 @@ def test_request_cancel_rejects_finished_unknown_and_malformed(
 # HTTP endpoint contract
 # --------------------------------------------------------------------------- #
 
+def test_http_static_asset_is_whitelisted_and_traversal_safe(
+    tmp_path: Path,
+) -> None:
+    _write_config(tmp_path)
+    (tmp_path / "index.html").write_text("<h1>HypoForge</h1>", encoding="utf-8")
+    (tmp_path / "ui-polish.css").write_text(
+        ".context-metrics{display:grid}", encoding="utf-8"
+    )
+    secret = tmp_path.parent / "secret.txt"
+    secret.write_text("must-not-leak", encoding="utf-8")
+    server = build_server(
+        host="127.0.0.1",
+        port=0,
+        config_path=tmp_path / "config.yaml",
+        output_root=tmp_path / "runs",
+        static_dir=tmp_path,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=10
+        )
+
+        conn.request("GET", "/assets/ui-polish.css")
+        response = conn.getresponse()
+        assert response.status == 200
+        assert response.getheader("Content-Type") == "text/css; charset=utf-8"
+        assert response.read() == b".context-metrics{display:grid}"
+
+        conn.request("GET", "/assets/missing.css")
+        response = conn.getresponse()
+        assert response.status == 404
+        response.read()
+
+        conn.request("GET", "/assets/%2e%2e/secret.txt")
+        response = conn.getresponse()
+        assert response.status == 404
+        assert b"must-not-leak" not in response.read()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_http_cancel_endpoint_statuses(tmp_path: Path) -> None:
     _write_config(tmp_path)
     server = build_server(
@@ -9790,6 +9834,25 @@ def test_iteration_visualisation_element_ids_present() -> None:
     assert 'id="gapList"' in html
     # Plan version switching (consumes GET /api/runs/{id}/versions).
     assert 'id="planCard"' in html
+
+
+def test_web_ui_exposes_context_budget_metrics_and_collapses_credentials() -> None:
+    html = _read_index_html()
+
+    assert '<link rel="stylesheet" href="/assets/ui-polish.css">' in html
+    assert '<details class="cred-card" id="credCard">' in html
+    assert '<details class="cred-card" id="credCard" open>' not in html
+    for element_id in (
+        "contextPackCount",
+        "contextTokenCount",
+        "contextIncludedCount",
+        "contextDroppedCount",
+    ):
+        assert f'id="{element_id}"' in html
+    assert 'e.event_type === "llm_context_built"' in html
+    assert 'sumContextMetric("estimated_tokens")' in html
+    assert 'sumContextMetric("included_count")' in html
+    assert 'sumContextMetric("dropped_count")' in html
     assert 'id="planVersions"' in html
     # Followup entry (POST /api/runs with parent_run_id + followup).
     assert 'id="followupBox"' in html
