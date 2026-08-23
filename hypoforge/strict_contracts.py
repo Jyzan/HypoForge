@@ -1326,6 +1326,7 @@ class StrictM4HypothesisGeneration(M4HypothesisGeneration):
                         output_schema=schema,
                         max_tokens=8192,
                         temperature=getattr(self.llm_config, "temperature", 0.1),
+                        disable_thinking=True,
                     ),
                     details={"candidates": len(candidates), "attempt": attempt},
                 )
@@ -1416,6 +1417,7 @@ class StrictM4HypothesisGeneration(M4HypothesisGeneration):
                         output_schema=schema,
                         max_tokens=8192,
                         temperature=getattr(self.llm_config, "temperature", 0.1),
+                        disable_thinking=True,
                     ),
                     details={"candidates": len(candidates), "attempt": attempt},
                 )

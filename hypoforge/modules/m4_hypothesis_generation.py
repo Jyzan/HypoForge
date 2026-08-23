@@ -1414,7 +1414,14 @@ class M4HypothesisGeneration(ModuleProtocol):
                 contract_failures.extend(retry_failures)
         generation_shortfall = bool(candidates) and len(candidates) < self.top_k
 
-        if not candidates:
+        if not candidates and self.fast_mode:
+            logger.warning(
+                "M4 fast mode found no contract-valid hypotheses after one "
+                "generator retry; skipping the additional LLM repair call and "
+                "using deterministic fallback hypotheses."
+            )
+            candidates = self._fast_fallback_hypotheses(state, question)
+        elif not candidates:
             try:
                 candidates, contract_failures = await self._repair_context_contract(
                     state=state,
@@ -1527,6 +1534,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                     output_schema=ranker_schema,
                     max_tokens=4096,
                     temperature=getattr(self.llm_config, "temperature", 0.1),
+                    disable_thinking=True,
                 ),
                 details={"candidates": len(candidates), "top_k": self.top_k},
             )
@@ -1653,6 +1661,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                     output_schema=critic_schema,
                     max_tokens=4096,
                     temperature=getattr(self.llm_config, "temperature", 0.1),
+                    disable_thinking=True,
                 ),
                 details={"candidates": len(candidates)},
             )
@@ -1734,6 +1743,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                     output_schema=falsifiability_schema,
                     max_tokens=4096,
                     temperature=getattr(self.llm_config, "temperature", 0.1),
+                    disable_thinking=True,
                 ),
                 details={"candidates": len(candidates)},
             )

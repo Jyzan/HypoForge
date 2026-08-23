@@ -147,6 +147,24 @@ class RunManager:
             preview_config.apply_fast_mode_preset()
         m2_override = preview_config.module_overrides.get("m2")
         m2_kwargs = dict(m2_override.kwargs) if m2_override is not None else {}
+        effective_qwen = str(
+            qwen_api_key or preview_config.qwen.base.api_key or ""
+        ).strip()
+        effective_semantic_scholar = str(
+            semantic_scholar_api_key
+            or m2_kwargs.get("semantic_scholar_api_key", "")
+            or os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "")
+        ).strip()
+        effective_openalex = str(
+            openalex_api_key
+            or m2_kwargs.get("openalex_api_key", "")
+            or os.environ.get("OPENALEX_API_KEY", "")
+        ).strip()
+        effective_openalex_mailto = " ".join(str(
+            openalex_mailto
+            or m2_kwargs.get("openalex_mailto", "")
+            or os.environ.get("OPENALEX_MAILTO", "")
+        ).split())
         effective_serper = str(
             serper_api_key
             or m2_kwargs.get("serper_api_key", "")
@@ -157,6 +175,16 @@ class RunManager:
             or m2_kwargs.get("ads_api_token", "")
             or os.environ.get("ADS_API_TOKEN", "")
         ).strip()
+        effective_unpaywall = " ".join(str(
+            unpaywall_email
+            or m2_kwargs.get("unpaywall_email", "")
+            or os.environ.get("UNPAYWALL_EMAIL", "")
+        ).split())
+        effective_crossref = " ".join(str(
+            crossref_mailto
+            or m2_kwargs.get("crossref_mailto", "")
+            or os.environ.get("CROSSREF_MAILTO", "")
+        ).split())
         enabled_sources = list(preview_config.search.tools)
         credential_warnings = (
             literature_credential_warnings(
@@ -169,27 +197,14 @@ class RunManager:
         )
         credential_status = {
             "llm_configured": bool(
-                qwen_api_key or preview_config.qwen.base.api_key
+                effective_qwen
             ),
-            "semantic_scholar_configured": bool(
-                semantic_scholar_api_key
-                or m2_kwargs.get("semantic_scholar_api_key", "")
-                or os.environ.get("SEMANTIC_SCHOLAR_API_KEY")
-            ),
-            "openalex_configured": bool(
-                openalex_api_key
-                or m2_kwargs.get("openalex_api_key", "")
-                or os.environ.get("OPENALEX_API_KEY")
-            ),
+            "semantic_scholar_configured": bool(effective_semantic_scholar),
+            "openalex_configured": bool(effective_openalex),
             "serper_configured": bool(effective_serper),
             "ads_configured": bool(effective_ads),
             "unpaywall_configured": bool(
-                unpaywall_email
-                or openalex_mailto
-                or m2_kwargs.get("unpaywall_email", "")
-                or m2_kwargs.get("openalex_mailto", "")
-                or os.environ.get("UNPAYWALL_EMAIL")
-                or os.environ.get("OPENALEX_MAILTO")
+                effective_unpaywall or effective_openalex_mailto
             ),
         }
         with self._lock:
@@ -227,14 +242,14 @@ class RunManager:
             # They are consumed once by the worker and never persisted.
             self._run_credentials[run_id] = {
                 "model_name": model_name,
-                "qwen_api_key": qwen_api_key,
-                "semantic_scholar_api_key": semantic_scholar_api_key,
-                "openalex_api_key": openalex_api_key,
-                "openalex_mailto": openalex_mailto,
-                "serper_api_key": serper_api_key,
-                "ads_api_token": ads_api_token,
-                "unpaywall_email": unpaywall_email,
-                "crossref_mailto": crossref_mailto,
+                "qwen_api_key": effective_qwen,
+                "semantic_scholar_api_key": effective_semantic_scholar,
+                "openalex_api_key": effective_openalex,
+                "openalex_mailto": effective_openalex_mailto,
+                "serper_api_key": effective_serper,
+                "ads_api_token": effective_ads,
+                "unpaywall_email": effective_unpaywall,
+                "crossref_mailto": effective_crossref,
                 "run_mode": run_mode,
             }
             if seed_state is not None:

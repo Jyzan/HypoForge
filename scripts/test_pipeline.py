@@ -3668,8 +3668,10 @@ def test_normalisation_discards_editorial_statements() -> None:
 class _SequenceClient:
     def __init__(self, responses: list[Any]) -> None:
         self.responses = list(responses)
+        self.calls: list[dict[str, Any]] = []
 
     async def structured_chat(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
         return self.responses.pop(0)
 
 
@@ -3928,6 +3930,11 @@ async def test_multi_agent_round_preserves_generator_statements_end_to_end() -> 
         h2.statement,
     ]
     assert result["top_hypotheses"][0].statement == h1.statement
+    assert client.calls[0]["disable_thinking"] is False
+    assert all(
+        client.calls[index]["disable_thinking"] is True
+        for index in (1, 2, 3, 4)
+    )
 
 
 @pytest.mark.asyncio
@@ -6861,6 +6868,10 @@ async def test_m4_critic_all_rejected_runs_gate_recovery() -> None:
 
     assert [card.hypothesis_id for card in survivors] == ["H3", "H4"]
     assert len(client.calls) == 5
+    assert client.calls[0]["disable_thinking"] is True
+    assert client.calls[2]["disable_thinking"] is True
+    assert client.calls[3]["disable_thinking"] is True
+    assert client.calls[4]["disable_thinking"] is True
     # the critic's critique text fed the regeneration prompt
     assert "missing mechanism" in client.calls[1]["user_prompt"]
     # gate recovery regeneration is capped at a small batch (C-3)
@@ -9465,6 +9476,56 @@ module_overrides:
     assert "oa-secret-for-test" not in persisted
     assert "serper-secret-for-test" not in persisted
     assert "ads-secret-for-test" not in persisted
+
+
+def test_run_manager_passes_environment_search_credentials_to_modules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured badge must mean the worker actually receives the key."""
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+enabled_modules: [m2]
+search:
+  tools: [semantic_scholar, openalex]
+module_overrides:
+  m2:
+    kwargs: {}
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SEMANTIC_SCHOLAR_API_KEY", "env-s2-secret")
+    monkeypatch.setenv("OPENALEX_API_KEY", "env-oa-secret")
+    monkeypatch.setenv("OPENALEX_MAILTO", "env@example.org")
+    monkeypatch.setattr(threading, "Thread", DeferredThread)
+    captured = {}
+
+    class FakeRunner:
+        def __init__(self, config, event_recorder=None):
+            captured["config"] = config
+
+        async def run(self, question: str, run_id: str):
+            return PipelineState(input_question=question, run_id=run_id)
+
+    monkeypatch.setattr("hypoforge.webapp.PipelineRunner", FakeRunner)
+    manager = RunManager(config_path=config_path, output_root=tmp_path / "runs")
+    run = manager.start("q")
+
+    assert run["credential_status"]["semantic_scholar_configured"] is True
+    assert run["credential_status"]["openalex_configured"] is True
+    manager._run_pipeline(run["run_id"], "q")
+
+    kwargs = captured["config"].module_overrides["m2"].kwargs
+    assert kwargs["semantic_scholar_api_key"] == "env-s2-secret"
+    assert kwargs["openalex_api_key"] == "env-oa-secret"
+    assert kwargs["openalex_mailto"] == "env@example.org"
+    persisted = (
+        tmp_path / "runs" / run["run_id"] / "manifest.json"
+    ).read_text(encoding="utf-8")
+    assert "env-s2-secret" not in persisted
+    assert "env-oa-secret" not in persisted
 
 
 def test_run_manager_rejects_malformed_openalex_credentials(
@@ -12473,17 +12534,20 @@ async def test_fast_m4_second_generator_failure_uses_fallback(monkeypatch) -> No
 
 
 @pytest.mark.asyncio
-async def test_fast_m4_contract_repair_failure_uses_fallback(monkeypatch) -> None:
-    """A failed final repair call cannot terminate a fast run."""
+async def test_fast_m4_skips_slow_contract_repair_and_uses_fallback(monkeypatch) -> None:
+    """After one retry, fast mode must not spend another LLM call on repair."""
     from hypoforge.modules.m4_hypothesis_generation import M4HypothesisGeneration
 
     module = M4HypothesisGeneration(mode="fast", fast_mode=True, top_k=1)
     module.client = object()
+    repair_calls = 0
 
     async def empty_generation(*args, **kwargs):
         return [], [], []
 
     async def failed_repair(*args, **kwargs):
+        nonlocal repair_calls
+        repair_calls += 1
         raise TimeoutError("simulated repair timeout")
 
     monkeypatch.setattr(module, "_generate_hypothesis_batch", empty_generation)
@@ -12493,6 +12557,7 @@ async def test_fast_m4_contract_repair_failure_uses_fallback(monkeypatch) -> Non
 
     assert len(output["candidate_hypotheses"]) == 3
     assert len(output["top_hypotheses"]) == 1
+    assert repair_calls == 0
 
 
 @pytest.mark.asyncio
