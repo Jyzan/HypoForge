@@ -5236,6 +5236,41 @@ async def test_m6_fails_closed_when_evidence_review_cites_no_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_m6_final_alignment_cannot_hide_unselected_required_requirement() -> None:
+    """Final review covers the whole M1 contract, not the hypothesis's own subset."""
+    state = robot_state()
+    state.problem_card.task_contract.requirements.append(TaskRequirement(
+        requirement_id="R2",
+        sub_question="How should transfer robustness be measured?",
+        primary_entity_id="E1",
+        related_entity_ids=["E2"],
+        relation="measure transfer robustness",
+        required=True,
+    ))
+    card = hypothesis()  # deliberately declares only R1
+    state.top_hypotheses = [card]
+    state.research_plans = [ResearchPlan(
+        hypothesis_id=card.hypothesis_id,
+        study_subjects="机械臂 sim-to-real 操控",
+        procedures=[card.statement],
+        measurement_metrics=["迁移成功率"],
+        supporting_evidence_ids=["ev-arm-1"],
+        task_trace=card.task_trace,
+    )]
+    module = M6ReviewIteration()
+    module.client = ReviewClient()
+
+    result = await module(state)
+
+    task_review = next(
+        review for review in result["reviews"]
+        if review.dimension.value == "task_alignment"
+    )
+    assert task_review.hard_gate_passed is False
+    assert "R2" in task_review.reasoning
+
+
+@pytest.mark.asyncio
 async def test_m6_rejects_legged_plan_even_if_llm_scores_it_five() -> None:
     state = robot_state().model_copy(update={
         "top_hypotheses": [hypothesis()],

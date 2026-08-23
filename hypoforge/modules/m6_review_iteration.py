@@ -265,17 +265,17 @@ class M6ReviewIteration(ModuleProtocol):
         graph = state.evidence_graph
         graph_context = build_graph_context(state)
         valid_evidence_ids = set(graph_context.available_evidence_ids)
-        hypothesis_requirement_ids = {
-            reference.contract_id
-            for reference in hypothesis.task_trace.requirement_mentions
-        }
+        # M4 may generate hypotheses scoped to a subset of atomic
+        # requirements, but M6 approves the final hypothesis-plan pair for the
+        # user's *whole* question.  Do not let a candidate hide an omitted M1
+        # requirement simply by leaving its ID out of its own trace.  This also
+        # keeps the live M6 hard gate consistent with the posthoc scorer.
         hypothesis_alignment = assess_task_alignment(
             state,
             hypothesis.model_dump_json(exclude={"task_trace"}),
             subject_text="\n".join([hypothesis.statement, hypothesis.mechanism]),
             trace=hypothesis.task_trace,
             semantic_client=None,
-            required_requirement_ids=(hypothesis_requirement_ids or None),
         )
         plan_alignment = assess_task_alignment(
             state,
@@ -283,7 +283,6 @@ class M6ReviewIteration(ModuleProtocol):
             subject_text=plan.study_subjects,
             trace=plan.task_trace,
             semantic_client=None,
-            required_requirement_ids=(hypothesis_requirement_ids or None),
         )
         if self.fast_mode:
             # Fast mode skips the extra task-object semantic LLM call.  The
