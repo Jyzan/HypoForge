@@ -62,6 +62,16 @@ class ContextPlanner:
             )
         }
 
+        focused_ids = {
+            item.entry_id
+            for values in buckets.values()
+            for item in values
+            if (
+                item.entry_id in focus_entries
+                or bool(set(item.evidence_ids) & focus_evidence)
+            )
+        }
+
         def priority(item: GraphContextItem) -> tuple[int, int]:
             focused = (
                 item.entry_id in focus_entries
@@ -140,7 +150,15 @@ class ContextPlanner:
             quotes_per_item=profile.quotes_per_item,
         )
         while estimate_input_tokens(rendered) > budget and included_ids:
-            remove_id = included_ids.pop()
+            remove_id = next(
+                (
+                    entry_id
+                    for entry_id in reversed(included_ids)
+                    if entry_id not in focused_ids
+                ),
+                included_ids[-1],
+            )
+            included_ids.remove(remove_id)
             for values in selected.values():
                 values[:] = [item for item in values if item.entry_id != remove_id]
             if remove_id not in dropped_ids:
@@ -210,7 +228,14 @@ class ContextPlanner:
             lines.append("\nKEY GRAPH RELATIONS:")
             lines.extend(f"- {relation}" for relation in relation_list)
         if dropped_ids:
-            lines.append("\nOMITTED ENTRY IDS: " + ", ".join(dropped_ids))
+            # The complete list belongs to ContextManifest. Repeating every
+            # potentially long ID inside the LLM prompt can itself overflow
+            # the very budget this planner enforces.
+            lines.append(
+                "\nOMITTED CONTEXT: "
+                f"{len(dropped_ids)} entries; IDs are available in the "
+                "context manifest (see context manifest)."
+            )
         if context.unresolved_entry_ids:
             lines.append(
                 "UNRESOLVED GRAPH IDS: " + ", ".join(context.unresolved_entry_ids)

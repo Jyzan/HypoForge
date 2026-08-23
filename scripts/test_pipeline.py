@@ -5775,6 +5775,53 @@ def test_context_planner_is_deterministic_budgeted_and_card_complete() -> None:
     assert len(first.manifest.render_hash) == 64
 
 
+def test_context_planner_bounds_omitted_id_text_and_preserves_focus() -> None:
+    """Large audit manifests must not consume the LLM content budget."""
+
+    from hypoforge.context import ContextPlanner, ContextRequest
+    from hypoforge.graph_context import GraphContextItem
+
+    def items(kind: str) -> list[GraphContextItem]:
+        return [GraphContextItem(
+            entry_id=f"{kind}-{index}-" + ("identifier" * 12),
+            kind=kind,
+            text=f"Complete evidence card {kind} {index}. " + ("fact " * 18),
+            evidence_ids=[f"ev-{kind}-{index}"],
+        ) for index in range(12)]
+
+    gaps = items("knowledge_gap")
+    focused_id = gaps[-1].entry_id
+    context = GraphContext(
+        original_question="How can focused evidence survive a large graph?",
+        established_facts=items("established_fact"),
+        conflicts=items("conflict"),
+        knowledge_gaps=gaps,
+    )
+
+    pack = ContextPlanner().plan(context, ContextRequest(
+        purpose="m4_generate",
+        max_input_tokens=700,
+        reserve_tokens=140,
+        focus_entry_ids=(focused_id,),
+    ))
+
+    assert pack.manifest.estimated_tokens <= 560
+    assert focused_id in pack.manifest.included_ids
+    assert set(pack.manifest.dropped_ids) == (
+        {
+            item.entry_id
+            for bucket in (
+                context.established_facts,
+                context.conflicts,
+                context.knowledge_gaps,
+            )
+            for item in bucket
+        }
+        - set(pack.manifest.included_ids)
+    )
+    assert "see context manifest" in pack.rendered
+
+
 def test_purpose_context_mix_reduces_estimated_tokens_by_half() -> None:
     from scripts.measure_context_budget import measure_context_budget
 
