@@ -726,6 +726,7 @@
             <span class="round-info" id="iterInfo">第 1 轮迭代 · 准备中</span>
           </div>
           <div class="pipeline-grid" id="pipelineGrid"></div>
+          <div id="postPipelineStatus" class="post-pipeline-status hidden" role="status" aria-live="polite"></div>
         </div>
 
         <div class="rounds-card hidden" id="roundsCard">
@@ -1252,6 +1253,25 @@ function renderTokenAttribution(){
   }).join("");
 }
 
+function setPostPipelineStatus(kind, text){
+  const box = $("postPipelineStatus");
+  if(!text){ box.className = "post-pipeline-status hidden"; box.textContent = ""; return; }
+  box.className = `post-pipeline-status ${kind || "running"}`;
+  box.innerHTML = `<span class="post-pipeline-dot"></span><span>${esc(text)}</span>`;
+}
+function applyPostPipelineEvent(event){
+  if(event.event_type === "scoring_started"){
+    setPostPipelineStatus("running", "M1–M6 已完成 · 独立评分中");
+  }else if(event.event_type === "scoring_metric_started"){
+    const metric = String(event.tool || "metric").replace(/^metric:/, "");
+    setPostPipelineStatus("running", `M1–M6 已完成 · 独立评分中：${metric}`);
+  }else if(event.event_type === "scoring_completed"){
+    setPostPipelineStatus("completed", "独立评分完成 · 最终结果已落盘");
+  }else if(event.event_type === "scoring_failed"){
+    setPostPipelineStatus("warning", "独立评分失败 · M1–M6 方案仍已保留");
+  }
+}
+
 /* ---------- 轮次时间线（事件驱动增量） ---------- */
 function roundEntryHtml(r, seqNo){
   const pathCls = esc(r.path_type || "unknown");
@@ -1330,6 +1350,7 @@ function applyEvents(events){
   let changedModules = new Set();
   let rowsChanged = false;
   for(const e of events){
+    applyPostPipelineEvent(e);
     lastSequence = Math.max(lastSequence, e.sequence || 0);
     allEvents.push(e);
     const mId = e.module;
@@ -2204,6 +2225,7 @@ async function openOverallView(rootId){
   $("runId").textContent = String(rootId);
   $("runStatus").textContent = `追问链 · 共 ${members.length} 轮`;
   $("runErrorBanner").classList.add("hidden");
+  setPostPipelineStatus("", "");
   $("credentialWarningBanner").classList.add("hidden");
   $("retryRow").classList.add("hidden");
   $("roundsCard").classList.add("hidden");
@@ -2452,6 +2474,7 @@ async function attachRun(run){
   $("runId").textContent = currentRun;
   $("runStatus").textContent = statusLabel(run.status || "running");
   $("runErrorBanner").classList.add("hidden");
+  setPostPipelineStatus("", "");
   renderCredentialWarnings(run);
   $("retryRow").classList.add("hidden");
   $("roundsCard").classList.add("hidden");

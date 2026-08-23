@@ -10176,6 +10176,15 @@ def test_web_ui_exposes_per_module_token_attribution() -> None:
     assert "renderTokenAttribution" in html
 
 
+def test_web_ui_distinguishes_post_pipeline_scoring_from_m6_completion() -> None:
+    html = _read_index_html()
+
+    assert 'id="postPipelineStatus"' in html
+    assert "scoring_metric_started" in html
+    assert "独立评分中" in html
+    assert "独立评分完成" in html
+
+
 # ==================== test_pipeline ====================
 
 import asyncio

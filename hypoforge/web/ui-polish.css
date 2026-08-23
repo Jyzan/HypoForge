@@ -125,6 +125,29 @@ header {
   backdrop-filter: blur(14px);
 }
 
+.post-pipeline-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 9px 12px;
+  border: 1px solid #c7d2fe;
+  border-radius: 12px;
+  color: #4338ca;
+  background: linear-gradient(90deg, rgba(238, 242, 255, .9), rgba(245, 243, 255, .9));
+  font-size: 11.5px;
+  font-weight: 650;
+}
+
+.post-pipeline-status.hidden { display: none; }
+.post-pipeline-dot { width: 7px; height: 7px; border-radius: 50%; background: #6366f1; }
+.post-pipeline-status.running .post-pipeline-dot { animation: blink 1s infinite; box-shadow: 0 0 0 4px rgba(99, 102, 241, .12); }
+.post-pipeline-status.completed { color: #15803d; border-color: #bbf7d0; background: rgba(240, 253, 244, .88); }
+.post-pipeline-status.completed .post-pipeline-dot { background: #22c55e; }
+.post-pipeline-status.warning { color: #b45309; border-color: #fde68a; background: rgba(255, 251, 235, .9); }
+.post-pipeline-status.warning .post-pipeline-dot { background: #f59e0b; }
+
 .state-card { padding: 16px 20px; }
 .state-counters { gap: 10px; margin-bottom: 12px; }
 .counter { border: 1px solid rgba(226, 232, 240, .78); padding: 10px; }
