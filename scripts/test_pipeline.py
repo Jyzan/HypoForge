@@ -501,6 +501,43 @@ async def test_entity_audit_missing_term_triggers_one_repair_and_reaudit() -> No
 
 
 @pytest.mark.asyncio
+async def test_standard_m1_promotes_audited_entity_after_role_only_repair_failure() -> None:
+    """Source-grounded entities survive a repeated role-label omission."""
+
+    extraction = {"entities": [
+        candidate(
+            "retrieval-augmented generation",
+            role="method",
+            required=True,
+        ),
+        candidate(
+            "hallucinations",
+            role="outcome",
+            required=True,
+        ),
+    ]}
+    audit = {
+        "items": [
+            audit_item("retrieval-augmented generation"),
+            audit_item("hallucinations"),
+        ],
+        "missing_explicit_entities": [],
+        "complete": True,
+    }
+    module = entity_module([extraction, audit, extraction, audit])
+
+    entities = await module._extract_and_audit_entities(
+        "How can retrieval-augmented generation reduce hallucinations?"
+    )
+
+    assert len(module.client.calls) == 4
+    assert entities[0].name == "retrieval-augmented generation"
+    assert entities[0].role == "primary_object"
+    assert entities[0].required is True
+    assert entities[0].source_mention == "retrieval-augmented generation"
+
+
+@pytest.mark.asyncio
 async def test_fast_m1_accepts_grounded_entities_without_source_audit() -> None:
     """A missed secondary entity cannot terminate fast M1 during an audit."""
 
@@ -10064,7 +10101,7 @@ def test_yaml_config_loads():
 
 
 def test_web_ui_timeout_budgets_cover_observed_llm_long_tail() -> None:
-    """Live timeouts must not cut off the observed 171-172s P90 calls."""
+    """Per-call limits stay bounded; multi-call M1 has no shared deadline."""
 
     config_path = Path(__file__).resolve().parent.parent / "configs" / "web_ui.yaml"
     config = PipelineConfig.from_yaml(str(config_path))
@@ -10072,7 +10109,7 @@ def test_web_ui_timeout_budgets_cover_observed_llm_long_tail() -> None:
 
     assert config.qwen.base.request_timeout_seconds >= 210.0
     assert config.qwen.plus.request_timeout_seconds >= 330.0
-    assert config.node_timeouts["m1"] >= 240.0
+    assert config.node_timeouts["m1"] == 0.0
     assert m4_kwargs["llm_call_timeout"] >= 360.0
     assert m4_kwargs["llm_call_timeout"] > config.qwen.plus.request_timeout_seconds
     assert m4_kwargs["total_time_budget_seconds"] >= 840.0

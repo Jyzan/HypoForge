@@ -17,11 +17,14 @@ pipeline:
   supplement_paper_budget: 6
   gap_no_improvement_limit: 3
 
-# Calibrated from live-run latency and a no-timeout replay.  M1 had a 172s P90;
-# the reasoning-enabled M4 generator completed naturally in 282.35s, so its
-# layered ceilings need additional headroom while still bounding stuck calls.
+# Calibrated from live-run latency and no-timeout replays. M1 performs many
+# bounded LLM calls in sequence; a 2026-08-24 standard run reached its normal
+# entity-repair stage but was incorrectly cancelled by the old 240s shared
+# deadline. Keep each provider request bounded and remove only M1's aggregate
+# deadline. The reasoning-enabled M4 generator completed naturally in 282.35s,
+# so its layered ceilings retain additional headroom.
 node_timeouts:
-  m1: 240.0
+  m1: 0.0
   m2: 900.0
   m3: 480.0
   m4: 900.0

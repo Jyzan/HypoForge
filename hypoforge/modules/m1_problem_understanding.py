@@ -600,6 +600,39 @@ class M1ProblemUnderstanding(ModuleProtocol):
             unicodedata.normalize("NFKC", str(value or "")).casefold().split()
         )
 
+    @staticmethod
+    def _promote_required_primary(
+        entities: List[TaskEntity],
+    ) -> tuple[List[TaskEntity], TaskEntity | None]:
+        """Repair only a missing role label; never create a new entity."""
+
+        if not entities or any(
+            item.role == "primary_object" and item.required
+            for item in entities
+        ):
+            return entities, None
+        primary_index = next(
+            (
+                index
+                for index, item in enumerate(entities)
+                if item.role == "primary_object"
+            ),
+            next(
+                (
+                    index
+                    for index, item in enumerate(entities)
+                    if item.required
+                ),
+                0,
+            ),
+        )
+        promoted = entities[primary_index]
+        repaired = list(entities)
+        repaired[primary_index] = promoted.model_copy(
+            update={"role": "primary_object", "required": True}
+        )
+        return repaired, promoted
+
     async def _extract_and_audit_entities(self, question: str) -> List[TaskEntity]:
         """Extract entities from the original question and independently audit them.
 
@@ -658,29 +691,8 @@ class M1ProblemUnderstanding(ModuleProtocol):
                     raise ValueError(
                         "fast M1 entity extraction returned no grounded entities"
                     )
-                if not any(
-                    item.role == "primary_object" and item.required
-                    for item in accepted
-                ):
-                    primary_index = next(
-                        (
-                            index
-                            for index, item in enumerate(accepted)
-                            if item.role == "primary_object"
-                        ),
-                        next(
-                            (
-                                index
-                                for index, item in enumerate(accepted)
-                                if item.required
-                            ),
-                            0,
-                        ),
-                    )
-                    promoted = accepted[primary_index]
-                    accepted[primary_index] = promoted.model_copy(
-                        update={"role": "primary_object", "required": True}
-                    )
+                accepted, promoted = self._promote_required_primary(accepted)
+                if promoted is not None:
                     emit_event(
                         "m1_contract_repaired",
                         module="m1",
@@ -788,6 +800,26 @@ class M1ProblemUnderstanding(ModuleProtocol):
                 },
             )
 
+        if accepted and not last_missing:
+            accepted, promoted = self._promote_required_primary(accepted)
+            if promoted is not None:
+                emit_event(
+                    "m1_contract_repaired",
+                    module="m1",
+                    tool="audited_entity_contract",
+                    status="completed",
+                    message=(
+                        "Promoted an independently audited entity to the "
+                        "required primary object after bounded role repair"
+                    ),
+                    details={
+                        "entity_id": promoted.entity_id,
+                        "entity_name": promoted.name,
+                        "previous_role": promoted.role,
+                        "source_mention": promoted.source_mention,
+                    },
+                )
+                return accepted
         if not any(
             item.role == "primary_object" and item.required
             for item in accepted
