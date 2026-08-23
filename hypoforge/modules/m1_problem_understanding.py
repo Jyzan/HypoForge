@@ -658,6 +658,44 @@ class M1ProblemUnderstanding(ModuleProtocol):
                     raise ValueError(
                         "fast M1 entity extraction returned no grounded entities"
                     )
+                if not any(
+                    item.role == "primary_object" and item.required
+                    for item in accepted
+                ):
+                    primary_index = next(
+                        (
+                            index
+                            for index, item in enumerate(accepted)
+                            if item.role == "primary_object"
+                        ),
+                        next(
+                            (
+                                index
+                                for index, item in enumerate(accepted)
+                                if item.required
+                            ),
+                            0,
+                        ),
+                    )
+                    promoted = accepted[primary_index]
+                    accepted[primary_index] = promoted.model_copy(
+                        update={"role": "primary_object", "required": True}
+                    )
+                    emit_event(
+                        "m1_contract_repaired",
+                        module="m1",
+                        tool="fast_entity_contract",
+                        status="completed",
+                        message=(
+                            "Promoted a grounded entity to the required "
+                            "primary object for fast-mode continuity"
+                        ),
+                        details={
+                            "entity_id": promoted.entity_id,
+                            "entity_name": promoted.name,
+                            "previous_role": promoted.role,
+                        },
+                    )
                 return accepted
             audit_payload = await self.client.structured_chat(
                 disable_thinking=self.fast_mode,

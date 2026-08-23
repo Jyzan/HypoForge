@@ -529,6 +529,38 @@ async def test_fast_m1_accepts_grounded_entities_without_source_audit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fast_m1_promotes_a_grounded_required_entity_when_role_is_missing() -> None:
+    """A model role-label omission must not terminate the fast pipeline."""
+
+    module = M1ProblemUnderstanding(mode="llm", fast_mode=True)
+    module.client = EntityClient([{
+        "entities": [
+            candidate(
+                "retrieval-augmented generation",
+                role="method",
+                required=True,
+                mention="retrieval-augmented generation",
+            ),
+            candidate(
+                "hallucination",
+                role="outcome",
+                required=True,
+                mention="hallucinations",
+            ),
+        ],
+    }])
+
+    entities = await module._extract_and_audit_entities(
+        "How can retrieval-augmented generation reduce hallucinations?"
+    )
+
+    assert entities[0].name == "retrieval-augmented generation"
+    assert entities[0].role == "primary_object"
+    assert entities[0].required is True
+    assert entities[0].source_mention == "retrieval-augmented generation"
+
+
+@pytest.mark.asyncio
 async def test_entity_prompts_never_receive_generated_subquestions() -> None:
     module = entity_module([
         {"entities": [candidate("robot arm", role="primary_object", required=True, mention="机械臂")]},
