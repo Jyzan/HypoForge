@@ -414,7 +414,11 @@ class M4HypothesisGeneration(ModuleProtocol):
         return canonical
 
     @staticmethod
-    def _render_task_contract_block(state: PipelineState) -> str:
+    def _render_task_contract_block(
+        state: PipelineState,
+        *,
+        require_all: bool = False,
+    ) -> str:
         """Render the binding M1 task contract for literal reproduction.
 
         The alignment gate matches entity names character-for-character, so
@@ -446,12 +450,21 @@ class M4HypothesisGeneration(ModuleProtocol):
                 rendered += f" — exact names/aliases: {' | '.join(terms)}"
             lines.append(rendered)
         if contract.requirements:
-            lines.append(
-                "Atomic auditable requirements — each hypothesis must select "
-                "one or more that it genuinely addresses and trace only those "
-                "via a literal excerpt; do not claim every ID merely because "
-                "the primary entity is mentioned:"
-            )
+            if require_all:
+                lines.append(
+                    "Fast one-pass final-output contract — every candidate "
+                    "must genuinely address every required requirement below "
+                    "and include one literal task_trace excerpt for each ID. "
+                    "There is no later review iteration in fast mode, so no "
+                    "required part of the user's question may be deferred:"
+                )
+            else:
+                lines.append(
+                    "Atomic auditable requirements — each hypothesis must select "
+                    "one or more that it genuinely addresses and trace only those "
+                    "via a literal excerpt; do not claim every ID merely because "
+                    "the primary entity is mentioned:"
+                )
             for requirement in contract.requirements:
                 lines.append(
                     f"- {requirement.requirement_id}: {requirement.relation} "
@@ -853,7 +866,10 @@ class M4HypothesisGeneration(ModuleProtocol):
                     ),
                     original_question=question,
                     feedback_context=feedback_context,
-                    task_contract_block=self._render_task_contract_block(state),
+                    task_contract_block=self._render_task_contract_block(
+                        state,
+                        require_all=self.fast_mode,
+                    ),
                 ),
                 output_schema={
                     "type": "array",

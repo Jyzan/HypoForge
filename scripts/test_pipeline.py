@@ -12527,6 +12527,20 @@ def test_web_standard_mode_bounds_semantic_scout_pool() -> None:
     assert config.module_overrides["m2"].kwargs["scout_candidate_limit"] == 16
 
 
+def test_fast_m4_contract_requires_every_required_atomic_requirement() -> None:
+    """A one-pass final hypothesis cannot defer part of the user's question."""
+    from hypoforge.modules.m4_hypothesis_generation import M4HypothesisGeneration
+
+    block = M4HypothesisGeneration._render_task_contract_block(
+        _pose_estimation_contract_state(),
+        require_all=True,
+    )
+
+    assert "every required requirement" in block
+    assert "R1" in block and "R2" in block
+    assert "select one or more" not in block
+
+
 def test_fast_mode_keeps_user_followup_routes_but_disables_internal_loops() -> None:
     """Fast followups still need M1→M4 and M1→M2 routing choices."""
     from hypoforge.config import PipelineConfig
