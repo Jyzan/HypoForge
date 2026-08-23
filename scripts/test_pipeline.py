@@ -12268,6 +12268,57 @@ async def test_fast_m5_malformed_model_payload_uses_fallback_plan() -> None:
     assert output["research_plans"][0].procedures
 
 
+@pytest.mark.asyncio
+async def test_fast_m5_repairs_alignment_locally_without_second_llm_call() -> None:
+    """A quick run must not spend a second full plan call on lexical alignment."""
+    from hypoforge.modules.m5_research_plan import M5ResearchPlan
+
+    class MisalignedPlanClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def structured_chat(self, **kwargs):
+            self.calls += 1
+            return ResearchPlan(
+                study_subjects="Generic language-model benchmark",
+                independent_variables=["retrieval policy"],
+                dependent_variables=["accuracy"],
+                control_groups=["static baseline"],
+                procedures=["Run the generated protocol"],
+                measurement_metrics=["factual accuracy"],
+                analysis_methods=["paired comparison"],
+                expected_results_if_supported="Accuracy improves.",
+                expected_results_if_refuted="Accuracy does not improve.",
+                timeline="Two weeks.",
+                risks_and_alternatives="Use a larger benchmark.",
+            ).model_dump(mode="json")
+
+    question = (
+        "How can retrieval-augmented generation maintain factual grounding "
+        "in changing scientific literature?"
+    )
+    state = _contract_state(
+        "retrieval-augmented generation",
+        "RAG",
+        "maintain factual grounding",
+        question,
+    )
+    state.top_hypotheses = [HypothesisCard(
+        hypothesis_id="H-fast-align",
+        statement="Dynamic retrieval improves factual grounding.",
+    )]
+    client = MisalignedPlanClient()
+    module = M5ResearchPlan(fast_mode=True)
+    module.client = client
+
+    output = await module(state)
+
+    plan = output["research_plans"][0]
+    assert client.calls == 1
+    assert "retrieval-augmented generation" in plan.study_subjects.casefold()
+    assert plan.procedures == ["Run the generated protocol"]
+
+
 def test_fast_m4_fallback_always_returns_three_hypotheses() -> None:
     """Fast mode's deterministic fallback must never leave M4 empty."""
     from hypoforge.modules.m4_hypothesis_generation import M4HypothesisGeneration

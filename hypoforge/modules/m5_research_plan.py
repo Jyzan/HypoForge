@@ -382,6 +382,35 @@ class M5ResearchPlan(ModuleProtocol):
             task_trace=TaskTrace(),
         )
 
+    @staticmethod
+    def _fast_repair_plan_alignment(
+        state: PipelineState,
+        plan: ResearchPlan,
+    ) -> ResearchPlan:
+        """Bind an otherwise usable quick plan back to the original task.
+
+        Fast mode already skips the expensive semantic audit.  When the only
+        remaining gate is a missing lexical task anchor, preserve every
+        generated procedure and measurement while making the original target
+        explicit in ``study_subjects`` instead of paying for a second full
+        research-plan generation.
+        """
+
+        original_question = (
+            state.problem_card.original_question
+            if state.problem_card and state.problem_card.original_question
+            else state.input_question
+        )
+        target = " ".join(str(original_question or "").split())
+        existing = " ".join(str(plan.study_subjects or "").split())
+        if not target:
+            return plan
+        study_subjects = (
+            f"Original research target: {target}\n"
+            f"Proposed study system: {existing or 'target system from the original question'}"
+        )
+        return plan.model_copy(update={"study_subjects": study_subjects})
+
     async def __call__(
         self,
         state: PipelineState,
@@ -426,7 +455,7 @@ class M5ResearchPlan(ModuleProtocol):
             plan: ResearchPlan | None = None
             plan_accepted = False
             last_alignment_rationale = "plan did not pass task alignment"
-            for attempt in range(2):
+            for attempt in range(1 if self.fast_mode else 2):
                 try:
                     payload = await asyncio.wait_for(
                         self.client.structured_chat(
@@ -456,7 +485,7 @@ class M5ResearchPlan(ModuleProtocol):
                         timeout=self.generation_timeout_seconds,
                     )
                 except asyncio.TimeoutError as exc:
-                    if attempt == 0:
+                    if attempt == 0 and not self.fast_mode:
                         emit_event(
                             "tool_retrying",
                             module="m5",
@@ -569,6 +598,48 @@ class M5ResearchPlan(ModuleProtocol):
                     )
                 else:
                     last_alignment_rationale = alignment.rationale
+                    if self.fast_mode:
+                        repaired_plan = self._fast_repair_plan_alignment(
+                            state, plan
+                        )
+                        repaired_plan = self._canonicalize_task_trace(
+                            state,
+                            repaired_plan,
+                            requirement_ids=(hypothesis_requirement_ids or None),
+                        )
+                        repaired_alignment = assess_task_alignment(
+                            state,
+                            self._plan_alignment_text(repaired_plan),
+                            subject_text=repaired_plan.study_subjects,
+                            trace=repaired_plan.task_trace,
+                            semantic_client=None,
+                            required_requirement_ids=(
+                                hypothesis_requirement_ids or None
+                            ),
+                        )
+                        emit_event(
+                            "tool_result",
+                            module="m5",
+                            tool="research_plan_designer",
+                            status=(
+                                "completed"
+                                if repaired_alignment.passed else "warning"
+                            ),
+                            message=(
+                                "Fast-mode task alignment repaired locally"
+                                if repaired_alignment.passed
+                                else "Fast-mode local alignment repair was insufficient; using fallback plan"
+                            ),
+                            details={
+                                "hypothesis_id": h.hypothesis_id,
+                                "initial_rationale": last_alignment_rationale,
+                                "repaired": repaired_alignment.passed,
+                            },
+                        )
+                        if repaired_alignment.passed:
+                            plan = repaired_plan
+                            plan_accepted = True
+                        break
                 alignment_feedback = (
                     "\nHARD ALIGNMENT RETRY: The previous plan was rejected because "
                     f"{last_alignment_rationale} Rewrite it for the original research object "
