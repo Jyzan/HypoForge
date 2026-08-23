@@ -940,6 +940,7 @@ const DIM_LABELS = {
 const STRUCTURED_DRAWER_MODULES = new Set(["m1","m2","m4","m5","m6"]);
 
 let currentRun = null, runRecord = null, lastSequence = 0, timer = null;
+let postPipelineScoringActive = false;
 let allEvents = [], collapsedCount = 0, renderedEventCount = 0;
 let moduleState = {}, iterationSeen = 0, startedAt = null, finishedAt = null;
 let resultData = null, versionsData = [], drawerModule = null, drawerSeg = 0;
@@ -1261,13 +1262,19 @@ function setPostPipelineStatus(kind, text){
 }
 function applyPostPipelineEvent(event){
   if(event.event_type === "scoring_started"){
+    postPipelineScoringActive = true;
     setPostPipelineStatus("running", "M1–M6 已完成 · 独立评分中");
   }else if(event.event_type === "scoring_metric_started"){
+    if(!postPipelineScoringActive) return;
     const metric = String(event.tool || "metric").replace(/^metric:/, "");
     setPostPipelineStatus("running", `M1–M6 已完成 · 独立评分中：${metric}`);
   }else if(event.event_type === "scoring_completed"){
+    if(!postPipelineScoringActive) return;
+    postPipelineScoringActive = false;
     setPostPipelineStatus("completed", "独立评分完成 · 最终结果已落盘");
   }else if(event.event_type === "scoring_failed"){
+    if(!postPipelineScoringActive) return;
+    postPipelineScoringActive = false;
     setPostPipelineStatus("warning", "独立评分失败 · M1–M6 方案仍已保留");
   }
 }
@@ -2225,6 +2232,7 @@ async function openOverallView(rootId){
   $("runId").textContent = String(rootId);
   $("runStatus").textContent = `追问链 · 共 ${members.length} 轮`;
   $("runErrorBanner").classList.add("hidden");
+  postPipelineScoringActive = false;
   setPostPipelineStatus("", "");
   $("credentialWarningBanner").classList.add("hidden");
   $("retryRow").classList.add("hidden");
@@ -2474,6 +2482,7 @@ async function attachRun(run){
   $("runId").textContent = currentRun;
   $("runStatus").textContent = statusLabel(run.status || "running");
   $("runErrorBanner").classList.add("hidden");
+  postPipelineScoringActive = false;
   setPostPipelineStatus("", "");
   renderCredentialWarnings(run);
   $("retryRow").classList.add("hidden");

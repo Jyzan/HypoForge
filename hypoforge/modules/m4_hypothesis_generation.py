@@ -51,7 +51,7 @@ from ..state import (
     TaskTraceReference,
 )
 from ..task_alignment import _mentions_entity, assess_task_alignment
-from ..tools.qwen_client import QwenClient
+from ..tools.qwen_client import QwenClient, track_token_scope
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +187,15 @@ class M4HypothesisGeneration(ModuleProtocol):
         timeout: Optional[float] = None,
     ) -> Any:
         started_at = time.monotonic()
+        tool_usage = {"input": 0, "output": 0, "calls": 0}
+
+        async def tracked_operation() -> Any:
+            with track_token_scope() as scope:
+                try:
+                    return await operation
+                finally:
+                    tool_usage.update(scope.snapshot())
+
         emit_event(
             "tool_started",
             module="m4",
@@ -197,9 +206,11 @@ class M4HypothesisGeneration(ModuleProtocol):
         )
         try:
             if timeout is not None:
-                result = await asyncio.wait_for(operation, timeout=timeout)
+                result = await asyncio.wait_for(
+                    tracked_operation(), timeout=timeout
+                )
             else:
-                result = await operation
+                result = await tracked_operation()
         except asyncio.CancelledError:
             emit_event(
                 "tool_cancelled",
@@ -208,7 +219,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                 status="cancelled",
                 message=f"M4 Agent cancelled: {tool}",
                 elapsed_seconds=time.monotonic() - started_at,
-                details=details,
+                details={**(details or {}), "token_usage": dict(tool_usage)},
             )
             raise
         except BaseException as exc:
@@ -219,7 +230,7 @@ class M4HypothesisGeneration(ModuleProtocol):
                 status="failed",
                 message=f"M4 Agent failed: {tool}: {type(exc).__name__}: {exc}",
                 elapsed_seconds=time.monotonic() - started_at,
-                details=details,
+                details={**(details or {}), "token_usage": dict(tool_usage)},
             )
             raise
         emit_event(
@@ -229,7 +240,7 @@ class M4HypothesisGeneration(ModuleProtocol):
             status="completed",
             message=f"M4 Agent completed: {tool}",
             elapsed_seconds=time.monotonic() - started_at,
-            details=details,
+            details={**(details or {}), "token_usage": dict(tool_usage)},
         )
         return result
 

@@ -125,8 +125,32 @@ class ContextPlanner:
         for entry_id in dropped_ids:
             dropped_reasons.setdefault(entry_id, "token_budget")
 
+        def relation_is_focused(relation: str) -> bool:
+            entry_markers = {
+                marker
+                for entry_id in focus_entries
+                for marker in (f"[{entry_id}]", f"[N_{entry_id}]")
+            }
+            if any(marker in relation for marker in entry_markers):
+                return True
+            relation_evidence: set[str] = set()
+            if " evidence=" in relation:
+                relation_evidence = {
+                    value.strip()
+                    for value in relation.rsplit(" evidence=", 1)[1].split(",")
+                    if value.strip()
+                }
+            return bool(relation_evidence & focus_evidence)
+
+        relation_candidates = sorted(
+            enumerate(context.relations),
+            key=lambda pair: (
+                0 if relation_is_focused(pair[1]) else 1,
+                pair[0],
+            ),
+        )
         relations: list[str] = []
-        for relation in context.relations[: profile.relations]:
+        for _, relation in relation_candidates[: profile.relations]:
             tentative = [*relations, relation]
             rendered = self._render(
                 context,

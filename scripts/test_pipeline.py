@@ -4181,6 +4181,95 @@ def test_graph_context_resolves_export_history_to_text_and_quote() -> None:
     assert context.unresolved_entry_ids == []
 
 
+def test_graph_context_does_not_pretruncate_late_focused_evidence() -> None:
+    """Purpose-aware planning, not graph construction, owns context pruning."""
+
+    from hypoforge.context import ContextPlanner, ContextRequest
+
+    state = robot_state()
+    run = state.m2_knowledge_export.runs[0]
+    state.evidence_graph.established_facts.clear()
+    run.knowledge_entries.clear()
+    run.evidence.clear()
+    for index in range(13):
+        evidence_id = f"ev-late-{index}"
+        entry_id = f"fact-late-{index}"
+        run.evidence.append(M2EvidenceExport(
+            evidence_id=evidence_id,
+            paper_id="S2:p1",
+            chunk_id=f"chunk-late-{index}",
+            quote=f"Late evidence quote {index}.",
+            normalized_claim=f"Late evidence claim {index}.",
+            relevance_score=0.9,
+        ))
+        run.knowledge_entries.append(KnowledgeEntry(
+            id=entry_id,
+            type="established_fact",
+            content=f"Late graph fact {index}.",
+            source_paper_id="S2:p1",
+            evidence_ids=[evidence_id],
+        ))
+        state.evidence_graph.established_facts.append(entry_id)
+
+    context = build_graph_context(state)
+    pack = ContextPlanner().plan(
+        context,
+        ContextRequest(
+            purpose="m5_plan",
+            focus_evidence_ids=("ev-late-12",),
+        ),
+    )
+
+    assert len(context.established_facts) == 13
+    assert "fact-late-12" in pack.manifest.included_ids
+    assert "Late graph fact 12." in pack.rendered
+
+
+def test_graph_context_does_not_pretruncate_late_focused_relation() -> None:
+    from hypoforge.context import ContextPlanner, ContextRequest
+    from hypoforge.state import (
+        EvidenceEdge,
+        EvidenceEdgeRelation,
+        EvidenceNode,
+        EvidenceNodeType,
+    )
+
+    state = PipelineState(
+        input_question="q",
+        evidence_graph=EvidenceGraph(
+            nodes=[
+                EvidenceNode(
+                    id=f"N{index}",
+                    type=EvidenceNodeType.CLAIM,
+                    label=f"claim {index}",
+                )
+                for index in range(22)
+            ],
+            edges=[
+                EvidenceEdge(
+                    source=f"N{index}",
+                    target=f"N{index + 1}",
+                    relation=EvidenceEdgeRelation.SUPPORTS,
+                    evidence_ids=(["ev-focus"] if index == 20 else []),
+                )
+                for index in range(21)
+            ],
+        ),
+    )
+
+    context = build_graph_context(state)
+    pack = ContextPlanner().plan(
+        context,
+        ContextRequest(
+            purpose="m5_plan",
+            focus_evidence_ids=("ev-focus",),
+        ),
+    )
+
+    assert len(context.relations) == 21
+    assert "evidence=ev-focus" in pack.rendered
+
+
 @pytest.mark.asyncio
 async def test_m4_generator_uses_one_audited_context_pack(tmp_path) -> None:
     """A graph fact must not be repeated in legacy bucket prompt fields."""
@@ -5921,6 +6010,31 @@ def test_context_planner_bounds_omitted_id_text_and_preserves_focus() -> None:
         - set(pack.manifest.included_ids)
     )
     assert "see context manifest" in pack.rendered
+
+
+def test_context_planner_prioritises_late_relation_with_focused_evidence() -> None:
+    """A focused edge must not lose to unrelated relations by source order."""
+
+    from hypoforge.context import ContextPlanner, ContextRequest
+    from hypoforge.graph_context import GraphContext
+
+    context = GraphContext(
+        original_question="How does the focused mechanism work?",
+        relations=[
+            *[f"[N{i}] unrelated --supports--> [N{i + 1}]" for i in range(8)],
+            "[N-focus] mechanism --supports--> [N-result] evidence=ev-focus",
+        ],
+    )
+
+    pack = ContextPlanner().plan(
+        context,
+        ContextRequest(
+            purpose="m5_plan",
+            focus_evidence_ids=("ev-focus",),
+        ),
+    )
+
+    assert "evidence=ev-focus" in pack.rendered
 
 
 def test_purpose_context_mix_reduces_estimated_tokens_by_half() -> None:
@@ -10180,6 +10294,8 @@ def test_web_ui_distinguishes_post_pipeline_scoring_from_m6_completion() -> None
     html = _read_index_html()
 
     assert 'id="postPipelineStatus"' in html
+    assert "postPipelineScoringActive" in html
+    assert "if(!postPipelineScoringActive) return" in html
     assert "scoring_metric_started" in html
     assert "独立评分中" in html
     assert "独立评分完成" in html
@@ -11266,6 +11382,70 @@ async def test_m2_reading_tool_event_records_isolated_token_usage(
     assert completed["details"]["paper_id"] == "P1"
     assert completed["details"]["token_usage"] == {
         "input": 19, "output": 6, "calls": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_m1_llm_call_event_records_scoped_token_usage(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from hypoforge.tools.qwen_client import QwenClient, track_token_usage
+
+    async def operation() -> str:
+        QwenClient._record_tokens(SimpleNamespace(response_metadata={
+            "token_usage": {"prompt_tokens": 23, "completion_tokens": 7}
+        }))
+        return "ok"
+
+    recorder = RunEventRecorder(tmp_path, "m1-tool-token")
+    module = M1ProblemUnderstanding()
+    with bind_recorder(recorder), track_token_usage():
+        result = await module._tracked_llm_call(
+            "qwen_entity_audit",
+            operation(),
+        )
+
+    assert result == "ok"
+    completed = next(
+        event for event in recorder.read_events()
+        if event["event_type"] == "llm_call_completed"
+    )
+    assert completed["tool"] == "qwen_entity_audit"
+    assert completed["details"]["token_usage"] == {
+        "input": 23, "output": 7, "calls": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_m4_observed_tool_records_scoped_token_usage(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from hypoforge.tools.qwen_client import QwenClient, track_token_usage
+
+    async def operation() -> str:
+        QwenClient._record_tokens(SimpleNamespace(response_metadata={
+            "token_usage": {"prompt_tokens": 31, "completion_tokens": 9}
+        }))
+        return "ok"
+
+    recorder = RunEventRecorder(tmp_path, "m4-tool-token")
+    with bind_recorder(recorder), track_token_usage():
+        result = await M4HypothesisGeneration._observe_tool(
+            "hypothesis_ranker",
+            operation(),
+        )
+
+    assert result == "ok"
+    completed = next(
+        event for event in recorder.read_events()
+        if event["event_type"] == "tool_completed"
+    )
+    assert completed["details"]["token_usage"] == {
+        "input": 31, "output": 9, "calls": 1,
     }
 
 

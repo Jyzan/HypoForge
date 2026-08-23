@@ -54,7 +54,7 @@ from ..state import (
     TaskEntity,
     TaskRequirement,
 )
-from ..tools.qwen_client import QwenClient
+from ..tools.qwen_client import QwenClient, track_token_scope
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +261,47 @@ class M1ProblemUnderstanding(ModuleProtocol):
         )
         self.client = QwenClient.from_config(llm_config) if llm_config else None
 
+    @staticmethod
+    async def _tracked_llm_call(tool: str, operation: Any) -> Any:
+        """Attribute exactly one M1 provider call to its logical Tool."""
+
+        started_at = time.monotonic()
+        emit_event(
+            "llm_call_started",
+            module="m1",
+            tool=tool,
+            status="running",
+            message=f"M1 LLM call started: {tool}",
+        )
+        with track_token_scope() as scope:
+            try:
+                result = await operation
+            except BaseException as exc:
+                emit_event(
+                    "llm_call_failed",
+                    module="m1",
+                    tool=tool,
+                    status="failed",
+                    message=(
+                        f"M1 LLM call failed: {tool}: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                    elapsed_seconds=time.monotonic() - started_at,
+                    details={"token_usage": scope.snapshot()},
+                )
+                raise
+            usage = scope.snapshot()
+        emit_event(
+            "llm_call_completed",
+            module="m1",
+            tool=tool,
+            status="completed",
+            message=f"M1 LLM call completed: {tool}",
+            elapsed_seconds=time.monotonic() - started_at,
+            details={"token_usage": usage},
+        )
+        return result
+
     async def __call__(
         self,
         state: PipelineState,
@@ -304,13 +345,16 @@ class M1ProblemUnderstanding(ModuleProtocol):
             message="Qwen started decomposing the scientific question",
         )
         try:
-            payload = await self.client.structured_chat(
-                disable_thinking=self.fast_mode,
-                system_prompt=M1_SYSTEM_PROMPT,
-                user_prompt=M1_USER_TEMPLATE.format(question=question),
-                output_schema=_CandidateDecomposition.model_json_schema(),
-                max_tokens=8192,
-                temperature=getattr(self.llm_config, "temperature", 0.1),
+            payload = await self._tracked_llm_call(
+                "qwen_problem_understanding",
+                self.client.structured_chat(
+                    disable_thinking=self.fast_mode,
+                    system_prompt=M1_SYSTEM_PROMPT,
+                    user_prompt=M1_USER_TEMPLATE.format(question=question),
+                    output_schema=_CandidateDecomposition.model_json_schema(),
+                    max_tokens=8192,
+                    temperature=getattr(self.llm_config, "temperature", 0.1),
+                ),
             )
         except BaseException as exc:
             emit_event(
@@ -331,13 +375,16 @@ class M1ProblemUnderstanding(ModuleProtocol):
                 *[f"- {violation}" for violation in violations],
                 "Return corrected domains and sub-questions only.",
             ])
-            retry_payload = await self.client.structured_chat(
-                disable_thinking=self.fast_mode,
-                system_prompt=M1_SYSTEM_PROMPT,
-                user_prompt=retry_prompt,
-                output_schema=_CandidateDecomposition.model_json_schema(),
-                max_tokens=8192,
-                temperature=0.0,
+            retry_payload = await self._tracked_llm_call(
+                "qwen_problem_understanding_retry",
+                self.client.structured_chat(
+                    disable_thinking=self.fast_mode,
+                    system_prompt=M1_SYSTEM_PROMPT,
+                    user_prompt=retry_prompt,
+                    output_schema=_CandidateDecomposition.model_json_schema(),
+                    max_tokens=8192,
+                    temperature=0.0,
+                ),
             )
             retried = _CandidateDecomposition.model_validate(retry_payload)
             retry_violations = self._sub_question_violations(
@@ -418,16 +465,19 @@ class M1ProblemUnderstanding(ModuleProtocol):
             return "\n".join(f"- {item}" for item in items)
 
         for round_index in range(1, self.coverage_max_rounds + 1):
-            payload = await self.client.structured_chat(
-                disable_thinking=self.fast_mode,
-                system_prompt=M1_COVERAGE_CHECK_SYSTEM_PROMPT,
-                user_prompt=M1_COVERAGE_CHECK_USER_TEMPLATE.format(
-                    question=question,
-                    sub_questions_text=render(questions),
+            payload = await self._tracked_llm_call(
+                "qwen_subquestion_coverage",
+                self.client.structured_chat(
+                    disable_thinking=self.fast_mode,
+                    system_prompt=M1_COVERAGE_CHECK_SYSTEM_PROMPT,
+                    user_prompt=M1_COVERAGE_CHECK_USER_TEMPLATE.format(
+                        question=question,
+                        sub_questions_text=render(questions),
+                    ),
+                    output_schema=_SubQuestionCoverage.model_json_schema(),
+                    max_tokens=4096,
+                    temperature=0.0,
                 ),
-                output_schema=_SubQuestionCoverage.model_json_schema(),
-                max_tokens=4096,
-                temperature=0.0,
             )
             audit = _SubQuestionCoverage.model_validate(payload)
             emit_event(
@@ -463,17 +513,20 @@ class M1ProblemUnderstanding(ModuleProtocol):
                 return questions
 
             if audit.over_fragmented:
-                merged_payload = await self.client.structured_chat(
-                disable_thinking=self.fast_mode,
-                    system_prompt=M1_COVERAGE_MERGE_SYSTEM_PROMPT,
-                    user_prompt=M1_COVERAGE_MERGE_USER_TEMPLATE.format(
-                        question=question,
-                        sub_questions_text=render(questions),
-                        merge_instructions_text=render(audit.merge_instructions),
+                merged_payload = await self._tracked_llm_call(
+                    "qwen_subquestion_merge",
+                    self.client.structured_chat(
+                        disable_thinking=self.fast_mode,
+                        system_prompt=M1_COVERAGE_MERGE_SYSTEM_PROMPT,
+                        user_prompt=M1_COVERAGE_MERGE_USER_TEMPLATE.format(
+                            question=question,
+                            sub_questions_text=render(questions),
+                            merge_instructions_text=render(audit.merge_instructions),
+                        ),
+                        output_schema=_SubQuestionSupplement.model_json_schema(),
+                        max_tokens=4096,
+                        temperature=0.0,
                     ),
-                    output_schema=_SubQuestionSupplement.model_json_schema(),
-                    max_tokens=4096,
-                    temperature=0.0,
                 )
                 merged = _SubQuestionSupplement.model_validate(merged_payload)
                 replacement = [
@@ -485,17 +538,20 @@ class M1ProblemUnderstanding(ModuleProtocol):
                     questions = list(dict.fromkeys(replacement))
 
             if not audit.sufficient:
-                supplement_payload = await self.client.structured_chat(
-                disable_thinking=self.fast_mode,
-                    system_prompt=M1_COVERAGE_SUPPLEMENT_SYSTEM_PROMPT,
-                    user_prompt=M1_COVERAGE_SUPPLEMENT_USER_TEMPLATE.format(
-                        question=question,
-                        sub_questions_text=render(questions),
-                        missing_aspects_text=render(audit.missing_aspects),
+                supplement_payload = await self._tracked_llm_call(
+                    "qwen_subquestion_supplement",
+                    self.client.structured_chat(
+                        disable_thinking=self.fast_mode,
+                        system_prompt=M1_COVERAGE_SUPPLEMENT_SYSTEM_PROMPT,
+                        user_prompt=M1_COVERAGE_SUPPLEMENT_USER_TEMPLATE.format(
+                            question=question,
+                            sub_questions_text=render(questions),
+                            missing_aspects_text=render(audit.missing_aspects),
+                        ),
+                        output_schema=_SubQuestionSupplement.model_json_schema(),
+                        max_tokens=4096,
+                        temperature=0.0,
                     ),
-                    output_schema=_SubQuestionSupplement.model_json_schema(),
-                    max_tokens=4096,
-                    temperature=0.0,
                 )
                 supplement = _SubQuestionSupplement.model_validate(
                     supplement_payload
@@ -522,16 +578,19 @@ class M1ProblemUnderstanding(ModuleProtocol):
                     + "; ".join(violations)
                 )
 
-        final_payload = await self.client.structured_chat(
+        final_payload = await self._tracked_llm_call(
+            "qwen_subquestion_coverage_final",
+            self.client.structured_chat(
                 disable_thinking=self.fast_mode,
-            system_prompt=M1_COVERAGE_CHECK_SYSTEM_PROMPT,
-            user_prompt=M1_COVERAGE_CHECK_USER_TEMPLATE.format(
-                question=question,
-                sub_questions_text=render(questions),
+                system_prompt=M1_COVERAGE_CHECK_SYSTEM_PROMPT,
+                user_prompt=M1_COVERAGE_CHECK_USER_TEMPLATE.format(
+                    question=question,
+                    sub_questions_text=render(questions),
+                ),
+                output_schema=_SubQuestionCoverage.model_json_schema(),
+                max_tokens=4096,
+                temperature=0.0,
             ),
-            output_schema=_SubQuestionCoverage.model_json_schema(),
-            max_tokens=4096,
-            temperature=0.0,
         )
         final_audit = _SubQuestionCoverage.model_validate(final_payload)
         if not final_audit.core_intent_covered:
@@ -560,21 +619,24 @@ class M1ProblemUnderstanding(ModuleProtocol):
         """Semantically merge overflow instead of dropping questions by position."""
 
         rendered = "\n".join(f"- {item}" for item in sub_questions)
-        payload = await self.client.structured_chat(
+        payload = await self._tracked_llm_call(
+            "qwen_subquestion_limit_merge",
+            self.client.structured_chat(
                 disable_thinking=self.fast_mode,
-            system_prompt=M1_COVERAGE_MERGE_SYSTEM_PROMPT,
-            user_prompt=M1_COVERAGE_MERGE_USER_TEMPLATE.format(
-                question=question,
-                sub_questions_text=rendered,
-                merge_instructions_text=(
-                    "Merge overlapping or adjacent aspects so the complete "
-                    "list contains at most 5 atomic sub-questions. Preserve "
-                    "the original core action and every indispensable aspect."
+                system_prompt=M1_COVERAGE_MERGE_SYSTEM_PROMPT,
+                user_prompt=M1_COVERAGE_MERGE_USER_TEMPLATE.format(
+                    question=question,
+                    sub_questions_text=rendered,
+                    merge_instructions_text=(
+                        "Merge overlapping or adjacent aspects so the complete "
+                        "list contains at most 5 atomic sub-questions. Preserve "
+                        "the original core action and every indispensable aspect."
+                    ),
                 ),
+                output_schema=_SubQuestionSupplement.model_json_schema(),
+                max_tokens=4096,
+                temperature=0.0,
             ),
-            output_schema=_SubQuestionSupplement.model_json_schema(),
-            max_tokens=4096,
-            temperature=0.0,
         )
         merged = _SubQuestionSupplement.model_validate(payload)
         result = list(dict.fromkeys(
@@ -655,13 +717,16 @@ class M1ProblemUnderstanding(ModuleProtocol):
                 extraction_prompt += M1_ENTITY_REPAIR_NOTE_TEMPLATE.format(
                     audit_feedback=audit_feedback,
                 )
-            candidate_payload = await self.client.structured_chat(
-                disable_thinking=self.fast_mode,
-                system_prompt=M1_ENTITY_EXTRACTION_SYSTEM_PROMPT,
-                user_prompt=extraction_prompt,
-                output_schema=_CandidateEntityList.model_json_schema(),
-                max_tokens=4096,
-                temperature=0.0,
+            candidate_payload = await self._tracked_llm_call(
+                "qwen_entity_extraction",
+                self.client.structured_chat(
+                    disable_thinking=self.fast_mode,
+                    system_prompt=M1_ENTITY_EXTRACTION_SYSTEM_PROMPT,
+                    user_prompt=extraction_prompt,
+                    output_schema=_CandidateEntityList.model_json_schema(),
+                    max_tokens=4096,
+                    temperature=0.0,
+                ),
             )
             candidate_list = _CandidateEntityList.model_validate(candidate_payload)
             if self.fast_mode:
@@ -709,20 +774,23 @@ class M1ProblemUnderstanding(ModuleProtocol):
                         },
                     )
                 return accepted
-            audit_payload = await self.client.structured_chat(
-                disable_thinking=self.fast_mode,
-                system_prompt=M1_ENTITY_AUDIT_SYSTEM_PROMPT,
-                user_prompt=M1_ENTITY_AUDIT_USER_TEMPLATE.format(
-                    question=question,
-                    candidate_entities_json=json.dumps(
-                        [item.model_dump(mode="json") for item in candidate_list.entities],
-                        ensure_ascii=False,
-                        indent=2,
+            audit_payload = await self._tracked_llm_call(
+                "qwen_entity_audit",
+                self.client.structured_chat(
+                    disable_thinking=self.fast_mode,
+                    system_prompt=M1_ENTITY_AUDIT_SYSTEM_PROMPT,
+                    user_prompt=M1_ENTITY_AUDIT_USER_TEMPLATE.format(
+                        question=question,
+                        candidate_entities_json=json.dumps(
+                            [item.model_dump(mode="json") for item in candidate_list.entities],
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
                     ),
+                    output_schema=_EntitySourceAudit.model_json_schema(),
+                    max_tokens=4096,
+                    temperature=0.0,
                 ),
-                output_schema=_EntitySourceAudit.model_json_schema(),
-                max_tokens=4096,
-                temperature=0.0,
             )
             audit = _EntitySourceAudit.model_validate(audit_payload)
             audit_by_name = {
@@ -918,17 +986,20 @@ class M1ProblemUnderstanding(ModuleProtocol):
                     "\nThe previous mapping failed deterministic validation. "
                     "Rebuild it using exactly the listed questions and entity IDs."
                 )
-            payload = await self.client.structured_chat(
-                disable_thinking=self.fast_mode,
-                system_prompt=M1_REQUIREMENT_SYSTEM_PROMPT,
-                user_prompt=M1_REQUIREMENT_USER_TEMPLATE.format(
-                    sub_questions_json=questions_json,
-                    entities_json=entities_json,
-                    repair_note=repair_note,
+            payload = await self._tracked_llm_call(
+                "qwen_requirement_mapping",
+                self.client.structured_chat(
+                    disable_thinking=self.fast_mode,
+                    system_prompt=M1_REQUIREMENT_SYSTEM_PROMPT,
+                    user_prompt=M1_REQUIREMENT_USER_TEMPLATE.format(
+                        sub_questions_json=questions_json,
+                        entities_json=entities_json,
+                        repair_note=repair_note,
+                    ),
+                    output_schema=_RequirementList.model_json_schema(),
+                    max_tokens=4096,
+                    temperature=0.0,
                 ),
-                output_schema=_RequirementList.model_json_schema(),
-                max_tokens=4096,
-                temperature=0.0,
             )
             result = _RequirementList.model_validate(payload)
             last_violations = self._requirement_violations(
@@ -982,18 +1053,21 @@ class M1ProblemUnderstanding(ModuleProtocol):
             details={"parent_run_id": followup.parent_run_id},
         )
         try:
-            payload = await self.client.structured_chat(
-                disable_thinking=self.fast_mode,
-                system_prompt=M1_FOLLOWUP_SYSTEM_PROMPT,
-                user_prompt=M1_FOLLOWUP_USER_TEMPLATE.format(
-                    problem_card_json=problem_card_json,
-                    followup_text=followup.text,
-                    graph_overview=graph_overview,
-                    parent_artifacts_summary=parent_artifacts_summary,
+            payload = await self._tracked_llm_call(
+                "qwen_followup_triage",
+                self.client.structured_chat(
+                    disable_thinking=self.fast_mode,
+                    system_prompt=M1_FOLLOWUP_SYSTEM_PROMPT,
+                    user_prompt=M1_FOLLOWUP_USER_TEMPLATE.format(
+                        problem_card_json=problem_card_json,
+                        followup_text=followup.text,
+                        graph_overview=graph_overview,
+                        parent_artifacts_summary=parent_artifacts_summary,
+                    ),
+                    output_schema=_FollowupTriageDecision.model_json_schema(),
+                    max_tokens=8192,
+                    temperature=0.0,
                 ),
-                output_schema=_FollowupTriageDecision.model_json_schema(),
-                max_tokens=8192,
-                temperature=0.0,
             )
             decision = _FollowupTriageDecision.model_validate(payload)
         except BaseException as exc:
