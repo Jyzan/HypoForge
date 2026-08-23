@@ -441,6 +441,7 @@ class PipelineConfig(BaseModel):
             "final_k": 2,
             "subquestion_concurrency": 4,
             "source_concurrency_limit": 3,
+            "source_timeout_seconds": 15.0,
             "fresh_run_timeout_seconds": 0.0,
             "allow_empty_results": True,
             "abstract_only": True,

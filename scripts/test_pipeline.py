@@ -11619,6 +11619,7 @@ def test_fast_preset_disables_iteration_and_sets_quick_switches() -> None:
     assert config.module_overrides["m2"].kwargs["abstract_only"] is True
     assert config.module_overrides["m2"].kwargs["fulltext_target_per_subquestion"] == 0
     assert config.module_overrides["m2"].kwargs["preprint_supplement_enabled"] is False
+    assert config.module_overrides["m2"].kwargs["source_timeout_seconds"] == 15.0
 
 
 def test_fast_mode_keeps_user_followup_routes_but_disables_internal_loops() -> None:
