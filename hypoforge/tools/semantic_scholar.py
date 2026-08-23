@@ -87,7 +87,10 @@ _S2_RATE_LIMIT = max(
     1.0,
     float(os.environ.get("SEMANTIC_SCHOLAR_MIN_INTERVAL_SECONDS", "5.0")),
 )
-_OPENALEX_RATE_LIMIT = 0.12
+_OPENALEX_RATE_LIMIT = max(
+    0.12,
+    float(os.environ.get("OPENALEX_MIN_INTERVAL_SECONDS", "0.25")),
+)
 _last_request_time: float = 0.0
 _rate_limit_lock = threading.Lock()
 
@@ -133,8 +136,11 @@ def _http_get_json(
 
     ``deadline`` (absolute ``time.monotonic()`` time) bounds the whole call:
     rate-limit waits, backoff sleeps and the socket timeout all respect it.
-    HTTP 429 fails fast instead of retrying. Other providers are not called
-    from this helper; source independence is handled by the search agent.
+    Semantic Scholar HTTP 429 fails fast so its circuit breaker can engage.
+    OpenAlex 429 is retried within the same bounded stage because concurrent
+    evidence-gap searches can briefly exceed its burst allowance. Other
+    providers are not called from this helper; source independence is handled
+    by the search agent.
     """
     # The endpoint determines the provider; an absent key must not make an
     # S2 request look like an OpenAlex request or use OpenAlex's rate limit.
@@ -164,9 +170,35 @@ def _http_get_json(
         except urllib.error.HTTPError as e:
             last_exc = e
             if e.code == 429:
-                logger.debug(
-                    "429 rate-limited (attempt %d); failing fast", attempt,
-                )
+                if is_s2:
+                    logger.debug(
+                        "Semantic Scholar 429 (attempt %d); failing fast",
+                        attempt,
+                    )
+                    raise
+                if attempt < 3:
+                    raw_retry_after = str(
+                        (e.headers or {}).get("Retry-After", "")
+                    ).strip()
+                    retry_after: float | None = None
+                    try:
+                        if raw_retry_after:
+                            retry_after = float(raw_retry_after)
+                    except (TypeError, ValueError):
+                        retry_after = None
+                    wait = (
+                        max(0.0, retry_after)
+                        if retry_after is not None
+                        else (2 ** attempt) + random.uniform(0, 0.25)
+                    )
+                    logger.warning(
+                        "OpenAlex rate-limited one request; retrying in %.1fs "
+                        "(attempt %d/4)",
+                        wait,
+                        attempt + 1,
+                    )
+                    _sleep_with_deadline(wait, deadline)
+                    continue
             raise
         except (urllib.error.URLError, OSError) as e:
             last_exc = e

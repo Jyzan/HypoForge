@@ -468,7 +468,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
             payload = await self._tracked_llm_call(
                 "qwen_subquestion_coverage",
                 self.client.structured_chat(
-                    disable_thinking=self.fast_mode,
+                    disable_thinking=True,
                     system_prompt=M1_COVERAGE_CHECK_SYSTEM_PROMPT,
                     user_prompt=M1_COVERAGE_CHECK_USER_TEMPLATE.format(
                         question=question,
@@ -516,7 +516,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
                 merged_payload = await self._tracked_llm_call(
                     "qwen_subquestion_merge",
                     self.client.structured_chat(
-                        disable_thinking=self.fast_mode,
+                        disable_thinking=True,
                         system_prompt=M1_COVERAGE_MERGE_SYSTEM_PROMPT,
                         user_prompt=M1_COVERAGE_MERGE_USER_TEMPLATE.format(
                             question=question,
@@ -541,7 +541,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
                 supplement_payload = await self._tracked_llm_call(
                     "qwen_subquestion_supplement",
                     self.client.structured_chat(
-                        disable_thinking=self.fast_mode,
+                        disable_thinking=True,
                         system_prompt=M1_COVERAGE_SUPPLEMENT_SYSTEM_PROMPT,
                         user_prompt=M1_COVERAGE_SUPPLEMENT_USER_TEMPLATE.format(
                             question=question,
@@ -581,7 +581,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
         final_payload = await self._tracked_llm_call(
             "qwen_subquestion_coverage_final",
             self.client.structured_chat(
-                disable_thinking=self.fast_mode,
+                disable_thinking=True,
                 system_prompt=M1_COVERAGE_CHECK_SYSTEM_PROMPT,
                 user_prompt=M1_COVERAGE_CHECK_USER_TEMPLATE.format(
                     question=question,
@@ -622,7 +622,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
         payload = await self._tracked_llm_call(
             "qwen_subquestion_limit_merge",
             self.client.structured_chat(
-                disable_thinking=self.fast_mode,
+                disable_thinking=True,
                 system_prompt=M1_COVERAGE_MERGE_SYSTEM_PROMPT,
                 user_prompt=M1_COVERAGE_MERGE_USER_TEMPLATE.format(
                     question=question,
@@ -720,7 +720,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
             candidate_payload = await self._tracked_llm_call(
                 "qwen_entity_extraction",
                 self.client.structured_chat(
-                    disable_thinking=self.fast_mode,
+                    disable_thinking=True,
                     system_prompt=M1_ENTITY_EXTRACTION_SYSTEM_PROMPT,
                     user_prompt=extraction_prompt,
                     output_schema=_CandidateEntityList.model_json_schema(),
@@ -777,7 +777,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
             audit_payload = await self._tracked_llm_call(
                 "qwen_entity_audit",
                 self.client.structured_chat(
-                    disable_thinking=self.fast_mode,
+                    disable_thinking=True,
                     system_prompt=M1_ENTITY_AUDIT_SYSTEM_PROMPT,
                     user_prompt=M1_ENTITY_AUDIT_USER_TEMPLATE.format(
                         question=question,
@@ -989,7 +989,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
             payload = await self._tracked_llm_call(
                 "qwen_requirement_mapping",
                 self.client.structured_chat(
-                    disable_thinking=self.fast_mode,
+                    disable_thinking=True,
                     system_prompt=M1_REQUIREMENT_SYSTEM_PROMPT,
                     user_prompt=M1_REQUIREMENT_USER_TEMPLATE.format(
                         sub_questions_json=questions_json,
@@ -1056,7 +1056,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
             payload = await self._tracked_llm_call(
                 "qwen_followup_triage",
                 self.client.structured_chat(
-                    disable_thinking=self.fast_mode,
+                    disable_thinking=True,
                     system_prompt=M1_FOLLOWUP_SYSTEM_PROMPT,
                     user_prompt=M1_FOLLOWUP_USER_TEMPLATE.format(
                         problem_card_json=problem_card_json,

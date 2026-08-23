@@ -31,8 +31,7 @@ from ..prompts.m6_prompts import (
     M6_USER_TEMPLATE,
 )
 from ..evaluation.rubric import review_rubric_line
-from ..evaluation.scorer import _quality_gates, score_hypothesis_async, _collect_knowledge_entries
-from ..evaluation.metrics import MetricRegistry
+from ..evaluation.scorer import _quality_gates
 from ..registry import ModuleRegistry
 from ..state import (
     EvidenceGap,
@@ -512,39 +511,6 @@ class M6ReviewIteration(ModuleProtocol):
                 version=version,
             ))
 
-            # 4. Metrics
-            independent_metrics = {}
-            if not self.fast_mode:
-                knowledge_entries = _collect_knowledge_entries(state)
-                # score_hypothesis_async runs all implemented independent metrics
-                metric_report = await score_hypothesis_async(
-                    hypothesis,
-                    knowledge_entries,
-                    llm_config=getattr(config, "llm", None),
-                    embed_config=getattr(config, "embedding", None),
-                    evidence_graph=state.evidence_graph
-                )
-                independent_metrics = metric_report.get("independent", {})
-            for m_name, m_score in independent_metrics.items():
-                m_score_scaled = m_score * 5.0
-                threshold = 1.5 if m_name == "novelty" else 2.5
-                m_passed = m_score_scaled >= threshold
-                dim_name = f"{m_name}_metric"
-                if m_name == "evidence_consistency":
-                    dim_name = "objective_evidence_consistency"
-                    
-                m_attr = "hypothesis"
-                    
-                new_reviews.append(ReviewResult(
-                    dimension=ReviewerDimension(dim_name),
-                    attribution=m_attr,
-                    reasoning=f"Calculated {m_name} score is {m_score:.2f} (scaled to {m_score_scaled:.1f}/5).",
-                    score=round(m_score_scaled, 1),
-                    comments=f"Objective metric {m_name} from MetricRegistry.",
-                    suggestions="" if m_passed else f"Improve {m_name} to meet the minimum threshold of {threshold}/5.",
-                    hard_gate_passed=m_passed,
-                    version=version,
-                ))
         except Exception as e:
             logger.warning(f"Failed to compute objective quality gates/metrics: {e}")
 

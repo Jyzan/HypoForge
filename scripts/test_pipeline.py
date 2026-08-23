@@ -343,6 +343,11 @@ async def test_initial_decomposition_call_cannot_generate_entities_or_contract()
 
     schema_properties = module.client.calls[0]["output_schema"]["properties"]
     assert set(schema_properties) == {"domain", "sub_questions"}
+    assert module.client.calls[0]["disable_thinking"] is False
+    assert all(
+        call["disable_thinking"] is True
+        for call in module.client.calls[1:]
+    )
     assert card.key_entities == ["robot arm", "offline reinforcement learning"]
     assert [entity.name for entity in card.task_contract.entities] == [
         "robot arm",
@@ -8212,13 +8217,14 @@ async def test_m6_switch_off_never_calls_verdict() -> None:
         "reviews", "iteration_count", "graph_correction_requests",
     }  # no evidence-verdict keys
     assert patch["iteration_count"] == 1
-    # alignment gate + 2 specialists + 3 objective gates + 3 metric dims + overall
-    assert len(patch["reviews"]) == 10
+    # alignment gate + 2 specialists + 3 objective gates + overall.  The real
+    # independent metrics are computed once by the authoritative posthoc scorer,
+    # not synthesized here with a missing evaluator configuration.
+    assert len(patch["reviews"]) == 7
     assert {r.dimension.value for r in patch["reviews"]} == {
         "task_alignment", "scientific_logic", "method_feasibility",
         "evidence_coverage_gate", "answer_completeness_gate",
-        "source_quality_gate", "testability_metric", "novelty_metric",
-        "objective_evidence_consistency", "overall",
+        "source_quality_gate", "overall",
     }
 
 
@@ -11027,6 +11033,61 @@ def test_openalex_query_normalization_removes_natural_language_wildcards() -> No
     assert _normalize_openalex_query(
         "retrieval* augmented? generation"
     ) == "retrieval augmented generation"
+
+
+def test_openalex_retries_transient_429_within_stage_deadline(
+    monkeypatch,
+) -> None:
+    """OpenAlex 429s are transient and must not discard the whole source."""
+
+    import time
+    import urllib.error
+
+    from hypoforge.tools import semantic_scholar
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"results": [], "meta": {"count": 0}}'
+
+    class Opener:
+        calls = 0
+
+        def open(self, request, timeout):
+            self.calls += 1
+            if self.calls == 1:
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    429,
+                    "Too Many Requests",
+                    {"Retry-After": "0"},
+                    None,
+                )
+            return Response()
+
+    opener = Opener()
+    waits = []
+    monkeypatch.setattr(semantic_scholar, "_NO_PROXY_OPENER", opener)
+    monkeypatch.setattr(semantic_scholar, "_rate_limit", lambda *args: None)
+    monkeypatch.setattr(
+        semantic_scholar,
+        "_sleep_with_deadline",
+        lambda seconds, deadline: waits.append(seconds),
+    )
+
+    payload = semantic_scholar._http_get_json(
+        "https://api.openalex.org/works?search=rag",
+        deadline=time.monotonic() + 5,
+    )
+
+    assert payload["results"] == []
+    assert opener.calls == 2
+    assert waits == [0.0]
 
 
 @pytest.mark.asyncio
