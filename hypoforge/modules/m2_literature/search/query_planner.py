@@ -12,8 +12,8 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Sequence
 
-from hypoforge.literature.models import QueryIntent, SearchQuery, SearchState
-from hypoforge.literature.protocols import QueryPlannerProtocol
+from hypoforge.modules.m2_literature.models import QueryIntent, SearchQuery, SearchState
+from hypoforge.modules.m2_literature.protocols import QueryPlannerProtocol
 from hypoforge.tools.qwen_client import QwenClient
 
 logger = logging.getLogger(__name__)

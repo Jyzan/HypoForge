@@ -4,7 +4,7 @@ import hashlib
 import re
 from collections.abc import Sequence
 
-from ..state import ConfidenceLevel, KnowledgeEntryType
+from ...state import ConfidenceLevel, KnowledgeEntryType
 from .adapter import AgenticM2Adapter
 from .models import (
     CoverageReport,

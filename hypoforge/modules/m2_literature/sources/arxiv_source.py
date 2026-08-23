@@ -7,8 +7,8 @@ import hashlib
 import re
 from typing import Optional
 
-from hypoforge.literature.models import FulltextStatus, PaperRecord, SearchQuery
-from hypoforge.literature.protocols import LiteratureSourceProtocol
+from hypoforge.modules.m2_literature.models import FulltextStatus, PaperRecord, SearchQuery
+from hypoforge.modules.m2_literature.protocols import LiteratureSourceProtocol
 from hypoforge.tools.arxiv_search import ArxivTool
 
 

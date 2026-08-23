@@ -6,8 +6,8 @@ import asyncio
 import hashlib
 from typing import Any
 
-from ...state import ConfidenceLevel, KnowledgeEntryType
-from ...tools.qwen_client import QwenClient
+from ....state import ConfidenceLevel, KnowledgeEntryType
+from ....tools.qwen_client import QwenClient
 from ..models import (
     EvidenceChunk,
     EvidenceLinkedKnowledge,

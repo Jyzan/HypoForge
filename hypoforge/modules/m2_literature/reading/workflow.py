@@ -7,7 +7,7 @@ import time
 from collections.abc import Awaitable, Callable, Sequence
 from typing import TypeVar
 
-from ...observability import emit_event
+from ....observability import emit_event
 from ..models import (
     ContentLevel,
     DocumentRecord,

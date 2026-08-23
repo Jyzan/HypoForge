@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlparse
 from dotenv import dotenv_values
 
 from .config import ModuleOverride, PipelineConfig
-from .literature.search.search_tool import literature_credential_warnings
+from .modules.m2_literature.search.search_tool import literature_credential_warnings
 from .observability import RunEventRecorder
 from .pipeline import PipelineRunner
 

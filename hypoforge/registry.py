@@ -157,8 +157,8 @@ class ModuleRegistry:
                 module_cls = cls._load_module_class(override.class_name, name)
             elif (
                 name == "m2"
-                and module_cls.__module__ == "hypoforge.modules.m2_literature_search"
-                and module_cls.__name__ == "M2LiteratureSearch"
+                and getattr(module_cls, "strict_contract_family", "")
+                == "agentic_m2"
             ):
                 # Keep the Pipeline-facing M2 facade in the modules package;
                 # only swap its implementation for the strict contract wrapper.

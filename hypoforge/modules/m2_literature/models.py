@@ -11,7 +11,7 @@ from typing import Annotated, Dict, List, Literal, Optional, Set
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
-from ..state import ConfidenceLevel, KnowledgeEntryType
+from ...state import ConfidenceLevel, KnowledgeEntryType
 
 
 NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]

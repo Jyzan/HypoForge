@@ -1,8 +1,11 @@
 # Agentic literature package
 
-The `hypoforge.literature` package defines the Agentic M2 contracts, source
-adapters, query planning, iterative search, ranking, full-text reading, and
-provenance export.
+The canonical `hypoforge.modules.m2_literature` package defines the Agentic M2
+contracts, source adapters, query planning, iterative search, ranking,
+full-text reading, and provenance export.  The historical
+`hypoforge.literature` namespace is a temporary compatibility alias: old deep
+imports resolve to the same canonical module objects, but new code must use
+the modules namespace.
 
 ## M2 data flow
 
@@ -17,7 +20,7 @@ ProblemCard -> SearchQuery -> PaperRecord -> DocumentChunk
 `evidence_ids` that must resolve within the same M2 export run.
 
 `M2LiteratureSearch` in `hypoforge.modules` is the Pipeline-facing M2 entry
-point. It delegates to the Literature-layer `AgenticM2Module`, while the
+point. It delegates to `m2_literature.AgenticM2Module`, while the
 lower-level `AgenticM2Adapter` remains the dependency-injection executor used
 by the module and integrated runner. The Literature package itself does not
 register a Pipeline module.

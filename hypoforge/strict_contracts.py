@@ -25,10 +25,10 @@ from .entity_normalization import (
     _stable_id,
     clean_entity_surface,
 )
-from .literature.adapter import AgenticM2Adapter
+from .modules.m2_literature.adapter import AgenticM2Adapter
 from .modules.m2_literature_search import M2LiteratureSearch
-from .literature.export import build_m2_knowledge_export_run
-from .literature.models import (
+from .modules.m2_literature.export import build_m2_knowledge_export_run
+from .modules.m2_literature.models import (
     PaperRecord,
     QueryIntent,
     SearchQuery,
@@ -1841,12 +1841,12 @@ class StrictM6ReviewIteration(M6ReviewIteration):
     """Built-in M6 marker ensuring strict runtime hooks are loaded explicitly."""
 
 
-from .literature.search.agent import IterativeSearchAgent as _IterativeSearchAgent
+from .modules.m2_literature.search.agent import IterativeSearchAgent as _IterativeSearchAgent
 
 _ORIGINAL_SEARCH_AGENT_RUN = _IterativeSearchAgent.run
 
 
-from .literature.search.scout import ScoutReader as _ScoutReader
+from .modules.m2_literature.search.scout import ScoutReader as _ScoutReader
 
 _ORIGINAL_SCOUT_READ = _ScoutReader.read
 
@@ -1862,7 +1862,7 @@ _ORIGINAL_GROUNDING_JUDGE_CANDIDATES = _GroundingWorkflow._judge_candidate_relat
 # The legacy modules imported the base service directly.  Rebind that module
 # global once when strict built-ins are loaded so every built-in M2/M3 path uses
 # the same pair-level identity contract.
-from .literature import adapter as _adapter_module
+from .modules.m2_literature import adapter as _adapter_module
 from .modules import m3_evidence_graph as _m3_module
 
 _adapter_module.EntityNormalizationService = StrictEntityNormalizationService

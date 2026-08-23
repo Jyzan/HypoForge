@@ -9,7 +9,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Tuple
 
-from ...observability import emit_event
+from ....observability import emit_event
 from ..models import (
     CoverageReport,
     PaperRecord,

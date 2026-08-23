@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from hypoforge.literature.models import FulltextStatus, PaperRecord, SearchQuery
-from hypoforge.literature.protocols import LiteratureSourceProtocol
+from hypoforge.modules.m2_literature.models import FulltextStatus, PaperRecord, SearchQuery
+from hypoforge.modules.m2_literature.protocols import LiteratureSourceProtocol
 from hypoforge.tools.pubmed_search import PubMedTool
 
 from .pubmed import (

@@ -4,7 +4,7 @@ Provides ``tool_definitions`` for QueryPlanner and a single search entry
 point that dispatches to the appropriate backend.
 
 For use with ``IterativeSearchAgent``, prefer the individual source
-implementations in ``hypoforge.literature.sources``.
+implementations in ``hypoforge.modules.m2_literature.sources``.
 """
 
 from __future__ import annotations
@@ -13,18 +13,18 @@ from collections.abc import Sequence
 import os
 from typing import Any, Dict, List, Optional
 
-from hypoforge.literature.models import PaperRecord, SearchQuery
-from hypoforge.literature.sources.academic_source import AcademicSource
-from hypoforge.literature.sources.arxiv_source import ArxivSource
-from hypoforge.literature.sources.openalex_source import (
+from hypoforge.modules.m2_literature.models import PaperRecord, SearchQuery
+from hypoforge.modules.m2_literature.sources.academic_source import AcademicSource
+from hypoforge.modules.m2_literature.sources.arxiv_source import ArxivSource
+from hypoforge.modules.m2_literature.sources.openalex_source import (
     OpenAlexOpenAccessSource,
     OpenAlexSource,
 )
-from hypoforge.literature.sources.openalex_enriched_scholar import (
+from hypoforge.modules.m2_literature.sources.openalex_enriched_scholar import (
     OpenAlexEnrichedScholarSource,
 )
-from hypoforge.literature.sources.pubmed_source import PubMedSource
-from hypoforge.literature.sources.specialist_sources import (
+from hypoforge.modules.m2_literature.sources.pubmed_source import PubMedSource
+from hypoforge.modules.m2_literature.sources.specialist_sources import (
     AdsSource,
     CrossrefSource,
     DblpSource,

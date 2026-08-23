@@ -28,7 +28,7 @@ from typing import Any, List, Sequence
 
 from pydantic import BaseModel, Field
 
-from ..observability import emit_event
+from ...observability import emit_event
 
 logger = logging.getLogger(__name__)
 

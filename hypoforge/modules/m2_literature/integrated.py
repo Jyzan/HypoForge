@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from ..tools.qwen_client import QwenClient
+from ...tools.qwen_client import QwenClient
 from .adapter import AgenticM2Adapter
 from .models import SearchBudget
 from .reading import (

@@ -5,8 +5,8 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any, Mapping, Optional, Sequence
 
-from hypoforge.literature.models import PaperRecord, SearchQuery
-from hypoforge.literature.protocols import LiteratureSourceProtocol
+from hypoforge.modules.m2_literature.models import PaperRecord, SearchQuery
+from hypoforge.modules.m2_literature.protocols import LiteratureSourceProtocol
 
 from .academic_source import _dict_to_record
 

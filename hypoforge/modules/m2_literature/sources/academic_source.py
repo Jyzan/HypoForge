@@ -9,8 +9,8 @@ from __future__ import annotations
 import math
 from typing import List, Optional
 
-from hypoforge.literature.models import FulltextStatus, PaperRecord, SearchQuery
-from hypoforge.literature.protocols import LiteratureSourceProtocol
+from hypoforge.modules.m2_literature.models import FulltextStatus, PaperRecord, SearchQuery
+from hypoforge.modules.m2_literature.protocols import LiteratureSourceProtocol
 from hypoforge.tools.semantic_scholar import SemanticScholarTool
 
 

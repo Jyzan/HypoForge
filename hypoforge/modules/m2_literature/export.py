@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 import re
 
-from ..state import (
+from ...state import (
     KnowledgeEntry,
     M2CoverageExport,
     M2EvidenceExport,

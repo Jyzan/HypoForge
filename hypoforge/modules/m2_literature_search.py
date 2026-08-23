@@ -2,14 +2,14 @@
 
 This module intentionally contains no search or reading implementation. It is
 the stable M1-M6 module boundary and delegates the actual literature workflow
-to :mod:`hypoforge.literature`.
+to :mod:`hypoforge.modules.m2_literature`.
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from ..literature.adapter import AgenticM2Module
+from .m2_literature.adapter import AgenticM2Module
 from ..registry import ModuleRegistry
 from ..state import PipelineState
 
@@ -21,6 +21,7 @@ class M2LiteratureSearch(AgenticM2Module):
     module_name = "m2"
     module_version = "0.3.0-literature-facade"
     description = "Literature search and evidence-linked knowledge extraction"
+    strict_contract_family = "agentic_m2"
 
     async def __call__(
         self,

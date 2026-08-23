@@ -7,7 +7,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
 
-from ...tools.pubmed_search import pubmed_count, search_pubmed_strict
+from ....tools.pubmed_search import pubmed_count, search_pubmed_strict
 from ..models import FulltextStatus, PaperRecord, SearchQuery
 from ..protocols import LiteratureSourceProtocol
 

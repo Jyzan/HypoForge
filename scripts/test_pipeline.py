@@ -1096,6 +1096,50 @@ from hypoforge.state import (
 )
 
 
+def test_m2_canonical_and_legacy_imports_share_identity() -> None:
+    """The compatibility namespace must never create duplicate M2 classes."""
+
+    import importlib
+
+    module_pairs = [
+        (
+            "hypoforge.literature.adapter",
+            "hypoforge.modules.m2_literature.adapter",
+            "AgenticM2Adapter",
+        ),
+        (
+            "hypoforge.literature.models",
+            "hypoforge.modules.m2_literature.models",
+            "SearchQuery",
+        ),
+        (
+            "hypoforge.literature.search.ranking",
+            "hypoforge.modules.m2_literature.search.ranking",
+            "PaperRanker",
+        ),
+        (
+            "hypoforge.literature.reading.workflow",
+            "hypoforge.modules.m2_literature.reading.workflow",
+            "FullTextReadingWorkflow",
+        ),
+        (
+            "hypoforge.literature.sources.openalex_source",
+            "hypoforge.modules.m2_literature.sources.openalex_source",
+            "OpenAlexSource",
+        ),
+    ]
+
+    for legacy_name, canonical_name, object_name in module_pairs:
+        legacy_module = importlib.import_module(legacy_name)
+        canonical_module = importlib.import_module(canonical_name)
+        legacy_object = getattr(legacy_module, object_name)
+        canonical_object = getattr(canonical_module, object_name)
+        assert legacy_object is canonical_object
+        assert canonical_object.__module__.startswith(
+            "hypoforge.modules.m2_literature"
+        )
+
+
 
 # ==================== 测试替身（原 scripts/test_doubles.py） ====================
 
@@ -5750,6 +5794,24 @@ def test_registry_selects_strict_builtin_contracts() -> None:
     assert adapter.fulltext_backfill_min_directness == 0.45
     assert adapter.preprint_supplementer is None
     assert adapter.preprint_supplement_max_attempts == 2
+
+
+def test_registry_selects_strict_m2_by_contract_marker(monkeypatch) -> None:
+    """Strict selection must survive a facade rename or package relocation."""
+
+    from hypoforge.modules.m2_literature_search import M2LiteratureSearch
+
+    class RelocatedM2Facade(M2LiteratureSearch):
+        strict_contract_family = "agentic_m2"
+
+    monkeypatch.setitem(ModuleRegistry._modules, "m2", RelocatedM2Facade)
+
+    instances = ModuleRegistry.build_all(PipelineConfig(
+        search=SearchConfig(implementation="agentic"),
+    ))
+
+    assert isinstance(instances["m2"], StrictAgenticM2Module)
+    assert not isinstance(instances["m2"], RelocatedM2Facade)
 
 
 def test_m2_query_llm_config_is_wired_to_query_planner() -> None:

@@ -24,11 +24,11 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from ..entity_normalization import EntityNormalizationService
-from ..memory.paper_store import PaperStore, normalize_query_text, paper_key
-from ..observability import emit_event
-from ..protocol import ModuleProtocol
-from ..state import (
+from ...entity_normalization import EntityNormalizationService
+from ...memory.paper_store import PaperStore, normalize_query_text, paper_key
+from ...observability import emit_event
+from ...protocol import ModuleProtocol
+from ...state import (
     EvidenceGap,
     EvidenceGapRequest,
     KnowledgeEntry,
@@ -41,7 +41,7 @@ from ..state import (
     PipelineState,
     SearchLedger,
 )
-from ..task_alignment import (
+from ...task_alignment import (
     search_entities_for_sub_question,
     sub_question_entity_terms,
 )
@@ -1631,7 +1631,7 @@ def build_adapter_from_config(
             raise ValueError("variant='integrated' requires llm_config")
         # Lazy import to avoid circular dependency (integrated.py imports
         # AgenticM2Adapter from this module).
-        from ..tools.qwen_client import QwenClient
+        from ...tools.qwen_client import QwenClient
         from .integrated import build_integrated_search_adapter
 
         client = QwenClient.from_config(llm_config)
