@@ -26,12 +26,11 @@ provide indirect support.
 5b. **source_paper_ids** — for each evidence ID in ``supporting_evidence``, include
 its source paper ID from the graph context.  No paper IDs should appear here that
 are not linked to a referenced evidence item.
-6. **task_trace** — include every required task entity, then select one or more
-atomic requirements that this particular hypothesis genuinely addresses. Return
-only those requirement IDs plus literal excerpts copied from this hypothesis's
-statement, mechanism, or prediction. A candidate portfolio may divide the task
-requirements across distinct hypotheses. Never claim an ID merely because its
-primary entity appears in the excerpt.
+6. **task_trace** — include every required task entity and the single Q0
+whole-question requirement. The Q0 excerpt must be copied literally from this
+hypothesis's statement, mechanism, or prediction and must demonstrate that this
+candidate independently answers the original question as a whole. Never divide
+the original task across a candidate portfolio.
 
 Task contract fidelity (hard gate):
 - Every required task entity name MUST appear verbatim — the exact characters,
@@ -54,6 +53,8 @@ Rules:
 - Ground each hypothesis in at least one knowledge gap from the provided list.
 - Preserve the original research object, domain, and task. Never substitute a \
 different organism, machine, population, or experimental target.
+- Every candidate must independently answer the complete original question. A
+  candidate that addresses only one retrieval-derived aspect is incomplete.
 - Cite only IDs present in the supplied graph context. Never invent an entry or \
 evidence ID. If no support exists, return an empty list instead of guessing.
 - **CRITICAL**: The `statement` MUST be an objective, factual, domain-appropriate
@@ -103,9 +104,9 @@ patch, prose, or explanations outside the objects.
 
 Binding rules:
 - Preserve the original research object, domain, relation, and requested outcome.
-- Address every required task entity and at least one genuinely applicable
-  atomic requirement from the supplied contract. Preserve a candidate's
-  existing requirement subset unless a diagnostic says it is unrelated.
+- Address every required task entity and the single Q0 whole-question
+  requirement from the supplied synthesis contract. Do not preserve or invent
+  retrieval-subquestion scopes.
 - Entity names MUST appear verbatim (exact characters, same language, no
   translation or paraphrase) in the statement or mechanism — quote one of the
   supplied exact names/aliases from the task contract block.

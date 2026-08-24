@@ -4069,7 +4069,10 @@ import pytest
 from pathlib import Path
 
 from hypoforge.graph_context import build_graph_context
-from hypoforge.synthesis_contract import synthesis_contract_for_state
+from hypoforge.synthesis_contract import (
+    SYNTHESIS_REQUIREMENT_ID,
+    synthesis_contract_for_state,
+)
 from hypoforge.modules.m1_problem_understanding import M1ProblemUnderstanding
 from hypoforge.modules.m4_hypothesis_generation import M4HypothesisGeneration
 from hypoforge.modules.m5_research_plan import M5ResearchPlan
@@ -4257,6 +4260,60 @@ def test_synthesis_contract_contains_only_original_question() -> None:
     assert contract.entities == state.problem_card.task_contract.entities
     assert all(question not in rendered for question in retrieval_questions)
     assert all(relation not in rendered for relation in retrieval_relations)
+
+
+def test_m4_contract_requires_original_question_without_retrieval_scope() -> None:
+    state = robot_state()
+    module = M4HypothesisGeneration(
+        num_candidates=1, top_k=1, mode="direct", fast_mode=True,
+    )
+
+    block = module._render_task_contract_block(state)
+
+    assert SYNTHESIS_REQUIREMENT_ID in block
+    assert state.problem_card.original_question in block
+    assert "answer the original question as a whole" in block
+    for question in state.problem_card.sub_questions:
+        assert question not in block
+    for requirement in state.problem_card.task_contract.requirements:
+        assert requirement.requirement_id not in block
+        assert requirement.relation not in block
+
+
+@pytest.mark.asyncio
+async def test_m4_prompt_hides_retrieval_subquestions() -> None:
+    state = robot_state()
+    candidate = hypothesis().model_copy(update={
+        "task_trace": TaskTrace(
+            entity_mentions=hypothesis().task_trace.entity_mentions,
+            requirement_mentions=[TaskTraceReference(
+                contract_id=SYNTHESIS_REQUIREMENT_ID,
+                output_excerpt=hypothesis().statement,
+            )],
+        ),
+    })
+    client = _SequenceClient([[candidate.model_dump(mode="json")]])
+    module = M4HypothesisGeneration(
+        num_candidates=1, top_k=1, mode="direct", fast_mode=True,
+    )
+    module.client = client
+
+    await module._generate_hypothesis_batch(
+        state,
+        question=state.problem_card.original_question,
+        graph_context=build_graph_context(state),
+        feedback_context="",
+        tool_name="hypothesis_generator",
+        attempt=1,
+    )
+
+    prompt = client.calls[0]["user_prompt"]
+    assert state.problem_card.original_question in prompt
+    assert SYNTHESIS_REQUIREMENT_ID in prompt
+    for question in state.problem_card.sub_questions:
+        assert question not in prompt
+    for requirement in state.problem_card.task_contract.requirements:
+        assert requirement.relation not in prompt
 
 
 @pytest.mark.asyncio

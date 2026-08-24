@@ -50,6 +50,7 @@ from ..state import (
     TaskTrace,
     TaskTraceReference,
 )
+from ..synthesis_contract import synthesis_contract_for_state
 from ..task_alignment import _mentions_entity, assess_task_alignment
 from ..tools.qwen_client import QwenClient, track_token_scope
 
@@ -299,7 +300,7 @@ class M4HypothesisGeneration(ModuleProtocol):
         problem_card = state.problem_card
         if problem_card is None:
             return cards
-        contract = problem_card.task_contract
+        contract = synthesis_contract_for_state(state)
         if not contract.entities and not contract.requirements:
             return cards
 
@@ -428,7 +429,7 @@ class M4HypothesisGeneration(ModuleProtocol):
         card = state.problem_card
         if card is None:
             return ""
-        contract = card.task_contract
+        contract = synthesis_contract_for_state(state)
         if not contract.entities and not contract.requirements:
             return ""
         lines = [
@@ -450,24 +451,17 @@ class M4HypothesisGeneration(ModuleProtocol):
                 rendered += f" — exact names/aliases: {' | '.join(terms)}"
             lines.append(rendered)
         if contract.requirements:
-            if require_all:
-                lines.append(
-                    "Fast one-pass final-output contract — every candidate "
-                    "must genuinely address every required requirement below "
-                    "and include one literal task_trace excerpt for each ID. "
-                    "There is no later review iteration in fast mode, so no "
-                    "required part of the user's question may be deferred:"
-                )
-            else:
-                lines.append(
-                    "Atomic auditable requirements — each hypothesis must select "
-                    "one or more that it genuinely addresses and trace only those "
-                    "via a literal excerpt; do not claim every ID merely because "
-                    "the primary entity is mentioned:"
-                )
+            lines.append(
+                "Whole-question synthesis requirement — every candidate must "
+                "independently answer the original question as a whole and "
+                "include one literal task_trace excerpt for Q0. Retrieval "
+                "sub-questions are intentionally unavailable and no part of the "
+                "original question may be deferred to another candidate:"
+            )
             for requirement in contract.requirements:
                 lines.append(
-                    f"- {requirement.requirement_id}: {requirement.relation} "
+                    f"- {requirement.requirement_id}: {requirement.relation}; "
+                    f"original question: {requirement.sub_question} "
                     f"(primary entity: {requirement.primary_entity_id})"
                 )
         lines.append(
@@ -487,7 +481,7 @@ class M4HypothesisGeneration(ModuleProtocol):
         card = state.problem_card
         if card is None:
             return ""
-        contract = card.task_contract
+        contract = synthesis_contract_for_state(state)
         if not contract.entities and not contract.requirements:
             return ""
         lines = ["Task-contract reminder: iteration feedback must not break task alignment."]
@@ -506,9 +500,9 @@ class M4HypothesisGeneration(ModuleProtocol):
         ]
         if requirements:
             lines.append(
-                "Available atomic requirement IDs: " + ", ".join(requirements)
-                + ". Preserve the current hypothesis's selected subset; do not "
-                "attach unrelated IDs."
+                "Required whole-question synthesis ID: " + ", ".join(requirements)
+                + ". Every candidate must continue to answer the original "
+                "question as a whole."
             )
         return "\n".join(lines) + "\n\n"
 
@@ -525,7 +519,7 @@ class M4HypothesisGeneration(ModuleProtocol):
         valid_references = set(context.available_evidence_ids)
         accepted: List[HypothesisCard] = []
         failures: List[Dict[str, Any]] = []
-        contract = state.problem_card.task_contract if state.problem_card else None
+        contract = synthesis_contract_for_state(state) if state.problem_card else None
         known_required_ids = {
             requirement.requirement_id
             for requirement in (contract.requirements if contract else [])
@@ -616,7 +610,7 @@ class M4HypothesisGeneration(ModuleProtocol):
         if not candidates:
             return [], []
         assert self.client is not None
-        contract = state.problem_card.task_contract if state.problem_card else None
+        contract = synthesis_contract_for_state(state) if state.problem_card else None
         primary_objects = [
             {
                 "entity_id": entity.entity_id,
@@ -1128,9 +1122,10 @@ class M4HypothesisGeneration(ModuleProtocol):
             for gap in state.evidence_gap_requests
         }
         card = state.problem_card
+        synthesis_contract = synthesis_contract_for_state(state)
         requirements = {
             item.requirement_id: item
-            for item in (card.task_contract.requirements if card else [])
+            for item in synthesis_contract.requirements
             if item.required
         }
         valid_evidence = set(context.available_evidence_ids)

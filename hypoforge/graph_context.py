@@ -8,6 +8,7 @@ from typing import Iterable, Literal
 from pydantic import BaseModel, Field
 
 from .state import EvidenceNode, KnowledgeEntry, PipelineState, TaskContract
+from .synthesis_contract import synthesis_contract_for_state
 
 
 class GraphContextItem(BaseModel):
@@ -236,7 +237,10 @@ def build_graph_context(
         original_question=(card.original_question if card else state.input_question),
         domains=list(card.domain if card else []),
         key_entities=list(card.key_entities if card else []),
-        task_contract=(card.task_contract if card else TaskContract(source="derived")),
+        # M1's atomic requirements are retrieval controls for M2/M3.  M4-M6
+        # receive a whole-question synthesis view so search decomposition never
+        # becomes an answer-generation instruction.
+        task_contract=synthesis_contract_for_state(state),
         established_facts=buckets["established_facts"],
         conflicts=buckets["conflicts"],
         knowledge_gaps=buckets["knowledge_gaps"],
