@@ -4069,6 +4069,7 @@ import pytest
 from pathlib import Path
 
 from hypoforge.graph_context import build_graph_context
+from hypoforge.synthesis_contract import synthesis_contract_for_state
 from hypoforge.modules.m1_problem_understanding import M1ProblemUnderstanding
 from hypoforge.modules.m4_hypothesis_generation import M4HypothesisGeneration
 from hypoforge.modules.m5_research_plan import M5ResearchPlan
@@ -4235,6 +4236,27 @@ def test_graph_context_does_not_pretruncate_late_focused_evidence() -> None:
     assert len(context.established_facts) == 13
     assert "fact-late-12" in pack.manifest.included_ids
     assert "Late graph fact 12." in pack.rendered
+
+
+def test_synthesis_contract_contains_only_original_question() -> None:
+    """Changing retrieval decomposition must not change M4-M6 task scope."""
+
+    state = robot_state()
+    retrieval_questions = list(state.problem_card.sub_questions)
+    retrieval_relations = [
+        item.relation for item in state.problem_card.task_contract.requirements
+    ]
+
+    contract = synthesis_contract_for_state(state)
+    rendered = contract.model_dump_json()
+
+    assert [item.requirement_id for item in contract.requirements] == ["Q0"]
+    assert contract.requirements[0].sub_question == (
+        state.problem_card.original_question
+    )
+    assert contract.entities == state.problem_card.task_contract.entities
+    assert all(question not in rendered for question in retrieval_questions)
+    assert all(relation not in rendered for relation in retrieval_relations)
 
 
 @pytest.mark.asyncio
