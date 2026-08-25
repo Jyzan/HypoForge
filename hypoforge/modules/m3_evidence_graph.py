@@ -42,6 +42,7 @@ from ..entity_normalization import (
     clean_entity_surface,
 )
 from ..entity_graph_merge import EmbedTexts, EntityGraphMerger
+from ..evidence_audit import EvidenceAuditService
 from ..observability import emit_event
 from ..prompts.m3_prompts import (
     M3_BATCH_RELATION_SYSTEM_PROMPT,
@@ -54,11 +55,14 @@ from ..state import (
     EvidenceEdge,
     EvidenceEdgeRelation,
     EvidenceGraph,
+    EvidenceGap,
+    EvidenceGapRequest,
     GraphAuditRecord,
     GraphCorrectionRequest,
     EvidenceNode,
     EvidenceNodeType,
     GroundingReport,
+    HypothesisPremise,
     KnowledgeEntryType,
     PipelineState,
 )
@@ -117,6 +121,7 @@ _NODE_SHAPE: Dict[str, tuple[str, str]] = {
     "limitation": ("[/", "/]"),
     "conflict": ("{{", "}}"),
     "entity": ("[(", ")]"),
+    "hypothesis": ("[/", "/]"),
 }
 
 
@@ -284,6 +289,7 @@ class M3EvidenceGraph(ModuleProtocol):
         self.enable_cross_batch = enable_cross_batch
         self.bridge_batch_size = max(1, bridge_batch_size)
         self.client = QwenClient.from_config(llm_config) if llm_config else None
+        self.evidence_auditor = EvidenceAuditService(self.client)
         self.entity_embedding_model = (
             entity_embedding_model or grounding_embedding_model
         )
@@ -336,15 +342,392 @@ class M3EvidenceGraph(ModuleProtocol):
     # ModuleProtocol implementation
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _m4_gap_candidate_evidence_ids(
+        state: PipelineState,
+        gap_id: str,
+    ) -> list[str]:
+        """Collect only evidence explicitly returned for one M4 gap."""
+        evidence_ids: list[str] = []
+        for result in state.literature_results:
+            if gap_id not in result.origin_gap_request_ids:
+                continue
+            for entry in result.knowledge_entries:
+                evidence_ids.extend(entry.evidence_ids)
+        if state.m2_knowledge_export:
+            for run in state.m2_knowledge_export.runs:
+                if gap_id not in run.origin_gap_request_ids:
+                    continue
+                evidence_ids.extend(item.evidence_id for item in run.evidence)
+                for entry in run.knowledge_entries:
+                    evidence_ids.extend(entry.evidence_ids)
+        return list(dict.fromkeys(str(item) for item in evidence_ids if str(item).strip()))
+
+    @staticmethod
+    def _m6_gap_candidate_evidence_ids(
+        state: PipelineState,
+        gap_id: str,
+    ) -> list[str]:
+        """Collect only evidence returned by M2 for one M6 gap."""
+        evidence_ids: list[str] = []
+        for result in state.literature_results:
+            if gap_id not in result.origin_gap_ids:
+                continue
+            for entry in result.knowledge_entries:
+                evidence_ids.extend(entry.evidence_ids)
+        if state.m2_knowledge_export:
+            for run in state.m2_knowledge_export.runs:
+                if gap_id not in run.origin_gap_ids:
+                    continue
+                evidence_ids.extend(item.evidence_id for item in run.evidence)
+                for entry in run.knowledge_entries:
+                    evidence_ids.extend(entry.evidence_ids)
+        return list(dict.fromkeys(
+            str(item) for item in evidence_ids if str(item).strip()
+        ))
+
+    async def _generate_bridge_hypothesis(
+        self,
+        state: PipelineState,
+        gap: Any,
+    ) -> dict[str, Any]:
+        """Generate one cautious, citation-free bridge hypothesis."""
+        fallback = {
+            "statement": (
+                f"It is hypothesized that {getattr(gap, 'audit_claim', '') or getattr(gap, 'target_sub_question', '') or gap.description}; "
+                "this bridge remains unverified."
+            ),
+            "falsifiable_prediction": "An intervention targeting the proposed bridge changes the downstream outcome.",
+            "involved_entity_ids": list(getattr(gap, "task_entity_ids", None) or getattr(gap, "canonical_entities", [])),
+            "rationale": "No suitable canonical evidence was found within the bounded search budget.",
+        }
+        if self.client is None:
+            return fallback
+        try:
+            payload = await self.client.structured_chat(
+                system_prompt=(
+                    "Generate one cautious bridge hypothesis for an unresolved evidence gap. "
+                    "Use may/could/hypothesize language, do not invent citations, and mark it "
+                    "as unverified. Return only the requested JSON fields."
+                ),
+                user_prompt=json.dumps({
+                    "original_question": state.input_question,
+                    "audit_claim": getattr(gap, "audit_claim", "") or getattr(gap, "target_sub_question", "") or gap.description,
+                    "entities": list(getattr(gap, "task_entity_ids", None) or getattr(gap, "canonical_entities", [])),
+                }, ensure_ascii=False),
+                output_schema={
+                    "type": "object",
+                    "properties": {
+                        "statement": {"type": "string"},
+                        "falsifiable_prediction": {"type": "string"},
+                        "involved_entity_ids": {"type": "array", "items": {"type": "string"}},
+                        "rationale": {"type": "string"},
+                    },
+                    "required": ["statement", "falsifiable_prediction", "involved_entity_ids", "rationale"],
+                },
+                max_tokens=1200,
+                temperature=0.1,
+                disable_thinking=True,
+            )
+            if not isinstance(payload, dict) or not str(payload.get("statement") or "").strip():
+                return fallback
+            statement = str(payload["statement"]).strip()
+            if not any(marker in statement.casefold() for marker in ("may", "could", "hypothes", "可能", "假设")):
+                statement = f"It is hypothesized that {statement}"
+            return {
+                "statement": statement,
+                "falsifiable_prediction": str(payload.get("falsifiable_prediction") or fallback["falsifiable_prediction"]).strip(),
+                "involved_entity_ids": list(dict.fromkeys(
+                    str(item).strip()
+                    for item in payload.get("involved_entity_ids", [])
+                    if str(item).strip()
+                )),
+                "rationale": str(payload.get("rationale") or fallback["rationale"]).strip(),
+            }
+        except Exception as exc:
+            logger.warning("M3 bridge hypothesis generation failed closed: %s", exc)
+            return {
+                **fallback,
+                "rationale": f"{fallback['rationale']} Generator failed: {type(exc).__name__}: {exc}",
+            }
+
+    async def _resolve_m6_gap_requests(
+        self,
+        state: PipelineState,
+        graph: EvidenceGraph,
+        gaps: list[EvidenceGap],
+    ) -> tuple[EvidenceGraph, list[EvidenceGap]]:
+        """Semantically resolve M6 supplement gaps and create one bridge when unresolved."""
+        updated_graph = graph.model_copy(deep=True)
+        auditor = getattr(self, "evidence_auditor", None) or EvidenceAuditService(self.client)
+        updated: list[EvidenceGap] = []
+        for gap in gaps:
+            if gap.status != "pending_grounding":
+                updated.append(gap.model_copy(deep=True))
+                continue
+            if gap.technical_errors and not gap.search_completed:
+                updated.append(gap.model_copy(update={
+                    "scientific_resolution": "unreviewed",
+                    "search_completed": False,
+                }))
+                continue
+            claim = gap.description or gap.target_sub_question
+            candidate_ids = self._m6_gap_candidate_evidence_ids(state, gap.gap_id)
+            premise = HypothesisPremise(
+                premise_id=gap.gap_id,
+                claim=claim,
+                kind="evidence_backed",
+                supporting_evidence_ids=candidate_ids,
+                required=True,
+            )
+            verdicts = await auditor.audit_premises(
+                [premise], updated_graph, candidate_evidence_ids=candidate_ids,
+            ) if hasattr(auditor, "audit_premises") else []
+            verdict = verdicts[0] if verdicts else None
+            if verdict and verdict.verdict in {"supported", "partially_supported"} and verdict.evidence_ids:
+                updated.append(gap.model_copy(update={
+                    "status": "closed",
+                    "scientific_resolution": "supported",
+                    "search_completed": True,
+                    "resolution_evidence_ids": list(dict.fromkeys(verdict.evidence_ids)),
+                    "rationale": verdict.rationale,
+                }))
+                continue
+            if verdict and verdict.verdict == "contradicted":
+                updated.append(gap.model_copy(update={
+                    "status": "closed",
+                    "scientific_resolution": "contradicted",
+                    "search_completed": True,
+                    "resolution_evidence_ids": [],
+                    "contradicting_evidence_ids": list(dict.fromkeys(verdict.evidence_ids)),
+                    "rationale": verdict.rationale,
+                }))
+                continue
+
+            node_id = gap.bridge_hypothesis_node_id or f"HYP_{gap.gap_id.removeprefix('GAP_')}"
+            if not any(node.id == node_id for node in updated_graph.nodes):
+                bridge = await self._generate_bridge_hypothesis(state, gap)
+                updated_graph.nodes.append(EvidenceNode(
+                    id=node_id,
+                    type=EvidenceNodeType.HYPOTHESIS,
+                    label=bridge["statement"],
+                    metadata={
+                        "verification_status": "unverified",
+                        "epistemic_role": "working_assumption",
+                        "origin_gap_id": gap.gap_id,
+                        "supporting_evidence_ids": [],
+                        "do_not_reopen": True,
+                        "falsifiable_prediction": bridge["falsifiable_prediction"],
+                    },
+                ))
+            updated.append(gap.model_copy(update={
+                "status": "closed",
+                "scientific_resolution": "unresolved",
+                "search_completed": True,
+                "bridge_hypothesis_node_id": node_id,
+                "resolution_evidence_ids": [],
+                "rationale": gap.rationale or "Effective search completed without entailment.",
+            }))
+        return updated_graph, updated
+
+    @staticmethod
+    def _attach_m6_bridges(
+        state: PipelineState,
+        gaps: list[EvidenceGap],
+    ) -> tuple[list[Any], list[Any]]:
+        """Attach unresolved M6 bridges to affected active hypotheses."""
+        affected: dict[str, list[EvidenceGap]] = {}
+        all_ids = [h.hypothesis_id for h in state.top_hypotheses if h.hypothesis_id]
+        for gap in gaps:
+            if gap.scientific_resolution != "unresolved":
+                continue
+            ids = list(gap.hypothesis_ids) or all_ids
+            for hid in ids:
+                affected.setdefault(hid, []).append(gap)
+
+        def update(cards):
+            result = []
+            for card in cards:
+                new = card.model_copy(deep=True)
+                for gap in affected.get(new.hypothesis_id, []):
+                    if not any(item.bridge_hypothesis_node_id == gap.bridge_hypothesis_node_id for item in new.working_assumptions):
+                        new.working_assumptions.append(HypothesisPremise(
+                            premise_id=f"WA_{gap.gap_id}",
+                            claim=gap.description or gap.target_sub_question,
+                            kind="unverified_bridge",
+                            bridge_hypothesis_node_id=gap.bridge_hypothesis_node_id,
+                            required=True,
+                        ))
+                result.append(new)
+            return result
+        return update(state.candidate_hypotheses), update(state.top_hypotheses)
+
+    async def _resolve_m4_gap_requests(
+        self,
+        state: PipelineState,
+        graph: EvidenceGraph,
+        gap_requests: list[EvidenceGapRequest],
+    ) -> tuple[EvidenceGraph, list[EvidenceGapRequest]]:
+        """Resolve M4 gaps semantically or add an unverified bridge node."""
+        updated_graph = graph.model_copy(deep=True)
+        auditor = getattr(self, "evidence_auditor", None) or EvidenceAuditService(self.client)
+        updated_gaps: list[EvidenceGapRequest] = []
+        for gap in gap_requests:
+            if gap.status != "searched":
+                updated_gaps.append(gap.model_copy(deep=True))
+                continue
+            if gap.technical_errors and not gap.search_completed:
+                # A failed retrieval is not a scientific unresolved result.
+                # Keep it pending for a technical retry and never create a
+                # bridge from an API/network failure.
+                updated_gaps.append(gap.model_copy(update={
+                    "status": "pending",
+                    "scientific_resolution": "unreviewed",
+                    "search_completed": False,
+                }))
+                continue
+            claim = gap.audit_claim or gap.sub_question
+            candidate_ids = self._m4_gap_candidate_evidence_ids(state, gap.gap_id)
+            new_three_state = bool(gap.premise_id and hasattr(auditor, "audit_premises"))
+            force_unresolved = False
+            if new_three_state:
+                premise = HypothesisPremise(
+                    premise_id=gap.premise_id,
+                    claim=claim,
+                    kind="evidence_backed",
+                    supporting_evidence_ids=candidate_ids,
+                    required=True,
+                )
+                premise_verdicts = await auditor.audit_premises(
+                    [premise],
+                    updated_graph,
+                    candidate_evidence_ids=candidate_ids,
+                )
+                premise_verdict = premise_verdicts[0] if premise_verdicts else None
+                if premise_verdict and premise_verdict.verdict == "supported" and premise_verdict.evidence_ids:
+                    updated_gaps.append(gap.model_copy(update={
+                        "status": "resolved",
+                        "scientific_resolution": "supported",
+                        "search_completed": True,
+                        "resolution_evidence_ids": list(dict.fromkeys(premise_verdict.evidence_ids)),
+                        "corrected_claim": premise_verdict.corrected_claim,
+                        "rationale": premise_verdict.rationale,
+                    }))
+                    continue
+                if premise_verdict and premise_verdict.verdict == "partially_supported" and premise_verdict.evidence_ids:
+                    updated_gaps.append(gap.model_copy(update={
+                        "status": "resolved",
+                        "scientific_resolution": "supported",
+                        "search_completed": True,
+                        "resolution_evidence_ids": list(dict.fromkeys(premise_verdict.evidence_ids)),
+                        "corrected_claim": premise_verdict.corrected_claim,
+                        "rationale": premise_verdict.rationale,
+                    }))
+                    continue
+                if premise_verdict and premise_verdict.verdict == "contradicted":
+                    updated_gaps.append(gap.model_copy(update={
+                        "status": "resolved",
+                        "scientific_resolution": "contradicted",
+                        "search_completed": True,
+                        "resolution_evidence_ids": [],
+                        "contradicting_evidence_ids": list(dict.fromkeys(premise_verdict.evidence_ids)),
+                        "rationale": premise_verdict.rationale,
+                    }))
+                    continue
+                # The retrieval completed successfully but no supported or
+                # contradicting entailment exists: this is the third state.
+                force_unresolved = True
+                verdict = None
+            else:
+                verdicts = await auditor.audit_claims(
+                    [claim],
+                    updated_graph,
+                    # An empty list is intentional: no evidence returned for
+                    # this gap must not fall back to unrelated historical graph nodes.
+                    candidate_evidence_ids=candidate_ids,
+                )
+                verdict = verdicts[0] if verdicts else None
+            if verdict and verdict.support_status in {"direct_support", "partial_support"} and verdict.evidence_ids:
+                updated_gaps.append(gap.model_copy(update={
+                    "status": "resolved",
+                    "scientific_resolution": "supported" if new_three_state else gap.scientific_resolution,
+                    "search_completed": True if new_three_state else gap.search_completed,
+                    "resolution_evidence_ids": list(dict.fromkeys(verdict.evidence_ids)),
+                    "rationale": verdict.rationale,
+                }))
+                continue
+            if not force_unresolved and gap.attempts < state.max_evidence_gap_rounds:
+                updated_gaps.append(gap.model_copy(update={
+                    "status": "pending",
+                    "rationale": (verdict.rationale if verdict else "No semantic verdict returned") or gap.rationale,
+                }))
+                continue
+
+            node_id = f"HYP_{gap.gap_id.removeprefix('GAP_')}"
+            existing_node = next((node for node in updated_graph.nodes if node.id == node_id), None)
+            if existing_node is None:
+                bridge = await self._generate_bridge_hypothesis(state, gap)
+                metadata = {
+                    "verification_status": "unverified",
+                    "origin_gap_id": gap.gap_id,
+                    "origin_hypothesis_id": gap.hypothesis_id,
+                    "audit_claim": claim,
+                    "generated_by": "m3_bridge_hypothesis_generator",
+                    "search_attempts": gap.attempts,
+                    "executed_queries": list(gap.executed_queries),
+                    "reason_no_evidence": gap.rationale,
+                    "supporting_evidence_ids": [],
+                    "falsifiable_prediction": bridge["falsifiable_prediction"],
+                }
+                updated_graph.nodes.append(EvidenceNode(
+                    id=node_id,
+                    type=EvidenceNodeType.HYPOTHESIS,
+                    label=bridge["statement"],
+                    metadata=metadata,
+                ))
+                for entity_id in bridge["involved_entity_ids"]:
+                    if any(node.id == entity_id for node in updated_graph.nodes):
+                        updated_graph.edges.append(EvidenceEdge(
+                            source=node_id,
+                            target=entity_id,
+                            relation=EvidenceEdgeRelation.INVOLVES,
+                            rationale="Unverified bridge hypothesis involves this task entity.",
+                        ))
+                emit_event(
+                    "tool_result",
+                    module="m3",
+                    tool="bridge_hypothesis_generator",
+                    status="warning",
+                    message=f"Created unverified bridge hypothesis {node_id}",
+                    details={
+                        "gap_id": gap.gap_id,
+                        "node_id": node_id,
+                        "verification_status": "unverified",
+                        "supporting_evidence_ids": [],
+                    },
+                )
+            updated_gaps.append(gap.model_copy(update={
+                "status": "hypothesized",
+                "scientific_resolution": "unresolved" if new_three_state else gap.scientific_resolution,
+                "search_completed": True if new_three_state else gap.search_completed,
+                "bridge_hypothesis_node_id": node_id,
+                "resolution_evidence_ids": [],
+                "rationale": (
+                    gap.rationale or "No suitable canonical evidence was found within the bounded search budget."
+                ),
+            }))
+        return updated_graph, updated_gaps
+
     async def __call__(
         self,
         state: PipelineState,
         config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        # A searched gap is only a completed retrieval attempt.  Its semantic
+        # resolution is decided below against the evidence returned for that
+        # specific gap; do not mechanically mark it indexed here.
         indexed_gap_requests = [
-            gap.model_copy(update={"status": "indexed"})
-            if gap.status == "searched" else gap.model_copy(deep=True)
-            for gap in state.evidence_gap_requests
+            gap.model_copy(deep=True) for gap in state.evidence_gap_requests
         ]
         # --- collect all knowledge entries ---
         all_entries = []
@@ -605,9 +988,55 @@ class M3EvidenceGraph(ModuleProtocol):
         # --- Step 5: pending_grounding gap confirmation ---
         new_entry_ids = {e.id for e in new_entries if e.id}
         gap_gain = self._compute_gap_gain(state, new_entry_ids)
-        gap_updates = self._evaluate_pending_gaps(state, gap_gain)
-        if gap_updates is not None:
-            result["evidence_gaps"] = gap_updates
+        # Keep the numeric gain as a diagnostic only.  Scientific closure is
+        # decided below by the gap-scoped semantic auditor, never by count.
+
+        graph, resolved_m4_gaps = await self._resolve_m4_gap_requests(
+            state,
+            result.get("evidence_graph", graph),
+            indexed_gap_requests,
+        )
+        result["evidence_graph"] = graph
+        result["evidence_gap_requests"] = resolved_m4_gaps
+
+        def _modern_m6_gap(gap: EvidenceGap) -> bool:
+            return bool(
+                gap.hypothesis_ids
+                or gap.search_completed
+                or gap.technical_errors
+                or gap.resolution_evidence_ids
+                or gap.contradicting_evidence_ids
+                or gap.bridge_hypothesis_node_id
+            )
+
+        legacy_pending = any(
+            gap.status == "pending_grounding" and not _modern_m6_gap(gap)
+            for gap in state.evidence_gaps
+        )
+        if legacy_pending:
+            gap_updates = self._evaluate_pending_gaps(state, gap_gain)
+            if gap_updates is not None:
+                result["evidence_gaps"] = gap_updates
+
+        modern_pending = any(
+            gap.status == "pending_grounding" and _modern_m6_gap(gap)
+            for gap in state.evidence_gaps
+        )
+        if modern_pending:
+            graph, resolved_m6_gaps = await self._resolve_m6_gap_requests(
+                state,
+                graph,
+                result.get("evidence_gaps", state.evidence_gaps),
+            )
+            result["evidence_graph"] = graph
+            result["evidence_gaps"] = resolved_m6_gaps
+            candidate_hypotheses, top_hypotheses = self._attach_m6_bridges(
+                state, resolved_m6_gaps,
+            )
+            if candidate_hypotheses != state.candidate_hypotheses:
+                result["candidate_hypotheses"] = candidate_hypotheses
+            if top_hypotheses != state.top_hypotheses:
+                result["top_hypotheses"] = top_hypotheses
 
         # CONTRACT (P2): per-gap new-effective-evidence counts
         # (dict[gap_id, int]).  PipelineState has no dedicated ``gap_gain``
@@ -629,9 +1058,6 @@ class M3EvidenceGraph(ModuleProtocol):
         snapshot_dir = self.output_dir or getattr(state, "memory_cache_dir", "")
         if snapshot_dir:
             self._write_round_snapshot(graph, snapshot_dir, state)
-
-        if indexed_gap_requests != state.evidence_gap_requests:
-            result["evidence_gap_requests"] = indexed_gap_requests
 
         return result
 

@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 ContextPurpose = Literal[
     "m4_generate",
+    "m4_epistemic_audit",
     "m4_critic",
     "m4_rank",
     "m5_plan",

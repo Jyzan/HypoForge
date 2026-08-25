@@ -25,6 +25,163 @@ from .observability import RunEventRecorder
 from .pipeline import PipelineRunner
 
 
+_LEGACY_M6_METRIC_MAP = {
+    "objective_evidence_consistency": "evidence_consistency",
+    "novelty_metric": "novelty",
+    "testability_metric": "testability",
+}
+
+
+def _is_legacy_m6_metric_review(review: dict[str, Any]) -> bool:
+    """Identify the old live proxies that ran before posthoc scoring.
+
+    Current M6 uses ``objective_evidence_consistency`` for a real specialist
+    review, so that dimension is legacy only when it carries the old generated
+    ``Calculated ... score`` rationale.  Novelty/testability metric reviews
+    were only ever posthoc proxies in the live review list.
+    """
+
+    dimension = str(review.get("dimension") or "")
+    if dimension in {"novelty_metric", "testability_metric"}:
+        return True
+    if dimension != "objective_evidence_consistency":
+        return False
+    reasoning = str(review.get("reasoning") or "").casefold()
+    return "calculated evidence_consistency score" in reasoning
+
+
+def _posthoc_independent_scores(scores: dict[str, Any] | None) -> dict[str, float]:
+    if not isinstance(scores, dict):
+        return {}
+    rows = scores.get("hypothesis_scores")
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        return {}
+    independent = rows[0].get("independent")
+    if not isinstance(independent, dict):
+        return {}
+    output: dict[str, float] = {}
+    for name in _LEGACY_M6_METRIC_MAP.values():
+        value = independent.get(name)
+        if isinstance(value, (int, float)):
+            output[name] = min(1.0, max(0.0, float(value)))
+    return output
+
+
+def _reconcile_legacy_m6_reviews(
+    reviews: Any,
+    scores: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Return browser-facing M6 reviews without treating missing scores as 0.
+
+    This is deliberately presentation-only: persisted pipeline state and the
+    routing decisions already taken by that historical run remain untouched.
+    """
+
+    copied = [dict(item) for item in reviews if isinstance(item, dict)] if isinstance(reviews, list) else []
+    legacy = [item for item in copied if _is_legacy_m6_metric_review(item)]
+    if not legacy:
+        return copied, {"status": "not_applicable", "dimensions": []}
+
+    independent = _posthoc_independent_scores(scores)
+    reconciled_dimensions: list[str] = []
+    affected_versions: set[int] = set()
+    final_available = bool(independent)
+
+    for review in legacy:
+        dimension = str(review.get("dimension") or "")
+        metric_name = _LEGACY_M6_METRIC_MAP[dimension]
+        version = int(review.get("version") or 1)
+        affected_versions.add(version)
+        review["superseded_live_score"] = review.get("score")
+        if metric_name not in independent:
+            review.update({
+                "score": None,
+                "hard_gate_passed": None,
+                "score_source": "posthoc_independent",
+                "score_status": "awaiting_posthoc",
+                "comments": (
+                    "最终独立评分尚未完成；旧版实时阶段写入的默认 0 分不计入硬门。"
+                ),
+                "reasoning": (
+                    f"Final independent {metric_name} score is unavailable; "
+                    "the historical live default is not treated as a real zero."
+                ),
+            })
+            continue
+
+        score = round(independent[metric_name] * 5.0, 1)
+        review.update({
+            "score": score,
+            "hard_gate_passed": score >= 3.0,
+            "score_source": "posthoc_independent",
+            "score_status": "final",
+                "comments": "最终独立评分已替代旧版实时阶段的临时分数。",
+            "reasoning": (
+                f"Final post-pipeline independent {metric_name} score is "
+                f"{independent[metric_name]:.2f} (scaled to {score:.1f}/5); "
+                "it supersedes the historical live default."
+            ),
+        })
+        reconciled_dimensions.append(dimension)
+
+    for version in affected_versions:
+        version_reviews = [
+            item for item in copied if int(item.get("version") or 1) == version
+        ]
+        overall = next(
+            (item for item in version_reviews if item.get("dimension") == "overall"),
+            None,
+        )
+        if overall is None:
+            continue
+        overall["superseded_live_score"] = overall.get("score")
+        overall["score_source"] = "reconciled_m6_display"
+        if not final_available:
+            overall["hard_gate_passed"] = None
+            overall["score_status"] = "awaiting_posthoc"
+            continue
+
+        failed_gates = [
+            str(item.get("dimension"))
+            for item in version_reviews
+            if item.get("dimension") != "overall"
+            and item.get("hard_gate_passed") is False
+        ]
+        core_scores = [
+            float(item["score"])
+            for item in version_reviews
+            if item.get("dimension") in {
+                "scientific_logic",
+                "objective_evidence_consistency",
+                "method_feasibility",
+            }
+            and isinstance(item.get("score"), (int, float))
+        ]
+        overall_score = sum(core_scores) / len(core_scores) if core_scores else 3.0
+        if "task_alignment" in failed_gates:
+            overall_score = min(overall_score, 1.9)
+        elif failed_gates:
+            overall_score = min(overall_score, 2.9)
+        overall.update({
+            "score": round(overall_score, 1),
+            "hard_gate_passed": not failed_gates,
+            "score_status": "final",
+            "reasoning": (
+                "Display score reconciled with final independent metrics; "
+                "hard-gate failures: "
+                + (", ".join(failed_gates) if failed_gates else "none")
+                + ". Historical routing is unchanged."
+            ),
+        })
+
+    status = "final" if final_available else "pending"
+    return copied, {
+        "status": status,
+        "dimensions": list(dict.fromkeys(reconciled_dimensions)),
+        "historical_routing_unchanged": True,
+    }
+
+
 def load_runtime_environment(env_file: str | Path | None = None) -> None:
     """Load local Qwen credentials and map them to the OpenAI-compatible client.
 
@@ -739,6 +896,10 @@ class RunManager:
     ) -> dict[str, Any]:
         """Return the browser-safe subset of a persisted pipeline state."""
 
+        reviews, score_reconciliation = _reconcile_legacy_m6_reviews(
+            state.get("reviews", []),
+            scores,
+        )
         return {
             "run_id": run_id,
             "question": state.get("input_question", ""),
@@ -754,7 +915,10 @@ class RunManager:
             "graph_correction_requests": state.get("graph_correction_requests", []),
             "research_plans": state.get("research_plans", []),
             "research_plan_history": state.get("research_plan_history", {}),
-            "reviews": state.get("reviews", []),
+            "reviews": reviews,
+            "experimental_validation_verdict": state.get("experimental_validation_verdict"),
+            "evidence_verdict": state.get("evidence_verdict"),
+            "m6_score_reconciliation": score_reconciliation,
             "iteration_count": state.get("iteration_count", 0),
             "routing_history": state.get("routing_history", []),
             "evidence_gaps": state.get("evidence_gaps", []),

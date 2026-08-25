@@ -83,7 +83,11 @@ def _validated_trace_ids(
             invalid.append(f"invalid requirement trace {reference.contract_id!r}")
             continue
         primary = entity_by_id.get(requirement.primary_entity_id)
-        if primary is not None and not _mentions_entity(excerpt, primary):
+        if (
+            requirement.requirement_id != "Q0"
+            and primary is not None
+            and not _mentions_entity(excerpt, primary)
+        ):
             invalid.append(
                 f"requirement trace {reference.contract_id!r} omits its primary entity"
             )
@@ -182,6 +186,7 @@ def assess_task_alignment(
     semantic_client: object | None = None,
     require_contract: bool = True,
     required_requirement_ids: Iterable[str] | None = None,
+    contract_override: TaskContract | None = None,
 ) -> AlignmentAssessment:
     """Validate an output against the task-local M1 contract.
 
@@ -208,7 +213,7 @@ def assess_task_alignment(
     """
 
     card = state.problem_card
-    if card is None:
+    if card is None and contract_override is None:
         if require_contract:
             raise RuntimeError(
                 "Task alignment cannot be evaluated because no M1 ProblemCard "
@@ -221,7 +226,7 @@ def assess_task_alignment(
             rationale="No M1 ProblemCard was available; semantic review is required.",
         )
 
-    contract = card.task_contract
+    contract = contract_override or card.task_contract
     if not contract.entities and not contract.requirements:
         if require_contract:
             raise RuntimeError(

@@ -23,6 +23,7 @@ class _PurposeProfile:
 
 _PROFILES = {
     "m4_generate": _PurposeProfile(8, 6, 6, 1, 10),
+    "m4_epistemic_audit": _PurposeProfile(8, 6, 6, 1, 10),
     "m4_critic": _PurposeProfile(4, 8, 4, 1, 8),
     "m4_rank": _PurposeProfile(3, 3, 3, 0, 0),
     "m5_plan": _PurposeProfile(6, 4, 4, 1, 6),
@@ -49,11 +50,13 @@ class ContextPlanner:
             "established_facts": list(context.established_facts),
             "conflicts": list(context.conflicts),
             "knowledge_gaps": list(context.knowledge_gaps),
+            "bridge_hypotheses": list(context.bridge_hypotheses),
         }
         caps = {
             "established_facts": profile.facts,
             "conflicts": profile.conflicts,
             "knowledge_gaps": profile.gaps,
+            "bridge_hypotheses": max(1, min(2, profile.gaps)),
         }
         source_order = {
             item.entry_id: index
@@ -232,6 +235,7 @@ class ContextPlanner:
             ("established_facts", "ESTABLISHED FACTS"),
             ("conflicts", "CONFLICTS"),
             ("knowledge_gaps", "KNOWLEDGE GAPS"),
+            ("bridge_hypotheses", "UNVERIFIED BRIDGE HYPOTHESES"),
         ):
             lines.append(f"\n{title}:")
             items = selected[bucket_name]

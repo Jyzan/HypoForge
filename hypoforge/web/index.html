@@ -571,7 +571,7 @@
   .graph-section{font-size:10px;letter-spacing:.15em;color:#5f6b7d;font-weight:750;margin:17px 0 7px;text-transform:uppercase}
   .graph-section:first-child{margin-top:0}
   .graph-item{background:#1b212c;border:1px solid #293241;border-left:3px solid #43b7a0;border-radius:9px;padding:9px 11px;margin-bottom:7px;cursor:pointer}
-  .graph-item.source{border-left-color:#e0a458}.graph-item:hover{border-color:#43b7a0}
+  .graph-item.source{border-left-color:#e0a458}.graph-item.hypothesis{border-left-color:#f97316;background:#241b16}.graph-item:hover{border-color:#43b7a0}
   .graph-item .meta{font-size:10.5px;color:#657185;margin-top:5px}
   .graph-badge{display:inline-block;color:#0e1116;font-size:10.5px;font-weight:750;border-radius:999px;padding:2px 9px;margin-bottom:8px}
   .graph-detail-title{font-size:15px;color:#e8edf4;line-height:1.55;margin-bottom:12px}
@@ -921,9 +921,9 @@ const MODULES = [
 ];
 const TERMINAL = ["completed","completed_with_errors","failed","cancelled"];
 const EVENT_RENDER_LIMIT = 200;
-const PATH_LABELS = { "full":"全量检索", "revise":"修订", "supplement":"补搜", "skip-search":"免检索直达", "end":"结束", "in-progress":"进行中" };
+const PATH_LABELS = { "full":"全量检索", "revise":"修订", "revise_m4":"假设修订", "revise_m5":"方案修订", "supplement":"补搜", "skip-search":"免检索直达", "end":"结束", "in-progress":"进行中" };
 // routing_history 的 to_module（decision）→ 时间线徽标类型。
-const DECISION_TO_PATH = { "supplement_m2":"supplement", "revise_m4":"revise", "direct_m4":"skip-search", "search_m2":"full", "end":"end" };
+const DECISION_TO_PATH = { "supplement_m2":"supplement", "search_gap":"supplement", "m2":"supplement", "m4":"supplement", "m5":"supplement", "revise_m4":"revise_m4", "revise_m5":"revise_m5", "direct_m4":"skip-search", "search_m2":"full", "end":"end" };
 const GAP_LABELS = { "open":"待补检索", "pending_grounding":"待 Grounding", "closed":"已闭合", "unimprovable":"无法改进", "unknown":"未知" };
 const DIM_LABELS = { 
   "task_alignment":"任务对齐", 
@@ -936,6 +936,7 @@ const DIM_LABELS = {
   "novelty_metric": "创新性独立打分",
   "testability_metric": "可测性独立打分",
   "objective_evidence_consistency": "客观证据一致性"
+  ,"experimental_validation_coverage": "实验验证覆盖"
 };
 const STRUCTURED_DRAWER_MODULES = new Set(["m1","m2","m4","m5","m6"]);
 
@@ -1012,8 +1013,11 @@ function ensureCurrentSegment(){
 }
 // routing_decision 的 from/to → 段类型（与时间线徽标同一映射）。
 function segmentPathType(d){
-  return d.from === "m1" ? ((d.to === "skip_search" || d.to === "direct_m4") ? "skip-search" : "full")
+  return d.route === "m4->m2->m3->m4" ? "supplement"
+    : d.from === "m1" ? ((d.to === "skip_search" || d.to === "direct_m4") ? "skip-search" : "full")
+    : d.from === "m3" ? "supplement"
     : d.to === "supplement_m2" ? "supplement"
+    : d.to === "search_gap" ? "supplement"
     : d.to === "revise_m4" ? "revise"
     : d.to === "end" ? "end" : (d.to || "unknown");
 }
@@ -1682,7 +1686,7 @@ function m4DetailsHtml(r){
   const allById = new Map();
   [...candidates, ...selected].forEach((h, index) => {
     const key = h.hypothesis_id || `hypothesis-${index}`;
-    if(!allById.has(key)) allById.set(key, h);
+    allById.set(key, h);
   });
   const hypotheses = [...allById.values()];
   if(!hypotheses.length) return `<div class="output-box" style="color:var(--ink3)">M4 尚未生成可读取的候选假设。</div>`;
@@ -1695,6 +1699,9 @@ function m4DetailsHtml(r){
       </summary>
       <div class="detail-card-body">
         ${h.mechanism ? `<div class="d-sec-title">作用机制</div><p>${esc(h.mechanism)}</p>` : ""}
+        ${h.research_gap ? `<div class="d-sec-title">研究缺口</div><p>${esc(h.research_gap)}</p>` : ""}
+        ${(h.factual_premises || []).length ? `<div class="d-sec-title">事实前提（独立证据审查）</div><div class="detail-list">${h.factual_premises.map(p => `<div class="transfer-row"><b>${esc(p.claim || "未命名前提")}</b><div class="detail-chips"><span class="detail-chip ${p.audit_verdict === "supported" || p.audit_verdict === "partially_supported" ? "good" : "warn"}">${esc(p.audit_verdict || "未审查")}</span>${detailIdChips(p.supporting_evidence_ids || [], "good")}</div>${p.audit_reason ? `<div class="paper-meta" style="margin-top:6px">${esc(p.audit_reason)}</div>` : ""}</div>`).join("")}</div>` : ""}
+        ${(h.working_assumptions || []).length ? `<div class="d-sec-title">工作假设（M3 未验证桥接关系）</div><div class="detail-list">${h.working_assumptions.map(p => `<div class="transfer-row"><b>${esc(p.claim || "未命名推演前提")}</b><div class="paper-meta">节点：${esc(p.bridge_hypothesis_node_id || "—")} · 不属于论文证据，必须由 M5 实验验证</div></div>`).join("")}</div>` : ""}
         <div class="d-sec-title">排序分数</div>${hypothesisScoreHtml(h.scores)}
         ${h.ranking_rationale ? `<div class="d-sec-title">入选 / 排序理由</div><p>${esc(h.ranking_rationale)}</p>` : ""}
         <div class="d-sec-title">可观察预测</div>${detailBulletList(h.observable_predictions, "暂无可观察预测")}
@@ -1708,11 +1715,16 @@ function m4DetailsHtml(r){
   const gapBlocks = gaps.map(g => `<div class="transfer-row">
     <div class="idx">${esc(g.gap_id || "EVIDENCE GAP")}</div>
     <b>${esc(g.sub_question || g.rationale || "未描述的证据缺口")}</b>
-    <div class="detail-chips"><span class="detail-chip warn">${esc(g.status || "pending")}</span>${g.hypothesis_id ? `<span class="detail-chip neutral">${esc(g.hypothesis_id)}</span>` : ""}</div>
+    <div class="detail-chips"><span class="detail-chip warn">${esc(g.status || "pending")}</span><span class="detail-chip neutral">科学裁决：${esc(g.scientific_resolution || "unreviewed")}</span>${g.hypothesis_id ? `<span class="detail-chip neutral">${esc(g.hypothesis_id)}</span>` : ""}</div>
+    ${g.premise_id ? `<div class="paper-meta" style="margin-top:7px">事实前提 ID：${esc(g.premise_id)}</div>` : ""}
+    ${g.audit_claim ? `<div class="paper-meta" style="margin-top:7px">M4 原子审查主张：${esc(g.audit_claim)}</div>` : ""}
     ${(g.suggested_queries || []).length ? `<div class="paper-meta" style="margin-top:7px">建议补搜：${esc(g.suggested_queries.join("；"))}</div>` : ""}
+    ${(g.contradicting_evidence_ids || []).length ? `<div class="paper-meta" style="margin-top:7px;color:#e05c5c">否定证据：${esc(g.contradicting_evidence_ids.join("、"))}</div>` : ""}
+    ${(g.technical_errors || []).length ? `<div class="paper-meta" style="margin-top:7px;color:#e0a458">技术失败（未等同于无证据）：${esc(g.technical_errors.join("；"))}</div>` : ""}
+    ${g.bridge_hypothesis_node_id ? `<div class="paper-meta" style="margin-top:7px;color:#f97316">已生成待验证桥接假设：${esc(g.bridge_hypothesis_node_id)}</div>` : ""}
   </div>`).join("");
   return `
-    <div class="detail-lead">这里展示 M4 实际生成、排序并交给 M5 的假设。绿色标签表示进入后续研究计划设计的 Top 假设。</div>
+    <div class="detail-lead">这里展示 M4 实际生成、排序并交给 M5 的假设。事实前提经过独立证据审查；机制、研究缺口和预测属于待验证研究贡献，M3 桥接节点不会被当作论文事实。旧快照中的 <code>audit_claims</code> 会继续显示为兼容字段。</div>
     <div class="detail-grid">
       <div class="detail-metric"><b>${candidates.length}</b><span>候选假设</span></div>
       <div class="detail-metric"><b>${selected.length}</b><span>最终入选</span></div>
@@ -1782,6 +1794,7 @@ function m5PlanHtml(plan, index){
       <div class="d-sec-title">方案级证据</div>${detailIdChips(plan.supporting_evidence_ids)}
       <div class="d-sec-title">来源论文</div>${detailIdChips(plan.source_paper_ids)}
       ${links.length ? `<div class="d-sec-title">计划环节—证据映射</div><div class="detail-list">${linkRows}</div>` : ""}
+      ${(plan.bridge_validations || []).length ? `<div class="d-sec-title">推演前提验证</div><div class="detail-list">${plan.bridge_validations.map(v => `<div class="transfer-row"><b>${esc(v.bridge_hypothesis_node_id || "未绑定桥接节点")}</b><div class="paper-meta" style="margin-top:6px">实验步骤：${esc(v.procedure || "—")}<br>测量：${esc(v.measurement || "—")}<br>证伪条件：${esc(v.falsification_condition || "—")}</div></div>`).join("")}</div>` : ""}
       ${plan.task_trace && Object.keys(plan.task_trace).length ? `<details><summary>查看任务契约追踪</summary><pre>${pretty(plan.task_trace)}</pre></details>` : ""}
     </div>
   </details>`;
@@ -1846,6 +1859,42 @@ function m6DetailsHtml(r){
   const latestOverall = latest[1].find(review => review.dimension === "overall");
   const latestPassed = latest[1].filter(review => review.hard_gate_passed === true).length;
   const latestGated = latest[1].filter(review => review.hard_gate_passed != null).length;
+  const validation = r?.experimental_validation_verdict;
+  const validationItems = Array.isArray(validation?.items) ? validation.items : [];
+  const evidenceVerdict = r?.evidence_verdict;
+  const premiseAudits = Array.isArray(evidenceVerdict?.premise_audits) ? evidenceVerdict.premise_audits : [];
+  const factualAuditHtml = evidenceVerdict
+    ? `<div class="d-sec-title">M4 事实前提的独立证据审查</div>
+       <div class="detail-card-body" style="padding:0 0 10px">
+         <div class="detail-chips"><span class="detail-chip ${evidenceVerdict.sufficient ? "good" : "warn"}">${evidenceVerdict.sufficient ? "事实证据充分" : "存在事实证据问题"}</span><span class="detail-chip neutral">${premiseAudits.length} 个前提</span></div>
+         ${evidenceVerdict.rationale ? `<p class="paper-meta">${esc(evidenceVerdict.rationale)}</p>` : ""}
+       </div>
+       ${premiseAudits.length ? `<div class="detail-list">${premiseAudits.map(item => `<details class="detail-card">
+         <summary><span class="paper-title">${esc(item.premise_id || "事实前提")}</span><span class="detail-chip ${item.verdict === "supported" || item.verdict === "partially_supported" ? "good" : "warn"}">${esc(item.verdict || "unsupported")}</span></summary>
+         <div class="detail-card-body"><p><b>主张：</b>${esc(item.claim || "—")}</p>${item.rationale ? `<p><b>理由：</b>${esc(item.rationale)}</p>` : ""}${item.corrected_claim ? `<p><b>修正版：</b>${esc(item.corrected_claim)}</p>` : ""}<div class="d-sec-title">规范证据 ID</div>${detailIdChips(item.evidence_ids || [], "good")}</div>
+       </details>`).join("")}</div>` : ""}
+       ${(evidenceVerdict.gaps || []).length ? `<div class="d-sec-title">由事实前提产生的证据缺口</div><pre>${pretty(evidenceVerdict.gaps)}</pre>` : ""}`
+    : "";
+  const validationHtml = validation
+    ? `<div class="d-sec-title">M4 假设 → M5 实验逐项覆盖</div>
+       <div class="detail-card-body" style="padding:0 0 10px">
+         <div class="detail-chips"><span class="detail-chip ${validation.sufficient ? "good" : "warn"}">${validation.sufficient ? "覆盖充分" : "存在验证缺口"}</span><span class="detail-chip neutral">${validationItems.length} 个目标</span></div>
+         ${validation.rationale ? `<p class="paper-meta">${esc(validation.rationale)}</p>` : ""}
+       </div>
+       <div class="detail-list">${validationItems.map(item => `<details class="detail-card">
+         <summary><span class="paper-title">${esc(item.target_id || item.target_kind || "验证目标")}</span><span class="detail-chip ${item.verdict === "covered" ? "good" : item.verdict === "partial" ? "warn" : "warn"}">${esc(item.verdict || "missing")}</span></summary>
+         <div class="detail-card-body">
+           <p><b>目标：</b>${esc(item.target_text || "—")}</p>
+           ${item.rationale ? `<p><b>审查理由：</b>${esc(item.rationale)}</p>` : ""}
+           <div class="d-sec-title">实验步骤</div>${detailIdChips(item.procedure_refs || [], "neutral")}
+           <div class="d-sec-title">测量指标</div>${detailIdChips(item.measurement_refs || [], "neutral")}
+           <div class="d-sec-title">对照</div>${detailIdChips(item.control_refs || [], "neutral")}
+           <div class="d-sec-title">分析方法</div>${detailIdChips(item.analysis_refs || [], "neutral")}
+           <div class="d-sec-title">桥接验证</div>${detailIdChips(item.bridge_validation_refs || [], "neutral")}
+           ${item.falsification_text ? `<p><b>判否标准：</b>${esc(item.falsification_text)}</p>` : `<p class="paper-meta">未提供明确判否标准</p>`}
+         </div>
+       </details>`).join("")}</div>`
+    : "";
   const versionBlocks = versions.map(([version, versionReviews], index) => {
     const overall = versionReviews.find(review => review.dimension === "overall");
     return `<details class="detail-card" ${index === versions.length - 1 ? "open" : ""}>
@@ -1868,13 +1917,16 @@ function m6DetailsHtml(r){
     </div>
     <div class="d-sec-title">逐轮评审与具体评分</div>
     <div class="detail-list">${versionBlocks}</div>
+    ${factualAuditHtml}
+    ${validationHtml}
     ${independentScores}
     ${routing.length ? `<details class="detail-card"><summary>查看评审后的迭代路由（${routing.length} 条）</summary><div class="detail-card-body"><pre>${pretty(routing)}</pre></div></details>` : ""}`;
 }
 
 const GRAPH_TYPE_META = {
   source:{zh:"论文",color:"#e0a458"}, evidence:{zh:"证据",color:"#43b7a0"},
-  entity:{zh:"实体",color:"#8ea0bd"}, claim:{zh:"论断",color:"#c9a84c"}
+  entity:{zh:"实体",color:"#8ea0bd"}, claim:{zh:"论断",color:"#c9a84c"},
+  hypothesis:{zh:"待验证假设",color:"#f97316"}
 };
 const GRAPH_REL_META = {
   involves:{zh:"涉及",color:"#77808f",dash:false}, supports:{zh:"支持",color:"#6fbf8b",dash:false},
@@ -1928,9 +1980,12 @@ function graphGuideHtml(graph, papers){
   const evidence = (graph.nodes || []).filter(n => n.type === "evidence");
   const entities = (graph.nodes || []).filter(n => n.type === "entity");
   const sources = (graph.nodes || []).filter(n => n.type === "source");
-  return `<div class="graph-guide">这张图是 M3 实际生成的证据结构：<b>${sources.length} 个论文节点</b>、<b>${evidence.length} 个证据节点</b>、<b>${entities.length} 个实体节点</b>和 <b>${(graph.edges || []).length} 条关系</b>。点击节点或边查看完整内容。</div>
+  const hypotheses = (graph.nodes || []).filter(n => n.type === "hypothesis");
+  return `<div class="graph-guide">这张图是 M3 实际生成的证据结构：<b>${sources.length} 个论文节点</b>、<b>${evidence.length} 个证据节点</b>、<b>${entities.length} 个实体节点</b>、<b>${hypotheses.length} 个待验证假设</b>和 <b>${(graph.edges || []).length} 条关系</b>。点击节点或边查看完整内容。</div>
     <div class="graph-section">核心证据</div>
     ${evidence.map(n => `<div class="graph-item" data-graph-node="${esc(n.id)}"><div>${esc(n.label || n.id)}</div><div class="meta">${esc(n.metadata?.entry_type || "evidence")} · ${esc(n.metadata?.confidence || "置信度未标注")}</div></div>`).join("") || `<div class="graph-guide">暂无证据节点</div>`}
+    <div class="graph-section">待验证假设（非论文证据）</div>
+    ${hypotheses.map(n => `<div class="graph-item hypothesis" data-graph-node="${esc(n.id)}"><div>${esc(n.label || n.id)}</div><div class="meta">${esc(n.metadata?.origin_gap_id || "缺口未知")} · 仅作为待验证前提</div></div>`).join("") || `<div class="graph-guide">暂无桥接假设</div>`}
     <div class="graph-section">论文来源</div>
     ${papers.map(p => { const nodeId = (graph.nodes || []).find(n => n.type === "source" && graphPaperIds(n).includes(p.paper_id))?.id || ""; return `<div class="graph-item source" ${nodeId ? `data-graph-node="${esc(nodeId)}"` : ""}><div>${esc(p.title || p.paper_id)}</div><div class="meta">${esc(p.year || "")} · ${esc((p.sources || []).map(x => SOURCE_LABELS[x] || x).join(" / "))}</div></div>`; }).join("")}
     <div class="graph-section">图谱桶</div>
@@ -1947,6 +2002,7 @@ function graphNodeDetails(node){
     <div class="graph-detail-title">${esc(node.label || node.id)}</div>
     ${meta.entry_type ? `<div class="graph-kv"><div class="k">知识类型</div><div class="v">${esc(meta.entry_type)}</div></div>` : ""}
     ${meta.confidence ? `<div class="graph-kv"><div class="k">置信度</div><div class="v">${esc(meta.confidence)}</div></div>` : ""}
+    ${node.type === "hypothesis" ? `<div class="graph-kv"><div class="k">verification_status</div><div class="v">待验证假设（非论文证据）</div></div><div class="graph-kv"><div class="k">来源缺口</div><div class="v">${esc(meta.origin_gap_id || "未知")}</div></div><div class="graph-kv"><div class="k">审查主张</div><div class="v">${esc(meta.audit_claim || "")}</div></div><div class="graph-kv"><div class="k">未找到证据原因</div><div class="v">${esc(meta.reason_no_evidence || "")}</div></div><div class="graph-kv"><div class="k">可证伪预测</div><div class="v">${esc(meta.falsifiable_prediction || "")}</div></div>` : ""}
     ${(meta.entities || []).length ? `<div class="graph-kv"><div class="k">关联实体</div><div class="v">${meta.entities.map(esc).join("、")}</div></div>` : ""}
     ${(meta.evidence_ids || []).length ? `<div class="graph-kv"><div class="k">Evidence IDs</div><div class="v">${meta.evidence_ids.map(esc).join("<br>")}</div></div>` : ""}
     ${papers.map(p => `<div class="graph-kv"><div class="k">来源论文</div><div class="v">${esc(p.title || p.paper_id)}</div>${p.abstract ? `<details><summary>查看摘要</summary><div class="v" style="margin-top:5px">${esc(p.abstract)}</div></details>` : ""}</div>`).join("")}

@@ -257,7 +257,11 @@ class PipelineConfig(BaseModel):
             "m2": 900.0,
             "m3": 480.0,
             "m4": 600.0,
-            "m5": 180.0,
+            # Standard M5 may perform one bounded coverage rewrite in addition
+            # to its initial plan and formal per-call timeouts.  Give the
+            # finite inner sequence enough outer headroom; each LLM call is
+            # still bounded by M5's generation/semantic/validation timeouts.
+            "m5": 1200.0,
             "m6": 180.0,
         }
     )

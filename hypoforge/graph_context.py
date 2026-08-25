@@ -7,13 +7,16 @@ from typing import Iterable, Literal
 
 from pydantic import BaseModel, Field
 
-from .state import EvidenceNode, KnowledgeEntry, PipelineState, TaskContract
+from .state import EvidenceNode, EvidenceNodeType, KnowledgeEntry, PipelineState, TaskContract
 from .synthesis_contract import synthesis_contract_for_state
 
 
 class GraphContextItem(BaseModel):
     entry_id: str
-    kind: Literal["established_fact", "conflict", "knowledge_gap", "other"]
+    kind: Literal[
+        "established_fact", "conflict", "knowledge_gap",
+        "bridge_hypothesis", "other",
+    ]
     text: str
     source_paper_id: str = ""
     source_paper_title: str = ""
@@ -29,6 +32,7 @@ class GraphContext(BaseModel):
     established_facts: list[GraphContextItem] = Field(default_factory=list)
     conflicts: list[GraphContextItem] = Field(default_factory=list)
     knowledge_gaps: list[GraphContextItem] = Field(default_factory=list)
+    bridge_hypotheses: list[GraphContextItem] = Field(default_factory=list)
     relations: list[str] = Field(default_factory=list)
     unresolved_entry_ids: list[str] = Field(default_factory=list)
     available_evidence_ids: list[str] = Field(default_factory=list)
@@ -39,7 +43,12 @@ class GraphContext(BaseModel):
     def available_reference_ids(self) -> set[str]:
         entries = {
             item.entry_id
-            for bucket in (self.established_facts, self.conflicts, self.knowledge_gaps)
+            for bucket in (
+                self.established_facts,
+                self.conflicts,
+                self.knowledge_gaps,
+                self.bridge_hypotheses,
+            )
             for item in bucket
         }
         return entries | set(self.available_evidence_ids)
@@ -55,6 +64,7 @@ class GraphContext(BaseModel):
             ("ESTABLISHED FACTS", self.established_facts),
             ("CONFLICTS", self.conflicts),
             ("KNOWLEDGE GAPS", self.knowledge_gaps),
+            ("UNVERIFIED BRIDGE HYPOTHESES", self.bridge_hypotheses),
         ):
             lines.append(f"\n{title}:")
             if not items:
@@ -204,6 +214,22 @@ def build_graph_context(
                 if item:
                     buckets[field].append(item)
 
+        # Bridge hypotheses are graph nodes, not KnowledgeEntry/evidence
+        # buckets. Keep them visible to M4-M6 as explicit assumptions while
+        # never adding their IDs to the canonical evidence whitelist below.
+        for node in graph.nodes:
+            if (
+                node.type is EvidenceNodeType.HYPOTHESIS
+                and (node.metadata or {}).get("verification_status") == "unverified"
+            ):
+                buckets["bridge_hypotheses"].append(GraphContextItem(
+                    entry_id=node.id,
+                    kind="bridge_hypothesis",
+                    text=node.label,
+                    evidence_ids=[],
+                    quotes=[],
+                ))
+
     relation_lines: list[str] = []
     if graph:
         for edge in graph.edges:
@@ -244,6 +270,7 @@ def build_graph_context(
         established_facts=buckets["established_facts"],
         conflicts=buckets["conflicts"],
         knowledge_gaps=buckets["knowledge_gaps"],
+        bridge_hypotheses=buckets["bridge_hypotheses"],
         relations=relation_lines,
         unresolved_entry_ids=_unique(unresolved),
         available_evidence_ids=evidence_ids,

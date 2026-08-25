@@ -1285,6 +1285,7 @@ class StrictM4HypothesisGeneration(M4HypothesisGeneration):
         return ranked
 
     async def _run_critic(self, state: PipelineState, candidates):
+        from .context import ContextPlanner, ContextRequest, emit_context_built
         from .graph_context import build_graph_context
         from .prompts.m4_prompts import (
             M4_CRITIC_SYSTEM_PROMPT,
@@ -1304,9 +1305,23 @@ class StrictM4HypothesisGeneration(M4HypothesisGeneration):
                 "required": ["hypothesis_id", "pass", "critique", "issues"],
             },
         }
+        graph_context = build_graph_context(state)
+        context_pack = ContextPlanner().plan(
+            graph_context,
+            ContextRequest(
+                purpose="m4_critic",
+                focus_evidence_ids=tuple(
+                    dict.fromkeys([
+                        *self._supplement_focus_evidence_ids(state),
+                        *(evidence_id for card in candidates for evidence_id in card.supporting_evidence),
+                    ])
+                ),
+            ),
+        )
+        emit_context_built("m4", "hypothesis_critic", context_pack)
         base_prompt = M4_CRITIC_USER_TEMPLATE.format(
-            graph_context=build_graph_context(state).render(),
-            established_facts=self._graph_bucket_text(state, "established_facts"),
+            graph_context=context_pack.rendered,
+            established_facts="(included in the audited context pack above)",
             hypotheses_json=json.dumps(
                 [card.model_dump(mode="json") for card in candidates],
                 ensure_ascii=False,

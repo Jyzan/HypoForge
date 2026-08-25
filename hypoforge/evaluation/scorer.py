@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Mapping, Optional
 from ..state import KnowledgeEntry, PipelineState, ResearchPlan
 from ..graph_context import build_graph_context
 from ..observability import emit_event
+from ..synthesis_contract import synthesis_contract_for_state
 from ..task_alignment import assess_task_alignment
 from ..tools.qwen_client import get_current_token_usage, token_usage_delta
 from .metrics import MetricRegistry
@@ -148,11 +149,21 @@ async def score_hypothesis_async(
             )
             continue
 
+    self_reported_composite = (
+        composite_score(self_reported, weights) if self_reported else None
+    )
+    independent_composite = (
+        composite_score(independent, weights) if independent else None
+    )
     return {
         "hypothesis_id": hypothesis.hypothesis_id,
         "self_reported": self_reported,
         "independent": independent,
-        "composite": composite_score(self_reported, weights) if self_reported else None,
+        "self_reported_composite": self_reported_composite,
+        "independent_composite": independent_composite,
+        # The canonical score must be independent.  M4's own assessment remains
+        # visible above for audit/debugging, but never drives the final result.
+        "composite": independent_composite,
         "traces": traces,
     }
 
@@ -238,6 +249,7 @@ def _quality_gates(state: PipelineState) -> Dict[str, Any]:
     """Independent object/evidence/coverage/source gates (O-09)."""
 
     context = build_graph_context(state)
+    synthesis_contract = synthesis_contract_for_state(state)
     valid_evidence = set(context.available_evidence_ids)
     alignment_rows = []
     for hypothesis in state.top_hypotheses:
@@ -251,6 +263,7 @@ def _quality_gates(state: PipelineState) -> Dict[str, Any]:
             subject_text="\n".join([hypothesis.statement, hypothesis.mechanism]),
             trace=hypothesis.task_trace,
             require_contract=False,
+            contract_override=synthesis_contract,
         )
         plan_assessment = (
             assess_task_alignment(
@@ -259,6 +272,7 @@ def _quality_gates(state: PipelineState) -> Dict[str, Any]:
                 subject_text=plan.study_subjects,
                 trace=plan.task_trace,
                 require_contract=False,
+                contract_override=synthesis_contract,
             ) if plan else None
         )
         passed = hypothesis_assessment.passed and bool(
@@ -285,11 +299,64 @@ def _quality_gates(state: PipelineState) -> Dict[str, Any]:
     supported_units = 0
     hyp_claim_units = 0
     hyp_supported_units = 0
+    plan_by_hypothesis = {
+        plan.hypothesis_id: plan for plan in state.research_plans
+    }
+
+    def bridge_validation_complete(hypothesis: Any) -> bool:
+        """Check M5's explicit test coverage for every required M3 bridge."""
+        assumptions = [
+            item for item in getattr(hypothesis, "working_assumptions", [])
+            if item.required
+        ]
+        if not assumptions:
+            return True
+        valid_bridge_ids = {
+            item.entry_id for item in context.bridge_hypotheses
+        }
+        plan = plan_by_hypothesis.get(hypothesis.hypothesis_id)
+        validations = {
+            item.bridge_hypothesis_node_id: item
+            for item in getattr(plan, "bridge_validations", [])
+        } if plan else {}
+        return all(
+            assumption.bridge_hypothesis_node_id in valid_bridge_ids
+            and assumption.bridge_hypothesis_node_id in validations
+            and all(
+                bool(str(getattr(validations[assumption.bridge_hypothesis_node_id], field) or "").strip())
+                for field in ("procedure", "measurement", "falsification_condition")
+            )
+            for assumption in assumptions
+        )
+
     for hypothesis in state.top_hypotheses:
         claim_units += 1
         hyp_claim_units += 1
-        cited = set(hypothesis.supporting_evidence)
-        if cited and all(item in valid_evidence for item in cited):
+        factual_premises = [
+            premise for premise in getattr(hypothesis, "factual_premises", [])
+            if premise.required
+        ]
+        if factual_premises:
+            premise_supported = all(
+                premise.audit_verdict in {"supported", "partially_supported"}
+                and bool(premise.supporting_evidence_ids)
+                and all(item in valid_evidence for item in premise.supporting_evidence_ids)
+                for premise in factual_premises
+            )
+            if premise_supported and getattr(hypothesis, "grounding_status", "legacy_unknown") == "mixed":
+                premise_supported = bridge_validation_complete(hypothesis)
+        else:
+            grounding_status = getattr(hypothesis, "grounding_status", "legacy_unknown")
+            if grounding_status == "bridge_only":
+                # Bridge hypotheses are not literature facts. Their structural
+                # coverage comes from M5's explicit validation matrix instead.
+                premise_supported = bridge_validation_complete(hypothesis)
+            else:
+                # Historical cards have no premise structure; preserve their
+                # old citation gate for compatibility only.
+                cited = set(hypothesis.supporting_evidence)
+                premise_supported = bool(cited) and all(item in valid_evidence for item in cited)
+        if premise_supported:
             supported_units += 1
             hyp_supported_units += 1
             

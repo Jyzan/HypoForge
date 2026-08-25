@@ -984,7 +984,9 @@ class AgenticM2Adapter(ModuleProtocol):
             ]
         searched_m4_ids: set[str] = set()
         m4_queries_by_gap: dict[str, list[str]] = {}
+        searched_m6_ids: set[str] = set()
         grounded_m6_ids: set[str] = set()
+        m6_errors_by_gap: dict[str, list[str]] = {}
         for index, outcome in outcomes.items():
             search_task = search_tasks[index]
             searched_m4_ids.update(search_task.m4_gap_ids)
@@ -992,19 +994,36 @@ class AgenticM2Adapter(ModuleProtocol):
                 m4_queries_by_gap.setdefault(gap_id, []).extend(
                     outcome.executed_queries
                 )
+            searched_m6_ids.update(search_task.m6_gap_ids)
             if outcome.export_run.evidence or outcome.export_run.knowledge_entries:
                 grounded_m6_ids.update(search_task.m6_gap_ids)
+        for run in export_runs:
+            for gap_id in run.origin_gap_ids:
+                if run.search_provenance.stop_reason != "error":
+                    searched_m6_ids.add(gap_id)
+                if run.search_provenance.errors:
+                    m6_errors_by_gap.setdefault(gap_id, []).extend(
+                        str(item)
+                        for item in run.search_provenance.errors
+                        if str(item).strip()
+                    )
 
         if pending_gaps:
+            pending_m4_ids = {gap.gap_id for gap in pending_gaps}
             result["evidence_gap_requests"] = [
-                gap.model_copy(update={
-                    "status": "searched",
-                    "attempts": gap.attempts + 1,
-                    "executed_queries": list(dict.fromkeys([
-                        *gap.executed_queries,
-                        *m4_queries_by_gap.get(gap.gap_id, []),
-                    ])),
-                }) if gap.gap_id in searched_m4_ids else gap.model_copy(deep=True)
+                self._update_m4_gap_after_search(
+                    gap,
+                    completed=gap.gap_id in searched_m4_ids,
+                    executed_queries=m4_queries_by_gap.get(gap.gap_id, []),
+                    error=next(
+                        (
+                            detail
+                            for index, (_, detail) in failures.items()
+                            if gap.gap_id in search_tasks[index].m4_gap_ids
+                        ),
+                        "",
+                    ),
+                ) if gap.gap_id in pending_m4_ids else gap.model_copy(deep=True)
                 for gap in state.evidence_gap_requests
             ]
             if searched_m4_ids:
@@ -1012,13 +1031,39 @@ class AgenticM2Adapter(ModuleProtocol):
                     state.evidence_gap_search_rounds + 1
                 )
         if revisit_gaps:
-            result["evidence_gaps"] = [
-                gap.model_copy(update={"status": "pending_grounding"})
-                if (
-                    gap.status == "open"
-                    and gap.gap_id in grounded_m6_ids
+            def _update_m6_gap(gap):
+                if gap.status != "open":
+                    return gap.model_copy(deep=True)
+                modern = bool(
+                    gap.hypothesis_ids
+                    or gap.search_completed
+                    or gap.technical_errors
+                    or gap.resolution_evidence_ids
+                    or gap.contradicting_evidence_ids
+                    or gap.bridge_hypothesis_node_id
                 )
-                else gap.model_copy(deep=True)
+                if not modern:
+                    if gap.gap_id in grounded_m6_ids:
+                        return gap.model_copy(update={"status": "pending_grounding"})
+                    return gap.model_copy(deep=True)
+                errors = list(dict.fromkeys(m6_errors_by_gap.get(gap.gap_id, [])))
+                if errors:
+                    return gap.model_copy(update={
+                        "search_completed": False,
+                        "technical_errors": errors,
+                        "scientific_resolution": "unreviewed",
+                    })
+                if gap.gap_id in searched_m6_ids:
+                    return gap.model_copy(update={
+                        "status": "pending_grounding",
+                        "search_completed": True,
+                        "technical_errors": [],
+                        "scientific_resolution": "unreviewed",
+                    })
+                return gap.model_copy(deep=True)
+
+            result["evidence_gaps"] = [
+                _update_m6_gap(gap)
                 for gap in state.evidence_gaps
             ]
         return result
@@ -1043,7 +1088,23 @@ class AgenticM2Adapter(ModuleProtocol):
             normalized_question = " ".join(str(question or "").split())
             if not normalized_question:
                 normalized_question = " ".join(state.input_question.split())
-            key = normalized_question.casefold()
+            # A factual premise gap is a scientific unit of work, even when
+            # two gaps happen to render the same text. Keep those searches
+            # and outcome packets isolated for M3 adjudication.
+            normalized_key = normalized_question.casefold()
+            if m4_gap_id:
+                # A same-question M6 revisit can share one worker with an M4
+                # gap; its packet keeps both origin lists. Two M4 premise
+                # gaps, however, remain isolated even when their wording is
+                # identical.
+                existing_shared = buckets.get(normalized_key)
+                key = (
+                    normalized_key
+                    if existing_shared and not existing_shared["m4_gap_ids"]
+                    else f"m4-gap:{m4_gap_id}"
+                )
+            else:
+                key = normalized_key
             bucket = buckets.setdefault(key, {
                 "question": normalized_question,
                 "m4_gap_ids": [],
@@ -1060,7 +1121,7 @@ class AgenticM2Adapter(ModuleProtocol):
                 m6_gap_id=gap.gap_id,
             )
         for gap in pending_gaps:
-            add_task(gap.sub_question, m4_gap_id=gap.gap_id)
+            add_task(gap.audit_claim or gap.sub_question, m4_gap_id=gap.gap_id)
 
         if not buckets:
             questions = (
@@ -1079,6 +1140,36 @@ class AgenticM2Adapter(ModuleProtocol):
             )
             for bucket in buckets.values()
         ]
+
+    @staticmethod
+    def _update_m4_gap_after_search(
+        gap: EvidenceGapRequest,
+        *,
+        completed: bool,
+        executed_queries: Sequence[str] = (),
+        error: str = "",
+    ) -> EvidenceGapRequest:
+        """Record search execution without claiming semantic resolution."""
+        if not completed:
+            detail = " ".join(str(error or "M2 search worker failed").split())[:500]
+            return gap.model_copy(update={
+                "status": "pending",
+                "search_completed": False,
+                "technical_errors": list(dict.fromkeys([
+                    *gap.technical_errors,
+                    detail,
+                ])),
+                "rationale": " ".join(filter(None, [gap.rationale, detail])).strip(),
+            })
+        return gap.model_copy(update={
+            "status": "searched",
+            "attempts": gap.attempts + 1,
+            "search_completed": True,
+            "executed_queries": list(dict.fromkeys([
+                *gap.executed_queries,
+                *(str(query).strip() for query in executed_queries if str(query).strip()),
+            ])),
+        })
 
     @staticmethod
     def _gap_as_sub_question(gap: EvidenceGap, original_question: str) -> str:

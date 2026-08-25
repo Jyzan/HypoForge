@@ -19,9 +19,10 @@ def build_synthesis_contract(card: ProblemCard | None) -> TaskContract:
     if card is None:
         return TaskContract(source="derived")
 
+    source_entities = list(card.task_contract.entities)
     entities = [
-        entity.model_copy(deep=True)
-        for entity in card.task_contract.entities
+        entity.model_copy(deep=True, update={"required": False})
+        for entity in source_entities
     ]
     primary_entity_id = next(
         (
@@ -33,7 +34,7 @@ def build_synthesis_contract(card: ProblemCard | None) -> TaskContract:
     )
     related_entity_ids = [
         entity.entity_id
-        for entity in entities
+        for entity in source_entities
         if entity.required and entity.entity_id != primary_entity_id
     ]
     return TaskContract(
@@ -56,3 +57,16 @@ def synthesis_contract_for_state(state: PipelineState) -> TaskContract:
     """Derive the synthesis contract for one pipeline state."""
 
     return build_synthesis_contract(state.problem_card)
+
+
+def synthesis_problem_payload(card: ProblemCard | None) -> dict[str, object]:
+    """Return the M4-M6 problem view without M1 retrieval sub-questions."""
+
+    if card is None:
+        return {}
+    return {
+        "original_question": card.original_question,
+        "domain": list(card.domain),
+        "key_entities": list(card.key_entities),
+        "task_contract": build_synthesis_contract(card).model_dump(mode="json"),
+    }

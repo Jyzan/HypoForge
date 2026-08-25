@@ -15,36 +15,51 @@ testable scientific hypotheses.
 
 Each hypothesis must include:
 
-1. **statement** — a clear, falsifiable statement of the hypothesis (1–3 sentences).
+1. **statement** — a clear, proposed falsifiable relation (1–3 sentences). \
+It is a proposed research claim, not an established fact.
 2. **mechanism** — the proposed causal chain (e.g. "X → Y → Z").
-3. **observable_predictions** — 2–4 concrete, measurable predictions that would \
+3. **factual_premises** — the atomic factual premises needed to understand the \
+mechanism. Each item must contain `premise_id`, `claim`, `kind`, and provenance. \
+Use `kind="evidence_backed"` only for claims directly supported by supplied \
+canonical evidence IDs; never turn a conjecture, prediction, or causal step into \
+a fact merely because it is plausible.
+4. **research_gap** — the precise unanswered scientific question that motivates \
+the conjecture. It is not itself a factual premise and does not require a citation.
+5. **working_assumptions** — only supplied M3 bridge hypotheses, each with \
+`kind="unverified_bridge"` and its `bridge_hypothesis_node_id`. Do not invent a \
+bridge node or attach evidence/paper IDs to it.
+6. **observable_predictions** — 2–4 concrete, measurable predictions that would \
 be true if the hypothesis is correct.
-4. **falsification_conditions** — 1–2 experimental outcomes that would definitively \
+7. **falsification_conditions** — 1–2 experimental outcomes that would definitively \
 *disprove* the hypothesis.
-5. **supporting_evidence** — canonical evidence IDs from the evidence graph that \
+8. **supporting_evidence** — canonical evidence IDs from the evidence graph that \
 provide indirect support.
-5b. **source_paper_ids** — for each evidence ID in ``supporting_evidence``, include
+8b. **source_paper_ids** — for each evidence ID in ``supporting_evidence``, include
 its source paper ID from the graph context.  No paper IDs should appear here that
 are not linked to a referenced evidence item.
-6. **task_trace** — include every required task entity and the single Q0
-whole-question requirement. The Q0 excerpt must be copied literally from this
+9. **task_trace** — include the single Q0 whole-question requirement and any
+task entities that are explicitly present in the output. The Q0 excerpt must be copied literally from this
 hypothesis's statement, mechanism, or prediction and must demonstrate that this
 candidate independently answers the original question as a whole. Never divide
 the original task across a candidate portfolio.
 
 Task contract fidelity (hard gate):
-- Every required task entity name MUST appear verbatim — the exact characters,
-  no translation or paraphrase — in the statement or mechanism. The validator
-  matches these names literally, so quote one of the supplied exact
-  names/aliases from the task contract block.
-- Match the hypothesis language to the original question. Use the alias in the
-  sentence's language when the contract lists one (e.g. "immune system" in an
-  English sentence if listed as an alias), or parenthesize as
-  ``Chinese name (English term)``. Never embed a Chinese contract name inside an
-  English sentence.
+- Match the hypothesis language to the original question. Task-entity names are
+  semantic hints and may be translated or paraphrased; do not force an English
+  retrieval term into a Chinese answer (or vice versa).
 - Requirement excerpts must be copied character-for-character from the
   hypothesis text, name the requirement's primary entity, and express that
   requirement's relation or action.
+
+Epistemic boundary rules:
+- The proposed statement and mechanism are the contribution to test; do not write
+  them as if the supplied literature has already proved the complete causal chain.
+- Every established claim used as the ground of the proposal must appear in
+  `factual_premises` with its exact canonical Evidence IDs.
+- `working_assumptions` may contain only M3 bridge hypotheses supplied in context.
+- If no factual premise is available, use a supplied M3 bridge and make the
+  unresolved status explicit; never invent a citation to make the card look grounded.
+- `grounding_status` must be one of `evidence_backed`, `mixed`, or `bridge_only`.
 
 Rules:
 - Hypotheses must be *novel* — do not restate established facts.
@@ -55,10 +70,16 @@ Rules:
 different organism, machine, population, or experimental target.
 - Every candidate must independently answer the complete original question. A
   candidate that addresses only one retrieval-derived aspect is incomplete.
+- Keep the epistemic boundary explicit: `factual_premises` are the evidence-backed
+  ground; `mechanism`, `research_gap`, predictions and falsification conditions are
+  the proposed research contribution. The generator must not claim that its own
+  mechanism has already been proven.
 - Cite only IDs present in the supplied graph context. Never invent an entry or \
 evidence ID. If no support exists, return an empty list instead of guessing.
-- **CRITICAL**: The `statement` MUST be an objective, factual, domain-appropriate
-scientific claim that names the system, proposed relation, and measurable effect.
+- **CRITICAL**: The `statement` MUST be an objective, domain-appropriate
+  proposed scientific relation that names the system, proposed relation, and
+  measurable effect. It must remain falsifiable without claiming that the
+  proposed mechanism is already established.
 Do NOT use meta-language, suggestions, or peer-review wording like "We hypothesize
 that", "Consider acknowledging", or "Future work should".
 
@@ -69,7 +90,50 @@ If the user message contains a "Revision guidance" block, you are REVISING exist
 hypotheses: directly address the reviewer feedback and any user guidance, preserve what \
 works, and fix the identified weaknesses instead of starting over.
 
-Output a JSON array of hypothesis objects.
+Output a JSON array of hypothesis objects with every epistemic field present.
+"""
+
+
+M4_EPISTEMIC_AUDITOR_SYSTEM_PROMPT = """\
+You are an epistemic-boundary auditor for scientific hypothesis cards.
+Return a JSON object with an `items` array. For every input hypothesis, return
+exactly one item containing `hypothesis_id`, `passed`, `hidden_factual_claims`,
+`overclaim_segments`, `repair_summary`, and a complete `corrected_hypothesis`.
+
+Rules:
+1. `factual_premises` contains only established claims directly supported by
+   canonical Evidence IDs in the supplied graph context.
+2. `working_assumptions` contains only M3 bridge nodes supplied in context and
+   must never carry evidence or paper IDs.
+3. `statement`, `mechanism`, predictions and falsification conditions are proposed
+   research content. They do not need direct proof, but they must not silently
+   present an unresolved mechanism as an established fact.
+4. Put every established claim needed to understand the proposed mechanism in
+   `factual_premises`; do not hide it in prose.
+5. Preserve task scope, IDs, predictions, falsification conditions and useful text
+   unless a repair is required by these rules.
+6. Never invent Evidence IDs, Paper IDs or bridge node IDs. Use empty lists when
+   the graph does not contain the requested provenance.
+7. Set `grounding_status` to `evidence_backed`, `mixed`, or `bridge_only`. The
+   application will recompute this value deterministically.
+"""
+
+
+M4_EPISTEMIC_AUDITOR_USER_TEMPLATE = """\
+Original question:
+{original_question}
+
+Provenance-rich graph context:
+{graph_context}
+
+Current hypotheses:
+{hypotheses_json}
+
+Deterministic diagnostics:
+{diagnostics_json}
+
+Audit and, where necessary, repair each complete hypothesis object. Return only
+the requested JSON object with `items`.
 """
 
 M4_GENERATOR_USER_TEMPLATE = """\
@@ -104,12 +168,10 @@ patch, prose, or explanations outside the objects.
 
 Binding rules:
 - Preserve the original research object, domain, relation, and requested outcome.
-- Address every required task entity and the single Q0 whole-question
-  requirement from the supplied synthesis contract. Do not preserve or invent
-  retrieval-subquestion scopes.
-- Entity names MUST appear verbatim (exact characters, same language, no
-  translation or paraphrase) in the statement or mechanism — quote one of the
-  supplied exact names/aliases from the task contract block.
+- Address the single Q0 whole-question requirement from the supplied synthesis
+  contract. Do not preserve or invent retrieval-subquestion scopes. Task-entity
+  names are semantic hints and may be translated or paraphrased to match the
+  original question's language.
 - In `task_trace`, use only contract IDs present in the supplied context.
 - Every `output_excerpt` must be copied literally from that same hypothesis's
   statement, mechanism, observable predictions, or falsification conditions.
@@ -141,7 +203,7 @@ Original question: {original_question}
 {feedback_context}
 
 {task_contract_block}
-Repair the candidates so that their content and literal task traces satisfy the
+Repair the candidates so that their content and Q0 trace satisfy the
 binding task contract. Do not add evidence that is absent from the graph context.
 """
 

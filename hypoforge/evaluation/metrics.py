@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field
 
 from ..protocol import MetricProtocol
 from ..state import HypothesisCard, KnowledgeEntry, EvidenceGraph, EvidenceNode, EvidenceEdgeRelation, EvidenceNodeType
+from ..evidence_audit import EvidenceAuditService
 
 logger = logging.getLogger(__name__)
 
@@ -433,7 +434,7 @@ class NoveltyMetric(GraphMetricBase):
         evidence_graph = kwargs.get("evidence_graph")
         if not evidence_graph or not self._client:
             return 0.0
-            
+
         claims = await self._decompose_hypothesis(hypothesis)
         if not claims:
             return 0.0
@@ -506,7 +507,11 @@ class NoveltyMetric(GraphMetricBase):
                 or any(not group for group in s_b_groups)
             )
             if missing_component:
-                total_score += 1.0  # Concept truly missing from the literature
+                # An entity missing from the bounded retrieval graph means the
+                # corpus is insufficient to judge novelty.  It is not evidence
+                # that the scientific concept itself is novel.
+                score = 0.0
+                total_score += score
                 trace_data["claims_novelty"].append({
                     "claim": claim_obj.get("claim", ""),
                     "extracted_subject": subject_str,
@@ -520,7 +525,8 @@ class NoveltyMetric(GraphMetricBase):
                     "start_components": start_components_trace,
                     "end_components": end_components_trace,
                     "distance": None,
-                    "score": 1.0,
+                    "score": score,
+                    "assessment": "insufficient_graph_coverage",
                 })
                 continue
 
@@ -583,7 +589,11 @@ class NoveltyMetric(GraphMetricBase):
                 "end_components": end_components_trace,
                 # ``None`` serializes as JSON null; Infinity is not valid JSON.
                 "distance": None if math.isinf(min_dist) else min_dist,
-                "score": score
+                "score": score,
+                "assessment": (
+                    "relation_absent_in_covered_graph"
+                    if math.isinf(min_dist) else "graph_distance"
+                ),
             })
             
         return round(total_score / len(claims), 4), trace_data
@@ -718,11 +728,83 @@ class EvidenceConsistencyMetric(GraphMetricBase):
         evidence_graph = kwargs.get("evidence_graph")
         if not evidence_graph or not self._client:
             return 0.0
+
+        # New M4 cards carry an explicit epistemic boundary. Only factual
+        # premises are eligible for an evidence-consistency score; mechanisms,
+        # predictions and working assumptions are not silently upgraded into
+        # established facts by this metric.
+        factual_premises = list(getattr(hypothesis, "factual_premises", []) or [])
+        if factual_premises:
+            auditor = EvidenceAuditService(self._client)
+            premise_results = await auditor.audit_premises(
+                factual_premises,
+                evidence_graph,
+            )
+            support_weights = {
+                "supported": 1.0,
+                "partially_supported": 0.5,
+                "unsupported": 0.0,
+                "contradicted": 0.0,
+                "invalid_citation": 0.0,
+                "not_applicable": 0.0,
+            }
+            trace_data = {
+                "atomic_claims": [
+                    {
+                        "premise_id": result.premise_id,
+                        "claim": result.claim,
+                        "matched_anchors": list(result.evidence_ids),
+                        "support_status": result.verdict,
+                        "support_evaluation": result.model_dump(mode="json"),
+                    }
+                    for result in premise_results
+                ]
+            }
+            score = sum(
+                support_weights[result.verdict] for result in premise_results
+            ) / max(len(premise_results), 1)
+            return round(score, 4), trace_data
             
         claims = await self._decompose_hypothesis(hypothesis)
         if not claims:
             return 0.0
-            
+
+        # Use the shared fail-closed semantic auditor so M4/M3 and the
+        # independent score use the same entailment vocabulary and evidence
+        # whitelist.  Keep the legacy helper methods below for compatibility
+        # with older callers, but do not run their duplicate judge path.
+        # Legacy metric callers may provide simplified graph nodes without the
+        # M2 evidence_ids metadata. Keep that compatibility only in the
+        # historical score path; M4/M3 use the strict default.
+        auditor = EvidenceAuditService(self._client, allow_legacy_node_ids=True)
+        claim_texts = [
+            str(item.get("claim") or "").strip()
+            for item in claims
+            if str(item.get("claim") or "").strip()
+        ]
+        verdicts = await auditor.audit_claims(claim_texts, evidence_graph)
+        support_weights = {
+            "direct_support": 1.0,
+            "partial_support": 0.5,
+            "related_only": 0.2,
+            "unsupported": 0.0,
+            "contradicted": 0.0,
+        }
+        trace_data = {
+            "atomic_claims": [
+                {
+                    "claim": verdict.claim,
+                    "matched_anchors": list(verdict.evidence_ids),
+                    "threat_context": [],
+                    "support_status": verdict.support_status,
+                    "support_evaluation": verdict.model_dump(mode="json"),
+                }
+                for verdict in verdicts
+            ]
+        }
+        score = sum(support_weights[item.support_status] for item in verdicts) / max(len(verdicts), 1)
+        return round(score, 4), trace_data
+
         # We use long sentence nodes (CLAIM, EVIDENCE, LIMITATION, CONFLICT) as anchors to compare against the atomic claims.
         sentence_types = {EvidenceNodeType.CLAIM, EvidenceNodeType.EVIDENCE, EvidenceNodeType.LIMITATION, EvidenceNodeType.CONFLICT}
         searchable_nodes = [n for n in evidence_graph.nodes if n.type in sentence_types]
@@ -734,12 +816,22 @@ class EvidenceConsistencyMetric(GraphMetricBase):
             except Exception as e:
                 logger.warning(f"Embedding failed, falling back: {e}")
                 
-        system_prompt = """You are a strict scientific reviewer.
-For every indexed Target Claim, determine whether it directly violates or ignores its Threat Context (known conflicts/limitations from literature).
-If the threat context is irrelevant to the claim, or if the claim successfully resolves the threat, there is no conflict.
-Return exactly one verdict for every supplied claim_index."""
+        system_prompt = """You are a strict evidence-entailment reviewer.
+For every indexed Target Claim, determine whether the supplied Evidence Context
+actually entails that claim. Mere topic similarity, a shared entity, an existing
+citation ID, or the absence of contradiction is NOT support.
 
-        consistent_count = 0
+Use exactly one support_status:
+- direct_support: the evidence explicitly supports the complete causal claim.
+- partial_support: the evidence supports part of the claim but leaves a material step open.
+- related_only: the evidence is about the same topic/entities but does not entail the claim.
+- unsupported: no supplied evidence supports the claim.
+- contradicted: supplied evidence directly conflicts with the claim.
+
+Threat Context contains known conflicts or limitations and must lower the verdict
+when applicable. Return exactly one verdict for every supplied claim_index."""
+
+        support_score_total = 0.0
         trace_data = {"atomic_claims": []}
         pending_evaluations: List[Dict[str, Any]] = []
         for claim_index, claim_obj in enumerate(claims):
@@ -766,27 +858,29 @@ Return exactly one verdict for every supplied claim_index."""
                 valid_anchors = self._keyword_search(comp_queries, searchable_nodes, search_metadata=True)
                 
             if not valid_anchors:
-                consistent_count += 1
-                trace_data["atomic_claims"].append({"claim": claim_text, "matched_anchors": [], "threat_context": [], "conflict_evaluation": None})
-                continue
-                
-            threat_nodes = self._build_threat_context(valid_anchors, evidence_graph)
-            if not threat_nodes:
-                consistent_count += 1
-                trace_data["atomic_claims"].append({"claim": claim_text, "matched_anchors": [n.id for n in valid_anchors], "threat_context": [], "conflict_evaluation": None})
+                trace_data["atomic_claims"].append({
+                    "claim": claim_text,
+                    "matched_anchors": [],
+                    "threat_context": [],
+                    "support_status": "unsupported",
+                    "support_evaluation": None,
+                })
                 continue
 
+            threat_nodes = self._build_threat_context(valid_anchors, evidence_graph)
             trace_index = len(trace_data["atomic_claims"])
             trace_data["atomic_claims"].append({
                 "claim": claim_text,
                 "matched_anchors": [n.id for n in valid_anchors],
                 "threat_context": [n.id for n in threat_nodes],
-                "conflict_evaluation": None,
+                "support_status": "pending",
+                "support_evaluation": None,
             })
             pending_evaluations.append({
                 "claim_index": claim_index,
                 "trace_index": trace_index,
                 "target_claim": claim_text,
+                "evidence_context": [n.label for n in valid_anchors],
                 "threat_context": [n.label for n in threat_nodes],
             })
 
@@ -798,14 +892,21 @@ Return exactly one verdict for every supplied claim_index."""
                         "type": "array",
                         "items": {
                             "type": "object",
-                            "properties": {
-                                "claim_index": {"type": "integer"},
-                                "is_conflict": {"type": "boolean"},
-                                "rationale": {"type": "string"},
-                            },
-                            "required": [
-                                "claim_index", "is_conflict", "rationale",
-                            ],
+                                "properties": {
+                                    "claim_index": {"type": "integer"},
+                                    "support_status": {
+                                        "type": "string",
+                                        "enum": [
+                                            "direct_support", "partial_support",
+                                            "related_only", "unsupported",
+                                            "contradicted",
+                                        ],
+                                    },
+                                    "rationale": {"type": "string"},
+                                },
+                                "required": [
+                                    "claim_index", "support_status", "rationale",
+                                ],
                         },
                     },
                 },
@@ -815,6 +916,7 @@ Return exactly one verdict for every supplied claim_index."""
                 {
                     "claim_index": item["claim_index"],
                     "target_claim": item["target_claim"],
+                    "evidence_context": item["evidence_context"],
                     "threat_context": item["threat_context"],
                 }
                 for item in pending_evaluations
@@ -843,30 +945,43 @@ Return exactly one verdict for every supplied claim_index."""
                         continue
                     claim_index = verdict.get("claim_index")
                     if (
-                        isinstance(claim_index, int)
-                        and claim_index in expected_indices
-                        and claim_index not in verdict_by_index
-                        and isinstance(verdict.get("is_conflict"), bool)
+                            isinstance(claim_index, int)
+                            and claim_index in expected_indices
+                            and claim_index not in verdict_by_index
+                            and verdict.get("support_status") in {
+                                "direct_support", "partial_support",
+                                "related_only", "unsupported", "contradicted",
+                            }
                     ):
                         verdict_by_index[claim_index] = verdict
                 for item in pending_evaluations:
                     trace = trace_data["atomic_claims"][item["trace_index"]]
                     verdict = verdict_by_index.get(item["claim_index"])
                     if verdict is None:
+                        trace["support_status"] = "unsupported"
                         trace["error"] = (
-                            "conflict evaluator returned no valid verdict"
+                            "evidence evaluator returned no valid verdict"
                         )
                         continue
-                    trace["conflict_evaluation"] = verdict
-                    if not verdict["is_conflict"]:
-                        consistent_count += 1
+                    status = verdict["support_status"]
+                    trace["support_status"] = status
+                    trace["support_evaluation"] = verdict
+                    support_score_total += {
+                        "direct_support": 1.0,
+                        "partial_support": 0.5,
+                        "related_only": 0.2,
+                        "unsupported": 0.0,
+                        "contradicted": 0.0,
+                    }[status]
             except Exception as e:
                 # Evaluation failures are auditable and conservative: do not
                 # award consistency when the judge never produced a verdict.
                 for item in pending_evaluations:
-                    trace_data["atomic_claims"][item["trace_index"]]["error"] = str(e)
-                
-        return round(consistent_count / len(claims), 4), trace_data
+                    trace = trace_data["atomic_claims"][item["trace_index"]]
+                    trace["support_status"] = "unsupported"
+                    trace["error"] = str(e)
+
+        return round(support_score_total / len(claims), 4), trace_data
 
     async def batch_compute(self, hypotheses: List[HypothesisCard], knowledge_entries: List[KnowledgeEntry], **kwargs) -> List[float]:
         results = [await self.compute(h, knowledge_entries, **kwargs) for h in hypotheses]

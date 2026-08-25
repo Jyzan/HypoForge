@@ -2,6 +2,7 @@
 每次修改后运行：pytest tests/test_pipeline.py -q
 """
 
+import json
 from typing import Any
 
 import pytest
@@ -3665,6 +3666,33 @@ def test_normalisation_discards_editorial_statements() -> None:
     assert [card.hypothesis_id for card in cards] == ["H1"]
 
 
+def test_m4_generator_payload_failure_distinguishes_legacy_wrapper_from_salvage() -> None:
+    module = M4HypothesisGeneration(mode="multi_agent")
+
+    assert module._generator_payload_failure([
+        {"hypothesis_id": "H1", "statement": "A causes B."}
+    ]) is None
+    assert module._generator_payload_failure({
+        "hypotheses": [{"hypothesis_id": "H1", "statement": "A causes B."}]
+    }) is None
+
+    failure = module._generator_payload_failure({
+        "entries": ["H1"],
+        "observable_predictions": ["prediction"],
+        "supporting_evidence": ["E1"],
+    })
+    assert failure is not None
+    assert failure["failure_type"] == "non_candidate_payload"
+    assert "entries" in failure["payload_keys"]
+
+    parse_failure = module._generator_payload_failure({
+        "_parse_error": True,
+        "raw_response": '{"entries": [{"hypothesis_id": "H1"',
+    })
+    assert parse_failure is not None
+    assert parse_failure["failure_type"] == "parse_error"
+
+
 class _SequenceClient:
     def __init__(self, responses: list[Any]) -> None:
         self.responses = list(responses)
@@ -3962,6 +3990,246 @@ async def test_m4_does_not_retry_optional_candidate_shortfall_after_top_k() -> N
     assert client.responses == []
 
 
+@pytest.mark.asyncio
+async def test_m4_shortfall_retry_timeout_preserves_existing_valid_candidate(
+    monkeypatch,
+) -> None:
+    module = M4HypothesisGeneration(
+        num_candidates=3,
+        top_k=2,
+        mode="direct",
+    )
+    module.client = object()
+    existing = HypothesisCard(
+        hypothesis_id="H1",
+        statement="Senescent-cell clearance reduces inflammatory burden.",
+    )
+    calls = []
+
+    async def fake_generate(
+        state,
+        *,
+        question,
+        graph_context,
+        feedback_context,
+        tool_name,
+        attempt,
+        requested_count=None,
+        disable_thinking=None,
+    ):
+        calls.append((tool_name, requested_count, disable_thinking))
+        if attempt == 1:
+            return [existing.model_dump()], [existing], []
+        raise TimeoutError("simulated shortfall retry timeout")
+
+    monkeypatch.setattr(module, "_generate_hypothesis_batch", fake_generate)
+    output = await module._run_llm(PipelineState(input_question="Q"))
+
+    assert calls[1] == ("hypothesis_generator_retry", 1, True)
+    assert [card.hypothesis_id for card in output["top_hypotheses"]] == ["H1"]
+
+
+@pytest.mark.asyncio
+async def test_m4_zero_candidates_retry_timeout_enters_contract_repair(monkeypatch):
+    module = M4HypothesisGeneration(
+        num_candidates=3,
+        top_k=1,
+        mode="direct",
+    )
+    module.client = object()
+    repaired = HypothesisCard(
+        hypothesis_id="H-repaired",
+        statement="Reducing senescent-cell burden delays functional decline.",
+    )
+    repair_calls = []
+
+    async def fake_generate(*args, attempt, **kwargs):
+        if attempt == 1:
+            return [], [], [{"rationale": "truncated generator JSON"}]
+        raise TimeoutError("simulated retry timeout")
+
+    async def fake_repair(
+        *,
+        state,
+        context,
+        candidates,
+        failures,
+        feedback_context,
+        requested_count=None,
+        disable_thinking=True,
+    ):
+        repair_calls.append((requested_count, disable_thinking, failures))
+        return [repaired], []
+
+    monkeypatch.setattr(module, "_generate_hypothesis_batch", fake_generate)
+    monkeypatch.setattr(module, "_repair_context_contract", fake_repair)
+
+    output = await module._run_llm(PipelineState(input_question="Q"))
+
+    assert repair_calls[0][0:2] == (1, True)
+    assert any(
+        item.get("failure_type") == "shortfall_retry_failed"
+        for item in repair_calls[0][2]
+    )
+    assert output["top_hypotheses"][0].hypothesis_id == "H-repaired"
+
+
+@pytest.mark.asyncio
+async def test_m4_generator_and_repair_exhaustion_returns_auditable_continuity_candidate(
+    monkeypatch,
+):
+    module = M4HypothesisGeneration(
+        num_candidates=3,
+        top_k=1,
+        mode="multi_agent",
+    )
+    module.client = object()
+    gate_calls = 0
+
+    async def fake_generate(*args, attempt, **kwargs):
+        if attempt == 1:
+            return [], [], [{"rationale": "truncated generator JSON"}]
+        raise TimeoutError("simulated shortfall retry timeout")
+
+    async def fake_repair(**kwargs):
+        raise TimeoutError("simulated contract repair timeout")
+
+    async def fake_gates(*args, **kwargs):
+        nonlocal gate_calls
+        gate_calls += 1
+        raise AssertionError(
+            "degraded continuity candidate must skip extra LLM gates"
+        )
+
+    monkeypatch.setattr(module, "_generate_hypothesis_batch", fake_generate)
+    monkeypatch.setattr(module, "_repair_context_contract", fake_repair)
+    monkeypatch.setattr(module, "_run_quality_gates", fake_gates)
+
+    state = PipelineState(
+        input_question="Can aging be delayed?",
+        problem_card=ProblemCard(
+            original_question="Can aging be delayed?",
+            sub_questions=["What mechanisms drive aging?"],
+            key_entities=["aging"],
+            domain=["biology"],
+        ),
+    )
+    output = await module._run_llm(state)
+
+    assert gate_calls == 0
+    assert len(output["candidate_hypotheses"]) == 1
+    assert len(output["top_hypotheses"]) == 1
+    candidate = output["top_hypotheses"][0]
+    assert "continuity fallback" in candidate.ranking_rationale.casefold()
+    assert candidate.supporting_evidence == []
+    assert candidate.source_paper_ids == []
+    assert candidate.scores["composite"] <= 0.2
+
+
+@pytest.mark.asyncio
+async def test_m4_shortfall_recovery_emits_warning_and_stays_bounded(tmp_path):
+    module = M4HypothesisGeneration(
+        num_candidates=3,
+        top_k=1,
+        mode="direct",
+    )
+    module.client = object()
+    calls = []
+
+    async def fake_generate(*args, attempt, **kwargs):
+        calls.append((attempt, kwargs.get("requested_count"), kwargs.get("disable_thinking")))
+        if attempt == 1:
+            return [], [], [{"rationale": "truncated generator JSON"}]
+        raise TimeoutError("simulated shortfall retry timeout")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(module, "_generate_hypothesis_batch", fake_generate)
+    recorder = RunEventRecorder(tmp_path, "m4-shortfall")
+    try:
+        with bind_recorder(recorder):
+            output = await module._run_llm(PipelineState(input_question="Q"))
+    finally:
+        monkeypatch.undo()
+
+    assert len(calls) == 2
+    assert calls[1] == (2, 1, True)
+    assert output["top_hypotheses"]
+    events = recorder.read_events()
+    warnings = [
+        event for event in events
+        if event["tool"] == "hypothesis_generator_shortfall_recovery"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["status"] == "warning"
+
+
+@pytest.mark.asyncio
+async def test_m4_continuity_fallback_emits_warning_event(tmp_path, monkeypatch):
+    module = M4HypothesisGeneration(
+        num_candidates=3,
+        top_k=1,
+        mode="multi_agent",
+    )
+    module.client = object()
+
+    async def failed_generation(*args, attempt, **kwargs):
+        if attempt == 1:
+            return [], [], [{"rationale": "truncated generator JSON"}]
+        raise TimeoutError("simulated shortfall retry timeout")
+
+    async def failed_repair(**kwargs):
+        raise TimeoutError("simulated contract repair timeout")
+
+    monkeypatch.setattr(module, "_generate_hypothesis_batch", failed_generation)
+    monkeypatch.setattr(module, "_repair_context_contract", failed_repair)
+    recorder = RunEventRecorder(tmp_path, "m4-fallback")
+
+    with bind_recorder(recorder):
+        output = await module._run_llm(PipelineState(input_question="Q"))
+
+    assert output["top_hypotheses"]
+    fallback_events = [
+        event for event in recorder.read_events()
+        if event["tool"] == "hypothesis_generator_continuity_fallback"
+    ]
+    assert len(fallback_events) == 1
+    assert fallback_events[0]["status"] == "warning"
+
+
+@pytest.mark.asyncio
+async def test_m4_timeout_recovery_exhaustion_uses_continuity_fallback(monkeypatch):
+    module = M4HypothesisGeneration(
+        num_candidates=3,
+        top_k=1,
+        mode="direct",
+    )
+    module.client = object()
+    calls = []
+
+    async def failed_generation(*args, tool_name, **kwargs):
+        calls.append(tool_name)
+        raise TimeoutError("simulated generator timeout")
+
+    async def failed_repair(**kwargs):
+        calls.append("hypothesis_contract_repair")
+        raise TimeoutError("simulated contract repair timeout")
+
+    monkeypatch.setattr(module, "_generate_hypothesis_batch", failed_generation)
+    monkeypatch.setattr(module, "_repair_context_contract", failed_repair)
+
+    output = await module._run_llm(PipelineState(input_question="Q"))
+
+    assert calls == [
+        "hypothesis_generator",
+        "hypothesis_generator_timeout_recovery",
+        "hypothesis_contract_repair",
+    ]
+    assert len(output["top_hypotheses"]) == 1
+    assert "continuity fallback" in (
+        output["top_hypotheses"][0].ranking_rationale.casefold()
+    )
+
+
 def test_method_feedback_is_routed_to_m5_not_m4() -> None:
     state = PipelineState(
         input_question="q",
@@ -4071,6 +4339,7 @@ from pathlib import Path
 from hypoforge.graph_context import build_graph_context
 from hypoforge.synthesis_contract import (
     SYNTHESIS_REQUIREMENT_ID,
+    synthesis_problem_payload,
     synthesis_contract_for_state,
 )
 from hypoforge.modules.m1_problem_understanding import M1ProblemUnderstanding
@@ -4257,9 +4526,83 @@ def test_synthesis_contract_contains_only_original_question() -> None:
     assert contract.requirements[0].sub_question == (
         state.problem_card.original_question
     )
-    assert contract.entities == state.problem_card.task_contract.entities
+    assert [item.name for item in contract.entities] == [
+        item.name for item in state.problem_card.task_contract.entities
+    ]
+    assert all(item.required is False for item in contract.entities)
     assert all(question not in rendered for question in retrieval_questions)
     assert all(relation not in rendered for relation in retrieval_relations)
+
+    payload = synthesis_problem_payload(state.problem_card)
+    payload_text = json.dumps(payload, ensure_ascii=False)
+    assert state.problem_card.original_question in payload_text
+    assert all(question not in payload_text for question in retrieval_questions)
+
+
+def test_m4_synthesis_does_not_require_literal_cross_language_entities() -> None:
+    state = robot_state()
+    state.problem_card.task_contract.entities = [
+        TaskEntity(
+            entity_id="E1", name="robotic arm",
+            role="primary_object", required=True,
+        ),
+        TaskEntity(
+            entity_id="E2", name="simulation-to-reality transfer",
+            role="method", required=True,
+        ),
+    ]
+    state.problem_card.key_entities = [
+        "robotic arm", "simulation-to-reality transfer",
+    ]
+    candidate = hypothesis().model_copy(update={"task_trace": TaskTrace()})
+
+    canonical = M4HypothesisGeneration._canonicalize_task_traces(
+        state, [candidate],
+    )
+    accepted, failures = M4HypothesisGeneration._check_context_contract(
+        state, build_graph_context(state), canonical,
+    )
+
+    assert failures == []
+    assert [item.hypothesis_id for item in accepted] == ["H1"]
+    assert {
+        item.contract_id
+        for item in canonical[0].task_trace.requirement_mentions
+    } == {SYNTHESIS_REQUIREMENT_ID}
+
+
+def test_m5_synthesis_does_not_require_literal_cross_language_entities() -> None:
+    state = robot_state()
+    state.problem_card.task_contract.entities = [
+        TaskEntity(
+            entity_id="E1", name="robotic arm",
+            role="primary_object", required=True,
+        ),
+        TaskEntity(
+            entity_id="E2", name="simulation-to-reality transfer",
+            role="method", required=True,
+        ),
+    ]
+    plan = ResearchPlan(
+        hypothesis_id="H1",
+        study_subjects="机械臂仿真到现实迁移系统",
+        procedures=["在仿真和现实环境中验证机械臂操控。"],
+    )
+
+    canonical = M5ResearchPlan._canonicalize_task_trace(state, plan)
+    assessment = assess_task_alignment(
+        state,
+        M5ResearchPlan._plan_alignment_text(canonical),
+        subject_text=canonical.study_subjects,
+        trace=canonical.task_trace,
+        contract_override=synthesis_contract_for_state(state),
+    )
+
+    assert assessment.passed is True
+    assert {
+        item.contract_id
+        for item in canonical.task_trace.requirement_mentions
+    } == {SYNTHESIS_REQUIREMENT_ID}
 
 
 def test_m4_contract_requires_original_question_without_retrieval_scope() -> None:
@@ -4316,6 +4659,85 @@ async def test_m4_prompt_hides_retrieval_subquestions() -> None:
         assert requirement.relation not in prompt
 
 
+def test_synthesis_alignment_accepts_q0_without_retrieval_ids() -> None:
+    state = robot_state()
+    card = hypothesis()
+    text = "\n".join([card.statement, card.mechanism])
+    trace = TaskTrace(
+        entity_mentions=card.task_trace.entity_mentions,
+        requirement_mentions=[TaskTraceReference(
+            contract_id=SYNTHESIS_REQUIREMENT_ID,
+            output_excerpt=card.statement,
+        )],
+    )
+
+    assessment = assess_task_alignment(
+        state,
+        text,
+        subject_text=text,
+        trace=trace,
+        semantic_client=None,
+        contract_override=synthesis_contract_for_state(state),
+    )
+
+    assert assessment.passed is True
+    assert assessment.missing_requirement_ids == ()
+
+
+def test_m5_uses_q0_instead_of_retrieval_requirement_ids() -> None:
+    state = robot_state()
+    plan = ResearchPlan(
+        hypothesis_id="H1",
+        study_subjects="机械臂 sim-to-real 操控平台",
+        procedures=["测试机械臂 sim-to-real 操控成功率。"],
+        measurement_metrics=["机械臂 sim-to-real 迁移成功率"],
+    )
+
+    canonical = M5ResearchPlan._canonicalize_task_trace(state, plan)
+
+    assert {
+        item.contract_id
+        for item in canonical.task_trace.requirement_mentions
+    } == {SYNTHESIS_REQUIREMENT_ID}
+
+
+@pytest.mark.asyncio
+async def test_m6_uses_q0_instead_of_retrieval_requirement_ids() -> None:
+    state = robot_state()
+    base = hypothesis()
+    q0_trace = TaskTrace(
+        entity_mentions=base.task_trace.entity_mentions,
+        requirement_mentions=[TaskTraceReference(
+            contract_id=SYNTHESIS_REQUIREMENT_ID,
+            output_excerpt=base.statement,
+        )],
+    )
+    card = base.model_copy(update={"task_trace": q0_trace})
+    state.top_hypotheses = [card]
+    state.research_plans = [ResearchPlan(
+        hypothesis_id=card.hypothesis_id,
+        study_subjects="机械臂 sim-to-real 操控平台",
+        procedures=[card.statement],
+        measurement_metrics=["机械臂 sim-to-real 迁移成功率"],
+        supporting_evidence_ids=["ev-arm-1"],
+        task_trace=q0_trace,
+    )]
+    module = M6ReviewIteration()
+    module.client = ReviewClient()
+
+    result = await module(state)
+    task_review = next(
+        review for review in result["reviews"]
+        if review.dimension.value == "task_alignment"
+    )
+
+    assert task_review.hard_gate_passed is True
+    assert "R1" not in task_review.reasoning
+    for call in module.client.calls:
+        for question in state.problem_card.sub_questions:
+            assert question not in call["user_prompt"]
+
+
 @pytest.mark.asyncio
 async def test_standard_m4_revision_generator_disables_extended_thinking() -> None:
     """Later rounds already have evidence/review feedback and avoid the 360s tail."""
@@ -4326,7 +4748,7 @@ async def test_standard_m4_revision_generator_disables_extended_thinking() -> No
             "hypothesis_id": candidate.hypothesis_id,
             "consistent": True,
             "rationale": "same task object and requirement",
-            "covered_requirement_ids": ["R1"],
+            "covered_requirement_ids": [SYNTHESIS_REQUIREMENT_ID],
         }],
     ])
     module = M4HypothesisGeneration(
@@ -4766,13 +5188,23 @@ async def test_m4_repairs_contract_diagnostics_once_without_weakening_gate() -> 
     }
     client = HypothesisRepairClient([
         [invalid],
+        [{
+            "hypothesis_id": "H1", "consistent": False,
+            "rationale": "generic device is not the original task object",
+            "covered_requirement_ids": [],
+        }],
         [invalid],  # the D1 retry also fails → the flow reaches the repair
+        [{
+            "hypothesis_id": "H1", "consistent": False,
+            "rationale": "generic device is not the original task object",
+            "covered_requirement_ids": [],
+        }],
         [repaired],
         [{
             "hypothesis_id": "H1",
             "consistent": True,
             "rationale": "same lithium-metal battery research object",
-            "covered_requirement_ids": ["R1"],
+            "covered_requirement_ids": [SYNTHESIS_REQUIREMENT_ID],
         }],
     ])
     module = M4HypothesisGeneration(num_candidates=1, top_k=1, mode="direct")
@@ -4780,15 +5212,15 @@ async def test_m4_repairs_contract_diagnostics_once_without_weakening_gate() -> 
 
     result = await module._run_llm(state)
 
-    assert len(client.calls) == 4
-    # calls[1] is the D1 retry: carries the contract-failure feedback
-    assert "Contract validation rejected some candidates" in client.calls[1]["user_prompt"]
-    # calls[2] is the deterministic repair: carries the diagnostics
-    assert client.calls[2]["temperature"] == 0.0
-    assert "missing required task entities" in client.calls[2]["user_prompt"]
-    assert "hypothesis_contract_auditor" not in client.calls[2]["user_prompt"]
-    # calls[3] is the semantic contract audit
-    assert "Primary task objects" in client.calls[3]["user_prompt"]
+    assert len(client.calls) == 6
+    # calls[2] is the D1 retry: carries semantic-contract feedback.
+    assert "Contract validation rejected some candidates" in client.calls[2]["user_prompt"]
+    # calls[4] is the deterministic repair: carries the diagnostics.
+    assert client.calls[4]["temperature"] == 0.0
+    assert "original task object" in client.calls[4]["user_prompt"]
+    assert "hypothesis_contract_auditor" not in client.calls[4]["user_prompt"]
+    # calls[5] is the semantic contract audit of the repaired output.
+    assert "Primary task objects" in client.calls[5]["user_prompt"]
     assert result["top_hypotheses"][0].statement == valid_statement
 
 
@@ -4828,7 +5260,7 @@ async def test_m4_generator_prompt_carries_literal_contract_names() -> None:
             "hypothesis_id": "H1",
             "consistent": True,
             "rationale": "same research object",
-            "covered_requirement_ids": ["R1"],
+            "covered_requirement_ids": [SYNTHESIS_REQUIREMENT_ID],
         }],
     ])
     module = M4HypothesisGeneration(num_candidates=1, top_k=1, mode="direct")
@@ -4839,8 +5271,9 @@ async def test_m4_generator_prompt_carries_literal_contract_names() -> None:
     generator_prompt = client.calls[0]["user_prompt"]
     assert "锂金属电池" in generator_prompt
     assert "lithium-metal battery" in generator_prompt
-    assert "R1" in generator_prompt
-    assert "Do not translate or paraphrase" in generator_prompt
+    assert SYNTHESIS_REQUIREMENT_ID in generator_prompt
+    assert "R1" not in generator_prompt
+    assert "may be translated or paraphrased" in generator_prompt
     assert result["top_hypotheses"][0].statement == valid["statement"]
 
 
@@ -4890,7 +5323,7 @@ async def test_m4_repair_prompt_carries_literal_contract_names() -> None:
             "hypothesis_id": "H1",
             "consistent": True,
             "rationale": "same research object",
-            "covered_requirement_ids": ["R1"],
+            "covered_requirement_ids": [SYNTHESIS_REQUIREMENT_ID],
         }],
     ])
     module = M4HypothesisGeneration(num_candidates=1, top_k=1, mode="direct")
@@ -4992,7 +5425,7 @@ def test_m4_canonicalizes_wrong_trace_excerpts_from_literal_content() -> None:
     assert canonical[0].task_trace.entity_mentions[4].output_excerpt == statement
     assert {
         ref.contract_id for ref in canonical[0].task_trace.requirement_mentions
-    } == {"R1", "R2"}
+    } == {SYNTHESIS_REQUIREMENT_ID}
 
 
 def test_m4_requirement_scope_does_not_expand_from_shared_primary_entity() -> None:
@@ -5020,7 +5453,7 @@ def test_m4_requirement_scope_does_not_expand_from_shared_primary_entity() -> No
     assert [card.hypothesis_id for card in accepted] == ["H1"]
     assert [
         ref.contract_id for ref in canonical[0].task_trace.requirement_mentions
-    ] == ["R1"]
+    ] == [SYNTHESIS_REQUIREMENT_ID]
 
 
 @pytest.mark.asyncio
@@ -5057,7 +5490,7 @@ async def test_m4_semantic_audit_rejects_entity_only_requirement_trace() -> None
     assert failures[0]["semantic_requirement_mismatch"] is True
 
 
-def test_m4_trace_canonicalization_does_not_invent_missing_content() -> None:
+def test_m4_trace_canonicalization_uses_q0_without_literal_entity_gate() -> None:
     state = _pose_estimation_contract_state()
     candidate = HypothesisCard(
         hypothesis_id="H1",
@@ -5074,8 +5507,8 @@ def test_m4_trace_canonicalization_does_not_invent_missing_content() -> None:
         state, build_graph_context(state), canonical,
     )
 
-    assert accepted == []
-    assert "训练" in failures[0]["missing_task_entities"]
+    assert [item.hypothesis_id for item in accepted] == ["H1"]
+    assert failures == []
     assert all(
         ref.contract_id != "E5"
         for ref in canonical[0].task_trace.entity_mentions
@@ -5099,15 +5532,29 @@ async def test_m4_repair_does_not_admit_a_second_invalid_result() -> None:
         "task_trace": {},
     }
     # generator → D1 retry → repair all fail: the repair must not admit the
-    # third invalid result either
-    client = HypothesisRepairClient([[invalid], [invalid], [invalid]])
+    # third invalid result either, but M4 must preserve pipeline continuity.
+    rejected = [{
+        "hypothesis_id": "H1", "consistent": False,
+        "rationale": "unrelated system is not the original task object",
+        "covered_requirement_ids": [],
+    }]
+    client = HypothesisRepairClient([
+        [invalid], rejected,
+        [invalid], rejected,
+        [invalid], rejected,
+    ])
     module = M4HypothesisGeneration(num_candidates=1, top_k=1, mode="direct")
     module.client = client
 
-    with pytest.raises(ValueError, match="one deterministic repair attempt"):
-        await module._run_llm(state)
+    output = await module._run_llm(state)
 
-    assert len(client.calls) == 3
+    assert len(client.calls) == 6
+    assert len(output["top_hypotheses"]) == 1
+    assert "continuity fallback" in (
+        output["top_hypotheses"][0].ranking_rationale.casefold()
+    )
+    assert output["top_hypotheses"][0].supporting_evidence == []
+    assert output["top_hypotheses"][0].source_paper_ids == []
 
 
 def test_m1_atomic_validator_flags_parallel_questions() -> None:
@@ -5123,9 +5570,13 @@ def test_m1_atomic_validator_flags_parallel_questions() -> None:
 class PlanClient:
     def __init__(self) -> None:
         self.calls = []
+        self.chat_calls = 0
 
     async def chat(self, prompt: str = "", **kwargs) -> str:
-        return "yes — test semantic client is consistent"
+        self.chat_calls += 1
+        if self.chat_calls == 1:
+            return "no — quadruped locomotion is not robotic-arm manipulation"
+        return "yes — robotic-arm sim-to-real is the original task object"
 
     async def structured_chat(self, **kwargs):
         self.calls.append(kwargs)
@@ -5194,14 +5645,13 @@ async def test_m5_semantic_alignment_times_out_without_blocking_event_loop() -> 
         )
 
 
-def test_m5_requires_original_language_and_literal_contract_terms() -> None:
+def test_m5_requires_original_language_and_semantic_entity_hints() -> None:
     prompt = M5_SYSTEM_PROMPT.casefold()
 
     assert "same language as the original question" in prompt
     assert "verbatim" in prompt
-    assert "never embed a chinese" in prompt
-    assert "contract name inside an english sentence" in prompt
-    assert "never paraphrase an entity" in prompt
+    assert "semantic hints" in prompt
+    assert "may be translated or paraphrased" in prompt
 
 
 def test_m5_canonicalizes_trace_excerpts_from_plan_content() -> None:
@@ -5228,6 +5678,7 @@ def test_m5_canonicalizes_trace_excerpts_from_plan_content() -> None:
         subject_text=canonical.study_subjects,
         trace=canonical.task_trace,
         semantic_client=None,
+        contract_override=synthesis_contract_for_state(state),
     )
 
     assert assessment.passed is True
@@ -5236,7 +5687,7 @@ def test_m5_canonicalizes_trace_excerpts_from_plan_content() -> None:
     } == {"E1", "E2", "E3", "E4", "E5"}
     assert {
         item.contract_id for item in canonical.task_trace.requirement_mentions
-    } == {"R1", "R2"}
+    } == {SYNTHESIS_REQUIREMENT_ID}
 
 
 @pytest.mark.asyncio
@@ -5247,23 +5698,31 @@ async def test_m5_retries_object_drift_and_sanitizes_citations() -> None:
 
     result = await module(state)
 
-    assert len(module.client.calls) == 2
+    # Two plan-generation calls (the first object-drift retry plus the valid
+    # plan) and one M5 internal coverage precheck.
+    assert len(module.client.calls) == 3
     plan = result["research_plans"][0]
     assert "机械臂" in plan.study_subjects
     assert plan.supporting_evidence_ids == ["ev-arm-1"]
     assert plan.source_paper_ids == ["S2:p1"]
     assert "Original question" in module.client.calls[1]["user_prompt"]
     assert "ev-arm-1" in module.client.calls[1]["user_prompt"]
+    assert "validation_targets" in module.client.calls[2]["user_prompt"]
+    for call in module.client.calls:
+        for question in state.problem_card.sub_questions:
+            assert question not in call["user_prompt"]
 
 
 class ReviewClient:
     def __init__(self, chat_response: str = "yes — consistent") -> None:
         self._chat_response = chat_response
+        self.calls = []
 
     async def chat(self, prompt: str = "", **kwargs) -> str:
         return self._chat_response
 
     async def structured_chat(self, **kwargs):
+        self.calls.append(kwargs)
         prompt = kwargs["system_prompt"]
         base = {
             "reasoning": "Reviewed against the supplied task and graph context.",
@@ -5342,8 +5801,8 @@ async def test_m6_fails_closed_when_evidence_review_cites_no_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_m6_final_alignment_cannot_hide_unselected_required_requirement() -> None:
-    """Final review covers the whole M1 contract, not the hypothesis's own subset."""
+async def test_m6_legacy_retrieval_traces_are_folded_into_q0() -> None:
+    """Historical R traces do not leak retrieval scope into final review."""
     state = robot_state()
     state.problem_card.task_contract.requirements.append(TaskRequirement(
         requirement_id="R2",
@@ -5372,8 +5831,9 @@ async def test_m6_final_alignment_cannot_hide_unselected_required_requirement() 
         review for review in result["reviews"]
         if review.dimension.value == "task_alignment"
     )
-    assert task_review.hard_gate_passed is False
-    assert "R2" in task_review.reasoning
+    assert task_review.hard_gate_passed is True
+    assert "R1" not in task_review.reasoning
+    assert "R2" not in task_review.reasoning
 
 
 @pytest.mark.asyncio
@@ -7922,6 +8382,83 @@ def test_append_routing_extends_history_and_bumps_revision_count():
     assert patch3 == {}
 
 
+def test_m6_executes_the_plan_revision_route_it_already_recorded():
+    """Updating the M5 retry counter must not change the current M6 route."""
+    runner = _runner()
+    state = _state_after_review(
+        score=2.9,
+        iteration_count=2,
+        max_iterations=3,
+        plan_revision_count=1,
+    )
+    state.reviews.insert(0, ReviewResult(
+        dimension=ReviewerDimension("experimental_validation_coverage"),
+        attribution="plan",
+        score=4.6,
+        hard_gate_passed=False,
+        version=2,
+    ))
+    patch: dict = {}
+
+    runner._append_routing("m6", state, patch)
+    assert patch["routing_history"][-1].to_module == "revise_m5"
+    assert patch["plan_revision_count"] == 2
+
+    post_state = PipelineState(**{
+        **state.model_dump(mode="python"),
+        **patch,
+    })
+    assert runner._decide_after_m6(post_state) == "revise_m5"
+
+
+def test_m4_executes_the_gap_search_route_it_already_recorded_at_round_limit():
+    """Appending the current M4 route must not consume it before execution."""
+    runner = _runner()
+    gap = EvidenceGapRequest(
+        gap_id="gap-current",
+        sub_question="What evidence supports the current premise?",
+        status="pending",
+    )
+    state = PipelineState(
+        evidence_gap_requests=[gap],
+        routing_history=[RoutingDecision(
+            round=1,
+            from_module="m4",
+            to_module="supplement_m2",
+            decided_by="m4",
+            gap_ids=["gap-previous"],
+        )],
+    )
+    patch: dict = {}
+
+    runner._append_routing("m4", state, patch)
+    assert patch["routing_history"][-1].to_module == "supplement_m2"
+
+    post_state = PipelineState(**{
+        **state.model_dump(mode="python"),
+        **patch,
+    })
+    assert _route_after_m4(post_state) == "continue"
+    assert runner._decide_after_m4(post_state) == "search_gap"
+
+
+def test_m6_plan_revision_route_has_plan_specific_reason():
+    runner = _runner()
+    state = _state_after_review(score=2.9, iteration_count=2)
+    state.reviews.insert(0, ReviewResult(
+        dimension=ReviewerDimension("method_feasibility"),
+        attribution="plan",
+        score=3.0,
+        hard_gate_passed=False,
+        version=2,
+    ))
+
+    decision = runner._routing_decision("m6", state)
+
+    assert decision.to_module == "revise_m5"
+    assert decision.reason == "revise the research plan against M6 validation feedback"
+
+
 def test_append_routing_direct_m4_emits_module_skipped_for_m2_m3():
     """The conditional edge bypasses M2/M3, so the bookkeeping step must emit
     the explicit module_skipped events for both (when enabled)."""
@@ -8392,25 +8929,27 @@ def make_m6_module(client, revisit: bool = True, limit: int = 3) -> M6ReviewIter
 
 @pytest.mark.asyncio
 async def test_m6_switch_off_never_calls_verdict() -> None:
-    # Exactly two reviewer payloads; a 3rd call would raise — proving the
+    # Exactly three reviewer payloads; a 4th call would raise — proving the
     # verdict call is never issued when the switch is off.
-    client = FakeM6Client([_review_payload()] * 2)
+    client = FakeM6Client([_review_payload()] * 3)
     module = make_m6_module(client, revisit=False)
     state = make_m6_state()
 
     patch = await module(state)
 
-    assert client.calls == 2
+    assert client.calls == 3
     assert set(patch) == {
         "reviews", "iteration_count", "graph_correction_requests",
-    }  # no evidence-verdict keys
+        "top_hypotheses", "research_plans",
+    }  # no evidence-verdict keys; legacy synthesis traces may be normalised
     assert patch["iteration_count"] == 1
-    # alignment gate + 2 specialists + 3 objective gates + overall.  The real
+    # alignment gate + 3 specialists + 3 objective gates + overall.  The real
     # independent metrics are computed once by the authoritative posthoc scorer,
     # not synthesized here with a missing evaluator configuration.
-    assert len(patch["reviews"]) == 7
+    assert len(patch["reviews"]) == 8
     assert {r.dimension.value for r in patch["reviews"]} == {
-        "task_alignment", "scientific_logic", "method_feasibility",
+        "task_alignment", "scientific_logic",
+        "objective_evidence_consistency", "method_feasibility",
         "evidence_coverage_gate", "answer_completeness_gate",
         "source_quality_gate", "overall",
     }
@@ -8443,13 +8982,13 @@ async def test_m6_verdict_matches_existing_gap_inherits_attempts() -> None:
             "suggested_queries": ["Hsp70 co-chaperone binding assay"],
         }],
     }
-    client = FakeM6Client([_review_payload()] * 2 + [verdict_payload])
+    client = FakeM6Client([_review_payload()] * 3 + [verdict_payload])
     module = make_m6_module(client)
     state = make_m6_state(evidence_gaps=[existing])
 
     patch = await module(state)
 
-    assert client.calls == 3  # 2 reviewers + 1 verdict
+    assert client.calls == 4  # 3 reviewers + 1 verdict
     assert patch["evidence_verdict"].sufficient is False
     gaps = patch["evidence_gaps"]
     assert len(gaps) == 1
@@ -8462,13 +9001,13 @@ async def test_m6_verdict_matches_existing_gap_inherits_attempts() -> None:
 
 @pytest.mark.asyncio
 async def test_m6_verdict_fail_closed() -> None:
-    client = FakeM6Client([_review_payload()] * 2 + [RuntimeError("boom")])
+    client = FakeM6Client([_review_payload()] * 3 + [RuntimeError("boom")])
     module = make_m6_module(client)
     state = make_m6_state()
 
     patch = await module(state)
 
-    assert client.calls == 3  # the verdict call was attempted
+    assert client.calls == 4  # the verdict call was attempted
     verdict = patch["evidence_verdict"]
     assert verdict.sufficient is False
     assert len(verdict.gaps) == 1
@@ -10674,10 +11213,19 @@ def test_web_ui_timeout_budgets_cover_observed_llm_long_tail() -> None:
     assert config.qwen.base.request_timeout_seconds >= 210.0
     assert config.qwen.plus.request_timeout_seconds >= 330.0
     assert config.node_timeouts["m1"] == 0.0
-    assert m4_kwargs["llm_call_timeout"] >= 360.0
+    assert m4_kwargs["llm_call_timeout"] == 480.0
     assert m4_kwargs["llm_call_timeout"] > config.qwen.plus.request_timeout_seconds
     assert m4_kwargs["total_time_budget_seconds"] >= 840.0
     assert config.node_timeouts["m4"] > m4_kwargs["total_time_budget_seconds"]
+
+
+def test_web_ui_standard_mode_allows_three_global_iterations() -> None:
+    """Standard web runs retain enough budget for one additional repair round."""
+
+    config_path = Path(__file__).resolve().parent.parent / "configs" / "web_ui.yaml"
+    config = PipelineConfig.from_yaml(str(config_path))
+
+    assert config.max_iterations == 3
 
 
 # --------------------------------------------------------------------------- #
@@ -11818,9 +12366,9 @@ async def test_evidence_consistency_batches_atomic_conflict_verdicts(
             self.calls.append(kwargs)
             return {
                 "verdicts": [
-                    {"claim_index": 0, "is_conflict": False, "rationale": "ok"},
-                    {"claim_index": 1, "is_conflict": True, "rationale": "conflict"},
-                    {"claim_index": 2, "is_conflict": False, "rationale": "ok"},
+                    {"claim_index": 0, "support_status": "direct_support", "rationale": "ok"},
+                    {"claim_index": 1, "support_status": "contradicted", "rationale": "conflict"},
+                    {"claim_index": 2, "support_status": "direct_support", "rationale": "ok"},
                 ]
             }
 
@@ -11863,9 +12411,9 @@ async def test_evidence_consistency_batches_atomic_conflict_verdicts(
     assert len(metric._client.calls) == 1
     assert len(trace["atomic_claims"]) == 3
     assert [
-        item["conflict_evaluation"]["is_conflict"]
+        item["support_evaluation"]["support_status"]
         for item in trace["atomic_claims"]
-    ] == [False, True, False]
+    ] == ["direct_support", "contradicted", "direct_support"]
 
 
 @pytest.mark.asyncio
@@ -12059,16 +12607,21 @@ async def test_entity_ambiguous_merge_defers_instead_of_aborting(tmp_path) -> No
 @pytest.mark.asyncio
 async def test_m4_zero_valid_candidates_get_retry_with_contract_feedback() -> None:
     """D1: a fully-discarded batch still gets one retry carrying the
-    contract-failure reasons; a still-empty result keeps the hard error."""
-    module = StrictM4HypothesisGeneration(mode="multi_agent")
+    contract-failure reasons; a still-empty result degrades audibly."""
+    module = StrictM4HypothesisGeneration(mode="multi_agent", top_k=1)
     module.client = object()  # satisfies the client guard; LLM calls are stubbed
     batches = []
 
     async def fake_generate(
         state, *, question, graph_context, feedback_context,
-        tool_name, attempt, requested_count=None,
+        tool_name, attempt, requested_count=None, disable_thinking=None,
     ):
-        batches.append((tool_name, feedback_context))
+        batches.append({
+            "tool": tool_name,
+            "feedback": feedback_context,
+            "requested_count": requested_count,
+            "disable_thinking": disable_thinking,
+        })
         if attempt == 1:
             return [], [], [{
                 "hypothesis_id": "H1",
@@ -12077,22 +12630,30 @@ async def test_m4_zero_valid_candidates_get_retry_with_contract_feedback() -> No
             }]
         return [], [], []
 
-    async def fake_repair(*, state, context, candidates, failures, feedback_context):
+    async def fake_repair(
+        *, state, context, candidates, failures, feedback_context,
+        requested_count=None, disable_thinking=True,
+    ):
         return [], []
 
     module._generate_hypothesis_batch = fake_generate
     module._repair_context_contract = fake_repair
 
-    with pytest.raises(ValueError, match="no task-contract-compliant hypotheses"):
-        await module._run_llm(
-            PipelineState(input_question="Q", problem_card=make_problem_card())
-        )
+    output = await module._run_llm(
+        PipelineState(input_question="Q", problem_card=make_problem_card())
+    )
 
-    assert [tool for tool, _ in batches] == [
+    assert [item["tool"] for item in batches] == [
         "hypothesis_generator", "hypothesis_generator_retry",
     ]
+    assert batches[1]["requested_count"] == 1
+    assert batches[1]["disable_thinking"] is True
     assert "missing required task entities in their required output scope: disease" \
-        in batches[1][1]
+        in batches[1]["feedback"]
+    assert len(output["top_hypotheses"]) == 1
+    assert "continuity fallback" in (
+        output["top_hypotheses"][0].ranking_rationale.casefold()
+    )
 
 
 @pytest.mark.asyncio
@@ -12157,8 +12718,8 @@ async def test_m4_iteration_feedback_includes_task_contract_reminder() -> None:
 
     feedback = batches[0][1]
     assert feedback.startswith("Task-contract reminder")
-    assert "microbiome, health, disease" in feedback
-    assert "R1" in feedback
+    assert SYNTHESIS_REQUIREMENT_ID in feedback
+    assert "R1" not in feedback
     assert "not novel enough" in feedback
 
 
@@ -12633,7 +13194,7 @@ def test_web_standard_mode_bounds_semantic_scout_pool() -> None:
     assert config.module_overrides["m2"].kwargs["scout_candidate_limit"] == 16
 
 
-def test_fast_m4_contract_requires_every_required_atomic_requirement() -> None:
+def test_fast_m4_contract_requires_the_whole_original_question() -> None:
     """A one-pass final hypothesis cannot defer part of the user's question."""
     from hypoforge.modules.m4_hypothesis_generation import M4HypothesisGeneration
 
@@ -12642,8 +13203,9 @@ def test_fast_m4_contract_requires_every_required_atomic_requirement() -> None:
         require_all=True,
     )
 
-    assert "every required requirement" in block
-    assert "R1" in block and "R2" in block
+    assert "original question as a whole" in block
+    assert SYNTHESIS_REQUIREMENT_ID in block
+    assert "R1" not in block and "R2" not in block
     assert "select one or more" not in block
 
 

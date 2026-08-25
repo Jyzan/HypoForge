@@ -68,6 +68,7 @@ HYPOTHESIS_RUBRIC: Dict[str, str] = {
 
 REVIEW_DIMENSIONS: tuple[str, ...] = (
     "scientific_logic",
+    "objective_evidence_consistency",
     "method_feasibility",
 )
 
@@ -138,6 +139,11 @@ REVIEW_RUBRIC: Dict[str, str] = {
     "scientific_logic": (
         "1 = incoherent or circular; 3 = plausible but with logical gaps; "
         "5 = rigorous — every step justified and the predictions follow from the mechanism."
+    ),
+    "objective_evidence_consistency": (
+        "1 = central claims are unsupported or contradicted; 3 = the mechanism is "
+        "plausible but at least one central step is only partially supported; "
+        "5 = every central causal step is directly entailed by canonical evidence."
     ),
     "method_feasibility": (
         "1 = not executable as written; 3 = feasible but controls / sample size / statistics "
