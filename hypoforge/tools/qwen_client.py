@@ -22,8 +22,12 @@ import json
 import logging
 import os
 import re
+import threading
 import urllib.request
-from typing import Any, Dict, Optional
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterator, Optional
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -99,6 +103,93 @@ def _ensure_dotenv() -> None:
 _ensure_dotenv()
 
 
+@dataclass
+class TokenUsageTracker:
+    """Mutable token counter bound to one logical pipeline run.
+
+    ``contextvars`` copy the tracker reference into child asyncio tasks, so
+    concurrent calls launched by M2 still contribute to the same run while a
+    second web request receives a completely separate tracker.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    calls: int = 0
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
+
+    def add(self, input_tokens: int, output_tokens: int) -> None:
+        with self._lock:
+            self.input_tokens += max(0, int(input_tokens))
+            self.output_tokens += max(0, int(output_tokens))
+            self.calls += 1
+
+    def snapshot(self) -> Dict[str, int]:
+        with self._lock:
+            return {
+                "input": self.input_tokens,
+                "output": self.output_tokens,
+                "calls": self.calls,
+            }
+
+
+_CURRENT_TOKEN_USAGE: ContextVar[TokenUsageTracker | None] = ContextVar(
+    "hypoforge_token_usage_tracker",
+    default=None,
+)
+_CURRENT_TOKEN_SCOPE: ContextVar[TokenUsageTracker | None] = ContextVar(
+    "hypoforge_token_usage_scope",
+    default=None,
+)
+
+
+@contextmanager
+def track_token_usage() -> Iterator[TokenUsageTracker]:
+    """Bind a fresh, concurrency-safe token counter to the current run."""
+
+    tracker = TokenUsageTracker()
+    token = _CURRENT_TOKEN_USAGE.set(tracker)
+    try:
+        yield tracker
+    finally:
+        _CURRENT_TOKEN_USAGE.reset(token)
+
+
+@contextmanager
+def track_token_scope() -> Iterator[TokenUsageTracker]:
+    """Track one nested Tool call without mixing concurrent sibling Tools."""
+
+    tracker = TokenUsageTracker()
+    token = _CURRENT_TOKEN_SCOPE.set(tracker)
+    try:
+        yield tracker
+    finally:
+        _CURRENT_TOKEN_SCOPE.reset(token)
+
+
+def get_current_token_usage() -> Dict[str, int]:
+    """Return a stable snapshot for module start/end attribution."""
+
+    tracker = _CURRENT_TOKEN_USAGE.get()
+    return tracker.snapshot() if tracker is not None else {
+        "input": 0,
+        "output": 0,
+        "calls": 0,
+    }
+
+
+def token_usage_delta(
+    before: Dict[str, int], after: Dict[str, int]
+) -> Dict[str, int]:
+    """Return a non-negative usage delta between two tracker snapshots."""
+
+    return {
+        key: max(0, int(after.get(key, 0)) - int(before.get(key, 0)))
+        for key in ("input", "output", "calls")
+    }
+
+
 class QwenClient:
     """
     Lightweight async wrapper around Qwen's OpenAI-compatible API.
@@ -123,6 +214,7 @@ class QwenClient:
 
     _total_input_tokens: int = 0
     _total_output_tokens: int = 0
+    _token_counter_lock = threading.Lock()
 
     def __init__(
         self,
@@ -145,13 +237,15 @@ class QwenClient:
     @classmethod
     def get_token_totals(cls) -> tuple[int, int]:
         """Return cumulative (input_tokens, output_tokens) across all instances."""
-        return cls._total_input_tokens, cls._total_output_tokens
+        with cls._token_counter_lock:
+            return cls._total_input_tokens, cls._total_output_tokens
 
     @classmethod
     def reset_token_totals(cls) -> None:
         """Reset the class-level token counters (useful between runs)."""
-        cls._total_input_tokens = 0
-        cls._total_output_tokens = 0
+        with cls._token_counter_lock:
+            cls._total_input_tokens = 0
+            cls._total_output_tokens = 0
 
     @classmethod
     def from_config(cls, llm_config: Any) -> "QwenClient":
@@ -245,9 +339,25 @@ class QwenClient:
         try:
             meta = response.response_metadata or {}
             usage = meta.get("token_usage", {})
-            if usage:
-                cls._total_input_tokens += int(usage.get("prompt_tokens", 0))
-                cls._total_output_tokens += int(usage.get("completion_tokens", 0))
+            input_tokens = int(usage.get("prompt_tokens", 0)) if usage else 0
+            output_tokens = int(usage.get("completion_tokens", 0)) if usage else 0
+            if not usage:
+                # Newer LangChain messages expose provider-normalised usage
+                # separately from ``response_metadata``.
+                normalised = getattr(response, "usage_metadata", None) or {}
+                input_tokens = int(normalised.get("input_tokens", 0))
+                output_tokens = int(normalised.get("output_tokens", 0))
+            if not usage and not (input_tokens or output_tokens):
+                return
+            with cls._token_counter_lock:
+                cls._total_input_tokens += input_tokens
+                cls._total_output_tokens += output_tokens
+            tracker = _CURRENT_TOKEN_USAGE.get()
+            if tracker is not None:
+                tracker.add(input_tokens, output_tokens)
+            scope = _CURRENT_TOKEN_SCOPE.get()
+            if scope is not None and scope is not tracker:
+                scope.add(input_tokens, output_tokens)
         except Exception:
             pass
 

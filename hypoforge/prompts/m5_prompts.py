@@ -6,15 +6,9 @@ test a specific scientific hypothesis.
 
 The original question, ProblemCard, and evidence graph are binding constraints.
 Write the entire plan in the same language as the original question — for a
-Chinese question, never switch the prose to English. Every required task-entity
-``name`` must appear verbatim in an appropriate plan field, but you may quote
-the alias that matches the plan's language when the contract lists one (an
-English sentence may use the English alias; a Chinese sentence uses the Chinese
-name), or parenthesize as ``Chinese name (English term)``. Never embed a Chinese
-contract name inside an English sentence, and never paraphrase an entity in a
-way that hides the literal contract term. In particular, required
-primary-object names must appear verbatim (the name or a matching-language
-alias from the contract) in ``study_subjects``.
+Chinese question, never switch the prose to English. Task-entity names are
+semantic hints and may be translated or paraphrased to match the original
+question's language; do not force an English retrieval term into Chinese prose.
 The study subject must be the same research object; never substitute a different
 organism, machine, population, or task. Every evidence citation must be an exact
 ID from the supplied graph context. For each critical procedure, parameter,
@@ -22,10 +16,21 @@ control, and risk claim, add an ``evidence_links`` item that includes both
 ``supporting_evidence_ids`` and ``source_paper_ids`` (from the graph context).
 Mark novel design choices as ``hypothesis_to_validate`` rather than fabricating
 support.
-Populate ``task_trace`` for every required task entity and requirement. Each
+Treat the M4 fields by role: cite literature only for ``factual_premises``;
+the M4 ``statement`` and ``mechanism`` are proposed contributions, not facts
+that can be made evidence-backed by repeating a paper ID. ``working_assumptions``
+are M3 bridge hypotheses and must be represented only through their explicit
+``bridge_validations`` experiments.
+For every M4 ``working_assumptions`` bridge supplied below, create exactly one
+``bridge_validations`` item. Each item must name the bridge node ID, the
+procedure that tests it, the measurement used to evaluate it, and an explicit
+falsification condition. A bridge is not a known fact and must be experimentally
+validated before it is used as a conclusion.
+Populate ``task_trace`` with the single Q0 whole-question requirement and any
+task entities explicitly present in the plan. Each
 trace item must use an exact contract ID and an ``output_excerpt`` copied
-verbatim from this plan. The required ``primary_object`` must be named in
-``study_subjects`` itself; mentioning it only in a rationale or trace is invalid.
+verbatim from this plan. ``study_subjects`` must still describe the original
+research object semantically; a task trace alone is never proof of alignment.
 
 For the given hypothesis, produce a detailed research plan covering ALL of \
 the following elements:

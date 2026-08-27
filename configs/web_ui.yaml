@@ -7,7 +7,7 @@ log_level: INFO
 
 pipeline:
   enabled_modules: ["m1", "m2", "m3", "m4", "m5", "m6"]
-  max_iterations: 2
+  max_iterations: 3
   max_evidence_gap_rounds: 1
   enable_iteration: true
   iteration_module_target: "m3"
@@ -17,15 +17,21 @@ pipeline:
   supplement_paper_budget: 6
   gap_no_improvement_limit: 3
 
-# Calibrated from live-run latency and a no-timeout replay.  M1 had a 172s P90;
-# the reasoning-enabled M4 generator completed naturally in 282.35s, so its
-# layered ceilings need additional headroom while still bounding stuck calls.
+# Calibrated from live-run latency and no-timeout replays. M1 performs many
+# bounded LLM calls in sequence; a 2026-08-24 standard run reached its normal
+# entity-repair stage but was incorrectly cancelled by the old 240s shared
+# deadline. Keep each provider request bounded and remove only M1's aggregate
+# deadline. The reasoning-enabled M4 generator completed naturally in 282.35s,
+# so its layered ceilings retain additional headroom.
 node_timeouts:
-  m1: 240.0
+  m1: 0.0
   m2: 900.0
   m3: 480.0
   m4: 900.0
-  m5: 180.0
+  # M5 standard mode may generate, precheck, rewrite once, and recheck.
+  # Its individual LLM calls are still bounded by module overrides; provide
+  # enough outer headroom for the finite inner sequence.
+  m5: 1200.0
   m6: 180.0
 
 qwen:
@@ -107,7 +113,10 @@ module_overrides:
       fresh_run_timeout_seconds: 840.0
       source_timeout_seconds: 30.0
       scout_timeout_seconds: 60.0
-      scout_candidate_limit: 24
+      # Semantic Scout reads at most two 8-paper batches.  Lower-ranked tail
+      # papers remain in the pool with the existing conservative lexical
+      # notes, so this bounds LLM cost without silently dropping candidates.
+      scout_candidate_limit: 16
       arxiv_download_timeout_seconds: 90.0
       resolver_timeout_seconds: 90.0
       reader_timeout_seconds: 75.0
@@ -124,7 +133,7 @@ module_overrides:
       top_k: 1
       mode: "multi_agent"
       llm_tier: "plus"
-      llm_call_timeout: 360.0
+      llm_call_timeout: 480.0
       total_time_budget_seconds: 840.0
       semantic_alignment_timeout_seconds: 45.0
   m5:
@@ -141,6 +150,7 @@ module_overrides:
       reviewer_timeout_seconds: 180.0
       reviewers:
         - scientific_logic
+        - objective_evidence_consistency
         - method_feasibility
         - overall
 

@@ -2,6 +2,7 @@
 每次修改后运行：pytest tests/test_pipeline.py -q
 """
 
+import json
 from typing import Any
 
 import pytest
@@ -169,6 +170,29 @@ async def test_core_intent_missing_after_budget_fails_closed() -> None:
             "如何实现机械臂策略迁移？",
             ["What is the simulation environment?"],
         )
+
+
+@pytest.mark.asyncio
+async def test_fast_m1_skips_subquestion_coverage_audit() -> None:
+    """Fast mode must keep the initial decomposition without an audit call."""
+
+    questions = ["How can a non-multimodal model understand images?"]
+    module = M1ProblemUnderstanding(
+        mode="llm",
+        fast_mode=True,
+        coverage_max_rounds=2,
+    )
+    module.client = SequenceClient([])
+
+    result = await module._check_subquestion_coverage(
+        "如何让非多模态模型理解图片？",
+        questions,
+    )
+
+    assert result == questions
+    assert module.client.calls == []
+
+
 def test_atomic_validator_rejects_packed_parallel_question() -> None:
     violations = M1ProblemUnderstanding._sub_question_violations([
         "离线强化学习如何迁移；摩擦力变化又如何处理？？"
@@ -320,6 +344,11 @@ async def test_initial_decomposition_call_cannot_generate_entities_or_contract()
 
     schema_properties = module.client.calls[0]["output_schema"]["properties"]
     assert set(schema_properties) == {"domain", "sub_questions"}
+    assert module.client.calls[0]["disable_thinking"] is False
+    assert all(
+        call["disable_thinking"] is True
+        for call in module.client.calls[1:]
+    )
     assert card.key_entities == ["robot arm", "offline reinforcement learning"]
     assert [entity.name for entity in card.task_contract.entities] == [
         "robot arm",
@@ -478,6 +507,103 @@ async def test_entity_audit_missing_term_triggers_one_repair_and_reaudit() -> No
 
 
 @pytest.mark.asyncio
+async def test_standard_m1_promotes_audited_entity_after_role_only_repair_failure() -> None:
+    """Source-grounded entities survive a repeated role-label omission."""
+
+    extraction = {"entities": [
+        candidate(
+            "retrieval-augmented generation",
+            role="method",
+            required=True,
+        ),
+        candidate(
+            "hallucinations",
+            role="outcome",
+            required=True,
+        ),
+    ]}
+    audit = {
+        "items": [
+            audit_item("retrieval-augmented generation"),
+            audit_item("hallucinations"),
+        ],
+        "missing_explicit_entities": [],
+        "complete": True,
+    }
+    module = entity_module([extraction, audit, extraction, audit])
+
+    entities = await module._extract_and_audit_entities(
+        "How can retrieval-augmented generation reduce hallucinations?"
+    )
+
+    assert len(module.client.calls) == 4
+    assert entities[0].name == "retrieval-augmented generation"
+    assert entities[0].role == "primary_object"
+    assert entities[0].required is True
+    assert entities[0].source_mention == "retrieval-augmented generation"
+
+
+@pytest.mark.asyncio
+async def test_fast_m1_accepts_grounded_entities_without_source_audit() -> None:
+    """A missed secondary entity cannot terminate fast M1 during an audit."""
+
+    module = M1ProblemUnderstanding(
+        mode="llm",
+        fast_mode=True,
+        entity_repair_attempts=1,
+    )
+    module.client = EntityClient([{
+        "entities": [
+            candidate(
+                "non-multimodal model",
+                role="primary_object",
+                required=True,
+                mention="非多模态模型",
+            ),
+        ],
+    }])
+
+    entities = await module._extract_and_audit_entities(
+        "如何让非多模态模型理解图片？"
+    )
+
+    assert [entity.name for entity in entities] == ["non-multimodal model"]
+    assert len(module.client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_fast_m1_promotes_a_grounded_required_entity_when_role_is_missing() -> None:
+    """A model role-label omission must not terminate the fast pipeline."""
+
+    module = M1ProblemUnderstanding(mode="llm", fast_mode=True)
+    module.client = EntityClient([{
+        "entities": [
+            candidate(
+                "retrieval-augmented generation",
+                role="method",
+                required=True,
+                mention="retrieval-augmented generation",
+            ),
+            candidate(
+                "hallucination",
+                role="outcome",
+                required=True,
+                mention="hallucinations",
+            ),
+        ],
+    }])
+
+    entities = await module._extract_and_audit_entities(
+        "How can retrieval-augmented generation reduce hallucinations?"
+    )
+
+    assert entities[0].name == "retrieval-augmented generation"
+    assert entities[0].role == "primary_object"
+    assert entities[0].required is True
+    assert entities[0].source_mention == "retrieval-augmented generation"
+
+
+@pytest.mark.asyncio
 async def test_entity_prompts_never_receive_generated_subquestions() -> None:
     module = entity_module([
         {"entities": [candidate("robot arm", role="primary_object", required=True, mention="机械臂")]},
@@ -546,6 +672,42 @@ async def test_requirement_builder_maps_each_final_question_exactly_once() -> No
     assert {item.primary_entity_id for item in requirements} == {"E1"}
     prompt = module.client.calls[0]["user_prompt"]
     assert "E1" in prompt and "E2" in prompt
+
+
+@pytest.mark.asyncio
+async def test_fast_m1_builds_requirements_without_llm_mapping_audit() -> None:
+    """Fast M1 deterministically maps questions so malformed LLM output cannot block it."""
+
+    questions = [
+        "How can a non-multimodal model understand images?",
+        "How should image understanding be evaluated?",
+    ]
+    entities = [
+        TaskEntity(
+            entity_id="E1",
+            name="non-multimodal model",
+            source_mention="非多模态模型",
+            role="primary_object",
+            required=True,
+        ),
+        TaskEntity(
+            entity_id="E2",
+            name="image",
+            source_mention="图片",
+            role="outcome",
+            required=True,
+        ),
+    ]
+    module = M1ProblemUnderstanding(mode="llm", fast_mode=True)
+    module.client = EntityClient([])
+
+    requirements = await module._build_requirements(questions, entities)
+
+    assert [item.requirement_id for item in requirements] == ["R1", "R2"]
+    assert [item.sub_question for item in requirements] == questions
+    assert {item.primary_entity_id for item in requirements} == {"E1"}
+    assert all(item.related_entity_ids == ["E2"] for item in requirements)
+    assert module.client.calls == []
 
 
 @pytest.mark.asyncio
@@ -996,6 +1158,7 @@ from hypoforge.observability import RunEventRecorder, bind_recorder
 from hypoforge.state import (
     ConfidenceLevel,
     EvidenceGap,
+    EvidenceGapRequest,
     KnowledgeEntry,
     KnowledgeEntryType,
     LiteratureResult,
@@ -1006,6 +1169,50 @@ from hypoforge.state import (
     ProblemCard,
     SearchLedger,
 )
+
+
+def test_m2_canonical_and_legacy_imports_share_identity() -> None:
+    """The compatibility namespace must never create duplicate M2 classes."""
+
+    import importlib
+
+    module_pairs = [
+        (
+            "hypoforge.literature.adapter",
+            "hypoforge.modules.m2_literature.adapter",
+            "AgenticM2Adapter",
+        ),
+        (
+            "hypoforge.literature.models",
+            "hypoforge.modules.m2_literature.models",
+            "SearchQuery",
+        ),
+        (
+            "hypoforge.literature.search.ranking",
+            "hypoforge.modules.m2_literature.search.ranking",
+            "PaperRanker",
+        ),
+        (
+            "hypoforge.literature.reading.workflow",
+            "hypoforge.modules.m2_literature.reading.workflow",
+            "FullTextReadingWorkflow",
+        ),
+        (
+            "hypoforge.literature.sources.openalex_source",
+            "hypoforge.modules.m2_literature.sources.openalex_source",
+            "OpenAlexSource",
+        ),
+    ]
+
+    for legacy_name, canonical_name, object_name in module_pairs:
+        legacy_module = importlib.import_module(legacy_name)
+        canonical_module = importlib.import_module(canonical_name)
+        legacy_object = getattr(legacy_module, object_name)
+        canonical_object = getattr(canonical_module, object_name)
+        assert legacy_object is canonical_object
+        assert canonical_object.__module__.startswith(
+            "hypoforge.modules.m2_literature"
+        )
 
 
 
@@ -1315,6 +1522,24 @@ def make_base_agent(source_results):
     return agent, source
 
 
+def test_scout_timeout_scales_with_serial_batch_waves() -> None:
+    """A fixed per-wave limit must not cancel later semantic batches."""
+
+    from hypoforge.modules.m2_literature.search.scout import ScoutReader
+
+    agent, _ = make_base_agent({})
+    agent.scout_reader = ScoutReader(
+        None,
+        batch_size=8,
+        max_concurrency=2,
+    )
+    agent.scout_timeout_seconds = 60.0
+
+    assert agent._effective_scout_timeout(16) == 60.0
+    assert agent._effective_scout_timeout(24) == 120.0
+    assert agent._effective_scout_timeout(40) == 180.0
+
+
 def make_gap(**overrides) -> EvidenceGap:
     base = dict(
         description="Missing Hsp70 co-chaperone data",
@@ -1405,6 +1630,113 @@ async def test_revisit_turns_open_gap_into_subquestion_and_reuses_full_flow() ->
     assert [
         run.sub_question for run in output["m2_knowledge_export"].runs
     ] == [SUB_QUESTION, gap_question]
+    gap_id = state.evidence_gaps[0].gap_id
+    assert output["literature_results"][-1].origin_gap_ids == [gap_id]
+    assert output["m2_knowledge_export"].runs[-1].origin_gap_ids == [gap_id]
+
+
+@pytest.mark.asyncio
+async def test_coexisting_m4_and_m6_gaps_are_both_searched() -> None:
+    """A later M2 visit must not let the M6 branch mask an M4 request."""
+
+    m6_question = "missing deployment robustness evidence 1"
+    m4_question = "missing calibration evidence 2"
+    agent = _ConcurrentFreshSearchAgent()
+    adapter = AgenticM2Adapter(
+        search_agent=agent,
+        reading_workflow=EchoReadingWorkflow(with_evidence=True),
+        subquestion_concurrency=2,
+        fresh_run_timeout_seconds=2,
+    )
+    state = make_supplement_state(
+        evidence_gaps=[make_gap(
+            description=m6_question,
+            target_sub_question=m6_question,
+        )],
+        evidence_gap_requests=[EvidenceGapRequest(
+            gap_id="M4-GAP-1",
+            sub_question=m4_question,
+        )],
+    )
+
+    output = await adapter(state)
+
+    assert {
+        run.sub_question for run in output["m2_knowledge_export"].runs[1:]
+    } == {m6_question, m4_question}
+    assert output["evidence_gap_requests"][0].status == "searched"
+    assert output["evidence_gaps"][0].status == "pending_grounding"
+
+
+@pytest.mark.asyncio
+async def test_failed_m4_gap_task_stays_pending_when_m6_task_succeeds() -> None:
+    """A sibling success must not advance an M4 request that was not searched."""
+
+    m6_question = "missing deployment robustness evidence 1"
+    m4_question = "missing calibration evidence 2"
+    adapter = AgenticM2Adapter(
+        search_agent=_ConcurrentFreshSearchAgent(
+            failing_questions={m4_question},
+        ),
+        reading_workflow=EchoReadingWorkflow(with_evidence=True),
+        subquestion_concurrency=2,
+        fresh_run_timeout_seconds=2,
+    )
+    state = make_supplement_state(
+        evidence_gaps=[make_gap(
+            description=m6_question,
+            target_sub_question=m6_question,
+        )],
+        evidence_gap_requests=[EvidenceGapRequest(
+            gap_id="M4-GAP-1",
+            sub_question=m4_question,
+        )],
+    )
+
+    output = await adapter(state)
+
+    assert output["evidence_gaps"][0].status == "pending_grounding"
+    assert output["evidence_gap_requests"][0].status == "pending"
+    assert output["evidence_gap_requests"][0].attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_identical_m4_and_m6_gap_question_runs_once() -> None:
+    """Deduplication must retain both origins of one shared question."""
+
+    shared_question = "missing transfer calibration evidence"
+    paper = PaperRecord(
+        paper_id="shared-1",
+        title="Shared evidence",
+        sources=["fake"],
+    )
+    agent = RecordingSearchAgent([SearchRunResult(
+        sub_question=shared_question,
+        candidates=[paper],
+        final_papers=[paper],
+        stop_reason=StopReason.COVERAGE_SATISFIED,
+    )])
+    adapter = AgenticM2Adapter(
+        search_agent=agent,
+        reading_workflow=EchoReadingWorkflow(with_evidence=True),
+    )
+    state = make_supplement_state(
+        evidence_gaps=[make_gap(
+            description=shared_question,
+            target_sub_question=shared_question,
+        )],
+        evidence_gap_requests=[EvidenceGapRequest(
+            gap_id="M4-GAP-SHARED",
+            sub_question=shared_question,
+        )],
+    )
+
+    output = await adapter(state)
+
+    assert len(agent.calls) == 1
+    assert output["evidence_gap_requests"][0].status == "searched"
+    assert output["evidence_gaps"][0].status == "pending_grounding"
+    assert len(output["m2_knowledge_export"].runs) == 2
 
 
 class _ConcurrentFreshSearchAgent:
@@ -3038,6 +3370,49 @@ async def test_gap_with_gain_is_closed():
 
 
 @pytest.mark.asyncio
+async def test_gap_gain_uses_explicit_m2_origin_when_question_text_differs():
+    """M6 gap descriptions must remain attributable after becoming M2 tasks."""
+
+    old_entry = _entry("KE_origin_old", "Baseline RAG evidence.")
+    new_entry = _entry(
+        "KE_origin_new",
+        "Dynamic retrieval changes the hallucination trade-off.",
+        "OA:W1",
+    )
+    module = M3EvidenceGraph(mode="rule")
+    initial = await module(PipelineState(
+        input_question="q",
+        literature_results=[LiteratureResult(
+            sub_question="How does RAG reduce hallucinations?",
+            papers_retrieved=1,
+            knowledge_entries=[old_entry],
+        )],
+    ))
+    gap = EvidenceGap(
+        description=(
+            "The proposed dynamic threshold lacks direct calibration evidence."
+        ),
+        target_sub_question="How does RAG reduce hallucinations?",
+        status="pending_grounding",
+    )
+
+    result = await module(PipelineState(
+        input_question="q",
+        evidence_graph=initial["evidence_graph"],
+        literature_results=[LiteratureResult(
+            sub_question=gap.description,
+            papers_retrieved=1,
+            knowledge_entries=[new_entry],
+            origin_gap_ids=[gap.gap_id],
+        )],
+        evidence_gaps=[gap],
+    ))
+
+    assert result["metrics"]["m3_gap_gain"] == {gap.gap_id: 1}
+    assert result["evidence_gaps"][0].status == "closed"
+
+
+@pytest.mark.asyncio
 async def test_gap_without_gain_becomes_unimprovable_at_limit():
     entry = _entry("KE_same", "No change in evidence base.")
     module = M3EvidenceGraph(mode="rule")
@@ -3291,11 +3666,40 @@ def test_normalisation_discards_editorial_statements() -> None:
     assert [card.hypothesis_id for card in cards] == ["H1"]
 
 
+def test_m4_generator_payload_failure_distinguishes_legacy_wrapper_from_salvage() -> None:
+    module = M4HypothesisGeneration(mode="multi_agent")
+
+    assert module._generator_payload_failure([
+        {"hypothesis_id": "H1", "statement": "A causes B."}
+    ]) is None
+    assert module._generator_payload_failure({
+        "hypotheses": [{"hypothesis_id": "H1", "statement": "A causes B."}]
+    }) is None
+
+    failure = module._generator_payload_failure({
+        "entries": ["H1"],
+        "observable_predictions": ["prediction"],
+        "supporting_evidence": ["E1"],
+    })
+    assert failure is not None
+    assert failure["failure_type"] == "non_candidate_payload"
+    assert "entries" in failure["payload_keys"]
+
+    parse_failure = module._generator_payload_failure({
+        "_parse_error": True,
+        "raw_response": '{"entries": [{"hypothesis_id": "H1"',
+    })
+    assert parse_failure is not None
+    assert parse_failure["failure_type"] == "parse_error"
+
+
 class _SequenceClient:
     def __init__(self, responses: list[Any]) -> None:
         self.responses = list(responses)
+        self.calls: list[dict[str, Any]] = []
 
     async def structured_chat(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
         return self.responses.pop(0)
 
 
@@ -3554,6 +3958,11 @@ async def test_multi_agent_round_preserves_generator_statements_end_to_end() -> 
         h2.statement,
     ]
     assert result["top_hypotheses"][0].statement == h1.statement
+    assert client.calls[0]["disable_thinking"] is False
+    assert all(
+        client.calls[index]["disable_thinking"] is True
+        for index in (1, 2, 3, 4)
+    )
 
 
 @pytest.mark.asyncio
@@ -3579,6 +3988,246 @@ async def test_m4_does_not_retry_optional_candidate_shortfall_after_top_k() -> N
 
     assert [card.hypothesis_id for card in result["top_hypotheses"]] == ["H1"]
     assert client.responses == []
+
+
+@pytest.mark.asyncio
+async def test_m4_shortfall_retry_timeout_preserves_existing_valid_candidate(
+    monkeypatch,
+) -> None:
+    module = M4HypothesisGeneration(
+        num_candidates=3,
+        top_k=2,
+        mode="direct",
+    )
+    module.client = object()
+    existing = HypothesisCard(
+        hypothesis_id="H1",
+        statement="Senescent-cell clearance reduces inflammatory burden.",
+    )
+    calls = []
+
+    async def fake_generate(
+        state,
+        *,
+        question,
+        graph_context,
+        feedback_context,
+        tool_name,
+        attempt,
+        requested_count=None,
+        disable_thinking=None,
+    ):
+        calls.append((tool_name, requested_count, disable_thinking))
+        if attempt == 1:
+            return [existing.model_dump()], [existing], []
+        raise TimeoutError("simulated shortfall retry timeout")
+
+    monkeypatch.setattr(module, "_generate_hypothesis_batch", fake_generate)
+    output = await module._run_llm(PipelineState(input_question="Q"))
+
+    assert calls[1] == ("hypothesis_generator_retry", 1, True)
+    assert [card.hypothesis_id for card in output["top_hypotheses"]] == ["H1"]
+
+
+@pytest.mark.asyncio
+async def test_m4_zero_candidates_retry_timeout_enters_contract_repair(monkeypatch):
+    module = M4HypothesisGeneration(
+        num_candidates=3,
+        top_k=1,
+        mode="direct",
+    )
+    module.client = object()
+    repaired = HypothesisCard(
+        hypothesis_id="H-repaired",
+        statement="Reducing senescent-cell burden delays functional decline.",
+    )
+    repair_calls = []
+
+    async def fake_generate(*args, attempt, **kwargs):
+        if attempt == 1:
+            return [], [], [{"rationale": "truncated generator JSON"}]
+        raise TimeoutError("simulated retry timeout")
+
+    async def fake_repair(
+        *,
+        state,
+        context,
+        candidates,
+        failures,
+        feedback_context,
+        requested_count=None,
+        disable_thinking=True,
+    ):
+        repair_calls.append((requested_count, disable_thinking, failures))
+        return [repaired], []
+
+    monkeypatch.setattr(module, "_generate_hypothesis_batch", fake_generate)
+    monkeypatch.setattr(module, "_repair_context_contract", fake_repair)
+
+    output = await module._run_llm(PipelineState(input_question="Q"))
+
+    assert repair_calls[0][0:2] == (1, True)
+    assert any(
+        item.get("failure_type") == "shortfall_retry_failed"
+        for item in repair_calls[0][2]
+    )
+    assert output["top_hypotheses"][0].hypothesis_id == "H-repaired"
+
+
+@pytest.mark.asyncio
+async def test_m4_generator_and_repair_exhaustion_returns_auditable_continuity_candidate(
+    monkeypatch,
+):
+    module = M4HypothesisGeneration(
+        num_candidates=3,
+        top_k=1,
+        mode="multi_agent",
+    )
+    module.client = object()
+    gate_calls = 0
+
+    async def fake_generate(*args, attempt, **kwargs):
+        if attempt == 1:
+            return [], [], [{"rationale": "truncated generator JSON"}]
+        raise TimeoutError("simulated shortfall retry timeout")
+
+    async def fake_repair(**kwargs):
+        raise TimeoutError("simulated contract repair timeout")
+
+    async def fake_gates(*args, **kwargs):
+        nonlocal gate_calls
+        gate_calls += 1
+        raise AssertionError(
+            "degraded continuity candidate must skip extra LLM gates"
+        )
+
+    monkeypatch.setattr(module, "_generate_hypothesis_batch", fake_generate)
+    monkeypatch.setattr(module, "_repair_context_contract", fake_repair)
+    monkeypatch.setattr(module, "_run_quality_gates", fake_gates)
+
+    state = PipelineState(
+        input_question="Can aging be delayed?",
+        problem_card=ProblemCard(
+            original_question="Can aging be delayed?",
+            sub_questions=["What mechanisms drive aging?"],
+            key_entities=["aging"],
+            domain=["biology"],
+        ),
+    )
+    output = await module._run_llm(state)
+
+    assert gate_calls == 0
+    assert len(output["candidate_hypotheses"]) == 1
+    assert len(output["top_hypotheses"]) == 1
+    candidate = output["top_hypotheses"][0]
+    assert "continuity fallback" in candidate.ranking_rationale.casefold()
+    assert candidate.supporting_evidence == []
+    assert candidate.source_paper_ids == []
+    assert candidate.scores["composite"] <= 0.2
+
+
+@pytest.mark.asyncio
+async def test_m4_shortfall_recovery_emits_warning_and_stays_bounded(tmp_path):
+    module = M4HypothesisGeneration(
+        num_candidates=3,
+        top_k=1,
+        mode="direct",
+    )
+    module.client = object()
+    calls = []
+
+    async def fake_generate(*args, attempt, **kwargs):
+        calls.append((attempt, kwargs.get("requested_count"), kwargs.get("disable_thinking")))
+        if attempt == 1:
+            return [], [], [{"rationale": "truncated generator JSON"}]
+        raise TimeoutError("simulated shortfall retry timeout")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(module, "_generate_hypothesis_batch", fake_generate)
+    recorder = RunEventRecorder(tmp_path, "m4-shortfall")
+    try:
+        with bind_recorder(recorder):
+            output = await module._run_llm(PipelineState(input_question="Q"))
+    finally:
+        monkeypatch.undo()
+
+    assert len(calls) == 2
+    assert calls[1] == (2, 1, True)
+    assert output["top_hypotheses"]
+    events = recorder.read_events()
+    warnings = [
+        event for event in events
+        if event["tool"] == "hypothesis_generator_shortfall_recovery"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["status"] == "warning"
+
+
+@pytest.mark.asyncio
+async def test_m4_continuity_fallback_emits_warning_event(tmp_path, monkeypatch):
+    module = M4HypothesisGeneration(
+        num_candidates=3,
+        top_k=1,
+        mode="multi_agent",
+    )
+    module.client = object()
+
+    async def failed_generation(*args, attempt, **kwargs):
+        if attempt == 1:
+            return [], [], [{"rationale": "truncated generator JSON"}]
+        raise TimeoutError("simulated shortfall retry timeout")
+
+    async def failed_repair(**kwargs):
+        raise TimeoutError("simulated contract repair timeout")
+
+    monkeypatch.setattr(module, "_generate_hypothesis_batch", failed_generation)
+    monkeypatch.setattr(module, "_repair_context_contract", failed_repair)
+    recorder = RunEventRecorder(tmp_path, "m4-fallback")
+
+    with bind_recorder(recorder):
+        output = await module._run_llm(PipelineState(input_question="Q"))
+
+    assert output["top_hypotheses"]
+    fallback_events = [
+        event for event in recorder.read_events()
+        if event["tool"] == "hypothesis_generator_continuity_fallback"
+    ]
+    assert len(fallback_events) == 1
+    assert fallback_events[0]["status"] == "warning"
+
+
+@pytest.mark.asyncio
+async def test_m4_timeout_recovery_exhaustion_uses_continuity_fallback(monkeypatch):
+    module = M4HypothesisGeneration(
+        num_candidates=3,
+        top_k=1,
+        mode="direct",
+    )
+    module.client = object()
+    calls = []
+
+    async def failed_generation(*args, tool_name, **kwargs):
+        calls.append(tool_name)
+        raise TimeoutError("simulated generator timeout")
+
+    async def failed_repair(**kwargs):
+        calls.append("hypothesis_contract_repair")
+        raise TimeoutError("simulated contract repair timeout")
+
+    monkeypatch.setattr(module, "_generate_hypothesis_batch", failed_generation)
+    monkeypatch.setattr(module, "_repair_context_contract", failed_repair)
+
+    output = await module._run_llm(PipelineState(input_question="Q"))
+
+    assert calls == [
+        "hypothesis_generator",
+        "hypothesis_generator_timeout_recovery",
+        "hypothesis_contract_repair",
+    ]
+    assert len(output["top_hypotheses"]) == 1
+    assert "continuity fallback" in (
+        output["top_hypotheses"][0].ranking_rationale.casefold()
+    )
 
 
 def test_method_feedback_is_routed_to_m5_not_m4() -> None:
@@ -3688,6 +4337,11 @@ import pytest
 from pathlib import Path
 
 from hypoforge.graph_context import build_graph_context
+from hypoforge.synthesis_contract import (
+    SYNTHESIS_REQUIREMENT_ID,
+    synthesis_problem_payload,
+    synthesis_contract_for_state,
+)
 from hypoforge.modules.m1_problem_understanding import M1ProblemUnderstanding
 from hypoforge.modules.m4_hypothesis_generation import M4HypothesisGeneration
 from hypoforge.modules.m5_research_plan import M5ResearchPlan
@@ -3810,6 +4464,503 @@ def test_graph_context_resolves_export_history_to_text_and_quote() -> None:
     assert context.established_facts[0].evidence_ids == ["ev-arm-1"]
     assert "robotic-arm transfer" in context.established_facts[0].quotes[0]
     assert context.unresolved_entry_ids == []
+
+
+def test_graph_context_does_not_pretruncate_late_focused_evidence() -> None:
+    """Purpose-aware planning, not graph construction, owns context pruning."""
+
+    from hypoforge.context import ContextPlanner, ContextRequest
+
+    state = robot_state()
+    run = state.m2_knowledge_export.runs[0]
+    state.evidence_graph.established_facts.clear()
+    run.knowledge_entries.clear()
+    run.evidence.clear()
+    for index in range(13):
+        evidence_id = f"ev-late-{index}"
+        entry_id = f"fact-late-{index}"
+        run.evidence.append(M2EvidenceExport(
+            evidence_id=evidence_id,
+            paper_id="S2:p1",
+            chunk_id=f"chunk-late-{index}",
+            quote=f"Late evidence quote {index}.",
+            normalized_claim=f"Late evidence claim {index}.",
+            relevance_score=0.9,
+        ))
+        run.knowledge_entries.append(KnowledgeEntry(
+            id=entry_id,
+            type="established_fact",
+            content=f"Late graph fact {index}.",
+            source_paper_id="S2:p1",
+            evidence_ids=[evidence_id],
+        ))
+        state.evidence_graph.established_facts.append(entry_id)
+
+    context = build_graph_context(state)
+    pack = ContextPlanner().plan(
+        context,
+        ContextRequest(
+            purpose="m5_plan",
+            focus_evidence_ids=("ev-late-12",),
+        ),
+    )
+
+    assert len(context.established_facts) == 13
+    assert "fact-late-12" in pack.manifest.included_ids
+    assert "Late graph fact 12." in pack.rendered
+
+
+def test_synthesis_contract_contains_only_original_question() -> None:
+    """Changing retrieval decomposition must not change M4-M6 task scope."""
+
+    state = robot_state()
+    retrieval_questions = list(state.problem_card.sub_questions)
+    retrieval_relations = [
+        item.relation for item in state.problem_card.task_contract.requirements
+    ]
+
+    contract = synthesis_contract_for_state(state)
+    rendered = contract.model_dump_json()
+
+    assert [item.requirement_id for item in contract.requirements] == ["Q0"]
+    assert contract.requirements[0].sub_question == (
+        state.problem_card.original_question
+    )
+    assert [item.name for item in contract.entities] == [
+        item.name for item in state.problem_card.task_contract.entities
+    ]
+    assert all(item.required is False for item in contract.entities)
+    assert all(question not in rendered for question in retrieval_questions)
+    assert all(relation not in rendered for relation in retrieval_relations)
+
+    payload = synthesis_problem_payload(state.problem_card)
+    payload_text = json.dumps(payload, ensure_ascii=False)
+    assert state.problem_card.original_question in payload_text
+    assert all(question not in payload_text for question in retrieval_questions)
+
+
+def test_m4_synthesis_does_not_require_literal_cross_language_entities() -> None:
+    state = robot_state()
+    state.problem_card.task_contract.entities = [
+        TaskEntity(
+            entity_id="E1", name="robotic arm",
+            role="primary_object", required=True,
+        ),
+        TaskEntity(
+            entity_id="E2", name="simulation-to-reality transfer",
+            role="method", required=True,
+        ),
+    ]
+    state.problem_card.key_entities = [
+        "robotic arm", "simulation-to-reality transfer",
+    ]
+    candidate = hypothesis().model_copy(update={"task_trace": TaskTrace()})
+
+    canonical = M4HypothesisGeneration._canonicalize_task_traces(
+        state, [candidate],
+    )
+    accepted, failures = M4HypothesisGeneration._check_context_contract(
+        state, build_graph_context(state), canonical,
+    )
+
+    assert failures == []
+    assert [item.hypothesis_id for item in accepted] == ["H1"]
+    assert {
+        item.contract_id
+        for item in canonical[0].task_trace.requirement_mentions
+    } == {SYNTHESIS_REQUIREMENT_ID}
+
+
+def test_m5_synthesis_does_not_require_literal_cross_language_entities() -> None:
+    state = robot_state()
+    state.problem_card.task_contract.entities = [
+        TaskEntity(
+            entity_id="E1", name="robotic arm",
+            role="primary_object", required=True,
+        ),
+        TaskEntity(
+            entity_id="E2", name="simulation-to-reality transfer",
+            role="method", required=True,
+        ),
+    ]
+    plan = ResearchPlan(
+        hypothesis_id="H1",
+        study_subjects="机械臂仿真到现实迁移系统",
+        procedures=["在仿真和现实环境中验证机械臂操控。"],
+    )
+
+    canonical = M5ResearchPlan._canonicalize_task_trace(state, plan)
+    assessment = assess_task_alignment(
+        state,
+        M5ResearchPlan._plan_alignment_text(canonical),
+        subject_text=canonical.study_subjects,
+        trace=canonical.task_trace,
+        contract_override=synthesis_contract_for_state(state),
+    )
+
+    assert assessment.passed is True
+    assert {
+        item.contract_id
+        for item in canonical.task_trace.requirement_mentions
+    } == {SYNTHESIS_REQUIREMENT_ID}
+
+
+def test_m4_contract_requires_original_question_without_retrieval_scope() -> None:
+    state = robot_state()
+    module = M4HypothesisGeneration(
+        num_candidates=1, top_k=1, mode="direct", fast_mode=True,
+    )
+
+    block = module._render_task_contract_block(state)
+
+    assert SYNTHESIS_REQUIREMENT_ID in block
+    assert state.problem_card.original_question in block
+    assert "answer the original question as a whole" in block
+    for question in state.problem_card.sub_questions:
+        assert question not in block
+    for requirement in state.problem_card.task_contract.requirements:
+        assert requirement.requirement_id not in block
+        assert requirement.relation not in block
+
+
+@pytest.mark.asyncio
+async def test_m4_prompt_hides_retrieval_subquestions() -> None:
+    state = robot_state()
+    candidate = hypothesis().model_copy(update={
+        "task_trace": TaskTrace(
+            entity_mentions=hypothesis().task_trace.entity_mentions,
+            requirement_mentions=[TaskTraceReference(
+                contract_id=SYNTHESIS_REQUIREMENT_ID,
+                output_excerpt=hypothesis().statement,
+            )],
+        ),
+    })
+    client = _SequenceClient([[candidate.model_dump(mode="json")]])
+    module = M4HypothesisGeneration(
+        num_candidates=1, top_k=1, mode="direct", fast_mode=True,
+    )
+    module.client = client
+
+    await module._generate_hypothesis_batch(
+        state,
+        question=state.problem_card.original_question,
+        graph_context=build_graph_context(state),
+        feedback_context="",
+        tool_name="hypothesis_generator",
+        attempt=1,
+    )
+
+    prompt = client.calls[0]["user_prompt"]
+    assert state.problem_card.original_question in prompt
+    assert SYNTHESIS_REQUIREMENT_ID in prompt
+    for question in state.problem_card.sub_questions:
+        assert question not in prompt
+    for requirement in state.problem_card.task_contract.requirements:
+        assert requirement.relation not in prompt
+
+
+def test_synthesis_alignment_accepts_q0_without_retrieval_ids() -> None:
+    state = robot_state()
+    card = hypothesis()
+    text = "\n".join([card.statement, card.mechanism])
+    trace = TaskTrace(
+        entity_mentions=card.task_trace.entity_mentions,
+        requirement_mentions=[TaskTraceReference(
+            contract_id=SYNTHESIS_REQUIREMENT_ID,
+            output_excerpt=card.statement,
+        )],
+    )
+
+    assessment = assess_task_alignment(
+        state,
+        text,
+        subject_text=text,
+        trace=trace,
+        semantic_client=None,
+        contract_override=synthesis_contract_for_state(state),
+    )
+
+    assert assessment.passed is True
+    assert assessment.missing_requirement_ids == ()
+
+
+def test_m5_uses_q0_instead_of_retrieval_requirement_ids() -> None:
+    state = robot_state()
+    plan = ResearchPlan(
+        hypothesis_id="H1",
+        study_subjects="机械臂 sim-to-real 操控平台",
+        procedures=["测试机械臂 sim-to-real 操控成功率。"],
+        measurement_metrics=["机械臂 sim-to-real 迁移成功率"],
+    )
+
+    canonical = M5ResearchPlan._canonicalize_task_trace(state, plan)
+
+    assert {
+        item.contract_id
+        for item in canonical.task_trace.requirement_mentions
+    } == {SYNTHESIS_REQUIREMENT_ID}
+
+
+@pytest.mark.asyncio
+async def test_m6_uses_q0_instead_of_retrieval_requirement_ids() -> None:
+    state = robot_state()
+    base = hypothesis()
+    q0_trace = TaskTrace(
+        entity_mentions=base.task_trace.entity_mentions,
+        requirement_mentions=[TaskTraceReference(
+            contract_id=SYNTHESIS_REQUIREMENT_ID,
+            output_excerpt=base.statement,
+        )],
+    )
+    card = base.model_copy(update={"task_trace": q0_trace})
+    state.top_hypotheses = [card]
+    state.research_plans = [ResearchPlan(
+        hypothesis_id=card.hypothesis_id,
+        study_subjects="机械臂 sim-to-real 操控平台",
+        procedures=[card.statement],
+        measurement_metrics=["机械臂 sim-to-real 迁移成功率"],
+        supporting_evidence_ids=["ev-arm-1"],
+        task_trace=q0_trace,
+    )]
+    module = M6ReviewIteration()
+    module.client = ReviewClient()
+
+    result = await module(state)
+    task_review = next(
+        review for review in result["reviews"]
+        if review.dimension.value == "task_alignment"
+    )
+
+    assert task_review.hard_gate_passed is True
+    assert "R1" not in task_review.reasoning
+    for call in module.client.calls:
+        for question in state.problem_card.sub_questions:
+            assert question not in call["user_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_standard_m4_revision_generator_disables_extended_thinking() -> None:
+    """Later rounds already have evidence/review feedback and avoid the 360s tail."""
+    candidate = hypothesis()
+    client = _SequenceClient([
+        [candidate.model_dump(mode="json")],
+        [{
+            "hypothesis_id": candidate.hypothesis_id,
+            "consistent": True,
+            "rationale": "same task object and requirement",
+            "covered_requirement_ids": [SYNTHESIS_REQUIREMENT_ID],
+        }],
+    ])
+    module = M4HypothesisGeneration(
+        num_candidates=1,
+        top_k=1,
+        mode="direct",
+        fast_mode=False,
+    )
+    module.client = client
+    state = robot_state().model_copy(update={"iteration_count": 1})
+
+    await module._run_llm(state, feedback_context="Address the review feedback.")
+
+    assert client.calls[0]["disable_thinking"] is True
+
+
+def test_graph_context_does_not_pretruncate_late_focused_relation() -> None:
+    from hypoforge.context import ContextPlanner, ContextRequest
+    from hypoforge.state import (
+        EvidenceEdge,
+        EvidenceEdgeRelation,
+        EvidenceNode,
+        EvidenceNodeType,
+    )
+
+    state = PipelineState(
+        input_question="q",
+        evidence_graph=EvidenceGraph(
+            nodes=[
+                EvidenceNode(
+                    id=f"N{index}",
+                    type=EvidenceNodeType.CLAIM,
+                    label=f"claim {index}",
+                )
+                for index in range(22)
+            ],
+            edges=[
+                EvidenceEdge(
+                    source=f"N{index}",
+                    target=f"N{index + 1}",
+                    relation=EvidenceEdgeRelation.SUPPORTS,
+                    evidence_ids=(["ev-focus"] if index == 20 else []),
+                )
+                for index in range(21)
+            ],
+        ),
+    )
+
+    context = build_graph_context(state)
+    pack = ContextPlanner().plan(
+        context,
+        ContextRequest(
+            purpose="m5_plan",
+            focus_evidence_ids=("ev-focus",),
+        ),
+    )
+
+    assert len(context.relations) == 21
+    assert "evidence=ev-focus" in pack.rendered
+
+
+@pytest.mark.asyncio
+async def test_m4_generator_uses_one_audited_context_pack(tmp_path) -> None:
+    """A graph fact must not be repeated in legacy bucket prompt fields."""
+
+    client = _RecordingClient([hypothesis().model_dump(mode="json")])
+    module = M4HypothesisGeneration(
+        mode="direct",
+        num_candidates=1,
+        top_k=1,
+        fast_mode=True,
+    )
+    module.client = client
+    recorder = RunEventRecorder(tmp_path / "m4-context", "m4-context")
+
+    with bind_recorder(recorder):
+        await module._run_llm(robot_state())
+
+    prompt = client.calls[0]["user_prompt"]
+    marker = "Domain randomization improves robotic-arm transfer success."
+    assert prompt.count(marker) == 1
+    context_events = [
+        event for event in recorder.read_events()
+        if event["event_type"] == "llm_context_built"
+    ]
+    assert context_events[0]["details"]["purpose"] == "m4_generate"
+    assert context_events[0]["details"]["included_ids"] == ["fact-arm-1"]
+
+
+@pytest.mark.asyncio
+async def test_m5_builds_a_focused_context_for_each_hypothesis(tmp_path) -> None:
+    """Two hypotheses with disjoint evidence must not share one context pack."""
+
+    state = robot_state()
+    run = state.m2_knowledge_export.runs[0]
+    run.evidence.append(M2EvidenceExport(
+        evidence_id="ev-arm-2",
+        paper_id="S2:p2",
+        chunk_id="chunk-2",
+        quote="Calibration reduces reality-gap error.",
+        normalized_claim="Calibration reduces reality-gap error.",
+        relevance_score=0.9,
+    ))
+    run.knowledge_entries.append(KnowledgeEntry(
+        id="fact-arm-2",
+        type="established_fact",
+        content="Calibration reduces reality-gap error.",
+        source_paper_id="S2:p2",
+        evidence_ids=["ev-arm-2"],
+    ))
+    run.papers.append(M2PaperExport(paper_id="S2:p2", title="Calibration"))
+    state.evidence_graph.established_facts.append("fact-arm-2")
+    first_hypothesis = hypothesis()
+    second_hypothesis = hypothesis().model_copy(update={
+        "hypothesis_id": "H2",
+        "statement": "校准可降低机械臂 sim-to-real 现实差距。",
+        "supporting_evidence": ["ev-arm-2"],
+    })
+    state.top_hypotheses = [first_hypothesis, second_hypothesis]
+
+    class RecordingSequenceClient:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def structured_chat(self, **kwargs):
+            self.calls.append(kwargs)
+            index = len(self.calls) - 1
+            card = state.top_hypotheses[index]
+            return ResearchPlan(
+                hypothesis_id=card.hypothesis_id,
+                study_subjects="机械臂 sim-to-real 操控",
+                procedures=["在仿真和现实环境中执行对照实验。"],
+                measurement_metrics=["迁移成功率"],
+                task_trace=card.task_trace,
+            ).model_dump(mode="json")
+
+    client = RecordingSequenceClient()
+    module = M5ResearchPlan(fast_mode=True)
+    module.client = client
+    recorder = RunEventRecorder(tmp_path / "m5-context", "m5-context")
+
+    with bind_recorder(recorder):
+        await module(state)
+
+    assert len(client.calls) == 2
+    first_prompt = client.calls[0]["user_prompt"]
+    second_prompt = client.calls[1]["user_prompt"]
+    assert first_prompt.index("fact-arm-1") < first_prompt.index("fact-arm-2")
+    assert second_prompt.index("fact-arm-2") < second_prompt.index("fact-arm-1")
+    events = [
+        event for event in recorder.read_events()
+        if event["event_type"] == "llm_context_built"
+        and event["module"] == "m5"
+    ]
+    assert [event["details"]["purpose"] for event in events] == [
+        "m5_plan", "m5_plan",
+    ]
+    assert events[0]["details"]["render_hash"] != events[1]["details"]["render_hash"]
+
+
+@pytest.mark.asyncio
+async def test_m6_uses_reviewer_specific_context_purposes(tmp_path) -> None:
+    """Logic and method reviewers must receive independently planned context."""
+
+    state = robot_state()
+    card = hypothesis()
+    state.top_hypotheses = [card]
+    state.research_plans = [ResearchPlan(
+        hypothesis_id=card.hypothesis_id,
+        study_subjects="机械臂 sim-to-real 操控",
+        procedures=["执行仿真与现实对照实验。"],
+        measurement_metrics=["迁移成功率"],
+        task_trace=card.task_trace,
+    )]
+
+    class ReviewerClient:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def structured_chat(self, **kwargs):
+            self.calls.append(kwargs)
+            return {
+                "reasoning": "The hypothesis-plan pair is auditable.",
+                "score": 4.0,
+                "comments": "acceptable",
+                "suggestions": "retain canonical evidence links",
+                "evidence_ids": ["ev-arm-1"],
+            }
+
+    client = ReviewerClient()
+    module = M6ReviewIteration(
+        reviewers=["scientific_logic", "method_feasibility"],
+        fast_mode=True,
+    )
+    module.client = client
+    recorder = RunEventRecorder(tmp_path / "m6-context", "m6-context")
+
+    with bind_recorder(recorder):
+        await module(state)
+
+    assert len(client.calls) == 2
+    events = [
+        event for event in recorder.read_events()
+        if event["event_type"] == "llm_context_built"
+        and event["module"] == "m6"
+    ]
+    assert [event["details"]["purpose"] for event in events] == [
+        "m6_logic", "m6_feasibility",
+    ]
+    assert events[0]["details"]["render_hash"] != events[1]["details"]["render_hash"]
+    assert "Context purpose: m6_logic" in client.calls[0]["user_prompt"]
+    assert "Context purpose: m6_feasibility" in client.calls[1]["user_prompt"]
 
 
 def test_task_alignment_rejects_legged_robot_substitution() -> None:
@@ -4037,13 +5188,23 @@ async def test_m4_repairs_contract_diagnostics_once_without_weakening_gate() -> 
     }
     client = HypothesisRepairClient([
         [invalid],
+        [{
+            "hypothesis_id": "H1", "consistent": False,
+            "rationale": "generic device is not the original task object",
+            "covered_requirement_ids": [],
+        }],
         [invalid],  # the D1 retry also fails → the flow reaches the repair
+        [{
+            "hypothesis_id": "H1", "consistent": False,
+            "rationale": "generic device is not the original task object",
+            "covered_requirement_ids": [],
+        }],
         [repaired],
         [{
             "hypothesis_id": "H1",
             "consistent": True,
             "rationale": "same lithium-metal battery research object",
-            "covered_requirement_ids": ["R1"],
+            "covered_requirement_ids": [SYNTHESIS_REQUIREMENT_ID],
         }],
     ])
     module = M4HypothesisGeneration(num_candidates=1, top_k=1, mode="direct")
@@ -4051,15 +5212,15 @@ async def test_m4_repairs_contract_diagnostics_once_without_weakening_gate() -> 
 
     result = await module._run_llm(state)
 
-    assert len(client.calls) == 4
-    # calls[1] is the D1 retry: carries the contract-failure feedback
-    assert "Contract validation rejected some candidates" in client.calls[1]["user_prompt"]
-    # calls[2] is the deterministic repair: carries the diagnostics
-    assert client.calls[2]["temperature"] == 0.0
-    assert "missing required task entities" in client.calls[2]["user_prompt"]
-    assert "hypothesis_contract_auditor" not in client.calls[2]["user_prompt"]
-    # calls[3] is the semantic contract audit
-    assert "Primary task objects" in client.calls[3]["user_prompt"]
+    assert len(client.calls) == 6
+    # calls[2] is the D1 retry: carries semantic-contract feedback.
+    assert "Contract validation rejected some candidates" in client.calls[2]["user_prompt"]
+    # calls[4] is the deterministic repair: carries the diagnostics.
+    assert client.calls[4]["temperature"] == 0.0
+    assert "original task object" in client.calls[4]["user_prompt"]
+    assert "hypothesis_contract_auditor" not in client.calls[4]["user_prompt"]
+    # calls[5] is the semantic contract audit of the repaired output.
+    assert "Primary task objects" in client.calls[5]["user_prompt"]
     assert result["top_hypotheses"][0].statement == valid_statement
 
 
@@ -4099,7 +5260,7 @@ async def test_m4_generator_prompt_carries_literal_contract_names() -> None:
             "hypothesis_id": "H1",
             "consistent": True,
             "rationale": "same research object",
-            "covered_requirement_ids": ["R1"],
+            "covered_requirement_ids": [SYNTHESIS_REQUIREMENT_ID],
         }],
     ])
     module = M4HypothesisGeneration(num_candidates=1, top_k=1, mode="direct")
@@ -4110,8 +5271,9 @@ async def test_m4_generator_prompt_carries_literal_contract_names() -> None:
     generator_prompt = client.calls[0]["user_prompt"]
     assert "锂金属电池" in generator_prompt
     assert "lithium-metal battery" in generator_prompt
-    assert "R1" in generator_prompt
-    assert "Do not translate or paraphrase" in generator_prompt
+    assert SYNTHESIS_REQUIREMENT_ID in generator_prompt
+    assert "R1" not in generator_prompt
+    assert "may be translated or paraphrased" in generator_prompt
     assert result["top_hypotheses"][0].statement == valid["statement"]
 
 
@@ -4161,7 +5323,7 @@ async def test_m4_repair_prompt_carries_literal_contract_names() -> None:
             "hypothesis_id": "H1",
             "consistent": True,
             "rationale": "same research object",
-            "covered_requirement_ids": ["R1"],
+            "covered_requirement_ids": [SYNTHESIS_REQUIREMENT_ID],
         }],
     ])
     module = M4HypothesisGeneration(num_candidates=1, top_k=1, mode="direct")
@@ -4263,7 +5425,7 @@ def test_m4_canonicalizes_wrong_trace_excerpts_from_literal_content() -> None:
     assert canonical[0].task_trace.entity_mentions[4].output_excerpt == statement
     assert {
         ref.contract_id for ref in canonical[0].task_trace.requirement_mentions
-    } == {"R1", "R2"}
+    } == {SYNTHESIS_REQUIREMENT_ID}
 
 
 def test_m4_requirement_scope_does_not_expand_from_shared_primary_entity() -> None:
@@ -4291,7 +5453,7 @@ def test_m4_requirement_scope_does_not_expand_from_shared_primary_entity() -> No
     assert [card.hypothesis_id for card in accepted] == ["H1"]
     assert [
         ref.contract_id for ref in canonical[0].task_trace.requirement_mentions
-    ] == ["R1"]
+    ] == [SYNTHESIS_REQUIREMENT_ID]
 
 
 @pytest.mark.asyncio
@@ -4328,7 +5490,7 @@ async def test_m4_semantic_audit_rejects_entity_only_requirement_trace() -> None
     assert failures[0]["semantic_requirement_mismatch"] is True
 
 
-def test_m4_trace_canonicalization_does_not_invent_missing_content() -> None:
+def test_m4_trace_canonicalization_uses_q0_without_literal_entity_gate() -> None:
     state = _pose_estimation_contract_state()
     candidate = HypothesisCard(
         hypothesis_id="H1",
@@ -4345,8 +5507,8 @@ def test_m4_trace_canonicalization_does_not_invent_missing_content() -> None:
         state, build_graph_context(state), canonical,
     )
 
-    assert accepted == []
-    assert "训练" in failures[0]["missing_task_entities"]
+    assert [item.hypothesis_id for item in accepted] == ["H1"]
+    assert failures == []
     assert all(
         ref.contract_id != "E5"
         for ref in canonical[0].task_trace.entity_mentions
@@ -4370,15 +5532,29 @@ async def test_m4_repair_does_not_admit_a_second_invalid_result() -> None:
         "task_trace": {},
     }
     # generator → D1 retry → repair all fail: the repair must not admit the
-    # third invalid result either
-    client = HypothesisRepairClient([[invalid], [invalid], [invalid]])
+    # third invalid result either, but M4 must preserve pipeline continuity.
+    rejected = [{
+        "hypothesis_id": "H1", "consistent": False,
+        "rationale": "unrelated system is not the original task object",
+        "covered_requirement_ids": [],
+    }]
+    client = HypothesisRepairClient([
+        [invalid], rejected,
+        [invalid], rejected,
+        [invalid], rejected,
+    ])
     module = M4HypothesisGeneration(num_candidates=1, top_k=1, mode="direct")
     module.client = client
 
-    with pytest.raises(ValueError, match="one deterministic repair attempt"):
-        await module._run_llm(state)
+    output = await module._run_llm(state)
 
-    assert len(client.calls) == 3
+    assert len(client.calls) == 6
+    assert len(output["top_hypotheses"]) == 1
+    assert "continuity fallback" in (
+        output["top_hypotheses"][0].ranking_rationale.casefold()
+    )
+    assert output["top_hypotheses"][0].supporting_evidence == []
+    assert output["top_hypotheses"][0].source_paper_ids == []
 
 
 def test_m1_atomic_validator_flags_parallel_questions() -> None:
@@ -4394,9 +5570,13 @@ def test_m1_atomic_validator_flags_parallel_questions() -> None:
 class PlanClient:
     def __init__(self) -> None:
         self.calls = []
+        self.chat_calls = 0
 
     async def chat(self, prompt: str = "", **kwargs) -> str:
-        return "yes — test semantic client is consistent"
+        self.chat_calls += 1
+        if self.chat_calls == 1:
+            return "no — quadruped locomotion is not robotic-arm manipulation"
+        return "yes — robotic-arm sim-to-real is the original task object"
 
     async def structured_chat(self, **kwargs):
         self.calls.append(kwargs)
@@ -4465,14 +5645,13 @@ async def test_m5_semantic_alignment_times_out_without_blocking_event_loop() -> 
         )
 
 
-def test_m5_requires_original_language_and_literal_contract_terms() -> None:
+def test_m5_requires_original_language_and_semantic_entity_hints() -> None:
     prompt = M5_SYSTEM_PROMPT.casefold()
 
     assert "same language as the original question" in prompt
     assert "verbatim" in prompt
-    assert "never embed a chinese" in prompt
-    assert "contract name inside an english sentence" in prompt
-    assert "never paraphrase an entity" in prompt
+    assert "semantic hints" in prompt
+    assert "may be translated or paraphrased" in prompt
 
 
 def test_m5_canonicalizes_trace_excerpts_from_plan_content() -> None:
@@ -4499,6 +5678,7 @@ def test_m5_canonicalizes_trace_excerpts_from_plan_content() -> None:
         subject_text=canonical.study_subjects,
         trace=canonical.task_trace,
         semantic_client=None,
+        contract_override=synthesis_contract_for_state(state),
     )
 
     assert assessment.passed is True
@@ -4507,7 +5687,7 @@ def test_m5_canonicalizes_trace_excerpts_from_plan_content() -> None:
     } == {"E1", "E2", "E3", "E4", "E5"}
     assert {
         item.contract_id for item in canonical.task_trace.requirement_mentions
-    } == {"R1", "R2"}
+    } == {SYNTHESIS_REQUIREMENT_ID}
 
 
 @pytest.mark.asyncio
@@ -4518,23 +5698,31 @@ async def test_m5_retries_object_drift_and_sanitizes_citations() -> None:
 
     result = await module(state)
 
-    assert len(module.client.calls) == 2
+    # Two plan-generation calls (the first object-drift retry plus the valid
+    # plan) and one M5 internal coverage precheck.
+    assert len(module.client.calls) == 3
     plan = result["research_plans"][0]
     assert "机械臂" in plan.study_subjects
     assert plan.supporting_evidence_ids == ["ev-arm-1"]
     assert plan.source_paper_ids == ["S2:p1"]
     assert "Original question" in module.client.calls[1]["user_prompt"]
     assert "ev-arm-1" in module.client.calls[1]["user_prompt"]
+    assert "validation_targets" in module.client.calls[2]["user_prompt"]
+    for call in module.client.calls:
+        for question in state.problem_card.sub_questions:
+            assert question not in call["user_prompt"]
 
 
 class ReviewClient:
     def __init__(self, chat_response: str = "yes — consistent") -> None:
         self._chat_response = chat_response
+        self.calls = []
 
     async def chat(self, prompt: str = "", **kwargs) -> str:
         return self._chat_response
 
     async def structured_chat(self, **kwargs):
+        self.calls.append(kwargs)
         prompt = kwargs["system_prompt"]
         base = {
             "reasoning": "Reviewed against the supplied task and graph context.",
@@ -4610,6 +5798,42 @@ async def test_m6_fails_closed_when_evidence_review_cites_no_id() -> None:
     assert coverage_review.hard_gate_passed is False
     assert overall.hard_gate_passed is False
     assert _should_continue_iterating(reviewed) == "iterate"
+
+
+@pytest.mark.asyncio
+async def test_m6_legacy_retrieval_traces_are_folded_into_q0() -> None:
+    """Historical R traces do not leak retrieval scope into final review."""
+    state = robot_state()
+    state.problem_card.task_contract.requirements.append(TaskRequirement(
+        requirement_id="R2",
+        sub_question="How should transfer robustness be measured?",
+        primary_entity_id="E1",
+        related_entity_ids=["E2"],
+        relation="measure transfer robustness",
+        required=True,
+    ))
+    card = hypothesis()  # deliberately declares only R1
+    state.top_hypotheses = [card]
+    state.research_plans = [ResearchPlan(
+        hypothesis_id=card.hypothesis_id,
+        study_subjects="机械臂 sim-to-real 操控",
+        procedures=[card.statement],
+        measurement_metrics=["迁移成功率"],
+        supporting_evidence_ids=["ev-arm-1"],
+        task_trace=card.task_trace,
+    )]
+    module = M6ReviewIteration()
+    module.client = ReviewClient()
+
+    result = await module(state)
+
+    task_review = next(
+        review for review in result["reviews"]
+        if review.dimension.value == "task_alignment"
+    )
+    assert task_review.hard_gate_passed is True
+    assert "R1" not in task_review.reasoning
+    assert "R2" not in task_review.reasoning
 
 
 @pytest.mark.asyncio
@@ -5301,6 +6525,141 @@ def test_m5_requires_every_evidence_item_to_match_declared_paper() -> None:
     assert cleaned.source_paper_ids == []
 
 
+def test_context_planner_is_deterministic_budgeted_and_card_complete() -> None:
+    """Budgeting must drop complete cards, never silently slice their text."""
+
+    from hypoforge.context import ContextPlanner, ContextRequest
+    from hypoforge.graph_context import GraphContextItem
+
+    def items(kind: str) -> list[GraphContextItem]:
+        return [GraphContextItem(
+            entry_id=f"{kind}-{index}",
+            kind=kind,
+            text=(f"BEGIN-{kind}-{index} " + ("evidence " * 80)
+                  + f"END-{kind}-{index}"),
+            evidence_ids=[f"ev-{kind}-{index}"],
+            quotes=[f"quote for {kind}-{index} " + ("detail " * 40)],
+        ) for index in range(6)]
+
+    context = GraphContext(
+        original_question="How does the mechanism work?",
+        established_facts=items("established_fact"),
+        conflicts=items("conflict"),
+        knowledge_gaps=items("knowledge_gap"),
+        relations=[f"relation-{index} " + ("edge " * 30) for index in range(8)],
+    )
+    request = ContextRequest(
+        purpose="m4_generate",
+        max_input_tokens=900,
+        reserve_tokens=180,
+        focus_entry_ids=("knowledge_gap-5",),
+    )
+
+    first = ContextPlanner().plan(context, request)
+    second = ContextPlanner().plan(context, request)
+
+    all_ids = {
+        item.entry_id
+        for bucket in (
+            context.established_facts,
+            context.conflicts,
+            context.knowledge_gaps,
+        )
+        for item in bucket
+    }
+    assert first == second
+    assert first.manifest.estimated_tokens <= 720
+    assert set(first.manifest.included_ids) | set(first.manifest.dropped_ids) == all_ids
+    assert "knowledge_gap-5" in first.manifest.included_ids
+    for entry_id in first.manifest.included_ids:
+        assert f"END-{entry_id}" in first.rendered
+    for entry_id in first.manifest.dropped_ids:
+        assert f"BEGIN-{entry_id}" not in first.rendered
+    assert len(first.manifest.render_hash) == 64
+
+
+def test_context_planner_bounds_omitted_id_text_and_preserves_focus() -> None:
+    """Large audit manifests must not consume the LLM content budget."""
+
+    from hypoforge.context import ContextPlanner, ContextRequest
+    from hypoforge.graph_context import GraphContextItem
+
+    def items(kind: str) -> list[GraphContextItem]:
+        return [GraphContextItem(
+            entry_id=f"{kind}-{index}-" + ("identifier" * 12),
+            kind=kind,
+            text=f"Complete evidence card {kind} {index}. " + ("fact " * 18),
+            evidence_ids=[f"ev-{kind}-{index}"],
+        ) for index in range(12)]
+
+    gaps = items("knowledge_gap")
+    focused_id = gaps[-1].entry_id
+    context = GraphContext(
+        original_question="How can focused evidence survive a large graph?",
+        established_facts=items("established_fact"),
+        conflicts=items("conflict"),
+        knowledge_gaps=gaps,
+    )
+
+    pack = ContextPlanner().plan(context, ContextRequest(
+        purpose="m4_generate",
+        max_input_tokens=700,
+        reserve_tokens=140,
+        focus_entry_ids=(focused_id,),
+    ))
+
+    assert pack.manifest.estimated_tokens <= 560
+    assert focused_id in pack.manifest.included_ids
+    assert set(pack.manifest.dropped_ids) == (
+        {
+            item.entry_id
+            for bucket in (
+                context.established_facts,
+                context.conflicts,
+                context.knowledge_gaps,
+            )
+            for item in bucket
+        }
+        - set(pack.manifest.included_ids)
+    )
+    assert "see context manifest" in pack.rendered
+
+
+def test_context_planner_prioritises_late_relation_with_focused_evidence() -> None:
+    """A focused edge must not lose to unrelated relations by source order."""
+
+    from hypoforge.context import ContextPlanner, ContextRequest
+    from hypoforge.graph_context import GraphContext
+
+    context = GraphContext(
+        original_question="How does the focused mechanism work?",
+        relations=[
+            *[f"[N{i}] unrelated --supports--> [N{i + 1}]" for i in range(8)],
+            "[N-focus] mechanism --supports--> [N-result] evidence=ev-focus",
+        ],
+    )
+
+    pack = ContextPlanner().plan(
+        context,
+        ContextRequest(
+            purpose="m5_plan",
+            focus_evidence_ids=("ev-focus",),
+        ),
+    )
+
+    assert "evidence=ev-focus" in pack.rendered
+
+
+def test_purpose_context_mix_reduces_estimated_tokens_by_half() -> None:
+    from scripts.measure_context_budget import measure_context_budget
+
+    report = measure_context_budget()
+
+    assert report["reduction_ratio"] >= 0.50
+    assert report["current_estimated_tokens"] < report["legacy_estimated_tokens"]
+    assert report["missing_focused_ids"] == []
+
+
 class CacheReadingWorkflow:
     def __init__(self) -> None:
         self.calls = 0
@@ -5558,6 +6917,24 @@ def test_registry_selects_strict_builtin_contracts() -> None:
     assert adapter.fulltext_backfill_min_directness == 0.45
     assert adapter.preprint_supplementer is None
     assert adapter.preprint_supplement_max_attempts == 2
+
+
+def test_registry_selects_strict_m2_by_contract_marker(monkeypatch) -> None:
+    """Strict selection must survive a facade rename or package relocation."""
+
+    from hypoforge.modules.m2_literature_search import M2LiteratureSearch
+
+    class RelocatedM2Facade(M2LiteratureSearch):
+        strict_contract_family = "agentic_m2"
+
+    monkeypatch.setitem(ModuleRegistry._modules, "m2", RelocatedM2Facade)
+
+    instances = ModuleRegistry.build_all(PipelineConfig(
+        search=SearchConfig(implementation="agentic"),
+    ))
+
+    assert isinstance(instances["m2"], StrictAgenticM2Module)
+    assert not isinstance(instances["m2"], RelocatedM2Facade)
 
 
 def test_m2_query_llm_config_is_wired_to_query_planner() -> None:
@@ -6092,10 +7469,50 @@ async def test_m4_critic_all_rejected_runs_gate_recovery() -> None:
 
     assert [card.hypothesis_id for card in survivors] == ["H3", "H4"]
     assert len(client.calls) == 5
+    assert client.calls[0]["disable_thinking"] is True
+    assert client.calls[1]["disable_thinking"] is True
+    assert client.calls[2]["disable_thinking"] is True
+    assert client.calls[3]["disable_thinking"] is True
+    assert client.calls[4]["disable_thinking"] is True
     # the critic's critique text fed the regeneration prompt
     assert "missing mechanism" in client.calls[1]["user_prompt"]
     # gate recovery regeneration is capped at a small batch (C-3)
     assert "Generate 3 candidate hypotheses" in client.calls[1]["user_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_standard_m4_generator_timeout_retries_without_thinking(monkeypatch) -> None:
+    """A reasoning long-tail must get one bounded recovery pass, not kill M1-M6."""
+    from hypoforge.modules.m4_hypothesis_generation import M4HypothesisGeneration
+
+    module = M4HypothesisGeneration(
+        mode="direct",
+        fast_mode=False,
+        top_k=1,
+    )
+    module.client = object()
+    calls = []
+    recovered = HypothesisCard(
+        hypothesis_id="H-recovered",
+        statement="A recovered scientific hypothesis improves the measured outcome.",
+    )
+
+    async def generation(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise TimeoutError("simulated reasoning timeout")
+        return [recovered], [recovered], []
+
+    monkeypatch.setattr(module, "_generate_hypothesis_batch", generation)
+
+    output = await module._run_llm(PipelineState(input_question="Q"))
+
+    assert [item.hypothesis_id for item in output["top_hypotheses"]] == [
+        "H-recovered"
+    ]
+    assert len(calls) == 2
+    assert calls[1]["tool_name"] == "hypothesis_generator_timeout_recovery"
+    assert calls[1]["disable_thinking"] is True
 
 
 @pytest.mark.asyncio
@@ -6965,6 +8382,83 @@ def test_append_routing_extends_history_and_bumps_revision_count():
     assert patch3 == {}
 
 
+def test_m6_executes_the_plan_revision_route_it_already_recorded():
+    """Updating the M5 retry counter must not change the current M6 route."""
+    runner = _runner()
+    state = _state_after_review(
+        score=2.9,
+        iteration_count=2,
+        max_iterations=3,
+        plan_revision_count=1,
+    )
+    state.reviews.insert(0, ReviewResult(
+        dimension=ReviewerDimension("experimental_validation_coverage"),
+        attribution="plan",
+        score=4.6,
+        hard_gate_passed=False,
+        version=2,
+    ))
+    patch: dict = {}
+
+    runner._append_routing("m6", state, patch)
+    assert patch["routing_history"][-1].to_module == "revise_m5"
+    assert patch["plan_revision_count"] == 2
+
+    post_state = PipelineState(**{
+        **state.model_dump(mode="python"),
+        **patch,
+    })
+    assert runner._decide_after_m6(post_state) == "revise_m5"
+
+
+def test_m4_executes_the_gap_search_route_it_already_recorded_at_round_limit():
+    """Appending the current M4 route must not consume it before execution."""
+    runner = _runner()
+    gap = EvidenceGapRequest(
+        gap_id="gap-current",
+        sub_question="What evidence supports the current premise?",
+        status="pending",
+    )
+    state = PipelineState(
+        evidence_gap_requests=[gap],
+        routing_history=[RoutingDecision(
+            round=1,
+            from_module="m4",
+            to_module="supplement_m2",
+            decided_by="m4",
+            gap_ids=["gap-previous"],
+        )],
+    )
+    patch: dict = {}
+
+    runner._append_routing("m4", state, patch)
+    assert patch["routing_history"][-1].to_module == "supplement_m2"
+
+    post_state = PipelineState(**{
+        **state.model_dump(mode="python"),
+        **patch,
+    })
+    assert _route_after_m4(post_state) == "continue"
+    assert runner._decide_after_m4(post_state) == "search_gap"
+
+
+def test_m6_plan_revision_route_has_plan_specific_reason():
+    runner = _runner()
+    state = _state_after_review(score=2.9, iteration_count=2)
+    state.reviews.insert(0, ReviewResult(
+        dimension=ReviewerDimension("method_feasibility"),
+        attribution="plan",
+        score=3.0,
+        hard_gate_passed=False,
+        version=2,
+    ))
+
+    decision = runner._routing_decision("m6", state)
+
+    assert decision.to_module == "revise_m5"
+    assert decision.reason == "revise the research plan against M6 validation feedback"
+
+
 def test_append_routing_direct_m4_emits_module_skipped_for_m2_m3():
     """The conditional edge bypasses M2/M3, so the bookkeeping step must emit
     the explicit module_skipped events for both (when enabled)."""
@@ -7260,6 +8754,8 @@ def test_build_followup_seed_inherits_only_whitelist_fields():
     assert state.metrics == {}
     assert state.total_input_tokens == 0
     assert state.total_output_tokens == 0
+    assert state.token_usage_by_module == {}
+    assert state.scoring_token_usage == {}
     assert state.routing_history == []
     assert state.evidence_verdict is None
     assert state.evidence_gaps == []
@@ -7271,6 +8767,29 @@ def test_build_followup_seed_memory_cache_falls_back_to_config():
     state = build_followup_seed(seed, followup_text="追问", run_id="f", config=config)
     assert state.memory_cache_dir == "default-cache"
     assert state.parent_run_id == "p"
+
+
+def test_public_result_exposes_pipeline_and_scoring_token_breakdown() -> None:
+    payload = RunManager._public_state_payload(
+        "run-token",
+        {
+            "input_question": "Q",
+            "total_input_tokens": 100,
+            "total_output_tokens": 20,
+            "token_usage_by_module": {
+                "m1": {"input": 25, "output": 5, "calls": 1},
+                "m4": {"input": 75, "output": 15, "calls": 3},
+            },
+            "scoring_token_usage": {"input": 30, "output": 4, "calls": 2},
+        },
+        is_final=True,
+    )
+
+    assert payload["token_usage"] == {"input": 100, "output": 20}
+    assert payload["token_usage_by_module"]["m4"]["calls"] == 3
+    assert payload["scoring_token_usage"] == {
+        "input": 30, "output": 4, "calls": 2,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -7410,26 +8929,29 @@ def make_m6_module(client, revisit: bool = True, limit: int = 3) -> M6ReviewIter
 
 @pytest.mark.asyncio
 async def test_m6_switch_off_never_calls_verdict() -> None:
-    # Exactly two reviewer payloads; a 3rd call would raise — proving the
+    # Exactly three reviewer payloads; a 4th call would raise — proving the
     # verdict call is never issued when the switch is off.
-    client = FakeM6Client([_review_payload()] * 2)
+    client = FakeM6Client([_review_payload()] * 3)
     module = make_m6_module(client, revisit=False)
     state = make_m6_state()
 
     patch = await module(state)
 
-    assert client.calls == 2
+    assert client.calls == 3
     assert set(patch) == {
         "reviews", "iteration_count", "graph_correction_requests",
-    }  # no evidence-verdict keys
+        "top_hypotheses", "research_plans",
+    }  # no evidence-verdict keys; legacy synthesis traces may be normalised
     assert patch["iteration_count"] == 1
-    # alignment gate + 2 specialists + 3 objective gates + 3 metric dims + overall
-    assert len(patch["reviews"]) == 10
+    # alignment gate + 3 specialists + 3 objective gates + overall.  The real
+    # independent metrics are computed once by the authoritative posthoc scorer,
+    # not synthesized here with a missing evaluator configuration.
+    assert len(patch["reviews"]) == 8
     assert {r.dimension.value for r in patch["reviews"]} == {
-        "task_alignment", "scientific_logic", "method_feasibility",
+        "task_alignment", "scientific_logic",
+        "objective_evidence_consistency", "method_feasibility",
         "evidence_coverage_gate", "answer_completeness_gate",
-        "source_quality_gate", "testability_metric", "novelty_metric",
-        "objective_evidence_consistency", "overall",
+        "source_quality_gate", "overall",
     }
 
 
@@ -7460,13 +8982,13 @@ async def test_m6_verdict_matches_existing_gap_inherits_attempts() -> None:
             "suggested_queries": ["Hsp70 co-chaperone binding assay"],
         }],
     }
-    client = FakeM6Client([_review_payload()] * 2 + [verdict_payload])
+    client = FakeM6Client([_review_payload()] * 3 + [verdict_payload])
     module = make_m6_module(client)
     state = make_m6_state(evidence_gaps=[existing])
 
     patch = await module(state)
 
-    assert client.calls == 3  # 2 reviewers + 1 verdict
+    assert client.calls == 4  # 3 reviewers + 1 verdict
     assert patch["evidence_verdict"].sufficient is False
     gaps = patch["evidence_gaps"]
     assert len(gaps) == 1
@@ -7479,13 +9001,13 @@ async def test_m6_verdict_matches_existing_gap_inherits_attempts() -> None:
 
 @pytest.mark.asyncio
 async def test_m6_verdict_fail_closed() -> None:
-    client = FakeM6Client([_review_payload()] * 2 + [RuntimeError("boom")])
+    client = FakeM6Client([_review_payload()] * 3 + [RuntimeError("boom")])
     module = make_m6_module(client)
     state = make_m6_state()
 
     patch = await module(state)
 
-    assert client.calls == 3  # the verdict call was attempted
+    assert client.calls == 4  # the verdict call was attempted
     verdict = patch["evidence_verdict"]
     assert verdict.sufficient is False
     assert len(verdict.gaps) == 1
@@ -7848,6 +9370,115 @@ def _runner_with_fakes(tmp_path: Path, cancel_event, m1_hook=None, m4_hook=None)
 
 
 @pytest.mark.asyncio
+async def test_runner_executes_m4_m2_m3_m4_gap_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The compiled graph must execute a bounded M4 evidence-search loop."""
+
+    from hypoforge.registry import ModuleRegistry
+
+    calls: list[str] = []
+    gap = EvidenceGapRequest(
+        gap_id="M4-RUNNER-GAP",
+        sub_question="missing calibration evidence",
+    )
+    hypothesis_card = HypothesisCard(
+        hypothesis_id="H1",
+        statement="Calibration evidence improves transfer reliability.",
+    )
+
+    class StatefulModule(ModuleProtocol):
+        module_version = "test"
+        description = "stateful routing test module"
+
+        def __init__(self, name: str, output_fields: list[str]) -> None:
+            self.module_name = name
+            self._output_fields = output_fields
+            self.count = 0
+
+        async def __call__(self, state, config=None):
+            calls.append(self.module_name)
+            self.count += 1
+            if self.module_name == "m1":
+                return {"problem_card": ProblemCard(
+                    original_question="Q",
+                    sub_questions=["initial question"],
+                )}
+            if self.module_name == "m2":
+                patch = {"literature_results": [LiteratureResult(
+                    sub_question="initial question",
+                    papers_retrieved=self.count,
+                )]}
+                if state.evidence_gap_requests:
+                    patch["evidence_gap_requests"] = [
+                        item.model_copy(update={"status": "searched", "attempts": 1})
+                        if item.status == "pending" else item
+                        for item in state.evidence_gap_requests
+                    ]
+                return patch
+            if self.module_name == "m3":
+                patch = {"evidence_graph": EvidenceGraph()}
+                if state.evidence_gap_requests:
+                    patch["evidence_gap_requests"] = [
+                        item.model_copy(update={"status": "indexed"})
+                        if item.status == "searched" else item
+                        for item in state.evidence_gap_requests
+                    ]
+                return patch
+            if self.module_name == "m4":
+                current_gap = (
+                    gap if self.count == 1
+                    else gap.model_copy(update={"status": "exhausted", "attempts": 1})
+                )
+                return {
+                    "candidate_hypotheses": [hypothesis_card],
+                    "top_hypotheses": [hypothesis_card],
+                    "evidence_gap_requests": [current_gap],
+                }
+            if self.module_name == "m5":
+                return {"research_plans": [ResearchPlan(hypothesis_id="H1")]}
+            return {"iteration_count": 1}
+
+        @classmethod
+        def get_input_fields(cls):
+            return []
+
+        def get_output_fields(self):
+            return list(self._output_fields)
+
+    modules = {
+        "m1": StatefulModule("m1", ["problem_card"]),
+        "m2": StatefulModule(
+            "m2", ["literature_results", "evidence_gap_requests"]
+        ),
+        "m3": StatefulModule("m3", ["evidence_graph", "evidence_gap_requests"]),
+        "m4": StatefulModule(
+            "m4",
+            ["candidate_hypotheses", "top_hypotheses", "evidence_gap_requests"],
+        ),
+        "m5": StatefulModule("m5", ["research_plans"]),
+        "m6": StatefulModule("m6", ["iteration_count"]),
+    }
+    config = PipelineConfig(
+        verbose=False,
+        enabled_modules=["m1", "m2", "m3", "m4", "m5", "m6"],
+        enable_iteration=False,
+    )
+    config.output_dir = str(tmp_path)
+    config.scoring.auto_score = False
+    runner = PipelineRunner(config)
+    monkeypatch.setattr(
+        ModuleRegistry, "build_all", staticmethod(lambda cfg: modules)
+    )
+
+    state = await runner.run("Q", run_id="m4-gap-runner")
+
+    assert calls == ["m1", "m2", "m3", "m4", "m2", "m3", "m4", "m5", "m6"]
+    assert state.evidence_gap_requests[0].status == "exhausted"
+
+
+@pytest.mark.asyncio
 async def test_cancel_flag_stops_after_current_module_and_persists_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -7983,6 +9614,97 @@ async def test_no_cancel_runs_to_completion(tmp_path: Path, monkeypatch):
     types = [event["event_type"] for event in recorder.read_events()]
     assert "run_completed" in types
     assert "run_cancelled" not in types
+
+
+@pytest.mark.asyncio
+async def test_runner_attributes_token_usage_to_each_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The persisted run must explain which module consumed each token."""
+    from types import SimpleNamespace
+
+    from hypoforge.registry import ModuleRegistry
+    from hypoforge.tools.qwen_client import QwenClient
+
+    class TokenModule(ModuleProtocol):
+        module_version = "test"
+        description = "token attribution module"
+
+        def __init__(self, name: str, prompt: int, completion: int) -> None:
+            self.module_name = name
+            self.prompt = prompt
+            self.completion = completion
+
+        async def __call__(self, state, config=None):
+            QwenClient._record_tokens(SimpleNamespace(response_metadata={
+                "token_usage": {
+                    "prompt_tokens": self.prompt,
+                    "completion_tokens": self.completion,
+                }
+            }))
+            if self.module_name == "m1":
+                return {"problem_card": ProblemCard(
+                    original_question=state.input_question,
+                    sub_questions=["token attribution question"],
+                )}
+            return {
+                "candidate_hypotheses": [HypothesisCard(
+                    hypothesis_id="H-token",
+                    statement="Track usage per module.",
+                )],
+                "top_hypotheses": [HypothesisCard(
+                    hypothesis_id="H-token",
+                    statement="Track usage per module.",
+                )],
+            }
+
+        @classmethod
+        def get_input_fields(cls):
+            return []
+
+        def get_output_fields(self):
+            return ["problem_card"] if self.module_name == "m1" else [
+                "candidate_hypotheses", "top_hypotheses"
+            ]
+
+    modules = {
+        "m1": TokenModule("m1", 10, 2),
+        "m4": TokenModule("m4", 30, 6),
+    }
+    config = PipelineConfig(
+        verbose=False,
+        enabled_modules=["m1", "m4"],
+        enable_iteration=False,
+    )
+    config.output_dir = str(tmp_path)
+    config.scoring.auto_score = False
+    recorder = RunEventRecorder(tmp_path, "token-run")
+    runner = PipelineRunner(config, event_recorder=recorder)
+    monkeypatch.setattr(
+        ModuleRegistry, "build_all", staticmethod(lambda cfg: modules)
+    )
+
+    state = await runner.run("Q", run_id="token-run")
+
+    assert state.total_input_tokens == 40
+    assert state.total_output_tokens == 8
+    assert state.token_usage_by_module == {
+        "m1": {"input": 10, "output": 2, "calls": 1},
+        "m4": {"input": 30, "output": 6, "calls": 1},
+    }
+    persisted = json.loads((tmp_path / "token-run.json").read_text(encoding="utf-8"))
+    assert persisted["token_usage_by_module"] == state.token_usage_by_module
+    completed = {
+        event["module"]: event
+        for event in recorder.read_events()
+        if event["event_type"] == "module_completed"
+    }
+    assert completed["m1"]["details"]["token_usage"] == {
+        "input": 10, "output": 2, "calls": 1,
+    }
+    assert completed["m4"]["details"]["token_usage"] == {
+        "input": 30, "output": 6, "calls": 1,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -8172,6 +9894,50 @@ def test_request_cancel_rejects_finished_unknown_and_malformed(
 # --------------------------------------------------------------------------- #
 # HTTP endpoint contract
 # --------------------------------------------------------------------------- #
+
+def test_http_static_asset_is_whitelisted_and_traversal_safe(
+    tmp_path: Path,
+) -> None:
+    _write_config(tmp_path)
+    (tmp_path / "index.html").write_text("<h1>HypoForge</h1>", encoding="utf-8")
+    (tmp_path / "ui-polish.css").write_text(
+        ".context-metrics{display:grid}", encoding="utf-8"
+    )
+    secret = tmp_path.parent / "secret.txt"
+    secret.write_text("must-not-leak", encoding="utf-8")
+    server = build_server(
+        host="127.0.0.1",
+        port=0,
+        config_path=tmp_path / "config.yaml",
+        output_root=tmp_path / "runs",
+        static_dir=tmp_path,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=10
+        )
+
+        conn.request("GET", "/assets/ui-polish.css")
+        response = conn.getresponse()
+        assert response.status == 200
+        assert response.getheader("Content-Type") == "text/css; charset=utf-8"
+        assert response.read() == b".context-metrics{display:grid}"
+
+        conn.request("GET", "/assets/missing.css")
+        response = conn.getresponse()
+        assert response.status == 404
+        response.read()
+
+        conn.request("GET", "/assets/%2e%2e/secret.txt")
+        response = conn.getresponse()
+        assert response.status == 404
+        assert b"must-not-leak" not in response.read()
+    finally:
+        server.shutdown()
+        server.server_close()
+
 
 def test_http_cancel_endpoint_statuses(tmp_path: Path) -> None:
     _write_config(tmp_path)
@@ -8426,6 +10192,56 @@ module_overrides:
     assert "oa-secret-for-test" not in persisted
     assert "serper-secret-for-test" not in persisted
     assert "ads-secret-for-test" not in persisted
+
+
+def test_run_manager_passes_environment_search_credentials_to_modules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured badge must mean the worker actually receives the key."""
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+enabled_modules: [m2]
+search:
+  tools: [semantic_scholar, openalex]
+module_overrides:
+  m2:
+    kwargs: {}
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SEMANTIC_SCHOLAR_API_KEY", "env-s2-secret")
+    monkeypatch.setenv("OPENALEX_API_KEY", "env-oa-secret")
+    monkeypatch.setenv("OPENALEX_MAILTO", "env@example.org")
+    monkeypatch.setattr(threading, "Thread", DeferredThread)
+    captured = {}
+
+    class FakeRunner:
+        def __init__(self, config, event_recorder=None):
+            captured["config"] = config
+
+        async def run(self, question: str, run_id: str):
+            return PipelineState(input_question=question, run_id=run_id)
+
+    monkeypatch.setattr("hypoforge.webapp.PipelineRunner", FakeRunner)
+    manager = RunManager(config_path=config_path, output_root=tmp_path / "runs")
+    run = manager.start("q")
+
+    assert run["credential_status"]["semantic_scholar_configured"] is True
+    assert run["credential_status"]["openalex_configured"] is True
+    manager._run_pipeline(run["run_id"], "q")
+
+    kwargs = captured["config"].module_overrides["m2"].kwargs
+    assert kwargs["semantic_scholar_api_key"] == "env-s2-secret"
+    assert kwargs["openalex_api_key"] == "env-oa-secret"
+    assert kwargs["openalex_mailto"] == "env@example.org"
+    persisted = (
+        tmp_path / "runs" / run["run_id"] / "manifest.json"
+    ).read_text(encoding="utf-8")
+    assert "env-s2-secret" not in persisted
+    assert "env-oa-secret" not in persisted
 
 
 def test_run_manager_rejects_malformed_openalex_credentials(
@@ -9211,6 +11027,25 @@ def test_iteration_visualisation_element_ids_present() -> None:
     assert 'id="gapList"' in html
     # Plan version switching (consumes GET /api/runs/{id}/versions).
     assert 'id="planCard"' in html
+
+
+def test_web_ui_exposes_context_budget_metrics_and_collapses_credentials() -> None:
+    html = _read_index_html()
+
+    assert '<link rel="stylesheet" href="/assets/ui-polish.css">' in html
+    assert '<details class="cred-card" id="credCard">' in html
+    assert '<details class="cred-card" id="credCard" open>' not in html
+    for element_id in (
+        "contextPackCount",
+        "contextTokenCount",
+        "contextIncludedCount",
+        "contextDroppedCount",
+    ):
+        assert f'id="{element_id}"' in html
+    assert 'e.event_type === "llm_context_built"' in html
+    assert 'sumContextMetric("estimated_tokens")' in html
+    assert 'sumContextMetric("included_count")' in html
+    assert 'sumContextMetric("dropped_count")' in html
     assert 'id="planVersions"' in html
     # Followup entry (POST /api/runs with parent_run_id + followup).
     assert 'id="followupBox"' in html
@@ -9221,6 +11056,32 @@ def test_iteration_visualisation_element_ids_present() -> None:
     assert 'id="runErrorBanner"' in html
     assert 'id="artifactsList"' in html
     assert 'id="eventsList"' in html
+
+
+def test_web_ui_exposes_per_module_token_attribution() -> None:
+    html = _read_index_html()
+
+    for element_id in (
+        "tokenPipelineTotal",
+        "tokenScoringTotal",
+        "tokenCallCount",
+        "tokenDistribution",
+    ):
+        assert f'id="{element_id}"' in html
+    assert "token_usage_by_module" in html
+    assert "scoring_token_usage" in html
+    assert "renderTokenAttribution" in html
+
+
+def test_web_ui_distinguishes_post_pipeline_scoring_from_m6_completion() -> None:
+    html = _read_index_html()
+
+    assert 'id="postPipelineStatus"' in html
+    assert "postPipelineScoringActive" in html
+    assert "if(!postPipelineScoringActive) return" in html
+    assert "scoring_metric_started" in html
+    assert "独立评分中" in html
+    assert "独立评分完成" in html
 
 
 # ==================== test_pipeline ====================
@@ -9343,7 +11204,7 @@ def test_yaml_config_loads():
 
 
 def test_web_ui_timeout_budgets_cover_observed_llm_long_tail() -> None:
-    """Live timeouts must not cut off the observed 171-172s P90 calls."""
+    """Per-call limits stay bounded; multi-call M1 has no shared deadline."""
 
     config_path = Path(__file__).resolve().parent.parent / "configs" / "web_ui.yaml"
     config = PipelineConfig.from_yaml(str(config_path))
@@ -9351,11 +11212,20 @@ def test_web_ui_timeout_budgets_cover_observed_llm_long_tail() -> None:
 
     assert config.qwen.base.request_timeout_seconds >= 210.0
     assert config.qwen.plus.request_timeout_seconds >= 330.0
-    assert config.node_timeouts["m1"] >= 240.0
-    assert m4_kwargs["llm_call_timeout"] >= 360.0
+    assert config.node_timeouts["m1"] == 0.0
+    assert m4_kwargs["llm_call_timeout"] == 480.0
     assert m4_kwargs["llm_call_timeout"] > config.qwen.plus.request_timeout_seconds
     assert m4_kwargs["total_time_budget_seconds"] >= 840.0
     assert config.node_timeouts["m4"] > m4_kwargs["total_time_budget_seconds"]
+
+
+def test_web_ui_standard_mode_allows_three_global_iterations() -> None:
+    """Standard web runs retain enough budget for one additional repair round."""
+
+    config_path = Path(__file__).resolve().parent.parent / "configs" / "web_ui.yaml"
+    config = PipelineConfig.from_yaml(str(config_path))
+
+    assert config.max_iterations == 3
 
 
 # --------------------------------------------------------------------------- #
@@ -9938,6 +11808,124 @@ def test_openalex_oa_search_uses_filter_and_citation_sort(monkeypatch) -> None:
     assert "sort=cited_by_count%3Adesc" in captured["url"]
 
 
+def test_openalex_query_normalization_removes_natural_language_wildcards() -> None:
+    """Question punctuation must not be interpreted as OpenAlex wildcards."""
+
+    from hypoforge.tools.semantic_scholar import _normalize_openalex_query
+
+    assert _normalize_openalex_query(
+        "How does RAG reduce hallucinations?"
+    ) == "How does RAG reduce hallucinations"
+    assert _normalize_openalex_query(
+        "retrieval* augmented? generation"
+    ) == "retrieval augmented generation"
+
+
+def test_openalex_retries_transient_429_within_stage_deadline(
+    monkeypatch,
+) -> None:
+    """OpenAlex 429s are transient and must not discard the whole source."""
+
+    import time
+    import urllib.error
+
+    from hypoforge.tools import semantic_scholar
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"results": [], "meta": {"count": 0}}'
+
+    class Opener:
+        calls = 0
+
+        def open(self, request, timeout):
+            self.calls += 1
+            if self.calls == 1:
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    429,
+                    "Too Many Requests",
+                    {"Retry-After": "0"},
+                    None,
+                )
+            return Response()
+
+    opener = Opener()
+    waits = []
+    monkeypatch.setattr(semantic_scholar, "_NO_PROXY_OPENER", opener)
+    monkeypatch.setattr(semantic_scholar, "_rate_limit", lambda *args: None)
+    monkeypatch.setattr(
+        semantic_scholar,
+        "_sleep_with_deadline",
+        lambda seconds, deadline: waits.append(seconds),
+    )
+
+    payload = semantic_scholar._http_get_json(
+        "https://api.openalex.org/works?search=rag",
+        deadline=time.monotonic() + 5,
+    )
+
+    assert payload["results"] == []
+    assert opener.calls == 2
+    assert waits == [0.0]
+
+
+@pytest.mark.asyncio
+async def test_crossref_retries_one_transient_rate_limit(monkeypatch) -> None:
+    """A single public-pool 429 must not discard an otherwise valid query."""
+
+    from hypoforge.modules.m2_literature.sources import specialist_sources
+    from hypoforge.modules.m2_literature.sources.specialist_sources import (
+        CrossrefSource,
+        SpecialistSourceError,
+    )
+
+    calls = 0
+
+    async def fake_get(url, timeout, headers=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise SpecialistSourceError(
+                "HTTP 429 from specialist source",
+                status_code=429,
+                retry_after_seconds=0.0,
+            )
+        return {"message": {"items": [{
+            "DOI": "10.1000/retry",
+            "title": ["Recovered Crossref result"],
+            "author": [],
+            "published": {"date-parts": [[2025]]},
+            "container-title": ["Test Journal"],
+            "is-referenced-by-count": 1,
+            "type": "journal-article",
+        }]}}
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(specialist_sources, "_get", fake_get)
+    monkeypatch.setattr(specialist_sources.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(CrossrefSource, "_wait_for_slot", staticmethod(lambda: None))
+
+    papers = await CrossrefSource().search(SearchQuery(
+        query_id="q",
+        text="dynamic retrieval",
+        target_source="crossref",
+        purpose="test",
+        relation_to_question="test",
+    ), limit=1)
+
+    assert calls == 2
+    assert [paper.title for paper in papers] == ["Recovered Crossref result"]
+
+
 def test_m1_unknown_candidate_role_degrades_to_other() -> None:
     from hypoforge.modules.m1_problem_understanding import _CandidateEntity
 
@@ -10150,6 +12138,285 @@ class _FakeLLM:
 
 
 @pytest.mark.asyncio
+async def test_qwen_token_tracker_isolates_concurrent_runs() -> None:
+    """Per-run counters must not mix concurrent web requests."""
+    from types import SimpleNamespace
+
+    from hypoforge.tools.qwen_client import QwenClient, track_token_usage
+
+    QwenClient.reset_token_totals()
+
+    async def record(prompt_tokens: int, completion_tokens: int) -> dict:
+        with track_token_usage() as tracker:
+            await asyncio.sleep(0)
+            QwenClient._record_tokens(SimpleNamespace(response_metadata={
+                "token_usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                }
+            }))
+            await asyncio.sleep(0)
+            return tracker.snapshot()
+
+    first, second = await asyncio.gather(record(11, 3), record(29, 7))
+
+    assert first == {"input": 11, "output": 3, "calls": 1}
+    assert second == {"input": 29, "output": 7, "calls": 1}
+    assert QwenClient.get_token_totals() == (40, 10)
+    QwenClient.reset_token_totals()
+
+
+@pytest.mark.asyncio
+async def test_qwen_token_scopes_isolate_concurrent_tools_within_one_run() -> None:
+    from types import SimpleNamespace
+
+    from hypoforge.tools.qwen_client import (
+        QwenClient,
+        track_token_scope,
+        track_token_usage,
+    )
+
+    async def tool_call(prompt_tokens: int, completion_tokens: int) -> dict:
+        with track_token_scope() as scope:
+            await asyncio.sleep(0)
+            QwenClient._record_tokens(SimpleNamespace(response_metadata={
+                "token_usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                }
+            }))
+            await asyncio.sleep(0)
+            return scope.snapshot()
+
+    with track_token_usage() as run:
+        first, second = await asyncio.gather(tool_call(13, 2), tool_call(31, 5))
+
+    assert first == {"input": 13, "output": 2, "calls": 1}
+    assert second == {"input": 31, "output": 5, "calls": 1}
+    assert run.snapshot() == {"input": 44, "output": 7, "calls": 2}
+
+
+@pytest.mark.asyncio
+async def test_m2_reading_tool_event_records_isolated_token_usage(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from hypoforge.modules.m2_literature.reading.workflow import FullTextReadingWorkflow
+    from hypoforge.tools.qwen_client import QwenClient, track_token_usage
+
+    async def operation() -> str:
+        QwenClient._record_tokens(SimpleNamespace(response_metadata={
+            "token_usage": {"prompt_tokens": 19, "completion_tokens": 6}
+        }))
+        return "ok"
+
+    recorder = RunEventRecorder(tmp_path, "m2-tool-token")
+    timings: dict[str, float] = {}
+    with bind_recorder(recorder), track_token_usage():
+        result = await FullTextReadingWorkflow._measure(
+            timings,
+            "paper_reader",
+            operation,
+            details={"paper_id": "P1"},
+        )
+
+    assert result == "ok"
+    completed = next(
+        event for event in recorder.read_events()
+        if event["event_type"] == "tool_completed"
+    )
+    assert completed["details"]["paper_id"] == "P1"
+    assert completed["details"]["token_usage"] == {
+        "input": 19, "output": 6, "calls": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_m1_llm_call_event_records_scoped_token_usage(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from hypoforge.tools.qwen_client import QwenClient, track_token_usage
+
+    async def operation() -> str:
+        QwenClient._record_tokens(SimpleNamespace(response_metadata={
+            "token_usage": {"prompt_tokens": 23, "completion_tokens": 7}
+        }))
+        return "ok"
+
+    recorder = RunEventRecorder(tmp_path, "m1-tool-token")
+    module = M1ProblemUnderstanding()
+    with bind_recorder(recorder), track_token_usage():
+        result = await module._tracked_llm_call(
+            "qwen_entity_audit",
+            operation(),
+        )
+
+    assert result == "ok"
+    completed = next(
+        event for event in recorder.read_events()
+        if event["event_type"] == "llm_call_completed"
+    )
+    assert completed["tool"] == "qwen_entity_audit"
+    assert completed["details"]["token_usage"] == {
+        "input": 23, "output": 7, "calls": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_m4_observed_tool_records_scoped_token_usage(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from hypoforge.tools.qwen_client import QwenClient, track_token_usage
+
+    async def operation() -> str:
+        QwenClient._record_tokens(SimpleNamespace(response_metadata={
+            "token_usage": {"prompt_tokens": 31, "completion_tokens": 9}
+        }))
+        return "ok"
+
+    recorder = RunEventRecorder(tmp_path, "m4-tool-token")
+    with bind_recorder(recorder), track_token_usage():
+        result = await M4HypothesisGeneration._observe_tool(
+            "hypothesis_ranker",
+            operation(),
+        )
+
+    assert result == "ok"
+    completed = next(
+        event for event in recorder.read_events()
+        if event["event_type"] == "tool_completed"
+    )
+    assert completed["details"]["token_usage"] == {
+        "input": 31, "output": 9, "calls": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_independent_metric_emits_progress_and_token_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Long posthoc scoring must identify the active metric and its cost."""
+    from types import SimpleNamespace
+
+    from hypoforge.evaluation.metrics import MetricRegistry
+    from hypoforge.evaluation.scorer import score_hypothesis_async
+    from hypoforge.tools.qwen_client import QwenClient, track_token_usage
+
+    class FakeMetric:
+        implemented = True
+        independent = True
+
+        def __init__(self, **kwargs):
+            pass
+
+        async def compute(self, hypothesis, knowledge_entries, evidence_graph=None):
+            QwenClient._record_tokens(SimpleNamespace(response_metadata={
+                "token_usage": {"prompt_tokens": 17, "completion_tokens": 4}
+            }))
+            return 0.75
+
+    monkeypatch.setattr(MetricRegistry, "list_all", classmethod(lambda cls: ["fake_metric"]))
+    monkeypatch.setattr(
+        MetricRegistry, "get", classmethod(lambda cls, name: FakeMetric)
+    )
+    recorder = RunEventRecorder(tmp_path, "score-token-run")
+    hypothesis = HypothesisCard(
+        hypothesis_id="H-score",
+        statement="Independent scoring should be observable.",
+    )
+
+    with bind_recorder(recorder), track_token_usage() as tracker:
+        result = await score_hypothesis_async(hypothesis, [])
+
+    assert result["independent"]["fake_metric"] == 0.75
+    assert tracker.snapshot() == {"input": 17, "output": 4, "calls": 1}
+    metric_events = [
+        event for event in recorder.read_events()
+        if event["tool"] == "metric:fake_metric"
+    ]
+    assert [event["event_type"] for event in metric_events] == [
+        "scoring_metric_started", "scoring_metric_completed"
+    ]
+    assert metric_events[-1]["details"]["token_usage"] == {
+        "input": 17, "output": 4, "calls": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_evidence_consistency_batches_atomic_conflict_verdicts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All threat-bearing claims should share one structured judge call."""
+
+    from types import MethodType
+
+    from hypoforge.evaluation.metrics import EvidenceConsistencyMetric
+    from hypoforge.state import EvidenceEdge, EvidenceEdgeRelation
+
+    class BatchJudge:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def structured_chat(self, **kwargs: Any) -> dict[str, Any]:
+            self.calls.append(kwargs)
+            return {
+                "verdicts": [
+                    {"claim_index": 0, "support_status": "direct_support", "rationale": "ok"},
+                    {"claim_index": 1, "support_status": "contradicted", "rationale": "conflict"},
+                    {"claim_index": 2, "support_status": "direct_support", "rationale": "ok"},
+                ]
+            }
+
+    metric = EvidenceConsistencyMetric()
+    metric._client = BatchJudge()
+
+    async def fake_decompose(self, hypothesis):
+        return [
+            {"claim": "claim zero", "subject": "a", "object": "b"},
+            {"claim": "claim one", "subject": "a", "object": "b"},
+            {"claim": "claim two", "subject": "a", "object": "b"},
+        ]
+
+    monkeypatch.setattr(
+        metric,
+        "_decompose_hypothesis",
+        MethodType(fake_decompose, metric),
+    )
+    anchor = EvidenceNode(id="A", type=EvidenceNodeType.CLAIM, label="anchor")
+    threat = EvidenceNode(id="T", type=EvidenceNodeType.CONFLICT, label="threat")
+    graph = EvidenceGraph(
+        nodes=[anchor, threat],
+        edges=[EvidenceEdge(
+            source="A",
+            target="T",
+            relation=EvidenceEdgeRelation.CONTRADICTS,
+        )],
+    )
+    monkeypatch.setattr(metric, "_keyword_search", lambda *args, **kwargs: [anchor])
+    monkeypatch.setattr(metric, "_build_threat_context", lambda *args: [threat])
+
+    result = await metric.compute(
+        HypothesisCard(hypothesis_id="H-batch", statement="batch claims"),
+        [],
+        evidence_graph=graph,
+    )
+
+    score, trace = result
+    assert score == pytest.approx(2 / 3, abs=1e-4)
+    assert len(metric._client.calls) == 1
+    assert len(trace["atomic_claims"]) == 3
+    assert [
+        item["support_evaluation"]["support_status"]
+        for item in trace["atomic_claims"]
+    ] == ["direct_support", "contradicted", "direct_support"]
+
+
+@pytest.mark.asyncio
 async def test_qwen_structured_chat_unwraps_alternate_array_key() -> None:
     """A2: array schema wrapped under a non-"entries" key still unwraps."""
     from hypoforge.tools.qwen_client import QwenClient
@@ -10340,16 +12607,21 @@ async def test_entity_ambiguous_merge_defers_instead_of_aborting(tmp_path) -> No
 @pytest.mark.asyncio
 async def test_m4_zero_valid_candidates_get_retry_with_contract_feedback() -> None:
     """D1: a fully-discarded batch still gets one retry carrying the
-    contract-failure reasons; a still-empty result keeps the hard error."""
-    module = StrictM4HypothesisGeneration(mode="multi_agent")
+    contract-failure reasons; a still-empty result degrades audibly."""
+    module = StrictM4HypothesisGeneration(mode="multi_agent", top_k=1)
     module.client = object()  # satisfies the client guard; LLM calls are stubbed
     batches = []
 
     async def fake_generate(
         state, *, question, graph_context, feedback_context,
-        tool_name, attempt, requested_count=None,
+        tool_name, attempt, requested_count=None, disable_thinking=None,
     ):
-        batches.append((tool_name, feedback_context))
+        batches.append({
+            "tool": tool_name,
+            "feedback": feedback_context,
+            "requested_count": requested_count,
+            "disable_thinking": disable_thinking,
+        })
         if attempt == 1:
             return [], [], [{
                 "hypothesis_id": "H1",
@@ -10358,22 +12630,30 @@ async def test_m4_zero_valid_candidates_get_retry_with_contract_feedback() -> No
             }]
         return [], [], []
 
-    async def fake_repair(*, state, context, candidates, failures, feedback_context):
+    async def fake_repair(
+        *, state, context, candidates, failures, feedback_context,
+        requested_count=None, disable_thinking=True,
+    ):
         return [], []
 
     module._generate_hypothesis_batch = fake_generate
     module._repair_context_contract = fake_repair
 
-    with pytest.raises(ValueError, match="no task-contract-compliant hypotheses"):
-        await module._run_llm(
-            PipelineState(input_question="Q", problem_card=make_problem_card())
-        )
+    output = await module._run_llm(
+        PipelineState(input_question="Q", problem_card=make_problem_card())
+    )
 
-    assert [tool for tool, _ in batches] == [
+    assert [item["tool"] for item in batches] == [
         "hypothesis_generator", "hypothesis_generator_retry",
     ]
+    assert batches[1]["requested_count"] == 1
+    assert batches[1]["disable_thinking"] is True
     assert "missing required task entities in their required output scope: disease" \
-        in batches[1][1]
+        in batches[1]["feedback"]
+    assert len(output["top_hypotheses"]) == 1
+    assert "continuity fallback" in (
+        output["top_hypotheses"][0].ranking_rationale.casefold()
+    )
 
 
 @pytest.mark.asyncio
@@ -10438,8 +12718,8 @@ async def test_m4_iteration_feedback_includes_task_contract_reminder() -> None:
 
     feedback = batches[0][1]
     assert feedback.startswith("Task-contract reminder")
-    assert "microbiome, health, disease" in feedback
-    assert "R1" in feedback
+    assert SYNTHESIS_REQUIREMENT_ID in feedback
+    assert "R1" not in feedback
     assert "not novel enough" in feedback
 
 
@@ -10797,6 +13077,57 @@ async def test_preprint_phase_is_skipped_after_fulltext_target_is_met() -> None:
     assert readings == [fulltext]
 
 
+@pytest.mark.asyncio
+async def test_zero_fulltext_target_never_invokes_preprint_supplement() -> None:
+    """An explicit zero is a disable switch, not a request for final_k."""
+
+    from types import MethodType, SimpleNamespace
+    from hypoforge.literature.adapter import AgenticM2Adapter
+    from hypoforge.literature.models import SearchRunResult
+
+    class EmptySearchAgent:
+        final_k = 2
+
+        async def run(self, sub_question, **kwargs):
+            return SearchRunResult(sub_question=sub_question)
+
+    class EmptyReadingWorkflow:
+        async def run(self, sub_question, papers, search_context=None):
+            return []
+
+    observed_targets: list[int] = []
+    adapter = AgenticM2Adapter(
+        search_agent=EmptySearchAgent(),
+        reading_workflow=EmptyReadingWorkflow(),
+        fulltext_backfill_enabled=False,
+        fulltext_backfill_target=0,
+        allow_empty_results=True,
+    )
+
+    async def record_supplement(
+        self, sub_question, domains, key_entities, search_result,
+        reading_results, attempted_ids, target,
+    ):
+        observed_targets.append(target)
+        return search_result, reading_results
+
+    adapter._supplement_preprint_fulltext = MethodType(
+        record_supplement, adapter
+    )
+    question = "How can retrieval improve scientific question answering?"
+    state = PipelineState(
+        input_question=question,
+        problem_card=ProblemCard(
+            original_question=question,
+            sub_questions=[question],
+        ),
+    )
+
+    await adapter._run_fresh_subquestion(state, [], 0, question)
+
+    assert observed_targets == [0]
+
+
 if __name__ == "__main__":
     # Allow running directly: python tests/test_pipeline.py
     async def _run_all():
@@ -10818,3 +13149,365 @@ if __name__ == "__main__":
         print("[PASS] Reason-before-score field order")
         print("\nAll offline unit tests passed!")
     asyncio.run(_run_all())
+
+
+# ---------------------------------------------------------------------------
+# Fast mode (new)
+# ---------------------------------------------------------------------------
+
+def test_fast_preset_disables_iteration_and_sets_quick_switches() -> None:
+    """Fast preset must be a one-pass config with reduced search and no review loops."""
+    from hypoforge.config import PipelineConfig
+
+    config = PipelineConfig()
+    config.apply_fast_mode_preset()
+
+    assert config.run_mode == "fast"
+    assert config.enable_iteration is False
+    assert config.m6_evidence_revisit is False
+    assert config.followup_routing is True
+    assert config.max_iterations == 1
+    assert config.max_search_rounds == 1
+    assert config.search.max_rounds == 1
+    assert config.search.max_queries == 6
+    assert config.scoring.auto_score is False
+    assert config.module_overrides["m4"].kwargs["mode"] == "fast"
+    assert config.module_overrides["m4"].kwargs["fast_mode"] is True
+    assert config.module_overrides["m6"].kwargs["fast_mode"] is True
+    assert config.module_overrides["m6"].kwargs["reviewers"] == ["overall"]
+    assert config.module_overrides["m2"].kwargs["abstract_only"] is True
+    assert config.module_overrides["m2"].kwargs["fulltext_target_per_subquestion"] == 0
+    assert config.module_overrides["m2"].kwargs["preprint_supplement_enabled"] is False
+    assert config.module_overrides["m2"].kwargs["source_timeout_seconds"] == 15.0
+    assert config.module_overrides["m2"].kwargs["fast_mode"] is True
+    assert config.module_overrides["m2"].kwargs["scout_candidate_limit"] == 8
+    assert config.module_overrides["m2"].kwargs["scout_abstract_char_limit"] == 1800
+    assert config.module_overrides["m2"].kwargs["scout_max_tokens"] == 3072
+
+
+def test_web_standard_mode_bounds_semantic_scout_pool() -> None:
+    """Standard web runs keep a wide pool but avoid a third 8-paper LLM batch."""
+    from hypoforge.config import PipelineConfig
+
+    config = PipelineConfig.from_yaml("configs/web_ui.yaml")
+
+    assert config.module_overrides["m2"].kwargs["scout_candidate_limit"] == 16
+
+
+def test_fast_m4_contract_requires_the_whole_original_question() -> None:
+    """A one-pass final hypothesis cannot defer part of the user's question."""
+    from hypoforge.modules.m4_hypothesis_generation import M4HypothesisGeneration
+
+    block = M4HypothesisGeneration._render_task_contract_block(
+        _pose_estimation_contract_state(),
+        require_all=True,
+    )
+
+    assert "original question as a whole" in block
+    assert SYNTHESIS_REQUIREMENT_ID in block
+    assert "R1" not in block and "R2" not in block
+    assert "select one or more" not in block
+
+
+def test_fast_mode_keeps_user_followup_routes_but_disables_internal_loops() -> None:
+    """Fast followups still need M1→M4 and M1→M2 routing choices."""
+    from hypoforge.config import PipelineConfig
+
+    config = PipelineConfig(verbose=False)
+    config.apply_fast_mode_preset()
+    edges = _edges_of(config)
+
+    assert ("m1", "m4") in edges
+    assert ("m1", "m2") in edges
+    assert ("m6", "m2") not in edges
+    assert ("m6", "m4") not in edges
+
+
+def test_fast_preset_has_no_module_total_deadlines_and_uses_rule_m3() -> None:
+    """No outer/shared deadline may pre-empt fast-mode fallbacks."""
+    from hypoforge.config import PipelineConfig
+
+    config = PipelineConfig()
+    config.apply_fast_mode_preset()
+
+    assert config.node_timeout_default == 0.0
+    assert set(config.node_timeouts.values()) == {0.0}
+    assert config.module_overrides["m2"].kwargs["fresh_run_timeout_seconds"] == 0.0
+    assert config.module_overrides["m2"].kwargs["allow_empty_results"] is True
+    assert config.module_overrides["m3"].kwargs["mode"] == "rule"
+    assert config.module_overrides["m3"].kwargs["allow_empty_graph"] is True
+    assert config.module_overrides["m3"].kwargs["enable_cross_batch"] is False
+    assert config.module_overrides["m4"].kwargs["total_time_budget_seconds"] == 0.0
+
+
+def test_fast_preset_reaches_the_strict_runtime_modules() -> None:
+    """Strict facade replacement must preserve fast-mode resilience flags."""
+    from hypoforge import modules as _modules  # noqa: F401
+    from hypoforge.config import PipelineConfig
+    from hypoforge.registry import ModuleRegistry
+
+    config = PipelineConfig.from_yaml("configs/web_ui.yaml")
+    config.apply_fast_mode_preset()
+    modules = ModuleRegistry.build_all(config)
+
+    assert modules["m1"].fast_mode is True
+    assert modules["m2"].adapter.fresh_run_timeout_seconds == 0.0
+    assert modules["m2"].adapter.allow_empty_results is True
+    # Fast mode keeps the two quality-critical LLM steps (Scout + PaperReader)
+    # but drops auxiliary entity/grouping/retention judge calls.
+    assert modules["m2"].adapter.entity_judge_client is None
+    assert modules["m2"].adapter.subquestion_entity_client is None
+    assert modules["m2"].adapter.search_agent.entity_classifier is None
+    assert modules["m2"].adapter.search_agent.retention_judge_client is None
+    assert modules["m2"].adapter.search_agent.scout_candidate_limit == 8
+    assert modules["m2"].adapter.search_agent.scout_reader.client is not None
+    assert modules["m2"].adapter.search_agent.scout_reader.abstract_char_limit == 1800
+    assert modules["m2"].adapter.search_agent.scout_reader.max_tokens == 3072
+    assert modules["m2"].adapter.reading_workflow.reader.client is not None
+    assert modules["m3"].mode == "rule"
+    assert modules["m3"].allow_empty_graph is True
+
+
+@pytest.mark.asyncio
+async def test_zero_fresh_m2_deadline_waits_for_workers_to_finish() -> None:
+    """A zero shared deadline means wait for completion, not immediate timeout."""
+    question = "atomic question 1"
+    adapter = AgenticM2Adapter(
+        search_agent=_ConcurrentFreshSearchAgent(),
+        reading_workflow=EchoReadingWorkflow(with_evidence=True),
+        fresh_run_timeout_seconds=0,
+    )
+    state = PipelineState(
+        input_question="Q",
+        problem_card=ProblemCard(
+            original_question="Q",
+            sub_questions=[question],
+            key_entities=["object"],
+            domain=["science"],
+        ),
+    )
+
+    output = await adapter(state)
+
+    assert output["literature_results"][0].papers_retrieved == 1
+
+
+@pytest.mark.asyncio
+async def test_fast_m2_exports_failures_when_every_subquestion_fails() -> None:
+    """Fast mode records real source failures and lets downstream fallbacks run."""
+    questions = ["atomic question 1", "atomic question 2"]
+    adapter = AgenticM2Adapter(
+        search_agent=_ConcurrentFreshSearchAgent(failing_questions=set(questions)),
+        reading_workflow=EchoReadingWorkflow(with_evidence=True),
+        fresh_run_timeout_seconds=0,
+        allow_empty_results=True,
+    )
+    state = PipelineState(
+        input_question="Q",
+        problem_card=ProblemCard(
+            original_question="Q",
+            sub_questions=questions,
+            key_entities=["object"],
+            domain=["science"],
+        ),
+    )
+
+    output = await adapter(state)
+
+    assert [item.papers_retrieved for item in output["literature_results"]] == [0, 0]
+    assert all(
+        run.search_provenance.stop_reason == "error"
+        for run in output["m2_knowledge_export"].runs
+    )
+    assert len(output["errors"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_fast_rule_m3_allows_an_auditable_empty_graph() -> None:
+    """A real zero-evidence M2 result must not block fast-mode scheme generation."""
+    from hypoforge.modules.m3_evidence_graph import M3EvidenceGraph
+
+    module = M3EvidenceGraph(
+        mode="rule",
+        allow_empty_graph=True,
+        entity_merge_enabled=False,
+    )
+
+    output = await module(PipelineState(input_question="Q"))
+
+    assert output["evidence_graph"].nodes == []
+    assert output["evidence_graph"].edges == []
+    assert output["metrics"]["m3_degraded_empty_graph"] is True
+
+
+@pytest.mark.asyncio
+async def test_fast_m4_second_generator_failure_uses_fallback(monkeypatch) -> None:
+    """The optional second generation attempt cannot terminate a fast run."""
+    from hypoforge.modules.m4_hypothesis_generation import M4HypothesisGeneration
+
+    module = M4HypothesisGeneration(mode="fast", fast_mode=True, top_k=1)
+    module.client = object()
+    calls = 0
+
+    async def generation(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return [], [], []
+        raise TimeoutError("simulated retry timeout")
+
+    monkeypatch.setattr(module, "_generate_hypothesis_batch", generation)
+
+    output = await module._run_llm(PipelineState(input_question="Q"))
+
+    assert len(output["candidate_hypotheses"]) == 3
+    assert len(output["top_hypotheses"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_fast_m4_skips_slow_contract_repair_and_uses_fallback(monkeypatch) -> None:
+    """After one retry, fast mode must not spend another LLM call on repair."""
+    from hypoforge.modules.m4_hypothesis_generation import M4HypothesisGeneration
+
+    module = M4HypothesisGeneration(mode="fast", fast_mode=True, top_k=1)
+    module.client = object()
+    repair_calls = 0
+
+    async def empty_generation(*args, **kwargs):
+        return [], [], []
+
+    async def failed_repair(*args, **kwargs):
+        nonlocal repair_calls
+        repair_calls += 1
+        raise TimeoutError("simulated repair timeout")
+
+    monkeypatch.setattr(module, "_generate_hypothesis_batch", empty_generation)
+    monkeypatch.setattr(module, "_repair_context_contract", failed_repair)
+
+    output = await module._run_llm(PipelineState(input_question="Q"))
+
+    assert len(output["candidate_hypotheses"]) == 3
+    assert len(output["top_hypotheses"]) == 1
+    assert repair_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_fast_m5_malformed_model_payload_uses_fallback_plan() -> None:
+    """Schema-invalid model output must degrade to a usable plan in fast mode."""
+    from hypoforge.modules.m5_research_plan import M5ResearchPlan
+
+    class MalformedPlanClient:
+        async def structured_chat(self, **kwargs):
+            return {}
+
+    hypothesis = HypothesisCard(hypothesis_id="H-fast", statement="Test hypothesis")
+    module = M5ResearchPlan(fast_mode=True)
+    module.client = MalformedPlanClient()
+
+    output = await module(PipelineState(
+        input_question="Q",
+        top_hypotheses=[hypothesis],
+    ))
+
+    assert len(output["research_plans"]) == 1
+    assert output["research_plans"][0].hypothesis_id == "H-fast"
+    assert output["research_plans"][0].procedures
+
+
+@pytest.mark.asyncio
+async def test_fast_m5_repairs_alignment_locally_without_second_llm_call() -> None:
+    """A quick run must not spend a second full plan call on lexical alignment."""
+    from hypoforge.modules.m5_research_plan import M5ResearchPlan
+
+    class MisalignedPlanClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def structured_chat(self, **kwargs):
+            self.calls += 1
+            return ResearchPlan(
+                study_subjects="Generic language-model benchmark",
+                independent_variables=["retrieval policy"],
+                dependent_variables=["accuracy"],
+                control_groups=["static baseline"],
+                procedures=["Run the generated protocol"],
+                measurement_metrics=["factual accuracy"],
+                analysis_methods=["paired comparison"],
+                expected_results_if_supported="Accuracy improves.",
+                expected_results_if_refuted="Accuracy does not improve.",
+                timeline="Two weeks.",
+                risks_and_alternatives="Use a larger benchmark.",
+            ).model_dump(mode="json")
+
+    question = (
+        "How can retrieval-augmented generation maintain factual grounding "
+        "in changing scientific literature?"
+    )
+    state = _contract_state(
+        "retrieval-augmented generation",
+        "RAG",
+        "maintain factual grounding",
+        question,
+    )
+    state.top_hypotheses = [HypothesisCard(
+        hypothesis_id="H-fast-align",
+        statement="Dynamic retrieval improves factual grounding.",
+    )]
+    client = MisalignedPlanClient()
+    module = M5ResearchPlan(fast_mode=True)
+    module.client = client
+
+    output = await module(state)
+
+    plan = output["research_plans"][0]
+    assert client.calls == 1
+    assert "retrieval-augmented generation" in plan.study_subjects.casefold()
+    assert plan.procedures == ["Run the generated protocol"]
+
+
+def test_fast_m4_fallback_always_returns_three_hypotheses() -> None:
+    """Fast mode's deterministic fallback must never leave M4 empty."""
+    from hypoforge.modules.m4_hypothesis_generation import M4HypothesisGeneration
+    from hypoforge.state import PipelineState
+
+    module = M4HypothesisGeneration(mode="fast", fast_mode=True)
+    cards = module._fast_fallback_hypotheses(
+        PipelineState(input_question="How can an AI model develop sentience?"),
+        "How can an AI model develop sentience?",
+    )
+
+    assert len(cards) == 3
+    assert all(card.statement for card in cards)
+    assert all(card.hypothesis_id for card in cards)
+
+
+def test_fast_mode_pipeline_runner_exposes_fast_config() -> None:
+    """PipelineRunner uses fast config without standard routing edges."""
+    from hypoforge.config import PipelineConfig
+    from hypoforge.pipeline import PipelineRunner
+
+    config = PipelineConfig()
+    config.apply_fast_mode_preset()
+    runner = PipelineRunner(config)
+
+    assert runner.config.run_mode == "fast"
+    assert runner.config.enable_iteration is False
+    assert runner.config.m6_evidence_revisit is False
+
+
+def test_fast_m5_fallback_returns_plan() -> None:
+    """Fast mode M5 fallback always returns a research plan for a hypothesis."""
+    from hypoforge.modules.m5_research_plan import M5ResearchPlan
+    from hypoforge.state import PipelineState
+
+    class FakeH:
+        hypothesis_id = "H-fallback"
+
+    plan = M5ResearchPlan._fast_fallback_plan(
+        PipelineState(input_question="Test question"),
+        FakeH(),
+        rationale="fast fallback",
+    )
+    assert plan.hypothesis_id == "H-fallback"
+    assert plan.study_subjects
+    assert plan.procedures

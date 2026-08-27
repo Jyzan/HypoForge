@@ -45,6 +45,7 @@ class EvidenceNodeType(str, Enum):
     LIMITATION = "limitation"
     CONFLICT = "conflict"
     ENTITY = "entity"
+    HYPOTHESIS = "hypothesis"
 
 
 class EvidenceEdgeRelation(str, Enum):
@@ -67,6 +68,7 @@ class ReviewerDimension(str, Enum):
     TESTABILITY = "testability_metric"
     NOVELTY = "novelty_metric"
     OBJECTIVE_EVIDENCE_CONSISTENCY = "objective_evidence_consistency"
+    EXPERIMENTAL_VALIDATION_COVERAGE = "experimental_validation_coverage"
     OVERALL = "overall"
 
 
@@ -262,6 +264,10 @@ class LiteratureResult(BaseModel):
     sub_question: str
     papers_retrieved: int = 0
     knowledge_entries: List[KnowledgeEntry] = Field(default_factory=list)
+    # Explicit routing provenance.  Text matching is not reliable once an M6
+    # evidence-gap description is converted into a supplement sub-question.
+    origin_gap_ids: List[str] = Field(default_factory=list)
+    origin_gap_request_ids: List[str] = Field(default_factory=list)
 
 
 # ============================================================================
@@ -374,6 +380,50 @@ class EvidenceGraph(BaseModel):
 # M4 产出 — Hypothesis Cards
 # ============================================================================
 
+HypothesisGroundingStatus = Literal[
+    "legacy_unknown",
+    "evidence_backed",
+    "mixed",
+    "bridge_only",
+]
+
+class HypothesisPremise(BaseModel):
+    """One epistemically explicit premise used by an M4 hypothesis.
+
+    ``evidence_backed`` premises may be strengthened only by canonical
+    evidence IDs.  ``unverified_bridge`` premises are graph hypotheses
+    created by M3 after an effective search leaves a relation unresolved;
+    they must never claim paper or evidence provenance.
+    """
+
+    premise_id: str
+    claim: str
+    kind: Literal["evidence_backed", "unverified_bridge"]
+    required: bool = True
+    supporting_evidence_ids: List[str] = Field(default_factory=list)
+    source_paper_ids: List[str] = Field(default_factory=list)
+    bridge_hypothesis_node_id: str = ""
+    origin_gap_id: str = ""
+    audit_verdict: Literal[
+        "supported", "partially_supported", "unsupported",
+        "contradicted", "invalid_citation", "not_applicable",
+    ] = "not_applicable"
+    audit_reason: str = ""
+    original_claim: str = ""
+
+    @model_validator(mode="after")
+    def validate_epistemic_source(self) -> "HypothesisPremise":
+        if self.kind == "evidence_backed":
+            if self.bridge_hypothesis_node_id:
+                raise ValueError("evidence-backed premise cannot reference a bridge node")
+        else:
+            if self.supporting_evidence_ids or self.source_paper_ids:
+                raise ValueError("unverified bridge cannot claim canonical evidence")
+            if not self.bridge_hypothesis_node_id:
+                raise ValueError("unverified bridge requires a hypothesis node ID")
+        return self
+
+
 class HypothesisCard(BaseModel):
     """A single candidate hypothesis (M4 output)."""
 
@@ -392,6 +442,16 @@ class HypothesisCard(BaseModel):
     # Multi-dimensional scores (populated by Ranker in M4)
     scores: Dict[str, float] = Field(default_factory=dict)
 
+    # Explicit epistemic structure.  Defaults keep historical checkpoints
+    # loadable and preserve the legacy M5/M6 fields above.
+    factual_premises: List[HypothesisPremise] = Field(default_factory=list)
+    working_assumptions: List[HypothesisPremise] = Field(default_factory=list)
+    research_gap: str = ""
+    # New M4 outputs must replace this compatibility value with an explicit
+    # epistemic status at the module boundary.  Keeping the default here lets
+    # historical checkpoints load without a migration step.
+    grounding_status: HypothesisGroundingStatus = "legacy_unknown"
+
 
 class EvidenceGapRequest(BaseModel):
     """A searchable M4 evidence gap with an auditable bounded lifecycle."""
@@ -409,12 +469,22 @@ class EvidenceGapRequest(BaseModel):
     suggested_queries: List[str] = Field(default_factory=list)
     executed_queries: List[str] = Field(default_factory=list)
     status: Literal[
-        "pending", "searched", "indexed", "resolved", "exhausted",
+        "pending", "searched", "indexed", "resolved", "hypothesized", "exhausted",
     ] = "pending"
     attempts: int = Field(default=0, ge=0)
     created_iteration: int = Field(default=0, ge=0)
     resolution_evidence_ids: List[str] = Field(default_factory=list)
+    audit_claim: str = ""
+    bridge_hypothesis_node_id: str = ""
     rationale: str = ""
+    premise_id: str = ""
+    scientific_resolution: Literal[
+        "unreviewed", "supported", "contradicted", "unresolved",
+    ] = "unreviewed"
+    contradicting_evidence_ids: List[str] = Field(default_factory=list)
+    search_completed: bool = False
+    technical_errors: List[str] = Field(default_factory=list)
+    corrected_claim: str = ""
 
 
 # ============================================================================
@@ -431,6 +501,53 @@ class ResearchPlanEvidenceLink(BaseModel):
     support_status: Literal[
         "supported", "hypothesis_to_validate", "unsupported"
     ] = "hypothesis_to_validate"
+
+
+class ValidationTarget(BaseModel):
+    """One M4 claim that M5 must be able to test or falsify."""
+
+    target_id: str
+    hypothesis_id: str
+    target_kind: Literal[
+        "statement", "mechanism", "prediction",
+        "falsification", "working_assumption",
+    ]
+    target_text: str
+    required: bool = True
+    bridge_hypothesis_node_id: str = ""
+
+
+class ValidationCoverageItem(BaseModel):
+    """M6's auditable mapping from one M4 target to M5 methods."""
+
+    target_id: str
+    target_kind: str
+    target_text: str
+    verdict: Literal["covered", "partial", "missing"]
+    procedure_refs: List[str] = Field(default_factory=list)
+    measurement_refs: List[str] = Field(default_factory=list)
+    control_refs: List[str] = Field(default_factory=list)
+    analysis_refs: List[str] = Field(default_factory=list)
+    bridge_validation_refs: List[str] = Field(default_factory=list)
+    falsification_text: str = ""
+    rationale: str = ""
+
+
+class ExperimentalValidationVerdict(BaseModel):
+    """Structured M6 verdict for whether M5 can test M4's hypothesis."""
+
+    sufficient: bool
+    items: List[ValidationCoverageItem] = Field(default_factory=list)
+    rationale: str = ""
+
+
+class WorkingAssumptionValidation(BaseModel):
+    """An explicit M5 experiment covering one unresolved M3 bridge."""
+
+    bridge_hypothesis_node_id: str
+    procedure: str
+    measurement: str
+    falsification_condition: str
 
 
 class ResearchPlan(BaseModel):
@@ -451,6 +568,7 @@ class ResearchPlan(BaseModel):
     supporting_evidence_ids: List[str] = Field(default_factory=list)
     source_paper_ids: List[str] = Field(default_factory=list)
     evidence_links: List[ResearchPlanEvidenceLink] = Field(default_factory=list)
+    bridge_validations: List[WorkingAssumptionValidation] = Field(default_factory=list)
     task_trace: TaskTrace = Field(default_factory=TaskTrace)
 
 
@@ -604,6 +722,8 @@ class M2KnowledgeRun(BaseModel):
     evidence: List[M2EvidenceExport] = Field(default_factory=list)
     knowledge_entries: List[KnowledgeEntry] = Field(default_factory=list)
     search_provenance: M2SearchProvenance = Field(default_factory=M2SearchProvenance)
+    origin_gap_ids: List[str] = Field(default_factory=list)
+    origin_gap_request_ids: List[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_provenance(self) -> "M2KnowledgeRun":
@@ -789,6 +909,10 @@ class EvidenceGap(BaseModel):
       grounding to confirm the new evidence actually closes the gap;
     * ``closed`` — resolved (confirmed or disappeared while sufficient);
     * ``unimprovable`` — cannot be addressed by more searching.
+
+    The ``scientific_resolution`` field is authoritative for modern M6
+    supplement rounds; ``status`` remains a lifecycle marker for backward
+    compatibility with legacy checkpoints.
     """
 
     gap_id: str = ""
@@ -800,6 +924,24 @@ class EvidenceGap(BaseModel):
     source_review_version: int = 0
     status: Literal["open", "pending_grounding", "closed", "unimprovable"] = "open"
     attempts: int = 0
+    # Gap-specific scientific outcome.  Defaults keep old checkpoints
+    # loadable while preventing M3 from using evidence-count as a verdict.
+    hypothesis_ids: List[str] = Field(default_factory=list)
+    # Stable provenance back to the M4/M5 claim that produced this gap.  The
+    # defaults keep historical checkpoints loadable and let routing
+    # distinguish a missing fact from a contradicted one without parsing
+    # free-form descriptions.
+    source_claim_type: Literal["", "factual_premise", "plan_fact"] = ""
+    source_claim_id: str = ""
+    scientific_resolution: Literal[
+        "unreviewed", "supported", "contradicted", "unresolved",
+    ] = "unreviewed"
+    resolution_evidence_ids: List[str] = Field(default_factory=list)
+    contradicting_evidence_ids: List[str] = Field(default_factory=list)
+    search_completed: bool = False
+    technical_errors: List[str] = Field(default_factory=list)
+    bridge_hypothesis_node_id: str = ""
+    rationale: str = ""
 
     @model_validator(mode="after")
     def _ensure_gap_id(self) -> "EvidenceGap":
@@ -809,12 +951,27 @@ class EvidenceGap(BaseModel):
         return self
 
 
+class FactualPremiseAudit(BaseModel):
+    """M6's persisted per-premise audit summary for the result/UI layer."""
+
+    premise_id: str
+    claim: str
+    verdict: Literal[
+        "supported", "partially_supported", "unsupported",
+        "contradicted", "invalid_citation", "not_applicable",
+    ] = "unsupported"
+    evidence_ids: List[str] = Field(default_factory=list)
+    corrected_claim: str = ""
+    rationale: str = ""
+
+
 class EvidenceSufficiencyVerdict(BaseModel):
     """M6 structured verdict: is the current evidence base sufficient?"""
 
     sufficient: bool
     gaps: List[EvidenceGap] = Field(default_factory=list)
     evidence_ids: List[str] = Field(default_factory=list)
+    premise_audits: List[FactualPremiseAudit] = Field(default_factory=list)
     rationale: str = ""
 
 
@@ -824,7 +981,7 @@ class RoutingDecision(BaseModel):
     round: int
     from_module: str
     to_module: str
-    decided_by: Literal["m6", "m1", "policy"]
+    decided_by: Literal["m6", "m4", "m1", "policy"]
     reason: str = ""
     gap_ids: List[str] = Field(default_factory=list)
 
@@ -886,6 +1043,7 @@ class PipelineState(BaseModel):
 
     # ---- M6 + iteration ----
     reviews: List[ReviewResult] = Field(default_factory=list)
+    experimental_validation_verdict: Optional[ExperimentalValidationVerdict] = None
     # iteration_count = number of M6 review rounds; doubles as the GLOBAL hard
     # stop (supplement rounds also consume this budget: global cap = max_iterations).
     iteration_count: int = 0
@@ -924,3 +1082,9 @@ class PipelineState(BaseModel):
     # ---- token tracking (populated by LLM-calling modules) ----
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    # Aggregated across repeated visits (for example M6 -> M2 -> M3 -> M4).
+    # Each row has ``input``, ``output`` and successful response ``calls``.
+    token_usage_by_module: Dict[str, Dict[str, int]] = Field(default_factory=dict)
+    # Post-pipeline independent evaluation is intentionally separate: it runs
+    # after M6 and must not make M6 appear more expensive than it is.
+    scoring_token_usage: Dict[str, int] = Field(default_factory=dict)

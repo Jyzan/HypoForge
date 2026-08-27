@@ -25,10 +25,10 @@ from .entity_normalization import (
     _stable_id,
     clean_entity_surface,
 )
-from .literature.adapter import AgenticM2Adapter
+from .modules.m2_literature.adapter import AgenticM2Adapter
 from .modules.m2_literature_search import M2LiteratureSearch
-from .literature.export import build_m2_knowledge_export_run
-from .literature.models import (
+from .modules.m2_literature.export import build_m2_knowledge_export_run
+from .modules.m2_literature.models import (
     PaperRecord,
     QueryIntent,
     SearchQuery,
@@ -1034,6 +1034,7 @@ class StrictM2LiteratureSearch(M2LiteratureSearch):
             preprint_supplement_max_attempts=base.preprint_supplement_max_attempts,
             subquestion_concurrency=base.subquestion_concurrency,
             fresh_run_timeout_seconds=base.fresh_run_timeout_seconds,
+            allow_empty_results=base.allow_empty_results,
         )
 
 
@@ -1284,6 +1285,7 @@ class StrictM4HypothesisGeneration(M4HypothesisGeneration):
         return ranked
 
     async def _run_critic(self, state: PipelineState, candidates):
+        from .context import ContextPlanner, ContextRequest, emit_context_built
         from .graph_context import build_graph_context
         from .prompts.m4_prompts import (
             M4_CRITIC_SYSTEM_PROMPT,
@@ -1303,9 +1305,23 @@ class StrictM4HypothesisGeneration(M4HypothesisGeneration):
                 "required": ["hypothesis_id", "pass", "critique", "issues"],
             },
         }
+        graph_context = build_graph_context(state)
+        context_pack = ContextPlanner().plan(
+            graph_context,
+            ContextRequest(
+                purpose="m4_critic",
+                focus_evidence_ids=tuple(
+                    dict.fromkeys([
+                        *self._supplement_focus_evidence_ids(state),
+                        *(evidence_id for card in candidates for evidence_id in card.supporting_evidence),
+                    ])
+                ),
+            ),
+        )
+        emit_context_built("m4", "hypothesis_critic", context_pack)
         base_prompt = M4_CRITIC_USER_TEMPLATE.format(
-            graph_context=build_graph_context(state).render(),
-            established_facts=self._graph_bucket_text(state, "established_facts"),
+            graph_context=context_pack.rendered,
+            established_facts="(included in the audited context pack above)",
             hypotheses_json=json.dumps(
                 [card.model_dump(mode="json") for card in candidates],
                 ensure_ascii=False,
@@ -1325,6 +1341,7 @@ class StrictM4HypothesisGeneration(M4HypothesisGeneration):
                         output_schema=schema,
                         max_tokens=8192,
                         temperature=getattr(self.llm_config, "temperature", 0.1),
+                        disable_thinking=True,
                     ),
                     details={"candidates": len(candidates), "attempt": attempt},
                 )
@@ -1415,6 +1432,7 @@ class StrictM4HypothesisGeneration(M4HypothesisGeneration):
                         output_schema=schema,
                         max_tokens=8192,
                         temperature=getattr(self.llm_config, "temperature", 0.1),
+                        disable_thinking=True,
                     ),
                     details={"candidates": len(candidates), "attempt": attempt},
                 )
@@ -1682,6 +1700,10 @@ class StrictM4HypothesisGeneration(M4HypothesisGeneration):
                     # Recovery only needs a few fresh candidates to merge with
                     # the rejected set — keep the pass small to bound the time.
                     requested_count=min(self.num_candidates, 3),
+                    # The gate has already supplied explicit, actionable
+                    # feedback.  A second long reasoning pass adds latency but
+                    # little diagnostic value, so keep recovery bounded.
+                    disable_thinking=True,
                 )
             )
         except Exception as regen_exc:
@@ -1840,12 +1862,12 @@ class StrictM6ReviewIteration(M6ReviewIteration):
     """Built-in M6 marker ensuring strict runtime hooks are loaded explicitly."""
 
 
-from .literature.search.agent import IterativeSearchAgent as _IterativeSearchAgent
+from .modules.m2_literature.search.agent import IterativeSearchAgent as _IterativeSearchAgent
 
 _ORIGINAL_SEARCH_AGENT_RUN = _IterativeSearchAgent.run
 
 
-from .literature.search.scout import ScoutReader as _ScoutReader
+from .modules.m2_literature.search.scout import ScoutReader as _ScoutReader
 
 _ORIGINAL_SCOUT_READ = _ScoutReader.read
 
@@ -1861,7 +1883,7 @@ _ORIGINAL_GROUNDING_JUDGE_CANDIDATES = _GroundingWorkflow._judge_candidate_relat
 # The legacy modules imported the base service directly.  Rebind that module
 # global once when strict built-ins are loaded so every built-in M2/M3 path uses
 # the same pair-level identity contract.
-from .literature import adapter as _adapter_module
+from .modules.m2_literature import adapter as _adapter_module
 from .modules import m3_evidence_graph as _m3_module
 
 _adapter_module.EntityNormalizationService = StrictEntityNormalizationService

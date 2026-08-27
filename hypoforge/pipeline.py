@@ -71,11 +71,27 @@ def _route_after_m6(
     if state.iteration_count >= state.max_iterations:
         return "end"
 
-    # 2. evidence-insufficient supplement (wins over the score threshold)
+    # 2. Evidence attribution comes before search routing. A canonical
+    # contradiction is no longer a reason to spend another M2 round: M4 must
+    # revise the premise/hypothesis that the graph disproved.
     revisit = config is not None and getattr(config, "m6_evidence_revisit", False)
     if revisit:
         verdict = state.evidence_verdict
-        has_open_gap = any(g.status == "open" for g in state.evidence_gaps)
+        all_gaps = list(state.evidence_gaps)
+        if verdict is not None:
+            known = {gap.gap_id for gap in all_gaps}
+            all_gaps.extend(gap for gap in verdict.gaps if gap.gap_id not in known)
+        if any(
+            gap.scientific_resolution == "contradicted"
+            and (gap.contradicting_evidence_ids or gap.resolution_evidence_ids)
+            for gap in all_gaps
+        ):
+            return "revise_m4"
+        has_open_gap = any(
+            gap.status in {"open", "pending_grounding"}
+            and gap.scientific_resolution != "contradicted"
+            for gap in all_gaps
+        )
         if (
             verdict is not None
             and not verdict.sufficient
@@ -98,14 +114,33 @@ def _route_after_m6(
     recent = [r for r in state.reviews if r.version == state.iteration_count]
     if any(review.hard_gate_passed is False for review in recent):
         failed_reviews = [r for r in recent if r.hard_gate_passed is False]
-        requires_m4 = False
-        requires_m5 = False
-        for r in failed_reviews:
-            if r.attribution in ("hypothesis", "both"):
-                requires_m4 = True
-            elif r.attribution == "plan":
-                requires_m5 = True
-        
+        m4_dimensions = {
+            "scientific_logic", "objective_evidence_consistency",
+            "task_alignment",
+        }
+        m5_dimensions = {
+            "experimental_validation_coverage", "method_feasibility",
+            "answer_completeness_gate",
+        }
+        requires_m4 = any(
+            review.dimension.value in m4_dimensions
+            or review.attribution == "hypothesis"
+            or (
+                review.dimension.value == "evidence_coverage_gate"
+                and review.attribution in {"hypothesis", "both"}
+            )
+            for review in failed_reviews
+        )
+        requires_m5 = any(
+            review.dimension.value in m5_dimensions
+            or review.attribution == "plan"
+            or (
+                review.dimension.value == "evidence_coverage_gate"
+                and review.attribution in {"plan", "both"}
+            )
+            for review in failed_reviews
+        )
+
         if revision_route == "revise_m3":
             return "revise_m3"
         elif requires_m4:
@@ -133,6 +168,68 @@ def _route_after_m6(
 
     # 4. legacy feedback loop
     return revision_route
+
+
+def active_supplement_origin(state: PipelineState) -> RoutingDecision | None:
+    """Return only the currently active supplement routing decision.
+
+    A supplement is active either immediately after M6/M4 has routed to M2,
+    or while the following M3→M4/M5 continuation is being evaluated. Older
+    supplement records are intentionally ignored; they describe completed
+    rounds and must not turn a later M6 revision into a no-op re-entry.
+    """
+    history = list(state.routing_history or [])
+    if not history:
+        return None
+    latest = history[-1]
+    if (
+        latest.to_module == "supplement_m2"
+        and latest.from_module in {"m4", "m6"}
+    ):
+        return latest
+    if (
+        latest.from_module == "m3"
+        and latest.to_module in {"m2", "m4", "m5"}
+        and len(history) >= 2
+    ):
+        origin = history[-2]
+        if (
+            origin.to_module == "supplement_m2"
+            and origin.from_module in {"m4", "m6"}
+            and (
+                not latest.gap_ids
+                or not origin.gap_ids
+                or set(latest.gap_ids) & set(origin.gap_ids)
+            )
+        ):
+            return origin
+    return None
+
+
+def _route_after_m3(state: PipelineState) -> Literal["m2", "m4", "m5"]:
+    """Choose the continuation after M3 resolves a supplement search.
+
+    The latest supplement source is intentionally read from routing history so
+    M3 does not have to infer provenance from free-text gap descriptions.
+    M4-originated gaps always return to M4 for portfolio reconciliation.  An
+    M6-originated supplement returns directly to M5 unless a gap was actually
+    contradicted; a technical failure can request another M2 attempt while a
+    search budget remains.
+    """
+    latest = active_supplement_origin(state)
+    if latest is None or latest.from_module == "m4":
+        return "m4"
+    gap_ids = set(latest.gap_ids)
+    gaps = [gap for gap in state.evidence_gaps if not gap_ids or gap.gap_id in gap_ids]
+    if any(gap.scientific_resolution == "contradicted" for gap in gaps):
+        return "m4"
+    if any(
+        not gap.search_completed
+        and gap.status in {"open", "pending_grounding"}
+        for gap in gaps
+    ) and state.search_round < 2:
+        return "m2"
+    return "m5"
 
 
 def _route_after_m1(
@@ -237,12 +334,31 @@ def build_followup_seed(
     )
 
 
+_MAX_M4_EVIDENCE_GAP_SEARCH_ROUNDS = 2
+
+
+def _m4_evidence_gap_search_rounds(state: PipelineState) -> int:
+    recorded_routes = sum(
+        decision.from_module == "m4"
+        and decision.to_module == "supplement_m2"
+        for decision in state.routing_history
+    )
+    return max(state.evidence_gap_search_rounds, recorded_routes)
+
+
 def _route_after_m4(state: PipelineState) -> str:
-    """Search before M5 only while a bounded M4 gap is explicitly pending."""
+    """Search before M5 while a pending gap remains within the global cap."""
 
     return (
         "search_gap"
-        if any(gap.status == "pending" for gap in state.evidence_gap_requests)
+        if (
+            _m4_evidence_gap_search_rounds(state)
+            < _MAX_M4_EVIDENCE_GAP_SEARCH_ROUNDS
+            and any(
+                gap.status == "pending"
+                for gap in state.evidence_gap_requests
+            )
+        )
         else "continue"
     )
 
@@ -431,23 +547,62 @@ class PipelineRunner:
                     summary["per_source"] = per_source
         elif name == "m3" and result.get("evidence_graph") is not None:
             graph = result["evidence_graph"]
-            summary.update({"nodes": len(graph.nodes), "edges": len(graph.edges)})
+            gap_requests = result.get("evidence_gap_requests") or []
+            summary.update({
+                "nodes": len(graph.nodes),
+                "edges": len(graph.edges),
+                "bridge_hypotheses": sum(
+                    node.type.value == "hypothesis"
+                    and (node.metadata or {}).get("verification_status") == "unverified"
+                    for node in graph.nodes
+                ),
+                "gap_resolutions": {
+                    str(getattr(gap, "scientific_resolution", "unreviewed")): sum(
+                        getattr(item, "scientific_resolution", "unreviewed") == getattr(gap, "scientific_resolution", "unreviewed")
+                        for item in gap_requests
+                    )
+                    for gap in gap_requests
+                },
+            })
         elif name == "m4":
             gaps = result.get("evidence_gap_requests") or []
+            hypotheses = result.get("top_hypotheses") or result.get("candidate_hypotheses") or []
             summary.update(
                 {
                     "candidates": len(result.get("candidate_hypotheses") or []),
                     "top_hypotheses": len(result.get("top_hypotheses") or []),
+                    "factual_premises": sum(
+                        len(getattr(hypothesis, "factual_premises", []) or [])
+                        for hypothesis in hypotheses
+                    ),
+                    "working_assumptions": sum(
+                        len(getattr(hypothesis, "working_assumptions", []) or [])
+                        for hypothesis in hypotheses
+                    ),
                     "pending_evidence_gaps": sum(
                         gap.status == "pending" for gap in gaps
                     ),
                     "exhausted_evidence_gaps": sum(
                         gap.status == "exhausted" for gap in gaps
                     ),
+                    "gap_resolutions": {
+                        str(getattr(gap, "scientific_resolution", "unreviewed")): sum(
+                            getattr(item, "scientific_resolution", "unreviewed") == getattr(gap, "scientific_resolution", "unreviewed")
+                            for item in gaps
+                        )
+                        for gap in gaps
+                    },
                 }
             )
         elif name == "m5":
-            summary["research_plans"] = len(result.get("research_plans") or [])
+            plans = result.get("research_plans") or []
+            summary.update({
+                "research_plans": len(plans),
+                "bridge_validations": sum(
+                    len(getattr(plan, "bridge_validations", []) or [])
+                    for plan in plans
+                ),
+            })
         elif name == "m6":
             reviews = result.get("reviews") or []
             summary.update(
@@ -540,18 +695,30 @@ class PipelineRunner:
         # m2+m4 as targets; the m6 three-way edge needs m2+m4.  If either
         # target is missing from enabled_modules we keep the legacy wiring so
         # behaviour is unchanged.
+        fast_mode = getattr(self.config, "run_mode", "standard") == "fast"
+        # Fast mode disables automatic M6/M4 loops, but user-driven followup
+        # triage still needs the M1→M2/M4 conditional routes.
         routing_enabled = bool(
-            self.config.followup_routing or self.config.m6_evidence_revisit
+            self.config.followup_routing
+            or (self.config.m6_evidence_revisit and not fast_mode)
         )
         routing_targets_available = routing_enabled and {"m2", "m4"} <= set(active)
         gap_route_enabled = (
-            all(name in enabled for name in ("m2", "m3", "m4"))
+            not fast_mode
+            and all(name in enabled for name in ("m2", "m3", "m4"))
             and enabled.index("m2") + 1 == enabled.index("m3")
             and enabled.index("m3") + 1 == enabled.index("m4")
+        )
+        supplement_return_enabled = (
+            gap_route_enabled
+            and "m5" in enabled
+            and enabled.index("m4") + 1 == enabled.index("m5")
         )
         for i in range(len(enabled) - 1):
             src, dst = enabled[i], enabled[i + 1]
             if src == "m4" and gap_route_enabled:
+                continue
+            if src == "m3" and dst == "m4" and supplement_return_enabled:
                 continue
             if src == "m1" and dst == "m2" and routing_targets_available:
                 workflow.add_conditional_edges(
@@ -570,8 +737,14 @@ class PipelineRunner:
             )
             workflow.add_conditional_edges(
                 "m4",
-                _route_after_m4,
+                self._decide_after_m4,
                 {"search_gap": "m2", "continue": continuation},
+            )
+        if supplement_return_enabled:
+            workflow.add_conditional_edges(
+                "m3",
+                _route_after_m3,
+                {"m2": "m2", "m4": "m4", "m5": "m5"},
             )
 
         # --- entry point ---
@@ -579,7 +752,11 @@ class PipelineRunner:
 
         # --- conditional iteration edge ---
         last_module = enabled[-1]
-        if self.config.enable_iteration and last_module == "m6":
+        if (
+            not fast_mode
+            and self.config.enable_iteration
+            and last_module == "m6"
+        ):
             if routing_targets_available:
                 iteration_target = self.config.iteration_module_target
                 workflow.add_conditional_edges(
@@ -588,7 +765,11 @@ class PipelineRunner:
                     {
                         "end": END,
                         "revise_m3": "m3",
-                        "revise_m4": iteration_target,
+                        # Dynamic routing is authoritative: an M6 hypothesis
+                        # revision must enter M4 directly.  The configured
+                        # iteration target remains only for the legacy branch
+                        # below, where routing targets are unavailable.
+                        "revise_m4": "m4",
                         "revise_m5": "m5",
                         "supplement_m2": "m2",
                     },
@@ -700,6 +881,11 @@ class PipelineRunner:
 
             try:
                 module_started_at = time.perf_counter()
+                from .tools.qwen_client import (
+                    get_current_token_usage,
+                    token_usage_delta,
+                )
+                module_usage_before = get_current_token_usage()
                 self._record_event(
                     "module_started",
                     module=name,
@@ -795,6 +981,26 @@ class PipelineRunner:
                     **after_patches,
                 }
 
+                # Attribute all LLM responses produced by the module itself,
+                # including its before/after hooks and M2 child asyncio tasks.
+                # Repeated visits are accumulated under one stable M1-M6 key.
+                module_usage = token_usage_delta(
+                    module_usage_before, get_current_token_usage()
+                )
+                usage_by_module = {
+                    module_name: {
+                        metric: int(values.get(metric, 0))
+                        for metric in ("input", "output", "calls")
+                    }
+                    for module_name, values in state.token_usage_by_module.items()
+                }
+                prior_usage = usage_by_module.setdefault(
+                    name, {"input": 0, "output": 0, "calls": 0}
+                )
+                for metric, amount in module_usage.items():
+                    prior_usage[metric] += amount
+                final["token_usage_by_module"] = usage_by_module
+
                 # --- search-round bookkeeping: every *actual* M2 execution is
                 # one round (independent of iteration_count).  M2 itself may
                 # override by returning its own ``search_round``. ---
@@ -856,6 +1062,7 @@ class PipelineRunner:
                         merged_snapshot,
                     )
                 details = self._summarize_result(name, final)
+                details["token_usage"] = module_usage
                 if snapshot_path is not None:
                     details["snapshot"] = str(snapshot_path)
                 self._record_event(
@@ -876,12 +1083,22 @@ class PipelineRunner:
                     if "module_started_at" in locals()
                     else None
                 )
+                failure_details = {}
+                if "module_usage_before" in locals():
+                    from .tools.qwen_client import (
+                        get_current_token_usage,
+                        token_usage_delta,
+                    )
+                    failure_details["token_usage"] = token_usage_delta(
+                        module_usage_before, get_current_token_usage()
+                    )
                 self._record_event(
                     "module_failed",
                     module=name,
                     status="failed",
                     message=f"{name.upper()} execution failed: {type(exc).__name__}: {exc}",
                     elapsed_seconds=elapsed,
+                    details=failure_details,
                 )
                 if self.config.verbose:
                     from .display import console, COLORS
@@ -1036,8 +1253,52 @@ class PipelineRunner:
     # Routing bookkeeping
     # ------------------------------------------------------------------
 
+    def _decide_after_m4(self, state: PipelineState) -> str:
+        """Execute the gap-search decision recorded by the current M4 node.
+
+        The M4 wrapper records ``supplement_m2`` before LangGraph evaluates
+        this edge.  Counting that newly recorded route during a second
+        evaluation can make the round limit look exhausted one step too
+        early.  A latest M4 decision whose gap IDs still exactly match the
+        pending requests is the current node's authoritative decision; older
+        M4 decisions fall back to normal state-based routing.
+        """
+        if state.routing_history:
+            latest = state.routing_history[-1]
+            pending_gap_ids = {
+                gap.gap_id
+                for gap in state.evidence_gap_requests
+                if gap.status == "pending"
+            }
+            if (
+                latest.from_module == "m4"
+                and latest.to_module == "supplement_m2"
+                and pending_gap_ids
+                and set(latest.gap_ids) == pending_gap_ids
+            ):
+                return "search_gap"
+        return _route_after_m4(state)
+
     def _decide_after_m6(self, state: PipelineState) -> str:
-        """Conditional-edge callback: route after M6."""
+        """Conditional-edge callback: execute M6's recorded decision.
+
+        The M6 wrapper records its decision before updating routing counters.
+        LangGraph invokes this callback after those counters have been merged
+        into state, so recomputing here can produce a different route at a
+        counter boundary.  The newest M6 decision is therefore authoritative
+        for the current edge; recomputation remains a compatibility fallback
+        for callers that provide no recorded decision.
+        """
+        if state.routing_history:
+            latest = state.routing_history[-1]
+            if (
+                latest.from_module == "m6"
+                and latest.to_module in {
+                    "end", "revise_m3", "revise_m4", "revise_m5",
+                    "supplement_m2",
+                }
+            ):
+                return latest.to_module
         return _route_after_m6(state, self.config)
 
     def _decide_after_m1(self, state: PipelineState) -> str:
@@ -1051,6 +1312,23 @@ class PipelineRunner:
         ``len(routing_history) + 1``.
         """
         round_no = len(state.routing_history) + 1
+        if name == "m4":
+            if _route_after_m4(state) != "search_gap":
+                return None
+            pending_gaps = [
+                gap for gap in state.evidence_gap_requests
+                if gap.status == "pending"
+            ]
+            if not pending_gaps:
+                return None
+            return RoutingDecision(
+                round=round_no,
+                from_module="m4",
+                to_module="supplement_m2",
+                decided_by="m4",
+                reason="M4 detected hypotheses without canonical supporting evidence",
+                gap_ids=[gap.gap_id for gap in pending_gaps],
+            )
         if name == "m6":
             to_module = _route_after_m6(state, self.config)
             if to_module == "supplement_m2":
@@ -1064,6 +1342,10 @@ class PipelineRunner:
             elif to_module == "revise_m3":
                 decided_by = "m6"
                 reason = "validate pending evidence-graph corrections before regenerating hypotheses"
+                gap_ids = []
+            elif to_module == "revise_m5":
+                decided_by = "policy"
+                reason = "revise the research plan against M6 validation feedback"
                 gap_ids = []
             else:
                 decided_by = "policy"
@@ -1091,6 +1373,25 @@ class PipelineRunner:
                 to_module=to_module,
                 decided_by=decided_by,
                 reason=reason,
+            )
+        if name == "m3":
+            supplement = active_supplement_origin(state)
+            if supplement is None:
+                return None
+            to_module = _route_after_m3(state)
+            return RoutingDecision(
+                round=round_no,
+                from_module="m3",
+                to_module=to_module,
+                decided_by="policy",
+                reason=(
+                    "M4-originated supplement requires hypothesis reconciliation"
+                    if supplement.from_module == "m4" and to_module == "m4"
+                    else "M6 supplement resolved without contradiction; continue with plan update"
+                    if to_module == "m5"
+                    else "M6 supplement has a contradiction or technical retry requirement"
+                ),
+                gap_ids=list(supplement.gap_ids),
             )
         return None
 
@@ -1122,7 +1423,7 @@ class PipelineRunner:
         routes to ``revise_m4`` this is also where ``revision_count`` gets
         incremented (audit-only counter).
         """
-        if name not in ("m1", "m6"):
+        if name not in ("m1", "m3", "m4", "m6"):
             return
         decision = self._routing_decision(name, state)
         if decision is None:
@@ -1408,7 +1709,12 @@ class PipelineRunner:
                 enabled=bool(self.config.verbose),
                 run_id=run_id,
             )
-            with bind_event_sink(progress_sink), bind_recorder(self.event_recorder):
+            from .tools.qwen_client import track_token_usage
+            with (
+                track_token_usage() as run_usage,
+                bind_event_sink(progress_sink),
+                bind_recorder(self.event_recorder),
+            ):
                 try:
                     async for chunk in graph.astream(
                         initial_state,
@@ -1433,9 +1739,13 @@ class PipelineRunner:
         # Reconstruct PipelineState from the final dict
         final_state = PipelineState(**final_state_dict)
 
-        # ---- populate token stats from QwenClient ----
+        # ---- populate concurrency-isolated pipeline token stats ----
         from .tools.qwen_client import QwenClient
-        final_state.total_input_tokens, final_state.total_output_tokens = QwenClient.get_token_totals()
+        run_usage_snapshot = run_usage.snapshot()
+        final_state.total_input_tokens = run_usage_snapshot["input"]
+        final_state.total_output_tokens = run_usage_snapshot["output"]
+        # Keep the legacy process-wide counter behaviour for callers that use
+        # it directly, but never use it as the authoritative per-run total.
         QwenClient.reset_token_totals()
 
         if self.cancelled:
@@ -1472,51 +1782,66 @@ class PipelineRunner:
         # ---- automated scoring report (single source: config.scoring) ----
         if self.config.scoring.auto_score:
             from .evaluation.scorer import save_scoring_report_async
+            from .tools.qwen_client import track_token_usage
             # The independent metrics use a lightweight model for LLM-as-judge
             # evaluations so they don't add meaningful latency.
             metric_llm_config = self.config.get_llm_for_tier(
                 self.config.evaluation_model_tier
             )
-            try:
-                score_started_at = time.perf_counter()
-                self._record_event(
-                    "scoring_started",
-                    module="m6",
-                    tool="posthoc_scorer",
-                    status="running",
-                    message="Independent scoring started",
-                )
-                scores_path = await save_scoring_report_async(
-                    final_state,
-                    self.config.output_dir,
-                    self.config.scoring.hypothesis_weights,
-                    llm_config=metric_llm_config,
-                    embed_config=self.config.evaluation.model_dump(),
-                )
-                self._record_event(
-                    "scoring_completed",
-                    module="m6",
-                    tool="posthoc_scorer",
-                    status="completed",
-                    message="Independent scoring completed",
-                    elapsed_seconds=time.perf_counter() - score_started_at,
-                    details={"scores_path": str(scores_path)},
-                )
-                if self.config.verbose:
-                    from .display import console, COLORS
-                    console.print(
-                        f"  [{COLORS['muted']}]Scores saved to {scores_path}[/{COLORS['muted']}]"
+            with (
+                track_token_usage() as scoring_usage,
+                bind_event_sink(progress_sink),
+                bind_recorder(self.event_recorder),
+            ):
+                try:
+                    score_started_at = time.perf_counter()
+                    self._record_event(
+                        "scoring_started",
+                        module="m6",
+                        tool="posthoc_scorer",
+                        status="running",
+                        message="Independent scoring started",
                     )
-            except Exception as exc:
-                import logging
-                logging.getLogger(__name__).warning("Scoring report failed: %s", exc)
-                self._record_event(
-                    "scoring_failed",
-                    module="m6",
-                    tool="posthoc_scorer",
-                    status="failed",
-                    message=f"Independent scoring failed: {type(exc).__name__}: {exc}",
-                )
+                    scores_path = await save_scoring_report_async(
+                        final_state,
+                        self.config.output_dir,
+                        self.config.scoring.hypothesis_weights,
+                        llm_config=metric_llm_config,
+                        embed_config=self.config.evaluation.model_dump(),
+                    )
+                    self._record_event(
+                        "scoring_completed",
+                        module="m6",
+                        tool="posthoc_scorer",
+                        status="completed",
+                        message="Independent scoring completed",
+                        elapsed_seconds=time.perf_counter() - score_started_at,
+                        details={
+                            "scores_path": str(scores_path),
+                            "token_usage": scoring_usage.snapshot(),
+                        },
+                    )
+                    if self.config.verbose:
+                        from .display import console, COLORS
+                        console.print(
+                            f"  [{COLORS['muted']}]Scores saved to {scores_path}[/{COLORS['muted']}]"
+                        )
+                except Exception as exc:
+                    import logging
+                    logging.getLogger(__name__).warning("Scoring report failed: %s", exc)
+                    self._record_event(
+                        "scoring_failed",
+                        module="m6",
+                        tool="posthoc_scorer",
+                        status="failed",
+                        message=f"Independent scoring failed: {type(exc).__name__}: {exc}",
+                        details={"token_usage": scoring_usage.snapshot()},
+                    )
+            final_state.scoring_token_usage = scoring_usage.snapshot()
+            QwenClient.reset_token_totals()
+            # The pre-scoring save keeps the result available immediately;
+            # this second atomic save adds the separately attributed scorer use.
+            self._save_output(final_state)
 
         self._record_event(
             "run_completed",
@@ -1527,6 +1852,8 @@ class PipelineRunner:
                 "errors": len(final_state.errors),
                 "input_tokens": final_state.total_input_tokens,
                 "output_tokens": final_state.total_output_tokens,
+                "token_usage_by_module": final_state.token_usage_by_module,
+                "scoring_token_usage": final_state.scoring_token_usage,
             },
         )
 

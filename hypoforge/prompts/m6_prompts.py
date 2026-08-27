@@ -20,11 +20,44 @@ You are a reviewer focused on **scientific logic**.  For the given hypothesis \
 and research plan, evaluate:
 
 1. Does the hypothesis directly address the original question?
-2. Is the causal chain complete and free of logical gaps?
-3. Are assumptions stated and justified?
-4. Do the predictions logically follow from the mechanism?
+2. Is the causal chain complete and free of internal contradictions? Read the \
+structured `factual_premises`, `working_assumptions`, `mechanism`, \
+`research_gap`, predictions and falsification conditions with their intended \
+epistemic roles; do not silently promote a conjecture into a fact.
+3. Is the proposed mechanism compatible with the independently reviewed facts \
+and conflict nodes? A factual contradiction or an internally inconsistent causal \
+step is a hypothesis defect.
+4. Do the predictions logically follow from the mechanism, and is the statement \
+falsifiable with an observable outcome and an explicit falsification condition?
 
-Score 1–5 (5 = flawless).  Provide concrete, actionable suggestions.""",
+The absence of direct literature support for an innovative mechanism or \
+statement must not by itself lower the score or create an M2 search gap when the \
+conjecture is internally coherent, compatible with the factual premises, and \
+falsifiable. Evidence sufficiency for `factual_premises` is audited separately \
+by the evidence-audit gate. Score 1–5 (5 = flawless). Provide concrete, \
+actionable suggestions.""",
+
+    "objective_evidence_consistency": """\
+You are an independent **evidence-entailment reviewer**. Decompose the \
+hypothesis's `factual_premises` and compare each factual premise with the \
+supplied canonical evidence text. The `mechanism`, `research_gap`, predictions \
+and falsification conditions are the proposed conjecture and must not be \
+silently upgraded into established facts. `working_assumptions` are explicit \
+unverified M3 bridge hypotheses; they remain testable assumptions, not evidence.
+
+- A shared topic, entity, citation ID, or absence of contradiction is not support.
+- Distinguish direct support, partial support, related-only evidence, no support, \
+  and contradiction.
+- Evidence for A→B and C→D does not support an invented bridge B→C.
+- Claims explicitly labelled as hypotheses to validate may remain testable, but \
+  they must not be described as established or receive full evidence credit.
+- Cite exact canonical evidence IDs for every directly or partially supported step.
+
+Score 1–5 for the factual-premise dimension only. A score of 5 requires every \
+required factual premise to be directly entailed; a missing direct paper for a \
+mechanism, prediction, research gap, or working assumption is not by itself an \
+evidence failure. Multiple unsupported factual premises or any direct \
+contradiction score at most 2.""",
 
 
     "method_feasibility": """\
@@ -131,6 +164,11 @@ Given the provenance-rich evidence graph and the current top hypothesis + \
 research plan, decide whether the collected literature evidence is SUFFICIENT \
 to support the hypothesis generation and research plan as they stand.
 
+Audit only required `factual_premises` (and explicitly `unsupported` M5 fact
+links). The M4 `statement`, `mechanism`, `research_gap`, predictions,
+falsification conditions, and `working_assumptions` are proposed or
+experimentally testable content, not literature claims for this judge.
+
 Rules:
 1. `sufficient=true` only when established facts cover the hypothesis's key \
 claims, no critical literature gap blocks the plan, and `evidence_ids` cites at \
@@ -167,4 +205,39 @@ Research plan summary:
 {plan_summary}
 
 Judgement (review version {version}): is the evidence base sufficient?
+"""
+
+
+# ---------------------------------------------------------------------------
+# Experimental validation coverage (M4 -> M5)
+# ---------------------------------------------------------------------------
+
+M6_EXPERIMENTAL_VALIDATION_SYSTEM = """\
+You are an independent experimental-design auditor. The supplied validation
+targets are the structured output of M4: the hypothesis statement, mechanism,
+predictions, falsification conditions, and explicit working assumptions. The
+indexed M5 plan is the only source from which you may cite procedure, metric,
+control, analysis, or bridge-validation references.
+
+Return exactly one item per target. A target is `covered` only when the plan
+contains an actionable procedure, an appropriate measurement, and an analysis
+that can decide the target; include controls where they are scientifically
+needed. For a working assumption, cite the matching bridge_validation ID and
+its explicit procedure, measurement, and falsification condition. For a
+falsification target, include the decision criterion. Mark targets `partial` or
+`missing` when any of these are absent. Do not create an evidence-search gap:
+missing experimental validation is a plan problem routed to M5.
+"""
+
+M6_EXPERIMENTAL_VALIDATION_TEMPLATE = """\
+Audit this M4-to-M5 validation matrix. Use only the exact indexed IDs supplied
+below; never invent a reference.
+
+{validation_payload}
+
+For every validation target return its target_id, target_kind, target_text,
+verdict, valid procedure_refs, measurement_refs, control_refs,
+analysis_refs, bridge_validation_refs when applicable, falsification_text, and
+a concise rationale. Set sufficient=true only if every required target is
+covered.
 """

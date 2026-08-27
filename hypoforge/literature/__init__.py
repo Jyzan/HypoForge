@@ -1,102 +1,31 @@
-"""Shared contracts for the agentic M2 literature pipeline.
+"""Compatibility alias for the canonical M2 package.
 
-Feature branches should import public contracts from this module instead of
-depending on another tool's private implementation.
+New code must import :mod:`hypoforge.modules.m2_literature`.  This loader
+keeps historical deep imports working while ensuring they resolve to the
+same module and class objects as the canonical namespace.
 """
 
-from .adapter import AgenticM2Adapter, AgenticM2Module
-from .models import (
-    ContentLevel,
-    CoverageReport,
-    DocumentChunk,
-    DocumentRecord,
-    EvidenceBucket,
-    EvidenceChunk,
-    EvidenceLinkedKnowledge,
-    FulltextStatus,
-    PaperReadingResult,
-    PaperRecord,
-    QueryIntent,
-    RemainingSearchBudget,
-    ScoutNote,
-    SearchBudget,
-    SearchQuery,
-    SearchRunResult,
-    SearchState,
-    StopReason,
-)
-from .export import build_m2_knowledge_export_run
-from .protocols import (
-    CoverageEvaluatorProtocol,
-    DocumentParserProtocol,
-    EvidenceRetrieverProtocol,
-    FulltextResolverProtocol,
-    LiteratureSourceProtocol,
-    PaperDeduplicatorProtocol,
-    PaperRankerProtocol,
-    PaperReaderProtocol,
-    QueryPlannerProtocol,
-    ReadingExtractionWorkflowProtocol,
-    ScoutReaderProtocol,
-)
-from .search import (
-    CoverageEvaluator,
-    IterativeSearchAgent,
-    PaperDeduplicator,
-    PaperRanker,
-    ScoutReader,
-)
-from .reading import (
-    BioCDocumentParser,
-    FullTextReadingWorkflow,
-    HybridEvidenceRetriever,
-    InMemoryChunkStore,
-    PMCFulltextResolver,
-    QwenPaperReader,
-)
+from __future__ import annotations
 
-__all__ = [
-    "AgenticM2Adapter",
-    "AgenticM2Module",
-    "ContentLevel",
-    "CoverageEvaluator",
-    "CoverageEvaluatorProtocol",
-    "CoverageReport",
-    "DocumentChunk",
-    "DocumentParserProtocol",
-    "DocumentRecord",
-    "EvidenceBucket",
-    "EvidenceChunk",
-    "EvidenceLinkedKnowledge",
-    "EvidenceRetrieverProtocol",
-    "FulltextResolverProtocol",
-    "FulltextStatus",
-    "FullTextReadingWorkflow",
-    "HybridEvidenceRetriever",
-    "InMemoryChunkStore",
-    "IterativeSearchAgent",
-    "LiteratureSourceProtocol",
-    "PaperDeduplicator",
-    "PaperDeduplicatorProtocol",
-    "PaperRanker",
-    "PaperRankerProtocol",
-    "PaperReaderProtocol",
-    "PaperReadingResult",
-    "PaperRecord",
-    "PMCFulltextResolver",
-    "QueryIntent",
-    "QueryPlannerProtocol",
-    "QwenPaperReader",
-    "ReadingExtractionWorkflowProtocol",
-    "RemainingSearchBudget",
-    "ScoutNote",
-    "ScoutReader",
-    "ScoutReaderProtocol",
-    "SearchBudget",
-    "SearchQuery",
-    "SearchRunResult",
-    "SearchState",
-    "StopReason",
-    "BioCDocumentParser",
-    "build_m2_knowledge_export_run",
-]
+import importlib
+import pkgutil
+import sys
+
+_LEGACY_PREFIX = __name__
+_CANONICAL_PREFIX = "hypoforge.modules.m2_literature"
+_canonical = importlib.import_module(_CANONICAL_PREFIX)
+
+for module_info in pkgutil.walk_packages(
+    _canonical.__path__,
+    prefix=f"{_CANONICAL_PREFIX}.",
+):
+    canonical_name = module_info.name
+    canonical_module = importlib.import_module(canonical_name)
+    legacy_name = canonical_name.replace(
+        _CANONICAL_PREFIX,
+        _LEGACY_PREFIX,
+        1,
+    )
+    sys.modules[legacy_name] = canonical_module
+
+sys.modules[_LEGACY_PREFIX] = _canonical

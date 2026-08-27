@@ -16,36 +16,102 @@ import hashlib
 import json
 import logging
 import time
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from ..observability import emit_event
+from ..context import ContextPlanner, ContextRequest, emit_context_built
+from ..evidence_audit import EvidenceAuditService, PremiseAuditResult
+from ..experimental_validation import ExperimentalValidationAuditor
 from ..graph_context import build_graph_context
 from ..protocol import ModuleProtocol
 from ..prompts.m6_prompts import (
     M6_EVIDENCE_VERDICT_SYSTEM,
     M6_EVIDENCE_VERDICT_TEMPLATE,
+    M6_EXPERIMENTAL_VALIDATION_SYSTEM,
+    M6_EXPERIMENTAL_VALIDATION_TEMPLATE,
     M6_FORMAT_NOTE,
     M6_REASON_FIRST,
     M6_REVIEWER_PROMPTS,
     M6_USER_TEMPLATE,
 )
 from ..evaluation.rubric import review_rubric_line
-from ..evaluation.scorer import _quality_gates, score_hypothesis_async, _collect_knowledge_entries
-from ..evaluation.metrics import MetricRegistry
+from ..evaluation.scorer import _quality_gates
 from ..registry import ModuleRegistry
 from ..state import (
     EvidenceGap,
     EvidenceSufficiencyVerdict,
+    ExperimentalValidationVerdict,
+    FactualPremiseAudit,
     GraphCorrectionRequest,
+    HypothesisPremise,
     PipelineState,
     ReviewResult,
+    ResearchPlan,
     ReviewerDimension,
+    ValidationCoverageItem,
+    ValidationTarget,
     make_gap_id,
+)
+from ..synthesis_contract import (
+    synthesis_contract_for_state,
+    synthesis_problem_payload,
 )
 from ..task_alignment import assess_task_alignment
 from ..tools.qwen_client import QwenClient
 
 logger = logging.getLogger(__name__)
+
+
+_CORE_OVERALL_DIMENSIONS = {
+    "scientific_logic",
+    "objective_evidence_consistency",
+    "method_feasibility",
+    "experimental_validation_coverage",
+}
+
+
+@dataclass(frozen=True)
+class _AuditableClaim:
+    """One factual claim that is allowed to create an M6 search gap."""
+
+    source_claim_type: str
+    source_claim_id: str
+    claim: str
+    required: bool = True
+    supporting_evidence_ids: tuple[str, ...] = field(default_factory=tuple)
+
+
+def _aggregate_overall_reviews(
+    reviews: List[ReviewResult],
+) -> tuple[float, List[str]]:
+    """Aggregate scientific quality without averaging in bookkeeping gates."""
+
+    core_scores = [
+        review.score for review in reviews
+        if review.dimension.value in _CORE_OVERALL_DIMENSIONS
+    ]
+    score = sum(core_scores) / len(core_scores) if core_scores else 3.0
+    failed_gates = [
+        review.dimension.value for review in reviews
+        if review.hard_gate_passed is False
+    ]
+    evidence_review = next(
+        (
+            review for review in reviews
+            if review.dimension.value == "objective_evidence_consistency"
+        ),
+        None,
+    )
+    if "task_alignment" in failed_gates:
+        score = min(score, 1.9)
+    elif "objective_evidence_consistency" in failed_gates:
+        score = min(score, 2.9)
+    elif failed_gates:
+        score = min(score, 2.9)
+    elif evidence_review is not None and evidence_review.score < 4.0:
+        score = min(score, 3.9)
+    return round(score, 1), failed_gates
 
 
 @ModuleRegistry.register
@@ -92,6 +158,80 @@ class M6ReviewIteration(ModuleProtocol):
             }))
         return output
 
+    @staticmethod
+    def _objective_evidence_review(
+        verdict: EvidenceSufficiencyVerdict,
+        *,
+        version: int,
+    ) -> ReviewResult:
+        """Derive the evidence score from the persisted factual-premise audit.
+
+        This is the sole score source for objective evidence consistency when
+        the structured M6 evidence audit is enabled.  Novel mechanisms,
+        predictions and working assumptions are intentionally absent from the
+        input contract and therefore cannot lower this dimension.
+        """
+
+        audits = list(verdict.premise_audits)
+        audit_verdicts = {item.verdict for item in audits}
+        if "contradicted" in audit_verdicts:
+            score = 1.0
+            passed = False
+        elif audit_verdicts & {"unsupported", "invalid_citation"}:
+            score = 2.0
+            passed = False
+        elif "partially_supported" in audit_verdicts:
+            score = 3.5
+            passed = True
+        else:
+            score = 5.0
+            passed = True
+
+        evidence_ids = list(dict.fromkeys(
+            evidence_id
+            for audit in audits
+            for evidence_id in audit.evidence_ids
+            if str(evidence_id).strip()
+        ))
+        reasoning = "; ".join(
+            f"{audit.premise_id}: {audit.verdict} — {audit.rationale}"
+            for audit in audits
+        ) or "No required factual premise needs evidence auditing."
+        suggestions = ""
+        if not passed:
+            suggestions = (
+                "Revise, remove, or supplement the unsupported factual "
+                "premises identified by the premise audit."
+            )
+        elif score < 5.0:
+            suggestions = (
+                "Keep partially supported premises qualified and preserve "
+                "their canonical evidence IDs."
+            )
+        return ReviewResult(
+            dimension=ReviewerDimension("objective_evidence_consistency"),
+            attribution="hypothesis",
+            reasoning=reasoning,
+            score=score,
+            comments=(
+                "Derived exclusively from the structured factual-premise "
+                "audit; conjectural mechanism text is out of scope."
+            ),
+            suggestions=suggestions,
+            evidence_ids=evidence_ids,
+            hard_gate_passed=passed,
+            version=version,
+        )
+
+    @staticmethod
+    def _reconcile_graph_corrections(
+        verdict: EvidenceSufficiencyVerdict,
+        corrections: List[GraphCorrectionRequest],
+    ) -> List[GraphCorrectionRequest]:
+        """Drop stale raw-review corrections after a sufficient fact audit."""
+
+        return [] if verdict.sufficient else list(corrections)
+
     # ------------------------------------------------------------------
     # Configurable
     # ------------------------------------------------------------------
@@ -105,8 +245,10 @@ class M6ReviewIteration(ModuleProtocol):
         gap_no_gain_limit: int = 3,
         semantic_alignment_timeout_seconds: float = 60.0,
         reviewer_timeout_seconds: float = 180.0,
+        fast_mode: bool = False,
         **kwargs,
     ):
+        self.fast_mode = bool(fast_mode)
         if semantic_alignment_timeout_seconds <= 0:
             raise ValueError(
                 "semantic_alignment_timeout_seconds must be positive"
@@ -115,6 +257,7 @@ class M6ReviewIteration(ModuleProtocol):
             raise ValueError("reviewer_timeout_seconds must be positive")
         self.reviewer_dims = reviewers or [
             "scientific_logic",
+            "objective_evidence_consistency",
             "method_feasibility",
             "overall",
         ]
@@ -154,7 +297,7 @@ class M6ReviewIteration(ModuleProtocol):
                 "aliases": list(entity.aliases),
             }
             for entity in (contract.entities if contract is not None else [])
-            if entity.role == "primary_object" and entity.required
+            if entity.role == "primary_object"
         ]
         if not primary_objects:
             return True, "No required primary object needs semantic auditing."
@@ -249,9 +392,33 @@ class M6ReviewIteration(ModuleProtocol):
                 "Ensure M5 completed and produced plans."
             )
 
-        hypothesis = state.top_hypotheses[0]
+        # Historical snapshots may still carry M1 retrieval trace IDs (R1...Rn).
+        # Rebuild both sides from their literal output before review so a
+        # resumed run is judged against the same whole-question Q0 contract as
+        # a fresh run.  The canonicalizers never synthesize scientific text.
+        from .m4_hypothesis_generation import M4HypothesisGeneration
+        from .m5_research_plan import M5ResearchPlan
+
+        normalised_hypotheses = M4HypothesisGeneration._canonicalize_task_traces(
+            state, list(state.top_hypotheses)
+        )
+        normalisation_state = state.model_copy(update={
+            "top_hypotheses": normalised_hypotheses,
+        })
+        normalised_plans = [
+            M5ResearchPlan._canonicalize_task_trace(normalisation_state, item)
+            for item in state.research_plans
+        ]
+        evaluation_state = normalisation_state.model_copy(update={
+            "research_plans": normalised_plans,
+        })
+
+        hypothesis = normalised_hypotheses[0]
         plan = next(
-            (p for p in state.research_plans if p.hypothesis_id == hypothesis.hypothesis_id),
+            (
+                p for p in normalised_plans
+                if p.hypothesis_id == hypothesis.hypothesis_id
+            ),
             None,
         )
         if plan is None:
@@ -261,20 +428,25 @@ class M6ReviewIteration(ModuleProtocol):
                 f"hypothesis-plan pair that were designed together."
             )
         graph = state.evidence_graph
+        legacy_checkpoint = (
+            state.problem_card is not None
+            and state.problem_card.task_contract.source == "derived"
+        )
         graph_context = build_graph_context(state)
-        rendered_graph_context = graph_context.render()
+        synthesis_contract = synthesis_contract_for_state(state)
         valid_evidence_ids = set(graph_context.available_evidence_ids)
-        hypothesis_requirement_ids = {
-            reference.contract_id
-            for reference in hypothesis.task_trace.requirement_mentions
-        }
+        # M4 may generate hypotheses scoped to a subset of atomic
+        # requirements, but M6 approves the final hypothesis-plan pair for the
+        # user's *whole* question.  Do not let a candidate hide an omitted M1
+        # requirement simply by leaving its ID out of its own trace.  This also
+        # keeps the live M6 hard gate consistent with the posthoc scorer.
         hypothesis_alignment = assess_task_alignment(
             state,
             hypothesis.model_dump_json(exclude={"task_trace"}),
             subject_text="\n".join([hypothesis.statement, hypothesis.mechanism]),
             trace=hypothesis.task_trace,
             semantic_client=None,
-            required_requirement_ids=(hypothesis_requirement_ids or None),
+            contract_override=synthesis_contract,
         )
         plan_alignment = assess_task_alignment(
             state,
@@ -282,11 +454,20 @@ class M6ReviewIteration(ModuleProtocol):
             subject_text=plan.study_subjects,
             trace=plan.task_trace,
             semantic_client=None,
-            required_requirement_ids=(hypothesis_requirement_ids or None),
+            contract_override=synthesis_contract,
         )
-        semantic_alignment_passed, semantic_alignment_rationale = (
-            await self._audit_pair_semantics(state, hypothesis, plan)
-        )
+        if self.fast_mode:
+            # Fast mode skips the extra task-object semantic LLM call.  The
+            # deterministic lexical alignment above is sufficient for a
+            # quick review; the run always ends after this pass.
+            semantic_alignment_passed = True
+            semantic_alignment_rationale = (
+                "fast mode: semantic pair audit skipped for speed"
+            )
+        else:
+            semantic_alignment_passed, semantic_alignment_rationale = (
+                await self._audit_pair_semantics(state, hypothesis, plan)
+            )
         deterministic_alignment_passed = (
             hypothesis_alignment.passed
             and plan_alignment.passed
@@ -331,8 +512,32 @@ class M6ReviewIteration(ModuleProtocol):
             dimension for dimension in self.reviewer_dims
             if dimension not in {"overall", "task_alignment"}
         ]
+        auditable_factual_claims = bool(
+            self._build_evidence_audit_scope(hypothesis, plan)
+        )
+        factual_verdict: Optional[EvidenceSufficiencyVerdict] = None
 
         for dim in specialist_dims:
+            context_purpose = (
+                "m6_feasibility"
+                if dim == "method_feasibility"
+                else "m6_logic"
+            )
+            context_pack = ContextPlanner().plan(
+                graph_context,
+                ContextRequest(
+                    purpose=context_purpose,
+                    focus_evidence_ids=tuple(dict.fromkeys([
+                        *hypothesis.supporting_evidence,
+                        *plan.supporting_evidence_ids,
+                    ])),
+                ),
+            )
+            emit_context_built(
+                "m6",
+                f"reviewer:{dim}",
+                context_pack,
+            )
             # Anchor the score (rubric) and force reason-before-score, both
             # sourced from the single rubric definition.
             system_prompt = "\n\n".join(
@@ -358,13 +563,14 @@ class M6ReviewIteration(ModuleProtocol):
                         system_prompt=system_prompt,
                         user_prompt=M6_USER_TEMPLATE.format(
                             original_question=state.input_question,
-                            problem_card_json=(
-                                state.problem_card.model_dump_json(indent=2)
-                                if state.problem_card else "{}"
+                            problem_card_json=json.dumps(
+                                synthesis_problem_payload(state.problem_card),
+                                ensure_ascii=False,
+                                indent=2,
                             ),
                             hypothesis_json=json.dumps(hypothesis.model_dump(mode="json"), ensure_ascii=False, indent=2),
                             plan_json=json.dumps(plan.model_dump(mode="json"), ensure_ascii=False, indent=2),
-                            graph_context=rendered_graph_context,
+                            graph_context=context_pack.rendered,
                             facts_count=len(graph.established_facts) if graph else 0,
                             conflicts_count=len(graph.conflicts) if graph else 0,
                             gaps_count=len(graph.knowledge_gaps) if graph else 0,
@@ -384,7 +590,10 @@ class M6ReviewIteration(ModuleProtocol):
             payload = dict(payload)
             payload["dimension"] = dim
             payload["version"] = version
-            if dim in {"scientific_logic", "testability", "novelty"}:
+            if dim in {
+                "scientific_logic", "objective_evidence_consistency",
+                "testability", "novelty",
+            }:
                 payload["attribution"] = "hypothesis"
             elif dim in {"method_feasibility"}:
                 payload["attribution"] = "plan"
@@ -396,15 +605,39 @@ class M6ReviewIteration(ModuleProtocol):
                 for identifier in review.evidence_ids
                 if identifier in valid_evidence_ids
             ))
-            updates: Dict[str, Any] = {"evidence_ids": cited_evidence}
-            updates["graph_correction_requests"] = (
-                self._normalise_graph_corrections(
-                    review,
-                    valid_evidence_ids=valid_evidence_ids,
-                    version=version,
-                )
+            graph_corrections = self._normalise_graph_corrections(
+                review,
+                valid_evidence_ids=valid_evidence_ids,
+                version=version,
             )
-            review = review.model_copy(update=updates)
+            if dim == "objective_evidence_consistency" and factual_verdict is not None:
+                review = self._objective_evidence_review(
+                    factual_verdict,
+                    version=version,
+                ).model_copy(update={
+                    "graph_correction_requests": graph_corrections,
+                })
+            else:
+                updates: Dict[str, Any] = {"evidence_ids": cited_evidence}
+                if dim == "objective_evidence_consistency":
+                    if auditable_factual_claims:
+                        calibrated_score = review.score
+                        if not cited_evidence:
+                            calibrated_score = min(calibrated_score, 2.0)
+                        hard_gate_passed = calibrated_score >= 3.0
+                    else:
+                        # There is no factual-premise scope to audit.  Novel
+                        # statements and M3 bridges are assessed by logic and
+                        # experimental-validation reviewers, not this evidence
+                        # gate; absence of paper IDs is therefore neutral.
+                        calibrated_score = 5.0
+                        hard_gate_passed = True
+                    updates.update({
+                        "score": calibrated_score,
+                        "hard_gate_passed": hard_gate_passed,
+                    })
+                updates["graph_correction_requests"] = graph_corrections
+                review = review.model_copy(update=updates)
             new_reviews.append(review)
             emit_event(
                 "tool_completed",
@@ -416,9 +649,35 @@ class M6ReviewIteration(ModuleProtocol):
                 details={"version": version, "score": review.score},
             )
 
+        # Preserve the established external-call order (specialist reviews
+        # first, factual audit second), then reconcile the evidence dimension
+        # before any quality gate or overall score is calculated.  The raw LLM
+        # review may still propose graph corrections, but it is no longer an
+        # independent score source.
+        if self.m6_evidence_revisit and not self.fast_mode:
+            factual_verdict = await self._judge_evidence_sufficiency(
+                state, hypothesis, plan, version,
+            )
+            authoritative_evidence_review = self._objective_evidence_review(
+                factual_verdict,
+                version=version,
+            )
+            for index, review in enumerate(new_reviews):
+                if review.dimension.value != "objective_evidence_consistency":
+                    continue
+                new_reviews[index] = authoritative_evidence_review.model_copy(
+                    update={
+                        "graph_correction_requests": self._reconcile_graph_corrections(
+                            factual_verdict,
+                            review.graph_correction_requests,
+                        ),
+                    }
+                )
+                break
+
         # --- NEW: Objective Quality Gates & Metrics ---
         try:
-            gates = _quality_gates(state)
+            gates = _quality_gates(evaluation_state)
             
             # 1. evidence_coverage
             coverage = gates.get("evidence_coverage", 0.0)
@@ -481,39 +740,40 @@ class M6ReviewIteration(ModuleProtocol):
                 version=version,
             ))
 
-            # 4. Metrics
-            knowledge_entries = _collect_knowledge_entries(state)
-            # score_hypothesis_async runs all implemented independent metrics
-            metric_report = await score_hypothesis_async(
-                hypothesis,
-                knowledge_entries,
-                llm_config=getattr(config, "llm", None),
-                embed_config=getattr(config, "embedding", None),
-                evidence_graph=state.evidence_graph
-            )
-            independent_metrics = metric_report.get("independent", {})
-            for m_name, m_score in independent_metrics.items():
-                m_score_scaled = m_score * 5.0
-                threshold = 1.5 if m_name == "novelty" else 2.5
-                m_passed = m_score_scaled >= threshold
-                dim_name = f"{m_name}_metric"
-                if m_name == "evidence_consistency":
-                    dim_name = "objective_evidence_consistency"
-                    
-                m_attr = "hypothesis"
-                    
-                new_reviews.append(ReviewResult(
-                    dimension=ReviewerDimension(dim_name),
-                    attribution=m_attr,
-                    reasoning=f"Calculated {m_name} score is {m_score:.2f} (scaled to {m_score_scaled:.1f}/5).",
-                    score=round(m_score_scaled, 1),
-                    comments=f"Objective metric {m_name} from MetricRegistry.",
-                    suggestions="" if m_passed else f"Improve {m_name} to meet the minimum threshold of {threshold}/5.",
-                    hard_gate_passed=m_passed,
-                    version=version,
-                ))
         except Exception as e:
             logger.warning(f"Failed to compute objective quality gates/metrics: {e}")
+
+        # M6's third independent layer: every M4 target must be covered by a
+        # concrete M5 procedure/measurement/analysis.  Fast mode preserves its
+        # existing lightweight behavior and skips this extra LLM audit.
+        experimental_validation_verdict: Optional[ExperimentalValidationVerdict] = None
+        if self.m6_evidence_revisit and not self.fast_mode and not legacy_checkpoint:
+            experimental_validation_verdict = await self._judge_experimental_validation(
+                hypothesis, plan, version,
+            )
+            item_count = len(experimental_validation_verdict.items)
+            weighted_coverage = sum(
+                1.0 if item.verdict == "covered" else 0.5 if item.verdict == "partial" else 0.0
+                for item in experimental_validation_verdict.items
+            )
+            validation_score = round(
+                5.0 * weighted_coverage / item_count if item_count else 5.0,
+                1,
+            )
+            new_reviews.append(ReviewResult(
+                dimension=ReviewerDimension("experimental_validation_coverage"),
+                attribution="plan",
+                reasoning=experimental_validation_verdict.rationale,
+                score=validation_score,
+                comments="Independent target-by-target audit of M4 claims against the M5 plan.",
+                suggestions="\n".join(
+                    f"- {item.target_id}: {item.rationale}"
+                    for item in experimental_validation_verdict.items
+                    if item.verdict != "covered" and item.rationale
+                ),
+                hard_gate_passed=experimental_validation_verdict.sufficient,
+                version=version,
+            ))
 
         # Compute overall as the mean of the specialist scores.
         if "overall" in self.reviewer_dims and new_reviews:
@@ -526,15 +786,7 @@ class M6ReviewIteration(ModuleProtocol):
                 message="Aggregating overall score",
                 details={"version": version},
             )
-            specialist_scores = [r.score for r in new_reviews if r.score > 0]
-            avg = sum(specialist_scores) / len(specialist_scores) if specialist_scores else 3.0
-            failed_gates = [
-                review.dimension.value
-                for review in new_reviews
-                if review.hard_gate_passed is False
-            ]
-            if failed_gates:
-                avg = min(avg, 1.9 if "task_alignment" in failed_gates else 2.9)
+            avg, failed_gates = _aggregate_overall_reviews(new_reviews)
             new_reviews.append(ReviewResult(
                 dimension=ReviewerDimension("overall"),
                 reasoning=(
@@ -574,14 +826,17 @@ class M6ReviewIteration(ModuleProtocol):
             "reviews": state.reviews + new_reviews,
             "iteration_count": version,
             "graph_correction_requests": list(correction_by_id.values()),
+            "top_hypotheses": normalised_hypotheses,
+            "research_plans": normalised_plans,
         }
+        if experimental_validation_verdict is not None:
+            patch["experimental_validation_verdict"] = experimental_validation_verdict
 
-        # --- iteration core: evidence-sufficiency verdict (fail-closed) ---
-        # Exactly ONE extra structured call, only when the switch is on.
-        if self.m6_evidence_revisit:
-            verdict = await self._judge_evidence_sufficiency(
-                state, hypothesis, plan, version
-            )
+        # --- iteration core: scoped factual-premise verdict (fail-closed) ---
+        # This audit is enabled by the same iteration switch as supplement
+        # routing; it never broadens into a free-form mechanism gap judge.
+        if factual_verdict is not None:
+            verdict = factual_verdict
             gap_gain = state.metrics.get("m3_gap_gain") or {}
             patch["evidence_verdict"] = verdict
             merged_gaps = self._merge_evidence_gaps(
@@ -600,8 +855,343 @@ class M6ReviewIteration(ModuleProtocol):
         return patch
 
     # ------------------------------------------------------------------
+    # Experimental validation coverage (M4 -> M5)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validation_targets(hypothesis: Any) -> List[ValidationTarget]:
+        """Compatibility wrapper for the shared experimental auditor."""
+        return ExperimentalValidationAuditor.validation_targets(hypothesis)
+
+    @staticmethod
+    def _validation_plan_context(plan: ResearchPlan) -> Dict[str, Any]:
+        """Compatibility wrapper for the shared experimental auditor."""
+        return ExperimentalValidationAuditor.validation_plan_context(plan)
+
+    @staticmethod
+    def _validation_item_from_target(
+        target: ValidationTarget,
+        raw: Optional[Dict[str, Any]],
+        valid_refs: Dict[str, set[str]],
+        plan_context: Dict[str, Any],
+    ) -> ValidationCoverageItem:
+        """Compatibility wrapper for the shared experimental auditor."""
+        return ExperimentalValidationAuditor.validation_item_from_target(
+            target, raw, valid_refs, plan_context
+        )
+
+
+    async def _judge_experimental_validation(
+        self,
+        hypothesis: Any,
+        plan: ResearchPlan,
+        version: int,
+    ) -> ExperimentalValidationVerdict:
+        """Review whether M5 can actually test every M4 target."""
+        auditor = ExperimentalValidationAuditor(
+            client=self.client,
+            llm_config=self.llm_config,
+            timeout_seconds=self.reviewer_timeout_seconds,
+        )
+        return (await auditor.audit(hypothesis, plan, version)).verdict
+
+    # ------------------------------------------------------------------
     # Evidence sufficiency (iteration core)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_evidence_audit_scope(
+        hypothesis: Any,
+        plan: Optional[ResearchPlan] = None,
+    ) -> List[_AuditableClaim]:
+        """Return the exclusive factual scope for evidence-gap auditing.
+
+        M4's epistemic contract is intentionally preserved here: only explicit
+        required factual premises and plan links explicitly marked
+        ``unsupported`` may request literature supplementation.  Mechanisms,
+        research gaps, predictions and bridge assumptions are conjectural
+        content and are reviewed for logic/experimental coverage elsewhere.
+        """
+        claims: List[_AuditableClaim] = []
+        for premise in list(getattr(hypothesis, "factual_premises", []) or []):
+            claim = str(getattr(premise, "claim", "") or "").strip()
+            if not getattr(premise, "required", True) or not claim:
+                continue
+            claims.append(_AuditableClaim(
+                source_claim_type="factual_premise",
+                source_claim_id=str(getattr(premise, "premise_id", "") or ""),
+                claim=claim,
+                required=True,
+                supporting_evidence_ids=tuple(
+                    str(item)
+                    for item in getattr(premise, "supporting_evidence_ids", [])
+                    if str(item).strip()
+                ),
+            ))
+        if plan is not None:
+            for index, link in enumerate(getattr(plan, "evidence_links", []) or []):
+                if getattr(link, "support_status", "") != "unsupported":
+                    continue
+                claim = str(getattr(link, "claim", "") or getattr(link, "plan_element", "") or "").strip()
+                if not claim:
+                    continue
+                claims.append(_AuditableClaim(
+                    source_claim_type="plan_fact",
+                    source_claim_id=f"plan:evidence_link:{index}",
+                    claim=claim,
+                    required=True,
+                    supporting_evidence_ids=tuple(
+                        str(item)
+                        for item in getattr(link, "supporting_evidence_ids", [])
+                        if str(item).strip()
+                    ),
+                ))
+        return claims
+
+    async def _audit_factual_premises(
+        self,
+        state: PipelineState,
+        hypothesis: Any,
+        plan: Any,
+        version: int,
+    ) -> EvidenceSufficiencyVerdict:
+        """Independently audit only required factual premises.
+
+        M6 must not turn an unproven mechanism or an innovative statement into
+        a literature-search gap.  The shared ``EvidenceAuditService`` receives
+        only ``evidence_backed`` premises (plus explicitly unsupported M5
+        fact-links), so the source claim remains available for routing while
+        conjectural text stays in the logic/coverage reviews.
+        """
+        graph_context = build_graph_context(state)
+        scope = self._build_evidence_audit_scope(hypothesis, plan)
+        started_at = time.monotonic()
+        emit_event(
+            "tool_started",
+            module="m6",
+            tool="evidence_sufficiency_judge",
+            status="running",
+            message="M6 factual-premise audit started",
+            details={"version": version, "auditable_claim_count": len(scope)},
+        )
+        if not scope:
+            # Checkpoints created before the structured M4 premise contract
+            # used a derived ProblemCard and may carry a legacy gap ledger.
+            # Preserve that ledger through one migration-only verdict call so
+            # old runs remain resumable; modern M1 cards with no factual
+            # premises do not enter this compatibility branch.
+            legacy_card = (
+                state.problem_card is not None
+                and state.problem_card.task_contract.source == "derived"
+            )
+            if legacy_card:
+                try:
+                    legacy_payload = await asyncio.wait_for(
+                        self.client.structured_chat(
+                            system_prompt=M6_EVIDENCE_VERDICT_SYSTEM,
+                            user_prompt=json.dumps({
+                                "legacy_gap_ledger": [
+                                    gap.model_dump(mode="json")
+                                    for gap in state.evidence_gaps
+                                ],
+                                "instruction": "Preserve or close only these existing legacy gaps; do not invent new claims.",
+                            }, ensure_ascii=False, indent=2),
+                            output_schema=EvidenceSufficiencyVerdict.model_json_schema(),
+                            max_tokens=4096,
+                            temperature=0.0,
+                            disable_thinking=True,
+                        ),
+                        timeout=self.reviewer_timeout_seconds,
+                    )
+                    legacy_verdict = EvidenceSufficiencyVerdict.model_validate(dict(legacy_payload or {}))
+                    for gap in legacy_verdict.gaps:
+                        gap.gap_id = make_gap_id(
+                            gap.target_sub_question or gap.description,
+                            gap.gap_type,
+                            gap.canonical_entities,
+                        )
+                        gap.source_review_version = version
+                        gap.status = "open" if gap.status not in {"closed", "unimprovable"} else gap.status
+                    emit_event(
+                        "tool_completed",
+                        module="m6",
+                        tool="evidence_sufficiency_judge",
+                        status="completed",
+                        message=f"Legacy gap ledger migrated: {len(legacy_verdict.gaps)} gap(s)",
+                        elapsed_seconds=time.monotonic() - started_at,
+                        details={"version": version, "sufficient": legacy_verdict.sufficient},
+                    )
+                    return legacy_verdict
+                except Exception as exc:
+                    legacy_gaps = list(state.evidence_gaps)
+                    if not legacy_gaps:
+                        legacy_gaps = [self._coverage_gap(state, version)]
+                    verdict = EvidenceSufficiencyVerdict(
+                        sufficient=False,
+                        gaps=legacy_gaps,
+                        rationale=f"Legacy evidence ledger migration failed closed: {type(exc).__name__}: {exc}",
+                    )
+                    emit_event(
+                        "tool_failed",
+                        module="m6",
+                        tool="evidence_sufficiency_judge",
+                        status="failed",
+                        message=verdict.rationale,
+                        elapsed_seconds=time.monotonic() - started_at,
+                        details={"version": version, "legacy": True},
+                    )
+                    return verdict
+            verdict = EvidenceSufficiencyVerdict(
+                sufficient=True,
+                rationale="No required factual premise or explicitly unsupported plan fact requires literature audit.",
+            )
+            emit_event(
+                "tool_completed",
+                module="m6",
+                tool="evidence_sufficiency_judge",
+                status="completed",
+                message="M6 factual-premise audit: no auditable claims",
+                elapsed_seconds=time.monotonic() - started_at,
+                details={"version": version, "sufficient": True, "gap_ids": []},
+            )
+            return verdict
+
+        factual_by_id = {
+            str(getattr(item, "premise_id", "")): item
+            for item in (getattr(hypothesis, "factual_premises", []) or [])
+            if str(getattr(item, "premise_id", "")).strip()
+        }
+        premises: List[HypothesisPremise] = []
+        for item in scope:
+            existing = factual_by_id.get(item.source_claim_id)
+            if existing is not None:
+                premises.append(existing)
+                continue
+            # Plan links are deliberately converted to a narrow factual
+            # premise for the shared auditor; their source identity is kept in
+            # the resulting EvidenceGap as ``plan_fact``.
+            premises.append(HypothesisPremise(
+                premise_id=item.source_claim_id,
+                claim=item.claim,
+                kind="evidence_backed",
+                required=item.required,
+                supporting_evidence_ids=list(item.supporting_evidence_ids),
+            ))
+
+        try:
+            auditor = EvidenceAuditService(
+                self.client,
+                timeout_seconds=self.reviewer_timeout_seconds,
+                allow_legacy_node_ids=False,
+            )
+            results = await auditor.audit_premises(
+                premises,
+                state.evidence_graph,
+                candidate_evidence_ids=graph_context.available_evidence_ids,
+            )
+        except Exception as exc:
+            # A technical failure remains bound to each concrete premise; it
+            # must never become a free-form gap about the whole mechanism.
+            results = [PremiseAuditResult(
+                premise_id=item.source_claim_id,
+                claim=item.claim,
+                verdict="unsupported",
+                rationale=f"Factual premise audit failed closed: {type(exc).__name__}: {exc}",
+            ) for item in scope]
+
+        scope_by_id = {item.source_claim_id: item for item in scope}
+        gaps: List[EvidenceGap] = []
+        accepted_evidence_ids: List[str] = []
+        for result in results:
+            source = scope_by_id.get(result.premise_id)
+            if source is None:
+                continue
+            accepted_evidence_ids.extend(
+                str(item) for item in result.evidence_ids if str(item).strip()
+            )
+            if result.verdict in {"supported", "partially_supported", "not_applicable"}:
+                continue
+            target = (
+                state.problem_card.original_question
+                if state.problem_card is not None and state.problem_card.original_question
+                else state.input_question
+            )
+            entities: List[str] = []
+            if state.problem_card is not None:
+                entities = list(dict.fromkeys([
+                    *[
+                        entity.name for entity in state.problem_card.task_contract.entities
+                        if entity.required and entity.name
+                    ],
+                    *state.problem_card.key_entities,
+                ]))[:6]
+            query = " ".join([source.claim, target]).strip()
+            contradicted = result.verdict == "contradicted"
+            gap = EvidenceGap(
+                description=(
+                    f"Factual premise {source.source_claim_id} is contradicted: {source.claim}"
+                    if contradicted
+                    else f"Factual premise {source.source_claim_id} lacks canonical support: {source.claim}"
+                ),
+                gap_type="conflict" if contradicted else "coverage",
+                canonical_entities=entities,
+                suggested_queries=[query or target],
+                target_sub_question=target,
+                source_review_version=version,
+                source_claim_type=source.source_claim_type,
+                source_claim_id=source.source_claim_id,
+                status="open",
+                hypothesis_ids=[hypothesis.hypothesis_id],
+                scientific_resolution="contradicted" if contradicted else "unreviewed",
+                resolution_evidence_ids=list(dict.fromkeys(result.evidence_ids)) if contradicted else [],
+                contradicting_evidence_ids=list(dict.fromkeys(result.evidence_ids)) if contradicted else [],
+                search_completed=False,
+                technical_errors=(
+                    [result.rationale] if "failed closed" in result.rationale.lower() else []
+                ),
+                rationale=result.rationale,
+            )
+            gap.gap_id = make_gap_id(
+                gap.target_sub_question, gap.gap_type, gap.canonical_entities,
+            )
+            gaps.append(gap)
+
+        rationale = "; ".join(
+            f"{result.premise_id}: {result.verdict} — {result.rationale}"
+            for result in results if result.rationale
+        )
+        verdict = EvidenceSufficiencyVerdict(
+            sufficient=not gaps,
+            gaps=gaps,
+            evidence_ids=list(dict.fromkeys(accepted_evidence_ids)),
+            premise_audits=[FactualPremiseAudit(
+                premise_id=result.premise_id,
+                claim=result.claim,
+                verdict=result.verdict,
+                evidence_ids=list(dict.fromkeys(result.evidence_ids)),
+                corrected_claim=result.corrected_claim,
+                rationale=result.rationale,
+            ) for result in results],
+            rationale=rationale or "All audited factual premises are supported.",
+        )
+        emit_event(
+            "tool_completed",
+            module="m6",
+            tool="evidence_sufficiency_judge",
+            status="completed",
+            message=(
+                f"M6 factual-premise audit: {'sufficient' if verdict.sufficient else 'insufficient'}"
+                f", {len(verdict.gaps)} gap(s)"
+            ),
+            elapsed_seconds=time.monotonic() - started_at,
+            details={
+                "version": version,
+                "sufficient": verdict.sufficient,
+                "auditable_claim_count": len(scope),
+                "gap_ids": [gap.gap_id for gap in verdict.gaps],
+            },
+        )
+        return verdict
 
     async def _judge_evidence_sufficiency(
         self,
@@ -610,6 +1200,11 @@ class M6ReviewIteration(ModuleProtocol):
         plan: Any,
         version: int,
     ) -> EvidenceSufficiencyVerdict:
+        return await self._audit_factual_premises(state, hypothesis, plan, version)
+
+        # Legacy implementation retained below only as a reference for old
+        # checkpoint compatibility; the return above ensures new runs use the
+        # scoped factual-premise auditor.
         """Judge sufficiency against auditable graph evidence.
 
         Empty graphs, missing canonical citations, and judge failures are
@@ -618,6 +1213,21 @@ class M6ReviewIteration(ModuleProtocol):
         """
         graph = state.evidence_graph
         graph_context = build_graph_context(state)
+        context_pack = ContextPlanner().plan(
+            graph_context,
+            ContextRequest(
+                purpose="m6_sufficiency",
+                focus_evidence_ids=tuple(dict.fromkeys([
+                    *hypothesis.supporting_evidence,
+                    *plan.supporting_evidence_ids,
+                ])),
+            ),
+        )
+        emit_context_built(
+            "m6",
+            "evidence_sufficiency_judge",
+            context_pack,
+        )
         started_at = time.monotonic()
         emit_event(
             "tool_started",
@@ -642,7 +1252,7 @@ class M6ReviewIteration(ModuleProtocol):
                         facts_count=len(graph.established_facts) if graph else 0,
                         conflicts_count=len(graph.conflicts) if graph else 0,
                         gaps_count=len(graph.knowledge_gaps) if graph else 0,
-                        graph_context=graph_context.render(),
+                        graph_context=context_pack.rendered,
                         hypothesis_json=json.dumps(
                             hypothesis.model_dump(mode="json"), ensure_ascii=False, indent=2
                         ),
@@ -698,6 +1308,7 @@ class M6ReviewIteration(ModuleProtocol):
             anchor = gap.target_sub_question or gap.description
             gap.gap_id = make_gap_id(anchor, gap.gap_type, gap.canonical_entities)
             gap.source_review_version = version
+            gap.hypothesis_ids = [hypothesis.hypothesis_id]
             if gap.status not in ("open", "pending_grounding"):
                 gap.status = "open"  # freshly reported gaps start open
         emit_event(
@@ -724,8 +1335,8 @@ class M6ReviewIteration(ModuleProtocol):
 
         card = state.problem_card
         target = (
-            card.sub_questions[0]
-            if card is not None and card.sub_questions
+            card.original_question
+            if card is not None and card.original_question
             else state.input_question
         )
         entities: List[str] = []
@@ -744,6 +1355,12 @@ class M6ReviewIteration(ModuleProtocol):
             suggested_queries=[query or target],
             source_review_version=version,
             status="open",
+            hypothesis_ids=[
+                item.hypothesis_id for item in state.top_hypotheses
+                if item.hypothesis_id
+            ],
+            scientific_resolution="unreviewed",
+            search_completed=False,
         )
 
     @staticmethod
@@ -789,6 +1406,15 @@ class M6ReviewIteration(ModuleProtocol):
                 continue  # resolved gaps stay resolved
             current.attempts += 1  # survived one more review round
             current.source_review_version = version
+            if gap.hypothesis_ids:
+                current.hypothesis_ids = list(dict.fromkeys(gap.hypothesis_ids))
+            if gap.source_claim_type:
+                current.source_claim_type = gap.source_claim_type
+            if gap.source_claim_id:
+                current.source_claim_id = gap.source_claim_id
+            current.scientific_resolution = gap.scientific_resolution
+            current.search_completed = gap.search_completed
+            current.technical_errors = list(gap.technical_errors)
             if gap.suggested_queries and not current.suggested_queries:
                 current.suggested_queries = list(gap.suggested_queries)
             if gap.target_sub_question and not current.target_sub_question:
@@ -865,4 +1491,7 @@ class M6ReviewIteration(ModuleProtocol):
 
     @classmethod
     def get_output_fields(cls) -> List[str]:
-        return ["reviews", "iteration_count"]
+        return [
+            "reviews", "iteration_count", "top_hypotheses", "research_plans",
+            "experimental_validation_verdict",
+        ]
