@@ -50,14 +50,14 @@ def _route_after_m6(
        ``sufficient == False`` **and** an ``open`` gap exists **and**
        ``search_round < max_search_rounds`` → ``"supplement_m2"``;
     3. evidence sufficient (verdict ``None`` because the switch is off, or
-       ``sufficient == True``) **and** this round's ``overall`` ≥
-       ``review_score_threshold`` → ``"end"``;
+       ``sufficient == True``) and no structured hard gate failed → ``"end"``;
     4. pending graph corrections → ``"revise_m3"``; otherwise →
        ``"revise_m4"`` (the legacy hypothesis feedback loop).
 
-    With the switch off the verdict is ``None``, rule 2 never fires and rule 3
-    degenerates to the legacy threshold check, so default behaviour is exactly
-    equivalent to the pre-refactor router.
+    The displayed M6 score is intentionally excluded from this decision.  It
+    is a quality summary for humans and downstream reporting; only structured
+    evidence, validation, graph-correction, and hard-gate verdicts can request
+    another module pass.
 
     ``config`` may be ``None`` — feature switches are then treated as
     disabled, keeping the function usable as a pure routing oracle.
@@ -106,9 +106,8 @@ def _route_after_m6(
         else "revise_m4"
     )
 
-    # 3. evidence sufficient + quality threshold met → end.
-    # The verdict is only meaningful while the switch is on; with it off any
-    # (stale) verdict is ignored, keeping behaviour equivalent to legacy.
+    # 3. The verdict is only meaningful while the switch is on; with it off any
+    # (stale) verdict is ignored. Numeric M6 scores never enter routing.
     verdict = state.evidence_verdict if revisit else None
     evidence_sufficient = verdict is None or verdict.sufficient
     recent = [r for r in state.reviews if r.version == state.iteration_count]
@@ -157,17 +156,18 @@ def _route_after_m6(
                 return "revise_m4"
             return "revise_m5"
         return revision_route
-    overall = [r for r in recent if r.dimension.value == "overall"]
-    if (
-        evidence_sufficient
-        and overall
-        and overall[0].score >= state.review_score_threshold
-        and overall[0].hard_gate_passed is not False
-    ):
-        return "end"  # quality threshold met
+    if revision_route == "revise_m3":
+        return "revise_m3"
+    if evidence_sufficient:
+        return "end"
 
-    # 4. legacy feedback loop
-    return revision_route
+    # 4. An explicit insufficient evidence verdict remains actionable even
+    # when its search budget is exhausted or no gap can be materialised. This
+    # is a structured scientific outcome, not a consequence of the numeric
+    # display score. With no verdict, a low score alone is terminal.
+    if verdict is not None and not verdict.sufficient:
+        return revision_route
+    return "end"
 
 
 def active_supplement_origin(state: PipelineState) -> RoutingDecision | None:

@@ -142,6 +142,7 @@ async def test_m5_rewrites_once_with_structured_coverage_feedback(monkeypatch):
     assert "H1:mechanism" in generated[1]
     assert "No direct pathway measurement" in generated[1]
     assert patch["research_plans"][0].study_subjects == "repaired plan"
+    assert patch["experimental_validation_verdict"].sufficient is True
 
 
 @pytest.mark.asyncio

@@ -24,6 +24,7 @@ from ..protocol import ModuleProtocol
 from ..prompts.m5_prompts import M5_SYSTEM_PROMPT, M5_USER_TEMPLATE
 from ..registry import ModuleRegistry
 from ..state import (
+    ExperimentalValidationVerdict,
     PipelineState,
     ResearchPlan,
     ResearchPlanEvidenceLink,
@@ -888,6 +889,7 @@ class M5ResearchPlan(ModuleProtocol):
             )
 
         plans: List[ResearchPlan] = []
+        validation_verdicts: List[ExperimentalValidationVerdict] = []
         supplement_reentry = self._is_supplement_reentry(state)
         reusable = self._reusable_plans(state) if supplement_reentry else {}
         graph_context = build_graph_context(state)
@@ -942,6 +944,7 @@ class M5ResearchPlan(ModuleProtocol):
             rendered_graph_context = context_pack.rendered
             coverage_retry_context = ""
             final_plan: ResearchPlan | None = None
+            final_validation_verdict: ExperimentalValidationVerdict | None = None
             validation_auditor = None if self.fast_mode else ExperimentalValidationAuditor(
                 client=self.client,
                 llm_config=self.llm_config,
@@ -991,6 +994,7 @@ class M5ResearchPlan(ModuleProtocol):
                         },
                     )
                     break
+                final_validation_verdict = outcome.verdict
                 unresolved = [
                     item for item in outcome.verdict.items
                     if item.verdict != "covered"
@@ -1037,11 +1041,33 @@ class M5ResearchPlan(ModuleProtocol):
                 )
             assert final_plan is not None
             plans.append(final_plan)
+            if final_validation_verdict is not None:
+                validation_verdicts.append(final_validation_verdict)
             continue
 
         history = dict(state.research_plan_history)
         history[state.iteration_count + 1] = [plan.model_copy(deep=True) for plan in plans]
-        return {"research_plans": plans, "research_plan_history": history}
+        if validation_verdicts:
+            validation_verdict = ExperimentalValidationVerdict(
+                sufficient=all(item.sufficient for item in validation_verdicts),
+                items=[
+                    coverage
+                    for item in validation_verdicts
+                    for coverage in item.items
+                ],
+                rationale=" ".join(
+                    item.rationale for item in validation_verdicts if item.rationale
+                ),
+            )
+        elif reusable and state.experimental_validation_verdict is not None:
+            validation_verdict = state.experimental_validation_verdict.model_copy(deep=True)
+        else:
+            validation_verdict = None
+        return {
+            "research_plans": plans,
+            "research_plan_history": history,
+            "experimental_validation_verdict": validation_verdict,
+        }
 
     @classmethod
     def get_input_fields(cls) -> List[str]:
@@ -1053,4 +1079,8 @@ class M5ResearchPlan(ModuleProtocol):
 
     @classmethod
     def get_output_fields(cls) -> List[str]:
-        return ["research_plans", "research_plan_history"]
+        return [
+            "research_plans",
+            "research_plan_history",
+            "experimental_validation_verdict",
+        ]

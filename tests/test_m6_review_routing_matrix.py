@@ -133,6 +133,20 @@ def test_all_layers_pass_route_to_end():
     assert _route_after_m6(state, _config()) == "end"
 
 
+def test_overall_score_alone_never_triggers_iteration():
+    """The displayed quality score must not become a hidden routing gate."""
+    state = _base(
+        reviews=[
+            _review("scientific_logic", score=1.0),
+            _review("method_feasibility", attribution="plan", score=1.0),
+            _review("overall", score=1.0),
+        ],
+        evidence_verdict=EvidenceSufficiencyVerdict(sufficient=True),
+    )
+
+    assert _route_after_m6(state, _config()) == "end"
+
+
 def test_iteration_budget_exhaustion_is_a_hard_stop():
     state = _base(iteration_count=3, max_iterations=3)
     assert _route_after_m6(state, _config()) == "end"

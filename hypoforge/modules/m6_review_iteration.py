@@ -3,8 +3,9 @@ M6: Review & Iterative Refinement.
 
 Three specialist reviewer agents (scientific_logic / evidence_consistency /
 method_feasibility) score the top hypothesis + research plan on a 1–5 scale;
-each reasons *before* it scores (rubric-anchored).  The ``overall`` score is
-computed as the mean of the specialist scores.
+each reasons *before* it scores (rubric-anchored).  M6 additionally persists a
+calibrated eight-dimension score with explicit caps; this display score is
+intentionally independent from iterative routing.
 
 Output: ``reviews`` appended; ``iteration_count`` incremented.
 """
@@ -22,15 +23,21 @@ from typing import Any, Dict, List, Optional
 from ..observability import emit_event
 from ..context import ContextPlanner, ContextRequest, emit_context_built
 from ..evidence_audit import EvidenceAuditService, PremiseAuditResult
-from ..experimental_validation import ExperimentalValidationAuditor
+from ..evaluation.m6_scoring import (
+    M6_SCORE_WEIGHTS,
+    M6ScoreConditions,
+    PlanQualityAssessment,
+    SemanticScoreAssessment,
+    aggregate_m6_scoring,
+)
 from ..graph_context import build_graph_context
 from ..protocol import ModuleProtocol
 from ..prompts.m6_prompts import (
     M6_EVIDENCE_VERDICT_SYSTEM,
     M6_EVIDENCE_VERDICT_TEMPLATE,
-    M6_EXPERIMENTAL_VALIDATION_SYSTEM,
-    M6_EXPERIMENTAL_VALIDATION_TEMPLATE,
     M6_FORMAT_NOTE,
+    M6_NOVELTY_REVIEW_SYSTEM,
+    M6_PLAN_QUALITY_SYSTEM,
     M6_REASON_FIRST,
     M6_REVIEWER_PROMPTS,
     M6_USER_TEMPLATE,
@@ -49,8 +56,7 @@ from ..state import (
     ReviewResult,
     ResearchPlan,
     ReviewerDimension,
-    ValidationCoverageItem,
-    ValidationTarget,
+    ScoreDimensionDetail,
     make_gap_id,
 )
 from ..synthesis_contract import (
@@ -279,6 +285,522 @@ class M6ReviewIteration(ModuleProtocol):
         )
         self.reviewer_timeout_seconds = float(reviewer_timeout_seconds)
         self.client = QwenClient.from_config(llm_config) if llm_config else None
+        # Real configured runs receive the detailed semantic audits. Tests and
+        # legacy callers that inject a fake client without an LLM config keep
+        # the bounded deterministic fallback unless they opt in explicitly.
+        self.detailed_scoring = llm_config is not None
+
+    @staticmethod
+    def _build_scoring_summary(
+        dimensions: list[Any],
+        conditions: M6ScoreConditions,
+    ):
+        """Build the persisted score through the pure calibration contract."""
+        return aggregate_m6_scoring(dimensions, conditions)
+
+    @staticmethod
+    def _dimension_detail(
+        dimension: str,
+        score: float,
+        *,
+        source: str,
+        confidence: float,
+        strengths: Optional[List[str]] = None,
+        weaknesses: Optional[List[str]] = None,
+        deductions: Optional[List[str]] = None,
+    ) -> ScoreDimensionDetail:
+        weight = M6_SCORE_WEIGHTS[dimension]
+        return ScoreDimensionDetail(
+            dimension=dimension,
+            score=max(1.0, min(5.0, round(float(score), 1))),
+            weight=weight,
+            weighted_contribution=round(float(score) * weight, 4),
+            source=source,
+            confidence=max(0.0, min(1.0, float(confidence))),
+            strengths=list(strengths or []),
+            weaknesses=list(weaknesses or []),
+            deductions=list(deductions or []),
+        )
+
+    @staticmethod
+    def _alignment_score(assessment: Any, semantic_passed: bool) -> float:
+        """Map the deterministic 0–1 alignment score to the 1–5 rubric."""
+        if not semantic_passed or not assessment.passed:
+            return 1.0
+        return round(1.0 + max(0.0, min(1.0, assessment.score)) * 4.0, 1)
+
+    @staticmethod
+    def _reproducibility_detail(plan: ResearchPlan) -> ScoreDimensionDetail:
+        """Score explicit reproducibility safeguards, not field presence."""
+        text = json.dumps(plan.model_dump(mode="json"), ensure_ascii=False).casefold()
+        indicators = {
+            "sample_size_basis": any(term in text for term in (
+                "power analysis", "效应量", "sample size", "样本量依据",
+            )),
+            "randomisation": any(term in text for term in (
+                "random", "随机", "randomization", "随机化",
+            )),
+            "blinding": any(term in text for term in (
+                "blind", "盲法", "blinded", "双盲",
+            )),
+            "replicates": any(term in text for term in (
+                "replicate", "重复", "biological n", "生物学重复",
+            )),
+            "batch_control": any(term in text for term in (
+                "batch", "批次", "lot", "批间",
+            )),
+            "primary_endpoint": any(term in text for term in (
+                "primary endpoint", "主要终点", "主要指标",
+            )),
+            "multiplicity": any(term in text for term in (
+                "multiple comparison", "多重比较", "预注册", "pre-spec",
+            )),
+        }
+        count = sum(indicators.values())
+        score = round(1.0 + 4.0 * count / len(indicators), 1)
+        missing = [name for name, present in indicators.items() if not present]
+        return M6ReviewIteration._dimension_detail(
+            "statistics_reproducibility",
+            score,
+            source="deterministic",
+            confidence=0.8,
+            strengths=[name for name, present in indicators.items() if present],
+            weaknesses=missing,
+            deductions=[f"Missing safeguard: {name}" for name in missing],
+        )
+
+    async def _review_novelty(
+        self,
+        state: PipelineState,
+        hypothesis: Any,
+        plan: ResearchPlan,
+        graph_context: Any,
+    ) -> SemanticScoreAssessment:
+        if self.fast_mode or not self.detailed_scoring or self.client is None:
+            return SemanticScoreAssessment(
+                score=3.0,
+                confidence=0.0,
+                weaknesses=["Detailed novelty audit skipped in fast/legacy mode."],
+                deductions=["No semantic novelty audit was executed."],
+            )
+        try:
+            payload = await asyncio.wait_for(
+                self.client.structured_chat(
+                    system_prompt=M6_NOVELTY_REVIEW_SYSTEM,
+                    user_prompt=M6_USER_TEMPLATE.format(
+                        original_question=state.input_question,
+                        problem_card_json=json.dumps(
+                            synthesis_problem_payload(state.problem_card),
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                        hypothesis_json=json.dumps(
+                            hypothesis.model_dump(mode="json"),
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                        plan_json=json.dumps(
+                            plan.model_dump(mode="json"),
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                        graph_context=graph_context.render(),
+                        facts_count=len(state.evidence_graph.established_facts)
+                        if state.evidence_graph else 0,
+                        conflicts_count=len(state.evidence_graph.conflicts)
+                        if state.evidence_graph else 0,
+                        gaps_count=len(state.evidence_graph.knowledge_gaps)
+                        if state.evidence_graph else 0,
+                    ),
+                    output_schema=SemanticScoreAssessment.model_json_schema(),
+                    max_tokens=4096,
+                    temperature=getattr(self.llm_config, "temperature", 0.1),
+                    disable_thinking=True,
+                ),
+                timeout=self.reviewer_timeout_seconds,
+            )
+            return SemanticScoreAssessment.model_validate(payload)
+        except Exception as exc:
+            logger.warning("M6 novelty audit degraded: %s", exc)
+            return SemanticScoreAssessment(
+                score=3.0,
+                confidence=0.0,
+                weaknesses=["Novelty semantic audit failed."],
+                deductions=[f"Novelty audit unavailable: {type(exc).__name__}"],
+            )
+
+    async def _review_plan_quality(
+        self,
+        state: PipelineState,
+        hypothesis: Any,
+        plan: ResearchPlan,
+        graph_context: Any,
+    ) -> PlanQualityAssessment:
+        if self.fast_mode or not self.detailed_scoring or self.client is None:
+            fallback = SemanticScoreAssessment(
+                score=3.0,
+                confidence=0.0,
+                weaknesses=["Detailed plan-quality audit skipped in fast/legacy mode."],
+                deductions=["No semantic plan-quality audit was executed."],
+            )
+            return PlanQualityAssessment(
+                task_coverage=fallback,
+                evidence_reliability=fallback,
+                testability=fallback,
+                experimental_rigor=fallback,
+                statistics_reproducibility=fallback,
+                technical_feasibility=fallback,
+            )
+
+        try:
+            payload = await asyncio.wait_for(
+                self.client.structured_chat(
+                    system_prompt=M6_PLAN_QUALITY_SYSTEM,
+                    user_prompt=M6_USER_TEMPLATE.format(
+                        original_question=state.input_question,
+                        problem_card_json=json.dumps(
+                            synthesis_problem_payload(state.problem_card),
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                        hypothesis_json=json.dumps(
+                            hypothesis.model_dump(mode="json"),
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                        plan_json=json.dumps(
+                            plan.model_dump(mode="json"),
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                        graph_context=graph_context.render(),
+                        facts_count=len(state.evidence_graph.established_facts)
+                        if state.evidence_graph else 0,
+                        conflicts_count=len(state.evidence_graph.conflicts)
+                        if state.evidence_graph else 0,
+                        gaps_count=len(state.evidence_graph.knowledge_gaps)
+                        if state.evidence_graph else 0,
+                    ),
+                    output_schema=PlanQualityAssessment.model_json_schema(),
+                    max_tokens=8192,
+                    temperature=getattr(self.llm_config, "temperature", 0.1),
+                    disable_thinking=True,
+                ),
+                timeout=self.reviewer_timeout_seconds,
+            )
+            return PlanQualityAssessment.model_validate(payload)
+        except Exception as exc:
+            logger.warning("M6 plan-quality audit degraded: %s", exc)
+            fallback = SemanticScoreAssessment(
+                score=3.0,
+                confidence=0.0,
+                weaknesses=["Plan-quality semantic audit failed."],
+                deductions=[f"Plan-quality audit unavailable: {type(exc).__name__}"],
+            )
+            return PlanQualityAssessment(
+                task_coverage=fallback,
+                evidence_reliability=fallback,
+                testability=fallback,
+                experimental_rigor=fallback,
+                statistics_reproducibility=fallback,
+                technical_feasibility=fallback,
+            )
+
+    async def _build_modern_scoring_dimensions(
+        self,
+        *,
+        state: PipelineState,
+        hypothesis: Any,
+        plan: ResearchPlan,
+        graph_context: Any,
+        hypothesis_alignment: Any,
+        plan_alignment: Any,
+        semantic_alignment_passed: bool,
+        deterministic_alignment_passed: bool,
+        factual_verdict: Optional[EvidenceSufficiencyVerdict],
+        experimental_validation_verdict: Optional[ExperimentalValidationVerdict],
+        gates: Dict[str, Any],
+        reviews: List[ReviewResult],
+    ) -> tuple[list[ScoreDimensionDetail], M6ScoreConditions]:
+        """Collect eight modern dimensions and structured cap conditions."""
+
+        def latest_review(*names: str) -> Optional[ReviewResult]:
+            for item in reversed(reviews):
+                if item.dimension.value in names:
+                    return item
+            return None
+
+        logic_review = latest_review("scientific_logic")
+        logic_score = logic_review.score if logic_review else 3.0
+        logic_source = "llm" if logic_review else "degraded"
+        logic_confidence = 0.8 if logic_review else 0.0
+        logic_row = self._dimension_detail(
+            "scientific_logic",
+            logic_score,
+            source=logic_source,
+            confidence=logic_confidence,
+            strengths=[logic_review.comments] if logic_review and logic_review.comments else [],
+            weaknesses=[logic_review.suggestions] if logic_review and logic_review.suggestions else [],
+        )
+
+        # Reuse the existing bounded plan-quality call for the dimensions that
+        # require semantic judgement.  No extra LLM request is introduced.
+        plan_quality = await self._review_plan_quality(
+            state, hypothesis, plan, graph_context
+        )
+
+        structural_task_score = min(
+            self._alignment_score(hypothesis_alignment, semantic_alignment_passed),
+            self._alignment_score(plan_alignment, semantic_alignment_passed),
+        )
+        task_semantic = plan_quality.task_coverage
+        task_score = min(structural_task_score, task_semantic.score)
+        task_row = self._dimension_detail(
+            "task_coverage",
+            task_score,
+            source="hybrid",
+            confidence=max(
+                task_semantic.confidence,
+                1.0 if semantic_alignment_passed else 0.4,
+            ),
+            strengths=task_semantic.strengths,
+            weaknesses=(
+                list(task_semantic.weaknesses)
+                +
+                list(getattr(hypothesis_alignment, "missing_anchors", []) or [])
+                + list(getattr(plan_alignment, "missing_anchors", []) or [])
+            ),
+            deductions=task_semantic.deductions,
+        )
+
+        novelty_semantic = await self._review_novelty(
+            state, hypothesis, plan, graph_context
+        )
+        novelty_score = novelty_semantic.score
+        novelty_source = "llm" if novelty_semantic.confidence else "degraded"
+        novelty_confidence = novelty_semantic.confidence
+        novelty_weaknesses = list(novelty_semantic.weaknesses)
+        novelty_deductions = list(novelty_semantic.deductions)
+        if self.detailed_scoring and not self.fast_mode and state.evidence_graph:
+            try:
+                from ..evaluation.metrics import NoveltyMetric
+
+                knowledge_entries = [
+                    entry
+                    for result in state.literature_results
+                    for entry in result.knowledge_entries
+                ]
+                independent_result = await asyncio.wait_for(
+                    NoveltyMetric(llm_config=self.llm_config).compute(
+                        hypothesis,
+                        knowledge_entries,
+                        evidence_graph=state.evidence_graph,
+                    ),
+                    timeout=self.reviewer_timeout_seconds,
+                )
+                independent_score, trace = (
+                    independent_result
+                    if isinstance(independent_result, tuple)
+                    else (independent_result, {})
+                )
+                claim_rows = list((trace or {}).get("claims_novelty", []))
+                usable = [
+                    row for row in claim_rows
+                    if row.get("assessment") != "insufficient_graph_coverage"
+                ]
+                coverage = len(usable) / len(claim_rows) if claim_rows else 0.0
+                if coverage >= 0.6:
+                    novelty_score = round(
+                        0.6 * float(independent_score) * 5.0
+                        + 0.4 * novelty_semantic.score,
+                        1,
+                    )
+                    novelty_source = "hybrid"
+                    novelty_confidence = round(
+                        min(novelty_semantic.confidence, coverage), 2
+                    )
+                else:
+                    novelty_score = min(novelty_semantic.score, 3.5)
+                    novelty_source = "degraded"
+                    novelty_confidence = min(novelty_semantic.confidence, 0.5)
+                    novelty_weaknesses.append(
+                        "Evidence-graph coverage was insufficient for an independent novelty estimate."
+                    )
+                    novelty_deductions.append(
+                        f"Usable graph novelty claims: {coverage:.0%}."
+                    )
+            except Exception as exc:
+                logger.warning("M6 independent novelty score degraded: %s", exc)
+                novelty_score = min(novelty_semantic.score, 3.5)
+                novelty_source = "degraded"
+                novelty_confidence = min(novelty_semantic.confidence, 0.3)
+                novelty_deductions.append(
+                    f"Independent novelty metric unavailable: {type(exc).__name__}."
+                )
+        novelty_row = self._dimension_detail(
+            "novelty",
+            novelty_score,
+            source=novelty_source,
+            confidence=novelty_confidence,
+            strengths=novelty_semantic.strengths,
+            weaknesses=novelty_weaknesses,
+            deductions=novelty_deductions,
+        )
+
+        audits = list(factual_verdict.premise_audits) if factual_verdict else []
+        audit_verdicts = {item.verdict for item in audits}
+        if "contradicted" in audit_verdicts:
+            factual_score = 1.0
+        elif audit_verdicts & {"unsupported", "invalid_citation"}:
+            factual_score = 2.0
+        elif "partially_supported" in audit_verdicts:
+            factual_score = 3.5
+        elif audits:
+            factual_score = 5.0
+        else:
+            factual_score = 3.0
+        evidence_coverage = float(gates.get("evidence_coverage", 0.0))
+        source_quality = float(gates.get("source_quality", 0.0))
+        deterministic_evidence_score = round(
+            0.6 * factual_score
+            + 0.25 * evidence_coverage * 5.0
+            + 0.15 * source_quality * 5.0,
+            1,
+        )
+        evidence_semantic = plan_quality.evidence_reliability
+        evidence_score = min(
+            deterministic_evidence_score,
+            evidence_semantic.score,
+        )
+        evidence_row = self._dimension_detail(
+            "evidence_reliability",
+            evidence_score,
+            source="hybrid" if audits else "degraded",
+            confidence=max(
+                evidence_semantic.confidence,
+                0.9 if audits else 0.3,
+            ),
+            strengths=evidence_semantic.strengths,
+            weaknesses=(
+                list(evidence_semantic.weaknesses)
+                + [item.rationale for item in audits if item.verdict != "supported"]
+                or (["No auditable factual premises were available."] if not audits else [])
+            ),
+            deductions=evidence_semantic.deductions,
+        )
+
+        predictions = list(getattr(hypothesis, "observable_predictions", []) or [])
+        falsifications = list(getattr(hypothesis, "falsification_conditions", []) or [])
+        if experimental_validation_verdict is not None:
+            target_items = experimental_validation_verdict.items
+            validation_ratio = (
+                sum(
+                    1.0 if item.verdict == "covered"
+                    else 0.5 if item.verdict == "partial" else 0.0
+                    for item in target_items
+                ) / len(target_items)
+                if target_items else 0.0
+            )
+            structural_testability_score = round(
+                1.0 + 4.0 * validation_ratio
+                if predictions and falsifications else 1.0,
+                1,
+            )
+        else:
+            structural_testability_score = 5.0 if predictions and falsifications else 2.0
+            validation_ratio = 1.0 if predictions and falsifications else 0.0
+        testability_semantic = plan_quality.testability
+        testability_score = min(
+            structural_testability_score,
+            testability_semantic.score,
+        )
+        testability_row = self._dimension_detail(
+            "testability",
+            testability_score,
+            source="hybrid" if experimental_validation_verdict else "deterministic",
+            confidence=max(
+                testability_semantic.confidence,
+                0.9 if experimental_validation_verdict else 0.5,
+            ),
+            strengths=testability_semantic.strengths,
+            weaknesses=(
+                list(testability_semantic.weaknesses)
+                + ([] if predictions and falsifications else [
+                    "Missing observable predictions or falsification conditions."
+                ])
+            ),
+            deductions=testability_semantic.deductions,
+        )
+
+        experimental_row = self._dimension_detail(
+            "experimental_rigor",
+            plan_quality.experimental_rigor.score,
+            source="llm" if plan_quality.experimental_rigor.confidence else "degraded",
+            confidence=plan_quality.experimental_rigor.confidence,
+            strengths=plan_quality.experimental_rigor.strengths,
+            weaknesses=plan_quality.experimental_rigor.weaknesses,
+            deductions=plan_quality.experimental_rigor.deductions,
+        )
+        reproducibility_row = self._reproducibility_detail(plan).model_copy(update={
+            "score": round(
+                0.6 * plan_quality.statistics_reproducibility.score
+                + 0.4 * self._reproducibility_detail(plan).score,
+                1,
+            ),
+            "source": (
+                "hybrid" if plan_quality.statistics_reproducibility.confidence
+                else "deterministic"
+            ),
+            "confidence": max(
+                plan_quality.statistics_reproducibility.confidence,
+                0.5,
+            ),
+            "weaknesses": (
+                list(plan_quality.statistics_reproducibility.weaknesses)
+                + list(self._reproducibility_detail(plan).weaknesses)
+            ),
+            "deductions": (
+                list(plan_quality.statistics_reproducibility.deductions)
+                + list(self._reproducibility_detail(plan).deductions)
+            ),
+        })
+        feasibility_row = self._dimension_detail(
+            "technical_feasibility",
+            plan_quality.technical_feasibility.score,
+            source="llm" if plan_quality.technical_feasibility.confidence else "degraded",
+            confidence=plan_quality.technical_feasibility.confidence,
+            strengths=plan_quality.technical_feasibility.strengths,
+            weaknesses=plan_quality.technical_feasibility.weaknesses,
+            deductions=plan_quality.technical_feasibility.deductions,
+        )
+
+        conditions = M6ScoreConditions(
+            task_misaligned=not deterministic_alignment_passed,
+            core_fact_contradicted="contradicted" in audit_verdicts,
+            core_untestable=not predictions or not falsifications,
+            experimental_validation_missing=(
+                experimental_validation_verdict is not None
+                and not experimental_validation_verdict.sufficient
+            ),
+            multiple_major_design_defects=sum(
+                len(item.blocking_issues)
+                for item in (
+                    plan_quality.experimental_rigor,
+                    plan_quality.statistics_reproducibility,
+                    plan_quality.technical_feasibility,
+                )
+            ) >= 2,
+        )
+        return [
+            task_row,
+            novelty_row,
+            logic_row,
+            evidence_row,
+            testability_row,
+            experimental_row,
+            reproducibility_row,
+            feasibility_row,
+        ], conditions
 
     async def _audit_pair_semantics(
         self,
@@ -428,10 +950,6 @@ class M6ReviewIteration(ModuleProtocol):
                 f"hypothesis-plan pair that were designed together."
             )
         graph = state.evidence_graph
-        legacy_checkpoint = (
-            state.problem_card is not None
-            and state.problem_card.task_contract.source == "derived"
-        )
         graph_context = build_graph_context(state)
         synthesis_contract = synthesis_contract_for_state(state)
         valid_evidence_ids = set(graph_context.available_evidence_ids)
@@ -675,7 +1193,8 @@ class M6ReviewIteration(ModuleProtocol):
                 )
                 break
 
-        # --- NEW: Objective Quality Gates & Metrics ---
+        # --- Objective Quality Gates & Metrics ---
+        gates: Dict[str, Any] = {}
         try:
             gates = _quality_gates(evaluation_state)
             
@@ -743,14 +1262,11 @@ class M6ReviewIteration(ModuleProtocol):
         except Exception as e:
             logger.warning(f"Failed to compute objective quality gates/metrics: {e}")
 
-        # M6's third independent layer: every M4 target must be covered by a
-        # concrete M5 procedure/measurement/analysis.  Fast mode preserves its
-        # existing lightweight behavior and skips this extra LLM audit.
-        experimental_validation_verdict: Optional[ExperimentalValidationVerdict] = None
-        if self.m6_evidence_revisit and not self.fast_mode and not legacy_checkpoint:
-            experimental_validation_verdict = await self._judge_experimental_validation(
-                hypothesis, plan, version,
-            )
+        # M5 already audits every M4 validation target and persists the final
+        # verdict.  Reuse that result here instead of repeating the same LLM
+        # request inside M6.
+        experimental_validation_verdict = state.experimental_validation_verdict
+        if experimental_validation_verdict is not None:
             item_count = len(experimental_validation_verdict.items)
             weighted_coverage = sum(
                 1.0 if item.verdict == "covered" else 0.5 if item.verdict == "partial" else 0.0
@@ -775,8 +1291,64 @@ class M6ReviewIteration(ModuleProtocol):
                 version=version,
             ))
 
-        # Compute overall as the mean of the specialist scores.
-        if "overall" in self.reviewer_dims and new_reviews:
+        # Modern calibrated score.  This is deliberately a separate reporting
+        # layer: the ReviewResult rows below carry ``hard_gate_passed=None`` so
+        # their numeric values cannot accidentally become routing signals.
+        scoring_dimensions, scoring_conditions = (
+            await self._build_modern_scoring_dimensions(
+                state=state,
+                hypothesis=hypothesis,
+                plan=plan,
+                graph_context=graph_context,
+                hypothesis_alignment=hypothesis_alignment,
+                plan_alignment=plan_alignment,
+                semantic_alignment_passed=semantic_alignment_passed,
+                deterministic_alignment_passed=deterministic_alignment_passed,
+                factual_verdict=factual_verdict,
+                experimental_validation_verdict=experimental_validation_verdict,
+                gates=gates,
+                reviews=new_reviews,
+            )
+        )
+        m6_scoring_summary = self._build_scoring_summary(
+            scoring_dimensions,
+            scoring_conditions,
+        )
+        legacy_failed_gates = [
+            review.dimension.value
+            for review in new_reviews
+            if review.hard_gate_passed is False
+        ]
+        modern_attribution = {
+            "task_coverage": "both",
+            "novelty": "hypothesis",
+            "scientific_logic": "hypothesis",
+            "evidence_reliability": "hypothesis",
+            "testability": "hypothesis",
+            "experimental_rigor": "plan",
+            "statistics_reproducibility": "plan",
+            "technical_feasibility": "plan",
+        }
+        for detail in scoring_dimensions:
+            new_reviews.append(ReviewResult(
+                dimension=ReviewerDimension(detail.dimension),
+                attribution=modern_attribution[detail.dimension],
+                reasoning=(
+                    f"Calibrated {detail.dimension} score from {detail.source} "
+                    f"assessment; confidence {detail.confidence:.2f}."
+                ),
+                score=detail.score,
+                comments="\n".join(detail.strengths),
+                suggestions="\n".join(
+                    [*detail.weaknesses, *detail.deductions]
+                ),
+                hard_gate_passed=None,
+                version=version,
+            ))
+
+        # ``overall`` is a display row backed by the persisted summary.  It is
+        # not a quality gate and therefore cannot request another iteration.
+        if "overall" in self.reviewer_dims:
             overall_started_at = time.monotonic()
             emit_event(
                 "tool_started",
@@ -786,22 +1358,23 @@ class M6ReviewIteration(ModuleProtocol):
                 message="Aggregating overall score",
                 details={"version": version},
             )
-            avg, failed_gates = _aggregate_overall_reviews(new_reviews)
             new_reviews.append(ReviewResult(
                 dimension=ReviewerDimension("overall"),
-                reasoning=(
-                    "Computed from specialist reviews; hard-gate failures: "
-                    + (", ".join(failed_gates) if failed_gates else "none")
+                reasoning=m6_scoring_summary.rationale,
+                score=m6_scoring_summary.final_score,
+                comments=(
+                    "Weighted eight-dimension score for display and reporting; "
+                    "numeric score is excluded from iteration routing."
                 ),
-                score=round(avg, 1),
-                comments="Computed from specialist reviews and capped when task/evidence hard gates fail.",
-                suggestions="See individual dimension reviews for detailed suggestions.",
+                suggestions="\n".join(
+                    cap.reason for cap in m6_scoring_summary.applied_caps
+                ),
                 evidence_ids=list(dict.fromkeys(
                     evidence_id
                     for review in new_reviews
                     for evidence_id in review.evidence_ids
                 )),
-                hard_gate_passed=not failed_gates,
+                hard_gate_passed=not legacy_failed_gates,
                 version=version,
             ))
             emit_event(
@@ -809,9 +1382,17 @@ class M6ReviewIteration(ModuleProtocol):
                 module="m6",
                 tool="overall_score_aggregator",
                 status="completed",
-                message=f"Overall score {avg:.1f}/5",
+                message=f"Overall score {m6_scoring_summary.final_score:.1f}/5",
                 elapsed_seconds=time.monotonic() - overall_started_at,
-                details={"version": version, "score": round(avg, 1)},
+                details={
+                    "version": version,
+                    "score": m6_scoring_summary.final_score,
+                    "raw_score": m6_scoring_summary.raw_score,
+                    "applied_caps": [
+                        cap.rule_id for cap in m6_scoring_summary.applied_caps
+                    ],
+                    "routing_uses_score": False,
+                },
             )
 
         correction_by_id = {
@@ -824,6 +1405,7 @@ class M6ReviewIteration(ModuleProtocol):
 
         patch: Dict[str, Any] = {
             "reviews": state.reviews + new_reviews,
+            "m6_scoring_summary": m6_scoring_summary,
             "iteration_count": version,
             "graph_correction_requests": list(correction_by_id.values()),
             "top_hypotheses": normalised_hypotheses,
@@ -857,44 +1439,6 @@ class M6ReviewIteration(ModuleProtocol):
     # ------------------------------------------------------------------
     # Experimental validation coverage (M4 -> M5)
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _validation_targets(hypothesis: Any) -> List[ValidationTarget]:
-        """Compatibility wrapper for the shared experimental auditor."""
-        return ExperimentalValidationAuditor.validation_targets(hypothesis)
-
-    @staticmethod
-    def _validation_plan_context(plan: ResearchPlan) -> Dict[str, Any]:
-        """Compatibility wrapper for the shared experimental auditor."""
-        return ExperimentalValidationAuditor.validation_plan_context(plan)
-
-    @staticmethod
-    def _validation_item_from_target(
-        target: ValidationTarget,
-        raw: Optional[Dict[str, Any]],
-        valid_refs: Dict[str, set[str]],
-        plan_context: Dict[str, Any],
-    ) -> ValidationCoverageItem:
-        """Compatibility wrapper for the shared experimental auditor."""
-        return ExperimentalValidationAuditor.validation_item_from_target(
-            target, raw, valid_refs, plan_context
-        )
-
-
-    async def _judge_experimental_validation(
-        self,
-        hypothesis: Any,
-        plan: ResearchPlan,
-        version: int,
-    ) -> ExperimentalValidationVerdict:
-        """Review whether M5 can actually test every M4 target."""
-        auditor = ExperimentalValidationAuditor(
-            client=self.client,
-            llm_config=self.llm_config,
-            timeout_seconds=self.reviewer_timeout_seconds,
-        )
-        return (await auditor.audit(hypothesis, plan, version)).verdict
-
     # ------------------------------------------------------------------
     # Evidence sufficiency (iteration core)
     # ------------------------------------------------------------------

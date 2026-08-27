@@ -4733,6 +4733,15 @@ async def test_m6_uses_q0_instead_of_retrieval_requirement_ids() -> None:
 
     assert task_review.hard_gate_passed is True
     assert "R1" not in task_review.reasoning
+    reviewed = state.model_copy(update=result)
+    assert reviewed.m6_scoring_summary is not None
+    assert len(reviewed.m6_scoring_summary.dimensions) == 8
+    overall = next(
+        review for review in reviewed.reviews
+        if review.dimension.value == "overall"
+    )
+    assert overall.score == reviewed.m6_scoring_summary.final_score
+    assert "routing" in reviewed.m6_scoring_summary.rationale.casefold()
     for call in module.client.calls:
         for question in state.problem_card.sub_questions:
             assert question not in call["user_prompt"]
@@ -8001,8 +8010,8 @@ def test_route_after_m6_pending_graph_correction_revises_m3():
     assert _route_after_m6(state, PipelineConfig(verbose=False)) == "revise_m3"
 
 
-def test_route_after_m6_low_score_revises_m4():
-    assert _route_after_m6(_state_after_review(score=3.0), _revisit_config()) == "revise_m4"
+def test_route_after_m6_low_score_does_not_trigger_iteration():
+    assert _route_after_m6(_state_after_review(score=3.0), _revisit_config()) == "end"
 
 
 def test_route_after_m6_switch_off_verdict_is_ignored():
@@ -8011,8 +8020,8 @@ def test_route_after_m6_switch_off_verdict_is_ignored():
     # m6_evidence_revisit now defaults True — the test pins the switch OFF
     # explicitly to exercise the legacy verdict-ignored behaviour.
     switch_off = PipelineConfig(verbose=False, m6_evidence_revisit=False)
-    assert _route_after_m6(state, switch_off) == "revise_m4"
-    assert _route_after_m6(state, None) == "revise_m4"
+    assert _route_after_m6(state, switch_off) == "end"
+    assert _route_after_m6(state, None) == "end"
     # high score + hostile verdict still ends when the switch is off
     high = _insufficient_state(score=4.9)
     assert _route_after_m6(high, switch_off) == "end"
@@ -8136,7 +8145,7 @@ def test_should_continue_iterating_wrapper_keeps_legacy_vocabulary():
     assert _should_continue_iterating(high_score) == "end"
 
     low_score = _state_after_review(score=3.0, threshold=4.0)
-    assert _should_continue_iterating(low_score) == "iterate"
+    assert _should_continue_iterating(low_score) == "end"
 
 
 def test_switches_off_config_routing_is_equivalent_to_legacy():
@@ -8362,12 +8371,12 @@ def test_routing_decision_fields_for_m1():
 
 def test_append_routing_extends_history_and_bumps_revision_count():
     runner = _runner()
-    state = _state_after_review(score=3.0)  # low score → revise_m4
+    state = _state_after_review(score=3.0)  # low score is display-only
     patch: dict = {}
     runner._append_routing("m6", state, patch)
     assert len(patch["routing_history"]) == 1
-    assert patch["routing_history"][0].to_module == "revise_m4"
-    assert patch["revision_count"] == 1  # revise_m4 bumps the audit counter
+    assert patch["routing_history"][0].to_module == "end"
+    assert "revision_count" not in patch
 
     # routing to end does NOT bump revision_count
     end_state = _state_after_review(score=4.9, iteration_count=3, max_iterations=3)
@@ -8940,18 +8949,19 @@ async def test_m6_switch_off_never_calls_verdict() -> None:
     assert client.calls == 3
     assert set(patch) == {
         "reviews", "iteration_count", "graph_correction_requests",
-        "top_hypotheses", "research_plans",
+        "top_hypotheses", "research_plans", "m6_scoring_summary",
     }  # no evidence-verdict keys; legacy synthesis traces may be normalised
     assert patch["iteration_count"] == 1
-    # alignment gate + 3 specialists + 3 objective gates + overall.  The real
-    # independent metrics are computed once by the authoritative posthoc scorer,
-    # not synthesized here with a missing evaluator configuration.
-    assert len(patch["reviews"]) == 8
+    # Legacy reviewer/gate rows plus eight modern display dimensions and the
+    # calibrated overall row.  The modern score remains independent of routing.
+    assert len(patch["reviews"]) == 16
     assert {r.dimension.value for r in patch["reviews"]} == {
         "task_alignment", "scientific_logic",
         "objective_evidence_consistency", "method_feasibility",
         "evidence_coverage_gate", "answer_completeness_gate",
         "source_quality_gate", "overall",
+        "task_coverage", "novelty", "evidence_reliability", "testability",
+        "experimental_rigor", "statistics_reproducibility", "technical_feasibility",
     }
 
 

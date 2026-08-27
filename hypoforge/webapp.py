@@ -916,6 +916,9 @@ class RunManager:
             "research_plans": state.get("research_plans", []),
             "research_plan_history": state.get("research_plan_history", {}),
             "reviews": reviews,
+            # New M6 score contract.  Older runs simply omit this field and
+            # remain renderable through the legacy review reconciliation above.
+            "m6_scoring_summary": state.get("m6_scoring_summary"),
             "experimental_validation_verdict": state.get("experimental_validation_verdict"),
             "evidence_verdict": state.get("evidence_verdict"),
             "m6_score_reconciliation": score_reconciliation,

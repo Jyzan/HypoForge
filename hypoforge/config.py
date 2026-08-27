@@ -145,11 +145,12 @@ class ModuleOverride(BaseModel):
 
 class ScoringConfig(BaseModel):
     """Scoring / evaluation settings — the single source of truth for the
-    composite weights and iteration threshold.
+    composite weights and display threshold.
 
     ``hypothesis_weights`` feeds *both* M4's composite formula and the
     post-hoc scorer, so the two can never drift apart.  ``review_threshold``
-    is the M6 ``overall`` score (1–5) at or above which iteration stops early.
+    is retained for checkpoint/config compatibility; the modern M6 numeric
+    score is display-only and never controls routing.
     """
 
     hypothesis_weights: Dict[str, float] = Field(

@@ -102,6 +102,81 @@ def test_public_result_keeps_experimental_validation_verdict():
 
 
 @pytest.mark.asyncio
+async def test_m6_reuses_m5_validation_verdict_without_reauditing(monkeypatch):
+    from types import SimpleNamespace
+
+    import hypoforge.modules.m6_review_iteration as m6_module
+    from hypoforge.modules.m6_review_iteration import M6ReviewIteration
+
+    async def forbidden_reaudit(*args, **kwargs):
+        raise AssertionError("M6 must not repeat M5 experimental validation")
+
+    monkeypatch.setattr(
+        M6ReviewIteration,
+        "_judge_experimental_validation",
+        forbidden_reaudit,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        m6_module,
+        "assess_task_alignment",
+        lambda *args, **kwargs: SimpleNamespace(
+            passed=True,
+            score=5.0,
+            rationale="aligned",
+            missing_anchors=[],
+        ),
+    )
+    verdict = ExperimentalValidationVerdict(
+        sufficient=True,
+        items=[ValidationCoverageItem(
+            target_id="H1:prediction:0",
+            target_kind="prediction",
+            target_text="Y increases.",
+            verdict="covered",
+            procedure_refs=["procedure:0"],
+            measurement_refs=["metric:0"],
+            analysis_refs=["analysis:0"],
+            falsification_text="Y does not increase.",
+        )],
+        rationale="M5 precheck covered every target.",
+    )
+    hypothesis = HypothesisCard(
+        hypothesis_id="H1",
+        statement="A may improve Y.",
+        mechanism="A changes pathway B.",
+        observable_predictions=["Y increases."],
+        falsification_conditions=["Y does not increase."],
+    )
+    module = M6ReviewIteration(
+        reviewers=["overall"],
+        m6_evidence_revisit=True,
+    )
+    module.client = object()
+    module.detailed_scoring = False
+
+    result = await module(PipelineState(
+        input_question="Can A improve Y?",
+        top_hypotheses=[hypothesis],
+        research_plans=[ResearchPlan(
+            hypothesis_id="H1",
+            study_subjects="A and Y",
+            procedures=["Apply A."],
+            measurement_metrics=["Measure Y."],
+            analysis_methods=["Compare Y between groups."],
+        )],
+        experimental_validation_verdict=verdict,
+    ))
+
+    assert result["experimental_validation_verdict"] == verdict
+    validation_review = next(
+        item for item in result["reviews"]
+        if item.dimension.value == "experimental_validation_coverage"
+    )
+    assert validation_review.hard_gate_passed is True
+
+
+@pytest.mark.asyncio
 async def test_m6_fact_audit_only_sends_factual_premises_and_maps_outcomes(monkeypatch):
     import hypoforge.modules.m6_review_iteration as m6_module
 
