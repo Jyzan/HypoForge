@@ -518,6 +518,16 @@
   .detail-chip.neutral{background:var(--bg);color:var(--ink2);border:1px solid var(--line)}
   .detail-chip.good{background:var(--green-soft);color:var(--green)}
   .detail-chip.warn{background:var(--amber-soft);color:var(--amber)}
+  .m6-radar-wrap{margin:14px 0 16px;padding:12px;border:1px solid var(--line);border-radius:14px;background:linear-gradient(180deg,#fbfcff 0%,#f7f8fc 100%)}
+  .m6-radar-svg{display:block;width:100%;max-width:560px;height:auto;margin:0 auto;overflow:visible}
+  .m6-radar-grid{fill:none;stroke:#d9deea;stroke-width:1}
+  .m6-radar-grid.outer{stroke:#b9c2d3;stroke-width:1.2}
+  .m6-radar-axis{stroke:#c9d0de;stroke-width:1}
+  .m6-radar-score{fill:rgba(79,70,229,.2);stroke:var(--accent);stroke-width:2.4;stroke-linejoin:round}
+  .m6-radar-dot{fill:#fff;stroke:var(--accent);stroke-width:2}
+  .m6-radar-label{fill:var(--ink2);font-size:11px;font-weight:650}
+  .m6-radar-value{fill:var(--accent);font-size:10px;font-weight:750}
+  .m6-radar-scale{fill:var(--ink3);font-size:9px}
     .fulltext-failure{display:flex;align-items:flex-start;gap:8px;margin:6px 0;padding:7px 10px;border-radius:9px;background:var(--bg);border-left:3px solid var(--amber)}
     .fulltext-failure .detail-chip{flex:none}
     .fulltext-failure .paper-meta{flex:1;overflow-wrap:anywhere}
@@ -937,6 +947,13 @@ const DIM_LABELS = {
   "testability_metric": "可测性独立打分",
   "objective_evidence_consistency": "客观证据一致性"
   ,"experimental_validation_coverage": "实验验证覆盖"
+  ,"task_coverage": "任务覆盖"
+  ,"novelty": "创新性"
+  ,"evidence_reliability": "证据可靠性"
+  ,"testability": "可检验性"
+  ,"experimental_rigor": "实验严谨性"
+  ,"statistics_reproducibility": "统计与可复现性"
+  ,"technical_feasibility": "技术可行性"
 };
 const STRUCTURED_DRAWER_MODULES = new Set(["m1","m2","m4","m5","m6"]);
 
@@ -1849,6 +1866,76 @@ function m6ReviewHtml(review){
     </div>
   </details>`;
 }
+function m6RadarHtml(dimensions){
+  const order = [
+    "task_coverage", "novelty", "scientific_logic", "evidence_reliability",
+    "testability", "experimental_rigor", "statistics_reproducibility",
+    "technical_feasibility"
+  ];
+  const byDimension = new Map((Array.isArray(dimensions) ? dimensions : []).map(item => [item.dimension, item]));
+  if(order.some(name => !byDimension.has(name))) return "";
+  const width = 520, height = 430, cx = 260, cy = 205, radius = 138;
+  const point = (index, scale=1) => {
+    const angle = -Math.PI / 2 + index * Math.PI / 4;
+    return [cx + Math.cos(angle) * radius * scale, cy + Math.sin(angle) * radius * scale];
+  };
+  const pointsText = points => points.map(([x,y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+  const grids = [1,2,3,4,5].map(level => {
+    const cls = level === 5 ? "m6-radar-grid outer" : "m6-radar-grid";
+    return `<polygon class="${cls}" points="${pointsText(order.map((_, index) => point(index, level / 5)))}"/>`;
+  }).join("");
+  const axes = order.map((_, index) => {
+    const [x,y] = point(index);
+    return `<line class="m6-radar-axis" x1="${cx}" y1="${cy}" x2="${x.toFixed(1)}" y2="${y.toFixed(1)}"/>`;
+  }).join("");
+  const scorePoints = order.map((name, index) => {
+    const score = Math.max(1, Math.min(5, Number(byDimension.get(name).score) || 1));
+    return point(index, score / 5);
+  });
+  const dots = scorePoints.map(([x,y], index) => {
+    const name = order[index];
+    const score = Math.max(1, Math.min(5, Number(byDimension.get(name).score) || 1));
+    const label = DIM_LABELS[name] || name;
+    return `<circle class="m6-radar-dot" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="3.6"><title>${esc(label)} ${score.toFixed(1)} / 5</title></circle>`;
+  }).join("");
+  const labels = order.map((name, index) => {
+    const score = Math.max(1, Math.min(5, Number(byDimension.get(name).score) || 1));
+    const [x,y] = point(index, 1.27);
+    const anchor = x < cx - 12 ? "end" : x > cx + 12 ? "start" : "middle";
+    return `<text class="m6-radar-label" x="${x.toFixed(1)}" y="${y.toFixed(1)}" text-anchor="${anchor}"><tspan>${esc(DIM_LABELS[name] || name)}</tspan><tspan class="m6-radar-value" x="${x.toFixed(1)}" dy="14">${score.toFixed(1)}</tspan></text>`;
+  }).join("");
+  const scaleLabels = [1,2,3,4,5].map(level => {
+    const y = cy - radius * level / 5;
+    return `<text class="m6-radar-scale" x="${cx + 5}" y="${(y - 3).toFixed(1)}">${level}</text>`;
+  }).join("");
+  return `<div class="m6-radar-wrap"><svg class="m6-radar-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="M6 八维评分雷达图">${grids}${axes}${scaleLabels}<polygon class="m6-radar-score" points="${pointsText(scorePoints)}"/>${dots}${labels}</svg></div>`;
+}
+function m6ScoringSummaryHtml(summary){
+  if(!summary || !Array.isArray(summary.dimensions) || !summary.dimensions.length) return "";
+  const dimensions = summary.dimensions.map(item => `
+    <details class="detail-card">
+      <summary><span class="paper-title">${esc(DIM_LABELS[item.dimension] || item.dimension || "未命名维度")}</span>
+        <span class="detail-chip ${Number(item.score) >= 4 ? "good" : Number(item.score) < 3 ? "warn" : "neutral"}">${Number(item.score).toFixed(1)} / 5</span>
+        <span class="detail-chip neutral">权重 ${(Number(item.weight || 0) * 100).toFixed(0)}%</span></summary>
+      <div class="detail-card-body">
+        <p><b>加权贡献：</b>${Number(item.weighted_contribution || 0).toFixed(3)} · <b>来源：</b>${esc(item.source || "—")} · <b>置信度：</b>${(Number(item.confidence || 0) * 100).toFixed(0)}%</p>
+        ${item.strengths?.length ? `<div class="d-sec-title">支持点</div><ul>${item.strengths.map(esc).map(x => `<li>${x}</li>`).join("")}</ul>` : ""}
+        ${item.weaknesses?.length ? `<div class="d-sec-title">不足</div><ul>${item.weaknesses.map(esc).map(x => `<li>${x}</li>`).join("")}</ul>` : ""}
+        ${item.deductions?.length ? `<div class="d-sec-title">扣分项</div><ul>${item.deductions.map(esc).map(x => `<li>${x}</li>`).join("")}</ul>` : ""}
+      </div>
+    </details>`).join("");
+  const caps = Array.isArray(summary.applied_caps) ? summary.applied_caps : [];
+  return `<div class="plan-sec m6-calibrated-score">
+    <h4>M6 客观细化评分</h4>
+    <div class="detail-lead">评分由八个维度加权得到，并可由明确缺陷触发上限。${summary.complete === false ? "部分独立审查不可用，本轮为降级评分。" : ""}</div>
+    <div class="detail-chips"><span class="detail-chip good">最终 ${Number(summary.final_score).toFixed(1)} / 5</span><span class="detail-chip neutral">未封顶原始分 ${Number(summary.raw_score).toFixed(1)} / 5</span><span class="detail-chip neutral">${summary.complete === false ? "审查不完整" : "审查完整"}</span></div>
+    <p class="paper-meta">${esc(summary.rationale || "")}</p>
+    ${m6RadarHtml(summary.dimensions)}
+    <div class="detail-list">${dimensions}</div>
+    <div class="d-sec-title">硬性封顶原因（不参与路由）</div>
+    ${caps.length ? `<div class="detail-list">${caps.map(cap => `<div class="output-box"><b>${esc(cap.rule_id || "score cap")}</b> · 最高 ${Number(cap.maximum).toFixed(1)} / 5<br><span class="paper-meta">${esc(cap.reason || "")}</span></div>`).join("")}</div>` : `<div class="output-box">本轮没有触发封顶。</div>`}
+  </div>`;
+}
 function m6DetailsHtml(r){
   const reviews = Array.isArray(r?.reviews) ? r.reviews : [];
   const versions = groupReviewsByVersion(reviews);
@@ -1909,6 +1996,7 @@ function m6DetailsHtml(r){
     ? `<div class="d-sec-title">流程外独立评分</div>${scoreRowsHtml(r.scores.aggregate)}<details><summary>查看完整独立评分</summary><pre>${pretty(r.scores)}</pre></details>` : "";
   return `
     <div class="detail-lead">这里按版本展示 M6 的各维度评分。每个分数都可展开查看评分理由、意见、建议、硬门结果和引用证据。</div>
+    ${m6ScoringSummaryHtml(r?.m6_scoring_summary)}
     <div class="detail-grid">
       <div class="detail-metric"><b>${versions.length}</b><span>评审版本</span></div>
       <div class="detail-metric"><b>${latestOverall ? Number(latestOverall.score).toFixed(1) : "—"}</b><span>最新版总体 / 5</span></div>

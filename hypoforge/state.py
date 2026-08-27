@@ -62,6 +62,13 @@ class ReviewerDimension(str, Enum):
     SCIENTIFIC_LOGIC = "scientific_logic"
     METHOD_FEASIBILITY = "method_feasibility"
     TASK_ALIGNMENT = "task_alignment"
+    TASK_COVERAGE = "task_coverage"
+    NOVELTY_SCORE = "novelty"
+    EVIDENCE_RELIABILITY = "evidence_reliability"
+    EXPERIMENTAL_RIGOR = "experimental_rigor"
+    STATISTICS_REPRODUCIBILITY = "statistics_reproducibility"
+    TECHNICAL_FEASIBILITY = "technical_feasibility"
+    TESTABILITY_DIMENSION = "testability"
     EVIDENCE_COVERAGE = "evidence_coverage_gate"
     ANSWER_COMPLETENESS = "answer_completeness_gate"
     SOURCE_QUALITY = "source_quality_gate"
@@ -612,6 +619,52 @@ class ReviewResult(BaseModel):
         return value
 
 
+class ScoreDimensionDetail(BaseModel):
+    """One auditable dimension of the modern M6 score."""
+
+    dimension: Literal[
+        "task_coverage",
+        "novelty",
+        "scientific_logic",
+        "evidence_reliability",
+        "testability",
+        "experimental_rigor",
+        "statistics_reproducibility",
+        "technical_feasibility",
+    ]
+    score: float = Field(ge=1.0, le=5.0)
+    weight: float = Field(gt=0.0, le=1.0)
+    weighted_contribution: float = Field(ge=0.0, le=5.0)
+    source: Literal[
+        "deterministic", "independent", "llm", "hybrid", "degraded"
+    ]
+    confidence: float = Field(ge=0.0, le=1.0)
+    strengths: List[str] = Field(default_factory=list)
+    weaknesses: List[str] = Field(default_factory=list)
+    deductions: List[str] = Field(default_factory=list)
+
+
+class ScoreCap(BaseModel):
+    """A conservative upper bound applied after weighted aggregation."""
+
+    rule_id: str
+    maximum: float = Field(ge=1.0, le=5.0)
+    reason: str
+    attribution: Literal["hypothesis", "plan", "both"] = "both"
+
+
+class M6ScoringSummary(BaseModel):
+    """Persisted modern M6 score and its audit trail."""
+
+    version: int = 1
+    raw_score: float = Field(ge=1.0, le=5.0)
+    final_score: float = Field(ge=1.0, le=5.0)
+    dimensions: List[ScoreDimensionDetail]
+    applied_caps: List[ScoreCap] = Field(default_factory=list)
+    rationale: str = ""
+    complete: bool = True
+
+
 # ============================================================================
 # M2 增强导出 — canonical KnowledgeExport (agentic M2 → M3)
 # ============================================================================
@@ -1043,12 +1096,15 @@ class PipelineState(BaseModel):
 
     # ---- M6 + iteration ----
     reviews: List[ReviewResult] = Field(default_factory=list)
+    m6_scoring_summary: Optional[M6ScoringSummary] = None
     experimental_validation_verdict: Optional[ExperimentalValidationVerdict] = None
     # iteration_count = number of M6 review rounds; doubles as the GLOBAL hard
     # stop (supplement rounds also consume this budget: global cap = max_iterations).
     iteration_count: int = 0
     max_iterations: int = 3
-    review_score_threshold: float = 4.0  # M6 overall (1–5) at/above which iteration stops
+    # Legacy display/config field retained for checkpoint compatibility.  M6
+    # numeric scores no longer control iteration routing.
+    review_score_threshold: float = 4.0
     user_guidance: List[str] = Field(default_factory=list)  # human guidance injected between iterations
 
     # ---- iteration core (evidence sufficiency / routing / followup) ----

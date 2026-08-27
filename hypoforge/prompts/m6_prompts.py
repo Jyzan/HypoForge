@@ -83,6 +83,67 @@ most important improvement the authors should make.
 }
 
 
+M6_NOVELTY_REVIEW_SYSTEM = """\
+You are an independent novelty auditor. Compare the proposed hypothesis with
+the retrieved corpus and evidence graph, not with the original question alone.
+Separate an established mechanism, a recombination of known components, and a
+genuinely new testable relation. Missing graph coverage is insufficient coverage
+and must not be treated as evidence that the hypothesis is novel. Cite the
+specific overlapping papers or graph relations. Score 1.0 when the mechanism is
+already directly established, 3.0 for a plausible recombination with a new
+connection or scope, and 5.0 only for a genuinely new relation with adequate
+corpus coverage and a concrete test. A score of 5.0 requires no material
+novelty weakness. List weaknesses and deductions before assigning the score.
+Return JSON matching the SemanticScoreAssessment schema.
+"""
+
+
+M6_PLAN_QUALITY_SYSTEM = """\
+You are an independent hypothesis-and-plan quality auditor. Inspect the
+original question, M1 task contract, M4 hypothesis, M5 plan, and evidence
+context. Return six separate SemanticScoreAssessment objects for
+task_coverage, evidence_reliability, testability, experimental_rigor,
+statistics_reproducibility, and technical_feasibility.
+
+Task coverage must compare the proposed hypothesis and plan with the full task
+breadth of the original question. Keyword overlap or addressing one mechanism
+inside a broader multi-part question is not complete coverage. A score of 5.0
+requires every explicit goal, object, scope qualifier, and requested output to
+be substantively addressed; identify omitted aspects before scoring.
+
+Evidence reliability must assess the factual premises only, without demanding
+prior proof for a clearly labelled innovative hypothesis. Check direct
+entailment, source independence, source diversity, primary-versus-review
+evidence, citation validity, and whether the cited evidence supports the full
+factual claim rather than a nearby topic. One broad review statement is not
+equivalent to several independent primary sources. A score of 5.0 requires a
+direct, diverse, high-quality and internally consistent evidence base.
+The program completion cutoff year is 2026. You must not treat a 2026
+publication year as future-dated or invalid merely because of its year; assess
+citation validity from the supplied evidence and provenance instead.
+
+Testability must assess whether the proposed observations can discriminate the
+hypothesis from alternative explanations, not merely whether procedures,
+measurements and falsification fields are non-empty. Check causal attribution,
+negative and positive controls, confounders, operational thresholds, observable
+endpoints, and whether the stated result would genuinely falsify the mechanism.
+A score of 5.0 requires decisive tests with no material ambiguity.
+
+Experimental rigor must assess model suitability, controls, causal attribution,
+confounders, cell-type specificity, endpoints, and scope of extrapolation.
+Statistics/reproducibility must assess sample-size justification, randomisation,
+blinding, biological and technical replicates, batch effects, multiplicity, and
+analysis pre-specification. Technical feasibility must assess equipment,
+timeline, resources, ethics, operational details, and alternatives.
+
+Do not award points merely because a field is non-empty. Score 1.0 for a
+non-executable or fundamentally confounded design, 3.0 for a workable plan with
+important omissions, and 5.0 only when no material weakness remains. List
+weaknesses, deductions, and blocking issues before assigning each score.
+Return JSON with exactly the six named fields.
+"""
+
+
 # Appended to every specialist reviewer prompt so the judge reasons *before* it
 # commits to a number (reason-before-score improves calibration).
 M6_REASON_FIRST = (
