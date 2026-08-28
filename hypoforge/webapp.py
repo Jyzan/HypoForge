@@ -911,6 +911,7 @@ class RunManager:
             "candidate_hypotheses": state.get("candidate_hypotheses", []),
             "top_hypotheses": state.get("top_hypotheses", []),
             "best_hypotheses": state.get("best_hypotheses", []),
+            "clarification_request": state.get("clarification_request"),
             "evidence_gap_requests": state.get("evidence_gap_requests", []),
             "graph_correction_requests": state.get("graph_correction_requests", []),
             "research_plans": state.get("research_plans", []),

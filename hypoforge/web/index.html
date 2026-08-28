@@ -1479,6 +1479,7 @@ function planDetailsHtml(p, index){
     : `<div class="plan-value">${esc(p.timeline || "—")}</div>`;
   return `<div style="margin-bottom:14px"><p class="plan-title"><b>方案 ${index+1} · ${esc(p.hypothesis_id || "")}</b></p>` +
     `<div class="plan-field"><span class="pf-label">研究对象</span><div class="plan-value">${esc(p.study_subjects || "—")}</div></div>` +
+    ${p.alignment_warning ? `<div class="error-banner" style="margin:6px 0 8px">⚠ 研究对象对齐警告：${esc(p.alignment_warning)}</div>` : ""} +
     `<div class="plan-field"><span class="pf-label">时间线</span>${timelineHtml}</div>` +
     `<p style="margin:6px 0 4px"><b>Evidence IDs：</b>${esc(evidence)}<br><b>Paper IDs：</b>${esc(papers)}</p>` +
     `<details><summary>完整实验设计与引用映射</summary><pre>${design}</pre></details></div>`;
@@ -2209,6 +2210,15 @@ function renderPlanBody(v, label){
   const sections = [];
   if(v){
     sections.push(`<div class="plan-sec"><h4>${esc(label)}</h4><p>overall 评分：<b>${v.overall == null ? "—" : Number(v.overall).toFixed(2)}</b> · 评审完成时间：${v.timestamp ? esc(eventClock(v.timestamp)) : "—"}</p></div>`);
+  }
+  if(isFinal && resultData.clarification_request){
+    const c = resultData.clarification_request;
+    const dirs = Array.isArray(c.suggested_directions) ? c.suggested_directions : [];
+    sections.push(`<div class="plan-sec"><h4>⚠ 问题需要细化</h4>
+      <div class="error-banner" style="margin-bottom:8px">${esc(c.message || "原始问题范围过宽，需要选择一个具体方向继续。")}</div>
+      ${c.reason ? `<p style="color:var(--ink2);font-size:12px">${esc(c.reason)}</p>` : ""}
+      ${dirs.length ? `<div class="d-sec-title">可选的细化方向</div><ul>${dirs.map(d => `<li>${esc(d)}</li>`).join("")}</ul>` : ""}
+    </div>`);
   }
   const hypotheses = (isFinal ? (resultData.top_hypotheses?.length ? resultData.top_hypotheses : resultData.best_hypotheses || []) : []);
   if(hypotheses.length){

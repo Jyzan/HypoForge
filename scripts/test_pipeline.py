@@ -7525,7 +7525,9 @@ async def test_standard_m4_generator_timeout_retries_without_thinking(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_m4_critic_all_rejected_after_recovery_still_fails() -> None:
+async def test_m4_critic_all_rejected_after_recovery_requests_refinement() -> None:
+    from hypoforge.modules.m4_hypothesis_generation import M4RefinementRequired
+
     module = StrictM4HypothesisGeneration(mode="multi_agent")
     candidates = [
         HypothesisCard(hypothesis_id="H1", statement="hypothesis one"),
@@ -7544,13 +7546,19 @@ async def test_m4_critic_all_rejected_after_recovery_still_fails() -> None:
     ])
     module.client = client
 
-    with pytest.raises(RuntimeError, match="rejected every candidate"):
+    with pytest.raises(M4RefinementRequired) as exc_info:
         await module._run_quality_gates(
             PipelineState(input_question="Q", problem_card=make_problem_card()),
             candidates,
             generation_shortfall=False,
             question="Q",
         )
+    assert exc_info.value.clarification.original_question == "Q"
+    assert exc_info.value.clarification.rejected_hypothesis_ids == ["H1", "H2"]
+    assert exc_info.value.clarification.suggested_directions == [
+        "hypothesis one",
+        "hypothesis two",
+    ]
     assert len(client.calls) == 3
 
 

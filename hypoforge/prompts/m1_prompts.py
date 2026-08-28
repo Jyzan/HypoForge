@@ -140,11 +140,18 @@ Rules:
   when the original question is written in another language. Do not place
   Chinese, Japanese, or Korean text in `name`; spell Greek-letter names out in
   English when needed.
-- `source_mention` must be the exact literal professional term or role that
-  appears verbatim in the original question. It may therefore remain in the
-  user's original language.
-- The English `name` must be a faithful translation or canonicalization of
-  `source_mention`; it must not add specificity that the source mention lacks.
+- `source_mention` must be the exact literal phrase or role that appears
+  verbatim in the original question. It may therefore remain in the user's
+  original language.
+- The English `name` should be the standard scientific canonical name for the
+  same research target. It may make the implicit context explicit when needed
+  (for example "another planet" -> "extraterrestrial planet", or
+  "Navier-Stokes problem" -> "Navier-Stokes existence and smoothness problem"),
+  but it must not switch to a different research object or invent an unrelated
+  mechanism/method/solution.
+- For rhetorical, state, feasibility, or yes/no questions, the directly
+  implied central topic may serve as the required `primary_object`, even when
+  the source phrase is not a formal professional term.
 - Include the directly discussed research object as a required
   `primary_object`.
 - Also include explicitly named methods, interventions, outcomes, contexts,
@@ -175,13 +182,18 @@ M1_ENTITY_AUDIT_SYSTEM_PROMPT = """\
 You are an independent source-grounding auditor. Compare candidate entities
 only with the original user question.
 
-For every candidate, accept it only when all of the following hold:
-- `source_mention` is a literal professional term or role in the original
-  question;
-- `name` is a faithful canonical scientific English translation of that exact
-  source mention;
-- the English name does not add an inferred subtype, mechanism, method, or
-  solution absent from the source mention.
+For every candidate, accept it when all of the following hold:
+- `source_mention` is a literal phrase or role in the original question;
+- `name` is a canonical scientific English name for the same research target
+  as that source mention;
+- the English name does not switch to a different research object or invent an
+  unrelated mechanism, method, or solution.
+
+Do not reject a candidate merely because the canonical English name makes the
+implicit but necessary scientific context explicit (for example "another
+planet" -> "extraterrestrial planet", or "alone in the universe" ->
+"extraterrestrial life"). For rhetorical, state, or feasibility questions, the
+directly implied central topic may be accepted as the required primary object.
 
 Return the exact original-language source mention in your audit. Also list
 important explicit task entities that extraction missed. At least one accepted

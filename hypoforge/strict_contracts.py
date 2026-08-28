@@ -37,7 +37,10 @@ from .modules.m2_literature.models import (
 )
 from .memory.paper_store import PaperStore, normalize_query_text, paper_key
 from .modules.m3_evidence_graph import M3EvidenceGraph
-from .modules.m4_hypothesis_generation import M4HypothesisGeneration
+from .modules.m4_hypothesis_generation import (
+    M4HypothesisGeneration,
+    M4RefinementRequired,
+)
 from .modules.m5_research_plan import M5ResearchPlan
 from .modules.m6_review_iteration import M6ReviewIteration
 from .observability import emit_event
@@ -50,6 +53,7 @@ from .paper_sources import (
     resolve_gap_sub_question,
 )
 from .state import (
+    ClarificationRequest,
     EvidenceGap,
     KnowledgeEntry,
     LiteratureResult,
@@ -1617,17 +1621,40 @@ class StrictM4HypothesisGeneration(M4HypothesisGeneration):
         try:
             candidates = await self._run_critic(state, candidates)
         except M4GateAllRejectedError as exc:
-            candidates = await self._recover_gate_rejection(
-                state,
-                candidates,
-                exc,
-                gate_name="M4 Critic",
-                feedback_block=self._critic_recovery_feedback_block(exc.reviews),
-                gate_call=self._run_critic,
-                question=question,
-                graph_context=graph_context,
-                feedback_context=feedback_context,
-            )
+            excerpts = "; ".join(
+                str(
+                    review.get("critique")
+                    or review.get("assessment")
+                    or ""
+                )[:120]
+                for review in exc.reviews
+                if isinstance(review, dict)
+            )[:400]
+            # If the first all-rejected result suggests the original question
+            # is too broad/definitional, ask the user to refine a direction.
+            # Otherwise run the normal gate recovery: the first rejection may
+            # simply be a weak generation batch.
+            if self._should_request_refinement(question, excerpts):
+                self._raise_refinement_required(
+                    state,
+                    candidates,
+                    gate_name="M4 Critic",
+                    excerpts=excerpts,
+                )
+            else:
+                candidates = await self._recover_gate_rejection(
+                    state,
+                    candidates,
+                    exc,
+                    gate_name="M4 Critic",
+                    feedback_block=self._critic_recovery_feedback_block(
+                        exc.reviews
+                    ),
+                    gate_call=self._run_critic,
+                    question=question,
+                    graph_context=graph_context,
+                    feedback_context=feedback_context,
+                )
         except Exception:
             if not generation_shortfall:
                 raise
@@ -1660,6 +1687,102 @@ class StrictM4HypothesisGeneration(M4HypothesisGeneration):
                 "left too few hypotheses; continuing with the current candidates."
             )
         return candidates
+
+    @staticmethod
+    def _should_request_refinement(
+        question: str,
+        excerpts: str,
+    ) -> bool:
+        """Decide whether a first all-rejected crash is a broad-question issue.
+
+        We only interrupt with a user refinement request when either the
+        question itself looks definitional/panoramic, or the critic's reasons
+        consistently say the candidates fail to answer the whole question.
+        Otherwise we keep the normal gate-recovery path, because the first
+        rejection may simply be a weak generation batch.
+        """
+        q = " ".join(str(question or "").casefold().split())
+        textual = " ".join(str(excerpts or "").casefold().split())
+
+        # Definitional / panoramic question patterns (English + Chinese).
+        broad_question_markers = [
+            "what is", "what are", "what's", "whats",
+            "what makes", "what constitutes", "what does",
+            "define ", "definition of", "nature of",
+            "made of", "made up of", "composed of", "consists of",
+            "universe", "gravity", "existence", "reality", "consciousness",
+            "mind", "life itself", "everything",
+            "什么是", "是什么", "由什么构成", "有什么本质",
+            "宇宙", "重力", "生命", "意识", "存在",
+        ]
+        # Critic reasons that indicate the candidate only answered part of a
+        # panoramic question rather than being logically bad.
+        broad_rejection_markers = [
+            "only addresses", "only covers", "only considers", "only about",
+            "fails to answer", "does not answer", "doesn't answer",
+            "primary question", "whole question", "entire question",
+            "one component", "one aspect", "one theory", "single theory",
+            "only part", "not the entire", "incomplete answer",
+            "ignores the", "does not address", "doesn't address",
+            "too narrow", "overly broad", "misses the full",
+        ]
+        return any(marker in q for marker in broad_question_markers) or any(
+            marker in textual for marker in broad_rejection_markers
+        )
+
+    def _raise_refinement_required(
+        self,
+        state: PipelineState,
+        candidates,
+        *,
+        gate_name: str,
+        excerpts: str,
+    ):
+        """Stop M4 with a user-facing refinement request instead of hard failure.
+
+        Used when every candidate is rejected for not answering the broad
+        whole-question task.  The rejected hypotheses themselves are retained
+        as candidate specific directions for the user to choose or refine.
+        """
+        question = (
+            state.problem_card.original_question
+            if state.problem_card and state.problem_card.original_question
+            else state.input_question
+        )
+        directions = list(dict.fromkeys(
+            str(card.statement or "").strip()
+            for card in candidates
+            if str(card.statement or "").strip()
+        ))
+        clarification = ClarificationRequest(
+            original_question=question,
+            reason=(
+                f"{gate_name} rejected every candidate, including after one "
+                f"gate-recovery regeneration pass. Review excerpts: {excerpts}"
+            ),
+            suggested_directions=directions[:10],
+            rejected_hypothesis_ids=[
+                card.hypothesis_id for card in candidates
+            ],
+            message=(
+                "This question is too broad for a single whole-question "
+                "hypothesis. Please refine it into a specific research "
+                "direction, or choose one of the suggested directions below."
+            ),
+        )
+        emit_event(
+            "m4_refinement_required",
+            module="m4",
+            tool="hypothesis_generator_gate_recovery",
+            status="warning",
+            message=clarification.message,
+            details={
+                "original_question": clarification.original_question,
+                "suggested_directions": clarification.suggested_directions,
+                "rejected_hypothesis_ids": clarification.rejected_hypothesis_ids,
+            },
+        )
+        raise M4RefinementRequired(clarification, candidates)
 
     async def _recover_gate_rejection(
         self,
@@ -1747,14 +1870,36 @@ class StrictM4HypothesisGeneration(M4HypothesisGeneration):
                 module="m4",
                 tool="hypothesis_generator_gate_recovery",
                 status="failed",
-                message=f"{gate_name} still rejected every candidate after the fix; candidates cannot be admitted",
+                message=f"{gate_name} still rejected every candidate after the fix; requesting user refinement",
                 details={"gate": exc.gate},
             )
-            raise RuntimeError(
-                f"{gate_name} rejected every candidate, including after one "
-                "gate-recovery regeneration pass; the configured quality gate "
-                f"cannot be skipped. Review excerpts: {excerpts}"
-            ) from second_exc
+            question = (
+                state.problem_card.original_question
+                if state.problem_card and state.problem_card.original_question
+                else state.input_question
+            )
+            directions = list(dict.fromkeys(
+                str(card.statement or "").strip()
+                for card in candidates
+                if str(card.statement or "").strip()
+            ))
+            clarification = ClarificationRequest(
+                original_question=question,
+                reason=(
+                    f"{gate_name} rejected every candidate, including after one "
+                    f"gate-recovery regeneration pass. Review excerpts: {excerpts}"
+                ),
+                suggested_directions=directions[:10],
+                rejected_hypothesis_ids=[
+                    card.hypothesis_id for card in candidates
+                ],
+                message=(
+                    "This question is too broad for a single whole-question "
+                    "hypothesis. Please refine it into a specific research "
+                    "direction, or choose one of the suggested directions below."
+                ),
+            )
+            raise M4RefinementRequired(clarification, candidates) from second_exc
         except Exception as re_exc:
             # Any non-rejection failure while re-running the gate (transport,
             # format) is reported cleanly; the recovery candidates never get a
