@@ -695,6 +695,61 @@ class M1ProblemUnderstanding(ModuleProtocol):
         )
         return repaired, promoted
 
+    @staticmethod
+    def _lenient_primary_entities(
+        source: str,
+        candidates: List[_CandidateEntity],
+    ) -> List[TaskEntity]:
+        """Best-effort source-grounded entities when strict audit is too strict.
+
+        This is a bounded fallback for rhetorical / state / feasibility
+        questions where the LLM extraction produced a central object but the
+        independent audit rejected it solely because the canonical name made
+        implicit scientific context explicit.  It never invents an entity:
+        every accepted candidate must still have a verbatim source mention in
+        the original question and an English canonical name.
+        """
+        accepted: List[TaskEntity] = []
+        seen: set[str] = set()
+        ordered = sorted(
+            enumerate(candidates),
+            key=lambda item: (
+                (
+                    0
+                    if item[1].role == "primary_object"
+                    else 1 if item[1].required else 2
+                ),
+                item[0],
+            ),
+        )
+        for _, candidate in ordered:
+            name = M1ProblemUnderstanding._normalize_source_text(candidate.name)
+            mention = M1ProblemUnderstanding._normalize_source_text(
+                candidate.source_mention
+            )
+            if (
+                not name
+                or not M1ProblemUnderstanding._is_english_output(candidate.name)
+                or not mention
+                or mention not in source
+                or name in seen
+            ):
+                continue
+            seen.add(name)
+            accepted.append(TaskEntity(
+                entity_id=f"E{len(accepted) + 1}",
+                name=candidate.name,
+                source_mention=candidate.source_mention,
+                aliases=candidate.aliases,
+                role=candidate.role,
+                required=candidate.required,
+            ))
+        if accepted:
+            accepted, _ = M1ProblemUnderstanding._promote_required_primary(
+                accepted
+            )
+        return accepted
+
     async def _extract_and_audit_entities(self, question: str) -> List[TaskEntity]:
         """Extract entities from the original question and independently audit them.
 
@@ -892,6 +947,30 @@ class M1ProblemUnderstanding(ModuleProtocol):
             item.role == "primary_object" and item.required
             for item in accepted
         ):
+            # Lenient fallback: strict audit may have rejected the only
+            # plausible central object because its canonical name made implicit
+            # scientific context explicit.  Re-admit source-verbatim candidates
+            # as the best-effort task contract so the pipeline can continue.
+            relaxed = self._lenient_primary_entities(
+                source,
+                candidate_list.entities,
+            )
+            if relaxed:
+                emit_event(
+                    "m1_contract_repaired",
+                    module="m1",
+                    tool="lenient_entity_contract",
+                    status="completed",
+                    message=(
+                        "Used lenient source-grounded entity fallback because "
+                        "strict audit left no required primary object"
+                    ),
+                    details={
+                        "entity_names": [item.name for item in relaxed],
+                        "source_mentions": [item.source_mention for item in relaxed],
+                    },
+                )
+                return relaxed
             raise ValueError(
                 "entity extraction has no required primary object grounded in "
                 "the original user question"

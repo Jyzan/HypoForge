@@ -32,7 +32,7 @@ node_timeouts:
   # Its individual LLM calls are still bounded by module overrides; provide
   # enough outer headroom for the finite inner sequence.
   m5: 1200.0
-  m6: 180.0
+  m6: 360.0
 
 qwen:
   base:

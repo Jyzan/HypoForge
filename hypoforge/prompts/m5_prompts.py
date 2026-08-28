@@ -31,6 +31,11 @@ task entities explicitly present in the plan. Each
 trace item must use an exact contract ID and an ``output_excerpt`` copied
 verbatim from this plan. ``study_subjects`` must still describe the original
 research object semantically; a task trace alone is never proof of alignment.
+Distinguish clearly between the primary research object required by the
+original question and the experimental models/means used to study it. If the
+plan uses animals, cell lines, viruses, simulations, computational systems,
+patient cohorts, or other proxies, state explicitly in ``study_subjects`` that
+these are means to study the primary research object, not substitutes for it.
 
 For the given hypothesis, produce a detailed research plan covering ALL of \
 the following elements:

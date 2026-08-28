@@ -349,6 +349,8 @@ def _m4_evidence_gap_search_rounds(state: PipelineState) -> int:
 def _route_after_m4(state: PipelineState) -> str:
     """Search before M5 while a pending gap remains within the global cap."""
 
+    if state.clarification_request is not None:
+        return "clarify"
     return (
         "search_gap"
         if (
@@ -639,6 +641,10 @@ class PipelineRunner:
             for field in cls._CORE_REQUIRED_OUTPUTS.get(name, ())
             if field in declared_output_fields
         ]
+        if name == "m4" and result.get("clarification_request") is not None:
+            # A broad whole-question problem may intentionally stop at M4 with
+            # a refinement request instead of producing a top hypothesis.
+            required = [field for field in required if field != "top_hypotheses"]
         missing = []
         for field in required:
             value = result.get(field)
@@ -738,7 +744,11 @@ class PipelineRunner:
             workflow.add_conditional_edges(
                 "m4",
                 self._decide_after_m4,
-                {"search_gap": "m2", "continue": continuation},
+                {
+                    "search_gap": "m2",
+                    "continue": continuation,
+                    "clarify": END,
+                },
             )
         if supplement_return_enabled:
             workflow.add_conditional_edges(

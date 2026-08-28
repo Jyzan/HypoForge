@@ -465,7 +465,12 @@ class M5ResearchPlan(ModuleProtocol):
             "overlap. Answer ONLY yes or no, followed by one short reason.\n\n"
             "Primary task objects:\n"
             + json.dumps(primary_objects, ensure_ascii=False, indent=2)
-            + "\n\nPlan study subjects:\n"
+            + "\n\nA plan may use animals, cell lines, viruses, simulators, "
+            + "computational systems, patient cohorts, or other proxies as "
+            + "experimental means. It should still be accepted as aligned when "
+            + "its study_subjects explicitly names the primary research object "
+            + "and explains that those proxies are means to study it, not "
+            + "substitutes for it.\n\nPlan study subjects:\n"
             + plan.study_subjects
         )
         try:
@@ -554,7 +559,6 @@ class M5ResearchPlan(ModuleProtocol):
         explicit in ``study_subjects`` instead of paying for a second full
         research-plan generation.
         """
-
         original_question = (
             state.problem_card.original_question
             if state.problem_card and state.problem_card.original_question
@@ -562,14 +566,36 @@ class M5ResearchPlan(ModuleProtocol):
         )
         target = " ".join(str(original_question or "").split())
         existing = " ".join(str(plan.study_subjects or "").split())
-        if not target:
+        contract = synthesis_contract_for_state(state)
+        primary_objects = [
+            entity for entity in contract.entities
+            if entity.role == "primary_object"
+        ]
+        missing_primary = [
+            entity for entity in primary_objects
+            if not _mentions_entity(existing, entity)
+        ]
+        if not target and not primary_objects:
             return plan
-        study_subjects = (
-            f"Original research target: {target}\n"
-            f"Proposed study system: {existing or 'target system from the original question'}"
-        )
+        if missing_primary:
+            primary_hint = "; ".join(
+                ", ".join(dict.fromkeys([
+                    entity.name,
+                    *entity.aliases,
+                ]))
+                for entity in primary_objects
+            )
+            study_subjects = (
+                f"Original research target: {target}\n"
+                f"Primary research object(s): {primary_hint}\n"
+                f"Proposed study system: {existing or 'target system from the original question'}"
+            )
+        else:
+            study_subjects = (
+                f"Original research target: {target}\n"
+                f"Proposed study system: {existing or 'target system from the original question'}"
+            )
         return plan.model_copy(update={"study_subjects": study_subjects})
-
     @staticmethod
     def _is_supplement_reentry(state: PipelineState) -> bool:
         """Only reuse plans for a contiguous M2 supplement return."""
@@ -742,14 +768,23 @@ class M5ResearchPlan(ModuleProtocol):
                     plan, hypothesis, graph_context,
                 )
                 plan = self._ensure_bridge_validations(plan, hypothesis)
+                # Always anchor the primary research object explicitly so
+                # animal/cell/virus models are not mistaken for the target.
+                plan = self._fast_repair_plan_alignment(state, plan)
                 if self.fast_mode:
                     # Fast mode deliberately skips the semantic LLM audit.
                     plan = self._fast_repair_plan_alignment(state, plan)
-                hypothesis_requirement_ids = {
-                    reference.contract_id
-                    for reference in hypothesis.task_trace.requirement_mentions
-                }
-                if SYNTHESIS_REQUIREMENT_ID not in hypothesis_requirement_ids:
+                # A final research plan should always answer the original
+                # whole-question Q0 contract.  Only force Q0 when the binding
+                # synthesis contract actually contains it; otherwise do not
+                # invent a non-existent requirement.
+                synthesis_contract = synthesis_contract_for_state(state)
+                if any(
+                    requirement.requirement_id == SYNTHESIS_REQUIREMENT_ID
+                    for requirement in synthesis_contract.requirements
+                ):
+                    hypothesis_requirement_ids = {SYNTHESIS_REQUIREMENT_ID}
+                else:
                     hypothesis_requirement_ids = set()
                 plan = self._canonicalize_task_trace(
                     state,
@@ -853,10 +888,27 @@ class M5ResearchPlan(ModuleProtocol):
         if not plan_accepted and self.fast_mode:
             plan = self._fast_fallback_plan(state, hypothesis, last_alignment_rationale)
         if not plan_accepted and not self.fast_mode:
-            raise ValueError(
-                f"M5 blocked task-misaligned plan for {hypothesis.hypothesis_id}: "
-                f"{last_alignment_rationale}"
+            # Soft-fail: keep the generated plan so the pipeline can continue,
+            # but surface a visible object-alignment warning for human review.
+            emit_event(
+                "tool_result",
+                module="m5",
+                tool="research_plan_designer",
+                status="warning",
+                message=(
+                    f"Research plan for {hypothesis.hypothesis_id} could not "
+                    "pass semantic object alignment; continuing with a warning"
+                ),
+                details={
+                    "hypothesis_id": hypothesis.hypothesis_id,
+                    "alignment_warning": last_alignment_rationale,
+                    "coverage_attempt": coverage_attempt,
+                },
             )
+            plan = plan.model_copy(update={
+                "alignment_warning": last_alignment_rationale,
+            })
+            plan_accepted = True
         plan = self._sanitize_evidence_links(plan, graph_context)
         plan = self._inherit_audited_premise_evidence(
             plan, hypothesis, graph_context,

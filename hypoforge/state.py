@@ -460,6 +460,16 @@ class HypothesisCard(BaseModel):
     grounding_status: HypothesisGroundingStatus = "legacy_unknown"
 
 
+class ClarificationRequest(BaseModel):
+    """A user-facing request to refine an overly broad scientific question."""
+
+    original_question: str = ""
+    reason: str = ""
+    suggested_directions: List[str] = Field(default_factory=list)
+    rejected_hypothesis_ids: List[str] = Field(default_factory=list)
+    message: str = ""
+
+
 class EvidenceGapRequest(BaseModel):
     """A searchable M4 evidence gap with an auditable bounded lifecycle."""
 
@@ -577,6 +587,9 @@ class ResearchPlan(BaseModel):
     evidence_links: List[ResearchPlanEvidenceLink] = Field(default_factory=list)
     bridge_validations: List[WorkingAssumptionValidation] = Field(default_factory=list)
     task_trace: TaskTrace = Field(default_factory=TaskTrace)
+    # Soft alignment warning set when M5 could not get a clean semantic
+    # object match but the plan is still usable enough to continue with review.
+    alignment_warning: str = ""
 
 
 # ============================================================================
@@ -1085,6 +1098,7 @@ class PipelineState(BaseModel):
     candidate_hypotheses: List[HypothesisCard] = Field(default_factory=list)
     top_hypotheses: List[HypothesisCard] = Field(default_factory=list)
     best_hypotheses: List[HypothesisCard] = Field(default_factory=list)  # keep-best across iterations
+    clarification_request: Optional[ClarificationRequest] = None
     evidence_gap_requests: List[EvidenceGapRequest] = Field(default_factory=list)
     evidence_gap_search_rounds: int = 0
     max_evidence_gap_rounds: int = 1

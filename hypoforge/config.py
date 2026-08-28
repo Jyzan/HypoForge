@@ -263,7 +263,7 @@ class PipelineConfig(BaseModel):
             # finite inner sequence enough outer headroom; each LLM call is
             # still bounded by M5's generation/semantic/validation timeouts.
             "m5": 1200.0,
-            "m6": 180.0,
+            "m6": 360.0,
         }
     )
     node_timeout_default: float = 600.0

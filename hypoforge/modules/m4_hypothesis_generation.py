@@ -58,6 +58,7 @@ from ..evaluation.rubric import (
 )
 from ..registry import ModuleRegistry
 from ..state import (
+    ClarificationRequest,
     EvidenceGapRequest,
     HypothesisCard,
     HypothesisPremise,
@@ -73,6 +74,23 @@ from ..task_alignment import _mentions_entity, assess_task_alignment
 from ..tools.qwen_client import QwenClient, track_token_scope
 
 logger = logging.getLogger(__name__)
+
+
+class M4RefinementRequired(Exception):
+    """Raised when M4 cannot form an acceptable whole-question hypothesis.
+
+    The pipeline should stop and ask the user to refine the broad original
+    question into a more specific research direction instead of failing hard.
+    """
+
+    def __init__(
+        self,
+        clarification: ClarificationRequest,
+        candidates: List[HypothesisCard],
+    ) -> None:
+        self.clarification = clarification
+        self.candidates = list(candidates)
+        super().__init__(clarification.message or "M4 requires user refinement")
 
 
 _EDITORIAL_STATEMENT_RE = re.compile(
@@ -2887,6 +2905,27 @@ class M4HypothesisGeneration(ModuleProtocol):
         )
         try:
             result = await self._run_llm(state, feedback_context)
+        except M4RefinementRequired as exc:
+            emit_event(
+                "m4_refinement_required",
+                module="m4",
+                tool="hypothesis_generator_gate_recovery",
+                status="warning",
+                message=exc.clarification.message,
+                details={
+                    "original_question": exc.clarification.original_question,
+                    "suggested_directions": exc.clarification.suggested_directions,
+                    "rejected_hypothesis_ids": exc.clarification.rejected_hypothesis_ids,
+                },
+            )
+            return {
+                "candidate_hypotheses": exc.candidates,
+                "top_hypotheses": [],
+                "best_hypotheses": [],
+                "evidence_gap_requests": [],
+                "clarification_request": exc.clarification,
+                "user_guidance": guidance,
+            }
         finally:
             self._run_deadline = None
         result["user_guidance"] = guidance
