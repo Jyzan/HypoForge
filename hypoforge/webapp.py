@@ -7,8 +7,12 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import sys
 import threading
+import time
 import traceback
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -23,6 +27,92 @@ from .config import ModuleOverride, PipelineConfig
 from .modules.m2_literature.search.search_tool import literature_credential_warnings
 from .observability import RunEventRecorder
 from .pipeline import PipelineRunner
+
+
+_WORKBENCH_URL = "http://127.0.0.1:5000"
+
+
+def _refinement_assistant_dir() -> Path:
+    return Path(__file__).resolve().parents[1] / "refinement_assistant"
+
+
+def _workbench_python() -> str | None:
+    """细化工作台的解释器：优先 REFINEMENT_PYTHON 环境变量（可在 .env 配置），
+    其余候选按部署约定排列；都没有时退回当前解释器。"""
+    candidates = [
+        os.getenv("REFINEMENT_PYTHON", ""),
+        os.getenv("WORKBENCH_PYTHON", ""),
+        sys.executable,
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def _workbench_alive(timeout: float = 1.5) -> bool:
+    try:
+        with urllib.request.urlopen(f"{_WORKBENCH_URL}/init", timeout=timeout) as resp:
+            return resp.status == HTTPStatus.OK
+    except Exception:
+        return False
+
+
+def _ensure_workbench_running() -> dict[str, Any]:
+    """确保细化工作台在 5000 端口可用；未运行则以独立进程拉起"""
+    if _workbench_alive():
+        return {"started": False, "url": _WORKBENCH_URL}
+    python_exe = _workbench_python()
+    if python_exe is None:
+        return {"started": False, "url": _WORKBENCH_URL,
+                "error": "未找到可用的 Python 解释器，请手动启动细化工作台"}
+    assistant_dir = _refinement_assistant_dir()
+    if not (assistant_dir / "app.py").is_file():
+        return {"started": False, "url": _WORKBENCH_URL,
+                "error": "找不到 refinement_assistant/app.py"}
+    kwargs: dict[str, Any] = {
+        "cwd": str(assistant_dir),
+        "env": {**os.environ, "WORKSPACE": "."},
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = (
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+    subprocess.Popen([python_exe, "app.py"], **kwargs)
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        if _workbench_alive(1.0):
+            return {"started": True, "url": _WORKBENCH_URL}
+        time.sleep(0.5)
+    return {"started": False, "url": _WORKBENCH_URL,
+            "error": "细化工作台启动超时，请稍后手动打开 " + _WORKBENCH_URL}
+
+
+def _export_refinement_input(run_id: str, result: dict[str, Any]) -> Path:
+    """把最终方案导出为细化工作台的固定输入文件 refinement_input.json"""
+    hypotheses = result.get("top_hypotheses") or result.get("best_hypotheses") or []
+    compact_hypotheses = [
+        {
+            "statement": h.get("statement") or h.get("title") or "",
+            "mechanism": h.get("mechanism") or "",
+        }
+        for h in hypotheses
+        if isinstance(h, dict)
+    ]
+    payload = {
+        "run_id": run_id,
+        "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": "hypoforge-ui",
+        "question": result.get("question", ""),
+        "hypotheses": compact_hypotheses,
+        "research_plans": result.get("research_plans", []),
+        "iteration_count": result.get("iteration_count", 0),
+    }
+    out_path = _refinement_assistant_dir() / "refinement_input.json"
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return out_path
 
 
 _LEGACY_M6_METRIC_MAP = {
@@ -1336,6 +1426,28 @@ class HypoForgeRequestHandler(BaseHTTPRequestHandler):
                 self._json({"error": "invalid request JSON"}, HTTPStatus.BAD_REQUEST)
                 return
             self._json({"run": info}, HTTPStatus.OK)
+            return
+        if route is not None and route[1] == "refine":
+            result = self.server.manager.result(route[0])
+            if result is None:
+                self._json(
+                    {"error": "该运行还没有最终方案，无法细化"},
+                    HTTPStatus.NOT_FOUND,
+                )
+                return
+            try:
+                out_path = _export_refinement_input(route[0], result)
+            except OSError as exc:
+                self._json(
+                    {"error": f"写入细化输入失败: {exc}"},
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                return
+            self._json({
+                "ok": True,
+                "input_path": str(out_path),
+                "workbench": _ensure_workbench_running(),
+            })
             return
         if parsed.path != "/api/runs":
             self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)

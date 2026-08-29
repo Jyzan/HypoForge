@@ -90,6 +90,26 @@ python run_hypoforge_ui.py --port 8080
 
 UI 提供实时事件流、模块级详情抽屉（检索源统计、证据、评审意见等）、历史运行管理与断点重试。
 
+### 5. 方案细化工作台（Refinement Workbench）
+
+Pipeline 产出的最终研究方案可以进入**对话式细化工作台**（`refinement_assistant/`，Flask + Qwen），
+把高层方案细化为可执行计划：材料与试剂清单、实验步骤拆解、时间线、风险与替代方案、干实验脚本。
+
+```powershell
+# 前置：在工作台环境安装依赖
+pip install -r refinement_assistant/requirements.txt
+
+# 方式一：从 Web UI 的方案卡片点击「固定此方案并细化」，工作台自动拉起并载入方案
+# 方式二：手动启动
+cd refinement_assistant
+python app.py                         # 默认 http://127.0.0.1:5000
+```
+
+工作台特性：历史会话持久化与改名、按会话隔离的 Token 预算、工具级权限审批
+（写文件/执行命令前需确认）、本地知识检索（论文/方案/产出 RAG）、干实验脚本生成
+（蛋白质/FoldX、AI/视觉、通用计算）。运行数据（会话、日志、缓存）均在
+`refinement_assistant/` 下且已被 gitignore，不会进入版本库。
+
 ## 配置文件
 
 | 文件 | 用途 |
@@ -152,6 +172,16 @@ hypoforge/
 scripts/
 ├── test_pipeline.py         # 整合测试集
 └── smoke_pipeline.py        # 冒烟验证脚本
+
+refinement_assistant/        # 方案细化工作台（Flask 对话式 Agent）
+├── app.py                   # Web 服务入口（127.0.0.1:5000）
+├── main.py                  # 对话主循环（工具调用 / 权限审批 / 自动压缩）
+├── core/                    # LLM 客户端、上下文管理、权限、RAG 检索
+├── tools/                   # 工具注册表（文件/命令/检索/干实验脚本生成）
+├── subagent/                # 执行子代理、安全审计、摘要代理
+├── skills/                  # 核心记忆与技能目录
+├── templates/ + static/     # 工作台前端
+└── test_refinement_driver.py# 命令行回归测试驱动
 ```
 
 ## 开发约定

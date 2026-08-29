@@ -18,8 +18,15 @@ from .state import PipelineState, TaskContract, TaskEntity, TaskTrace
 
 
 def _normalise(value: str) -> str:
-    value = unicodedata.normalize("NFKC", str(value or "")).casefold()
-    return re.sub(r"\s+", " ", value).strip()
+    value = unicodedata.normalize("NFKC", str(value or ""))
+    # candidate_text 通常是 model_dump_json 的产物：换行/引号等被转义成
+    # \n、\" 字面量，而溯源摘录来自原始文本（真实换行）。先还原转义、
+    # 再折叠空白，否则任何跨行摘录都无法命中。
+    value = re.sub(r"\\[ntrbf]", " ", value)
+    value = value.replace("\\", "")
+    value = re.sub(r"\s+", " ", value)
+    value = value.casefold().strip()
+    return value
 
 
 def _contains(text: str, phrase: str) -> bool:
@@ -38,8 +45,11 @@ def _contains(text: str, phrase: str) -> bool:
 
 
 def _entity_terms(entity: TaskEntity) -> list[str]:
+    # source_mention 是实体在原始问题中的原语言形态（如中文问题里的中文术语），
+    # 下游模块（如 M5）常用该语言撰写计划；不纳入会导致跨语言 trace 校验必然失败。
     return list(dict.fromkeys(
-        term for term in [entity.name, *entity.aliases] if str(term).strip()
+        term for term in [entity.name, entity.source_mention, *entity.aliases]
+        if str(term).strip()
     ))
 
 
