@@ -120,10 +120,26 @@ def refinement_start():
     ai_brain.config_manager.save()
     return jsonify({"status": "success"})
 
-# ================= 细化结果展示 =================
-def _latest_refinement_output():
-    """返回当前对话对应 run 的细化产出；没有则回退到全局最新的一份"""
-    root = os.path.abspath(os.path.join(ai_brain.workspace_path, "..", "output", "refined"))
+# ================= 细化结果展示（按对话隔离） =================
+def _refined_root():
+    return os.path.abspath(os.path.join(ai_brain.workspace_path, "..", "output", "refined"))
+
+def _current_session_record():
+    """当前会话的持久化记录（不存在时返回 None）"""
+    sid = getattr(ai_brain, "current_session_id", None)
+    if not sid:
+        return None, None
+    path = os.path.join(_sessions_dir(), _safe_session_file(sid))
+    if not os.path.exists(path):
+        return sid, None
+    try:
+        return sid, _read_archive_file(path)
+    except Exception:
+        return sid, None
+
+def _refinement_output_for_session():
+    """返回 (产出条目, 原因)。只认当前对话自己的细化产出，绝不回退到别的对话。"""
+    root = _refined_root()
 
     def _entry(run_id):
         md_path = os.path.join(root, run_id, "refinement.md")
@@ -136,27 +152,22 @@ def _latest_refinement_output():
             }
         return None
 
-    # 优先：当前对话所属的固定方案 run
-    preferred = str(getattr(ai_brain, "current_refinement_run_id", "") or "")
-    if preferred:
-        entry = _entry(preferred)
-        if entry:
-            return entry
-
-    # 回退：全局最新的一份
-    best = None
-    if os.path.isdir(root):
-        for run_dir in os.listdir(root):
-            candidate = _entry(run_dir)
-            if candidate and (best is None or candidate["mtime"] > best["mtime"]):
-                best = candidate
-    return best
+    sid, record = _current_session_record()
+    if not sid:
+        return None, "当前还没有已保存的对话。"
+    run_id = str((record or {}).get("refinement_run_id") or "")
+    if not run_id:
+        return None, "当前对话还没有关联的细化产出：完成一次细化并保存后，这里会展示该对话的方案。"
+    entry = _entry(run_id)
+    if entry is None:
+        return None, f"该对话关联的方案（run_id: {run_id}）尚未生成细化产出。"
+    return entry, ""
 
 @app.route('/api/refinement/output')
 def refinement_output():
-    best = _latest_refinement_output()
+    best, reason = _refinement_output_for_session()
     if best is None:
-        return jsonify({"exists": False})
+        return jsonify({"exists": False, "reason": reason})
     try:
         with open(best["md_path"], encoding="utf-8", errors="ignore") as f:
             markdown = f.read()
@@ -180,9 +191,9 @@ def refinement_output():
 
 @app.route('/api/refinement/output/download')
 def refinement_output_download():
-    best = _latest_refinement_output()
+    best, reason = _refinement_output_for_session()
     if best is None:
-        return jsonify({"error": "还没有细化方案产出"}), 404
+        return jsonify({"error": reason or "还没有细化方案产出"}), 404
     return send_file(
         best["md_path"],
         as_attachment=True,
@@ -341,6 +352,7 @@ def _save_current_session(touch=True):
     updated_at = now
     title_custom = False
     existing_title = ""
+    refinement_run_id = str(getattr(ai_brain, "current_refinement_run_id", "") or "")
     if sid:
         path = os.path.join(_sessions_dir(), _safe_session_file(sid))
         if os.path.exists(path):
@@ -351,6 +363,8 @@ def _save_current_session(touch=True):
                     updated_at = old.get("updated_at", now)
                 title_custom = bool(old.get("title_custom"))
                 existing_title = old.get("title", "")
+                # 会话一旦关联过方案，不得被全局标记覆盖
+                refinement_run_id = str(old.get("refinement_run_id") or refinement_run_id)
             except Exception:
                 pass
     else:
@@ -364,6 +378,7 @@ def _save_current_session(touch=True):
         "id": sid,
         "title": title,
         "title_custom": title_custom,
+        "refinement_run_id": refinement_run_id,
         "created_at": created_at,
         "updated_at": updated_at,
         "messages": [{"role": m["role"], "content": m["content"]} for m in msgs],
