@@ -179,7 +179,8 @@ async function openRefinementPanel() {
         const res = await fetch('/api/refinement/output');
         const data = await res.json();
         if (!data.exists) {
-            detail.innerHTML = '<div class="archive-empty">还没有细化方案产出。完成一次细化并保存后，这里会展示最新的方案。</div>';
+            detail.innerHTML = `<div class="archive-empty">${escapeHtml(data.reason || '当前对话还没有细化方案产出。')}</div>`;
+            meta.innerText = '';
             return;
         }
         meta.innerText = `run_id: ${data.run_id} · 保存于 ${data.updated_at}`;
