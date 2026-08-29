@@ -342,6 +342,9 @@
   .plan-versions{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
   .ver-btn{border:1px solid var(--line);background:#fff;border-radius:999px;padding:4px 12px;font-size:12px;cursor:pointer;color:var(--ink2)}
   .ver-btn.active{background:var(--accent);border-color:var(--accent);color:#fff}
+  .ver-btn.refine-btn{background:#0e8a7b;border-color:#0e8a7b;color:#fff;font-weight:600}
+  .ver-btn.refine-btn:hover{background:#0b6f63;border-color:#0b6f63}
+  .ver-btn.refine-btn:disabled{opacity:.6;cursor:wait}
   .plan-body{padding:22px 24px}
   .plan-sec{margin-bottom:18px}
   .plan-sec:last-child{margin-bottom:0}
@@ -1479,7 +1482,7 @@ function planDetailsHtml(p, index){
     : `<div class="plan-value">${esc(p.timeline || "—")}</div>`;
   return `<div style="margin-bottom:14px"><p class="plan-title"><b>方案 ${index+1} · ${esc(p.hypothesis_id || "")}</b></p>` +
     `<div class="plan-field"><span class="pf-label">研究对象</span><div class="plan-value">${esc(p.study_subjects || "—")}</div></div>` +
-    ${p.alignment_warning ? `<div class="error-banner" style="margin:6px 0 8px">⚠ 研究对象对齐警告：${esc(p.alignment_warning)}</div>` : ""} +
+    (p.alignment_warning ? `<div class="error-banner" style="margin:6px 0 8px">⚠ 研究对象对齐警告：${esc(p.alignment_warning)}</div>` : "") +
     `<div class="plan-field"><span class="pf-label">时间线</span>${timelineHtml}</div>` +
     `<p style="margin:6px 0 4px"><b>Evidence IDs：</b>${esc(evidence)}<br><b>Paper IDs：</b>${esc(papers)}</p>` +
     `<details><summary>完整实验设计与引用映射</summary><pre>${design}</pre></details></div>`;
@@ -2264,9 +2267,31 @@ function renderPlanCard(){
   const latest = versionsData[versionsData.length - 1];
   const round = chainRoundOf(currentRun);
   const label = round > 1 ? `本轮定稿 · V${round}` : "本轮定稿 · V1";
-  $("planVersions").innerHTML = `<span class="ver-label">${esc(label)}</span>`;
+  $("planVersions").innerHTML = `<span class="ver-label">${esc(label)}</span>` +
+    `<button class="ver-btn refine-btn" id="refineBtn" title="把该方案固定为细化任务，在对话式工作台中生成可执行计划">🔬 固定此方案并细化</button>`;
+  const refineBtn = $("refineBtn");
+  if (refineBtn) refineBtn.addEventListener("click", () => startRefinement(currentRun));
   $("planCard").classList.remove("hidden");
   renderPlanBody(latest, label);
+}
+async function startRefinement(runId){
+  if(!runId) return;
+  if(!confirm("将该方案固定为细化任务，并打开对话式细化工作台？")) return;
+  const btn = $("refineBtn");
+  const original = btn ? btn.textContent : "";
+  if(btn){ btn.disabled = true; btn.textContent = "正在导出方案…"; }
+  try{
+    const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/refine`, { method: "POST" });
+    const data = await res.json();
+    if(!res.ok || !data.ok) throw new Error(data.error || "导出失败");
+    const wb = data.workbench || {};
+    if(wb.error) alert("方案已导出，但工作台启动异常：" + wb.error);
+    window.open(wb.url || "http://127.0.0.1:5000", "_blank");
+  }catch(err){
+    alert("细化导出失败：" + err.message);
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = original; }
+  }
 }
 /* ---------- 追问链整体方案（链级版本命名 + 跨轮次对比） ---------- */
 // 链级版本语义：V1 = 原问题（根运行）方案，V2 = 第 1 次追问方案，以此类推；

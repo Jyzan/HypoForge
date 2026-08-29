@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HypoForge 细化工作台</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🔬</text></svg>">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script>
+        window.MathJax = {
+            tex: {
+                inlineMath: [['$', '$'], ['\\(', '\\)']],
+                displayMath: [['$$', '$$'], ['\\[', '\\]']],
+                processEscapes: true
+            },
+            options: {
+                ignoreHtmlClass: 'no-mathjax',
+                processHtmlClass: 'mathjax-process'
+            }
+        };
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+    <div id="nav-bar">
+        <div class="brand">
+            <div class="brand-logo">🔬</div>
+            <div class="brand-text">
+                <div class="brand-title">HypoForge 细化工作台</div>
+                <div class="brand-sub">Research Plan Refinement · 科研方案对话式细化</div>
+            </div>
+        </div>
+        <div id="model-info" title="当前对话模型">模型: 读取中...</div>
+        <div class="btns">
+            <button class="btn btn-night" id="night-btn" onclick="toggleNightMode()">夜间模式</button>
+            <button class="btn btn-schedule" onclick="openScheduleModal()">任务安排</button>
+            <button class="btn btn-archive" onclick="saveCurrentArchive()">存档</button>
+            <button class="btn btn-archive" onclick="openArchiveModal()">档案</button>
+            <button class="btn btn-config" onclick="openConfigModal()">设置</button>
+            <button class="btn btn-stop" onclick="if(confirm('确定要关闭工作台吗？')) shutdownApp()">关闭工作台</button>
+        </div>
+    </div>
+
+    <div id="layout">
+        <aside id="sidebar">
+            <button class="btn btn-reset sidebar-new-btn" onclick="resetChat()">＋ 新对话</button>
+            <div class="sidebar-label">历史对话</div>
+            <div id="session-list" class="session-list"></div>
+        </aside>
+        <div id="main-area">
+            <div id="conv-header">
+                <div class="conv-title" id="conv-title" title="点击重命名当前对话" onclick="renameCurrentSession()">
+                    新对话
+                </div>
+                <div class="conv-meta">
+                    <div id="token-info" title="当前对话的 Token 累计用量 / 额度上限">Token: —</div>
+                    <button class="btn btn-schedule conv-btn" onclick="openRefinementPanel()">细化方案</button>
+                </div>
+            </div>
+            <div id="chat-box">
+                <div class="status-tag">系统已就绪。已固定的研究方案加载后，可直接开始对话式细化；也可以先描述您的研究问题。</div>
+            </div>
+
+            <div id="input-area">
+                <textarea id="user-input" rows="1" placeholder="描述细化需求，例如：为蛋白质突变稳定性方案生成材料清单与 FoldX 干实验脚本…（Enter 发送，Shift+Enter 换行）" autocomplete="off"></textarea>
+                <button id="send-btn" onclick="send()">发送</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="config-modal" class="modal">
+        <div class="modal-content">
+            <h2>工作台配置</h2>
+
+            <label style="display: block; margin-bottom: 20px; font-weight: bold; cursor: pointer;">
+                <input type="checkbox" id="config-allowlist"> 启用白名单自动审批机制
+            </label>
+
+            <div style="margin-bottom: 20px;">
+                <label style="font-weight: bold; display: block; margin-bottom: 8px;">Token 上限（会话累计预算）：</label>
+                <div style="display: flex; gap: 10px; align-items: center;">
+                    <input type="number" id="config-token-limit" min="1000" step="10000"
+                           style="flex: 1; padding: 10px 14px; border: 1px solid #c8d4e0; border-radius: 8px; font-size: 14px; outline: none;">
+                    <span id="config-token-status"
+                          style="font-family: Consolas, monospace; font-size: 12px; color: #14496e; background: #eef3f8; border: 1px solid #dde6ee; padding: 6px 12px; border-radius: 999px; white-space: nowrap;"></span>
+                </div>
+                <span style="font-size: 12px; color: #7f8c8d; display: block; margin-top: 5px;">* 右侧为当前用量。上下文压缩按模型上下文窗口（<span id="config-context-window">131072</span> tokens）自动进行，与该预算无关。</span>
+            </div>
+
+            <div style="margin-bottom: 20px;">
+                <label style="font-weight: bold; display: block; margin-bottom: 8px;">挂载的本地工具：</label>
+                <div id="tools-checkbox-container" class="checkbox-group">
+                    </div>
+                <span style="font-size: 12px; color: #7f8c8d; display: block; margin-top: 5px;">* 取消勾选的工具将从大模型的认知中抹除，用于节省 Token。</span>
+            </div>
+
+            <div style="margin-bottom: 25px;">
+                <label style="font-weight: bold; display: block; margin-bottom: 8px;">挂载的技能记忆：</label>
+                <div id="skills-checkbox-container" class="checkbox-group">
+                    </div>
+                <span style="font-size: 12px; color: #7f8c8d; display: block; margin-top: 5px;">* 核心文件 (base.md) 始终保持强制加载状态。</span>
+            </div>
+
+            <div class="modal-btns">
+                <button class="btn btn-stop" onclick="closeConfigModal()">取消</button>
+                <button class="btn btn-reset" onclick="saveConfig()">保存配置并热重启</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="schedule-modal" class="modal">
+        <div class="modal-content schedule-modal-content">
+            <h2>未来一周任务安排</h2>
+            <div id="schedule-grid" class="schedule-grid"></div>
+            <div class="schedule-hint">如需调整安排，可直接告诉助手，例如：帮我把未来一周的实验安排重新排一下。</div>
+            <div class="modal-btns">
+                <button class="btn btn-config" onclick="loadSchedule()">刷新</button>
+                <button class="btn btn-stop" onclick="closeScheduleModal()">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="archive-modal" class="modal">
+        <div class="modal-content archive-modal-content">
+            <h2>细化记录存档</h2>
+            <div class="archive-layout">
+                <div id="archive-list" class="archive-list"></div>
+                <div id="archive-detail" class="archive-detail">选择一个存档查看内容。</div>
+            </div>
+            <div class="modal-btns">
+                <button class="btn btn-stop" onclick="closeArchiveModal()">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="refinement-modal" class="modal">
+        <div class="modal-content refinement-modal-content">
+            <h2>细化方案 <span id="refinement-meta" style="font-size:12px;color:#7f8c8d;font-weight:400;margin-left:8px;"></span></h2>
+            <div id="refinement-detail" class="refinement-detail">正在加载…</div>
+            <div class="modal-btns">
+                <button class="btn btn-config" onclick="downloadRefinementMd()">下载 Markdown</button>
+                <button class="btn btn-stop" onclick="closeRefinementPanel()">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/api.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/ui.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/commands.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/schedule.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/chat.js') }}"></script>
+</body>
+</html>

@@ -43,3 +43,19 @@ build/
 docs/
 .chatgpt/
 tmp_pytest/
+
+# Refinement workbench runtime data (sessions, caches, approvals)
+refinement_assistant/sessions/
+refinement_assistant/log/
+refinement_assistant/logs/
+refinement_assistant/archives/
+refinement_assistant/allowlist/
+refinement_assistant/sandbox/
+refinement_assistant/memories/
+refinement_assistant/config.json
+refinement_assistant/token_state.json
+refinement_assistant/refinement_input.json
+refinement_assistant/llm_response_cache.sqlite3
+refinement_assistant/server.stderr.log
+refinement_assistant/server.stdout.log
+*.log
