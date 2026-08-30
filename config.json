@@ -1,0 +1,8 @@
+{
+    "enable_allowlist": true,
+    "disabled_tools": [],
+    "disabled_skills": [],
+    "sandbox_confirmed": false,
+    "sandbox_path": "",
+    "token_limit": 1000000
+}

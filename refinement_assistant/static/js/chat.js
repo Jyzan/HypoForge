@@ -90,6 +90,54 @@ document.getElementById('user-input').addEventListener('keydown', (e) => {
     }
 });
 
+// ================= 权限审批卡片 =================
+function renderApprovalCard(container, data) {
+    const card = document.createElement('div');
+    card.className = 'approval-card';
+
+    const tool = escapeHtml(String(data.tool_name || '工具'));
+    const message = data.message ? `<div class="approval-msg">${escapeHtml(String(data.message))}</div>` : '';
+    const cmd = escapeHtml(String(data.command || ''));
+    const cmdShort = cmd.length > 500 ? cmd.slice(0, 500) + `\n…（其余 ${cmd.length - 500} 字符已省略）` : cmd;
+
+    card.innerHTML = `
+        <div class="approval-title">⚠️ 权限申请：<b>${tool}</b></div>
+        ${message}
+        <pre class="approval-cmd">${cmdShort}</pre>
+        <div class="approval-actions">
+            <button class="btn btn-stop ap-deny">拒绝</button>
+            <button class="btn btn-reset ap-approve">批准</button>
+            <span class="approval-status"></span>
+        </div>`;
+
+    const decide = async (approved) => {
+        const okBtn = card.querySelector('.ap-approve');
+        const noBtn = card.querySelector('.ap-deny');
+        okBtn.disabled = true;
+        noBtn.disabled = true;
+        card.classList.add(approved ? 'ap-approved' : 'ap-denied');
+        card.querySelector('.approval-status').innerText = approved ? '✓ 已批准' : '✕ 已拒绝';
+        try {
+            await fetch('/approve', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    tool_call_id: data.tool_call_id,
+                    command: data.command,
+                    approved,
+                    audit_type: data.audit_type
+                })
+            });
+        } catch (e) {
+            card.querySelector('.approval-status').innerText = '提交失败：' + e.message;
+        }
+    };
+    card.querySelector('.ap-approve').onclick = () => decide(true);
+    card.querySelector('.ap-deny').onclick = () => decide(false);
+
+    container.appendChild(card);
+}
+
 // ================= 数学公式保护 =================
 // marked 会把 LaTeX 中的 _ ^ 等符号当作 Markdown 语法吃掉，导致 MathJax 拿到损坏的公式
 // 因此在 marked 解析前用占位符保护数学块，解析后再还原
@@ -190,21 +238,9 @@ async function processStream(response, statusBox, contentBox) {
                 statusBox.innerHTML += lines.map(l => `<div class="status-tag">🛠 ${escapeHtml(l)}</div>`).join('');
                 chatBox.scrollTop = chatBox.scrollHeight;
             } else if (data.type === 'approval') {
-                const ok = confirm(`⚠️ 安全确认：AI 申请运行指令：\n${data.command}\n\n是否批准？`);
-                
-                // 仅发送通知，目的是叫醒后端挂起的士兵
-                await fetch('/approve', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        tool_call_id: data.tool_call_id,
-                        command: data.command,
-                        approved: ok,
-                        audit_type: data.audit_type
-                    })
-                });
-                // 核心修复：绝对不能 return processStream(nextRes)！
-                // 使用 continue 跳过当前循环，原有的 reader 继续往下读，无缝衔接后端唤醒后发来的新数据！
+                // 页面内审批卡片：不会像原生弹窗一样被浏览器拦截或堆叠
+                renderApprovalCard(statusBox, data);
+                chatBox.scrollTop = chatBox.scrollHeight;
                 continue;
             } else if (data.type === 'final') {
                 contentBox.innerHTML = renderMarkdownWithMath(data.content);
