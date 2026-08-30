@@ -44,6 +44,10 @@ def create_file(filename, content=""):
     """创建新文件并写入内容"""
     try:
         target_path = _get_safe_path(filename)
+        # 子目录不存在时自动创建（如 scripts/model.py）
+        parent_dir = os.path.dirname(target_path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
         with open(target_path, "w", encoding="utf-8") as f:
             f.write(content)
         logger.info(f"文件创建成功: {target_path}")

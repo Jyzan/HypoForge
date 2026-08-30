@@ -235,61 +235,90 @@ async function processStream(response, statusBox, contentBox) {
     const decoder = new TextDecoder();
     const chatBox = document.getElementById('chat-box');
 
+    // SSE 事件可能被网络分包切开（审批事件携带完整文件内容，体积大），
+    // 必须跨 chunk 缓冲、按 \n\n 切分；单条解析失败跳过而非中断整个流
+    let buffer = '';
     while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        const lines = decoder.decode(value).split('\n\n');
-        for (let line of lines) {
+        buffer += decoder.decode(value, { stream: true });
+
+        let sep;
+        while ((sep = buffer.indexOf('\n\n')) !== -1) {
+            const line = buffer.slice(0, sep).trim();
+            buffer = buffer.slice(sep + 2);
             if (!line.startsWith('data: ')) continue;
-            const data = JSON.parse(line.substring(6));
-            
-            if (contentBox.innerText === "正在思考..." ||
-                contentBox.innerText.startsWith("正在整理") || 
-                contentBox.innerText.startsWith("正在封存") || 
-                contentBox.innerText.startsWith("正在挂载")) {
-                contentBox.innerText = "";
-            }
-            if (data.type === 'status') {
-                statusBox.innerHTML += `<div class="status-tag">⚡ ${escapeHtml(String(data.content || ''))}</div>`;
-                if (String(data.content || '').includes('Refinement saved')) {
-                    statusBox.innerHTML += `<div class="status-tag">📄 细化方案已保存，点顶栏「细化方案」查看与下载</div>`;
-                }
-                chatBox.scrollTop = chatBox.scrollHeight;
-            } else if (data.type === 'mobile_progress') {
-                // 执行子代理的委派/反馈信息，逐行展示
-                const lines = String(data.content || '').split('\n').filter(l => l.trim());
-                statusBox.innerHTML += lines.map(l => `<div class="status-tag">🛠 ${escapeHtml(l)}</div>`).join('');
-                chatBox.scrollTop = chatBox.scrollHeight;
-            } else if (data.type === 'approval') {
-                // 页面内审批卡片：不会像原生弹窗一样被浏览器拦截或堆叠
-                renderApprovalCard(statusBox, data);
-                chatBox.scrollTop = chatBox.scrollHeight;
+
+            let data;
+            try {
+                data = JSON.parse(line.substring(6));
+            } catch (err) {
+                console.warn('[SSE] 跳过无法解析的事件片段:', line.slice(0, 80));
                 continue;
-            } else if (data.type === 'final') {
-                contentBox.innerHTML = renderMarkdownWithMath(data.content);
-                window.chatTranscript.push({
-                    role: 'assistant',
-                    content: data.content,
-                    created_at: new Date().toISOString()
-                });
-                document.getElementById('token-info').innerText = `Token 实时状态: ${data.tokens}`;
-                if (window.MathJax && window.MathJax.typesetPromise) {
-                    MathJax.typesetPromise([contentBox]).catch(err => console.log('MathJax error:', err));
-                }
-            } else if (data.type === 'error') {
-                contentBox.innerHTML = `<span style="color:#e74c3c; font-weight:bold;">❌ 系统提示：${data.content}</span>`;
-                window.chatTranscript.push({
-                    role: 'assistant',
-                    content: `[ERROR] ${data.content}`,
-                    created_at: new Date().toISOString()
-                });
-                if (data.content.includes("Token")) {
-                    contentBox.innerHTML += `<br><span style="font-size: 13px; color: #7f8c8d;">💡 提示：您可以使用指令 <b>/token [数字]</b> 提升阈值，或使用 <b>/new</b> 开启新对话清理上下文。</span>`;
-                }
+            }
+
+            try {
+                handleStreamEvent(data, statusBox, contentBox, chatBox);
+            } catch (err) {
+                console.error('[SSE] 事件处理异常:', err);
             }
         }
         chatBox.scrollTop = chatBox.scrollHeight;
     }
+}
+
+function handleStreamEvent(data, statusBox, contentBox, chatBox) {
+    if (contentBox.innerText === "正在思考..." ||
+        contentBox.innerText.startsWith("正在整理") ||
+        contentBox.innerText.startsWith("正在封存") ||
+        contentBox.innerText.startsWith("正在挂载")) {
+        contentBox.innerText = "";
+    }
+    if (data.type === 'status') {
+        // insertAdjacentHTML 而非 innerHTML +=：后者会重建子元素，
+        // 销毁已渲染审批卡片上的按钮事件处理器
+        statusBox.insertAdjacentHTML('beforeend', `<div class="status-tag">⚡ ${escapeHtml(String(data.content || ''))}</div>`);
+        if (String(data.content || '').includes('Refinement saved')) {
+            statusBox.insertAdjacentHTML('beforeend', `<div class="status-tag">📄 细化方案已保存，点顶栏「细化方案」查看与下载</div>`);
+        }
+        chatBox.scrollTop = chatBox.scrollHeight;
+    } else if (data.type === 'mobile_progress') {
+        // 执行子代理的委派/反馈信息，逐行展示
+        const lines = String(data.content || '').split('\n').filter(l => l.trim());
+        statusBox.insertAdjacentHTML('beforeend', lines.map(l => `<div class="status-tag">🛠 ${escapeHtml(l)}</div>`).join(''));
+        chatBox.scrollTop = chatBox.scrollHeight;
+    } else if (data.type === 'approval') {
+        // 页面内审批卡片：不会像原生弹窗一样被浏览器拦截或堆叠
+        renderApprovalCard(statusBox, data);
+        chatBox.scrollTop = chatBox.scrollHeight;
+    } else if (data.type === 'final') {
+        contentBox.innerHTML = renderMarkdownWithMath(data.content);
+        window.chatTranscript.push({
+            role: 'assistant',
+            content: data.content,
+            created_at: new Date().toISOString()
+        });
+        const tk = parseTokenStatus(data.tokens);
+        document.getElementById('token-info').innerText = formatTokenChip(tk.used, tk.limit);
+        if (window.MathJax && window.MathJax.typesetPromise) {
+            MathJax.typesetPromise([contentBox]).catch(err => console.log('MathJax error:', err));
+        }
+    } else if (data.type === 'error') {
+        contentBox.innerHTML = `<span style="color:#e74c3c; font-weight:bold;">❌ 系统提示：${escapeHtml(String(data.content || ''))}</span>`;
+        window.chatTranscript.push({
+            role: 'assistant',
+            content: `[ERROR] ${data.content}`,
+            created_at: new Date().toISOString()
+        });
+        if (String(data.content || '').includes("Token")) {
+            contentBox.innerHTML += `<br><span style="font-size: 13px; color: #7f8c8d;">💡 提示：您可以在设置中调大 Token 上限，或使用 <b>/new</b> 开启新对话清理上下文。</span>`;
+        }
+    }
+}
+
+function parseTokenStatus(text) {
+    const m = /\[(\d+)\s*\/\s*(\d+)\]/.exec(String(text || ''));
+    return m ? { used: Number(m[1]), limit: Number(m[2]) } : { used: 0, limit: 0 };
 }
 
 async function send(forcedText) {
