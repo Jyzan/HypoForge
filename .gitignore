@@ -62,3 +62,8 @@ refinement_assistant/server.stdout.log
 
 # Runtime config accidentally created at repo root (workbench must run from refinement_assistant/)
 /config.json
+
+# uv 实验运行产物（工作台会话内生成的临时项目环境）
+refinement_assistant/pyproject.toml
+refinement_assistant/uv.lock
+refinement_assistant/.python-version

@@ -82,6 +82,9 @@ class PermissionManager:
 
     def evaluate(self, tool_name, args):
         args = args or {}
+        # 完全信任模式：跳过所有权限审批，直接放行
+        if self.config.get("full_trust_mode"):
+            return PermissionDecision(action="allow")
         if tool_name in self.FILE_WRITE_TOOLS:
             return self._evaluate_file_write(tool_name, args)
         if tool_name == "run_powershell":

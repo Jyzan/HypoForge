@@ -546,7 +546,7 @@ class AIAssistant:
                 cmd = args.get("command", "")
                 audit_res = (
                     "SAFE"
-                    if permission_gate_approved
+                    if (permission_gate_approved or self.config_manager.config.get("full_trust_mode"))
                     else self.security_agent.audit(
                         cmd,
                         self.context_manager.get_allowlist(),

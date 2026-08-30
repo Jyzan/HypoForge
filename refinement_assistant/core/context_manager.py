@@ -45,6 +45,16 @@ class ContextManager:
             f"     * 你必须交叉核对战报中的【具体工具执行结果】。例如，如果 Worker 声称“已输入文字”，但战报中并未出现包含 `type` 动作的 `execute_io_macro` 工具调用记录，则说明它在撒谎（幻觉）！\n"
             f"     * 发现进度造假或未完成时，你必须识破它，并根据实际做到哪一步，重新下发未完成的任务！\n"
         )
+
+        # 完全信任模式：告知 Agent 无需在对话中反复请求权限
+        # main.py 传入的是 ConfigManager 实例，取其内部的 config 字典
+        cfg = getattr(self.config, "config", self.config)
+        if isinstance(cfg, dict) and cfg.get("full_trust_mode"):
+            self.system_prompt_base += (
+                f"\n【当前权限模式：完全信任】\n"
+                f"用户已启用完全信任模式，系统层面对所有工具调用与命令执行自动放行。"
+                f"请直接执行操作，不要在回复中反复请求权限或确认；仅在遇到真正的语义歧义时才向用户提问。执行完成后简要汇报结果即可。\n"
+            )
         self._base_dirty = False
 
     def invalidate_base(self):

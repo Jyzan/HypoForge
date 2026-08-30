@@ -13,7 +13,8 @@ class ConfigManager:
             "disabled_skills": [],      # 例如 ["powershell_tips.md"]
             "sandbox_confirmed": False,
             "sandbox_path": "",
-            "token_limit": 1000000      # 会话累计 Token 预算，可在设置界面调整
+            "token_limit": 1000000,     # 会话累计 Token 预算，可在设置界面调整
+            "full_trust_mode": False    # 完全信任模式：跳过所有权限审批（慎用）
         }
         self.load()
 
