@@ -10,6 +10,9 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+# 最近一次 save_refinement_output 保存的 run_id，供会话自动关联细化产出
+LAST_SAVED_REFINEMENT_RUN_ID = ""
+
 
 def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default) or default
@@ -129,10 +132,10 @@ def read_downloaded_papers(run_id: str = "", limit: int = 20) -> str:
 
 
 def save_refinement_output(run_id: str, json_data: str, markdown: str = "") -> str:
+    global LAST_SAVED_REFINEMENT_RUN_ID
     root = _project_root()
-    out_dir = root / "output" / "refined" / (
-        run_id or datetime.now().strftime("refine-%Y%m%d-%H%M%S")
-    )
+    run_id = (run_id or "").strip() or datetime.now().strftime("refine-%Y%m%d-%H%M%S")
+    out_dir = root / "output" / "refined" / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
         parsed = json.loads(json_data) if json_data.strip() else {}
@@ -142,6 +145,8 @@ def save_refinement_output(run_id: str, json_data: str, markdown: str = "") -> s
     md_path = out_dir / "refinement.md"
     json_path.write_text(json.dumps(parsed, ensure_ascii=False, indent=2), encoding="utf-8")
     md_path.write_text(markdown or str(parsed), encoding="utf-8")
+    # 记录最近一次保存，供会话自动关联（手动开头的对话没有 HypoForge run_id）
+    LAST_SAVED_REFINEMENT_RUN_ID = run_id
     return f"Refinement saved:\nJSON: {json_path}\nMarkdown: {md_path}"
 
 

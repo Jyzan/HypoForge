@@ -353,6 +353,19 @@ def _save_current_session(touch=True):
     title_custom = False
     existing_title = ""
     refinement_run_id = str(getattr(ai_brain, "current_refinement_run_id", "") or "")
+    # 手动开头的对话没有固定方案，但若本对话内保存过细化产出，也自动关联
+    try:
+        from tools.hypoforge_tools import LAST_SAVED_REFINEMENT_RUN_ID as _last_saved
+        # 若会话已有的关联从未产生过实际产出（陈旧引用），且本对话刚保存过产出，则改用新的
+        if refinement_run_id:
+            has_output = os.path.isfile(os.path.join(
+                _refined_root(), refinement_run_id, "refinement.md"))
+            if not has_output and _last_saved:
+                refinement_run_id = str(_last_saved)
+        elif _last_saved:
+            refinement_run_id = str(_last_saved)
+    except Exception:
+        pass
     if sid:
         path = os.path.join(_sessions_dir(), _safe_session_file(sid))
         if os.path.exists(path):
