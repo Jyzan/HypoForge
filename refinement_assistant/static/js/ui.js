@@ -35,6 +35,7 @@ async function openConfigModal() {
         const availableSkills = data.available_skills;
         
         document.getElementById('config-allowlist').checked = config.enable_allowlist !== false;
+        document.getElementById('config-full-trust').checked = config.full_trust_mode === true;
 
         const tokenLimitInput = document.getElementById('config-token-limit');
         tokenLimitInput.value = config.token_limit || 1000000;
@@ -99,9 +100,18 @@ async function saveConfig() {
 
     const newConfig = {
         enable_allowlist: allowlist,
+        full_trust_mode: document.getElementById('config-full-trust').checked,
         disabled_tools: disabledTools,
         disabled_skills: disabledSkills
     };
+
+    // 开启完全信任时二次确认
+    if (newConfig.full_trust_mode && !confirm(
+        '⚠️ 即将开启【完全信任模式】：AI 将可以不经确认直接创建/修改/删除文件并执行任意命令。\n\n确定开启吗？（可随时回到设置关闭）'
+    )) {
+        newConfig.full_trust_mode = false;
+        document.getElementById('config-full-trust').checked = false;
+    }
 
     // Token 上限：留空则不修改
     const tokenLimit = parseInt(document.getElementById('config-token-limit').value, 10);

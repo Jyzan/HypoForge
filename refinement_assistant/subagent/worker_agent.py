@@ -325,9 +325,10 @@ class WorkerAgent:
 
         if name == "run_powershell":
             cmd = args.get("command", "")
+            full_trust = bool(getattr(self.permission_manager, "config", {}).get("full_trust_mode"))
             audit_res = (
                 "SAFE"
-                if permission_gate_approved
+                if (permission_gate_approved or full_trust)
                 else self.security_agent.audit(cmd, allowlist)
             )
             
