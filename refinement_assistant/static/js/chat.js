@@ -1,5 +1,28 @@
 /* static/js/chat.js */
 
+// ================= 生成中保护（防误刷新） =================
+window._streamActive = false;
+
+function setStreamIndicator(on) {
+    let el = document.getElementById('stream-indicator');
+    if (on && !el) {
+        el = document.createElement('div');
+        el.id = 'stream-indicator';
+        el.innerText = '⏳ 生成中，请勿刷新页面…';
+        document.getElementById('conv-header').appendChild(el);
+    } else if (!on && el) {
+        el.remove();
+    }
+}
+
+window.addEventListener('beforeunload', (e) => {
+    if (window._streamActive) {
+        e.preventDefault();
+        e.returnValue = '正在生成中，刷新会中断本次生成。确定离开？';
+        return e.returnValue;
+    }
+});
+
 // 初始化
 window.onload = () => {
     syncStatus();
@@ -303,11 +326,16 @@ async function send(forcedText) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ message: text })
         });
+        window._streamActive = true;
+        setStreamIndicator(true);
         await processStream(response, aiDiv.querySelector('.status-box'), aiDiv.querySelector('.content-box'));
         // 对话流结束后后端已自动保存会话，刷新左侧列表与对话条（标题/token）
         refreshSessions();
         updateConvHeader();
     } catch (e) {
         aiDiv.querySelector('.content-box').innerHTML = `<span style="color:red">连接中断。</span>`;
+    } finally {
+        window._streamActive = false;
+        setStreamIndicator(false);
     }
 }

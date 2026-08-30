@@ -1133,3 +1133,24 @@ body.dark-mode .approval-card.ap-denied .approval-title { color: #e08a80; }
 body.dark-mode .approval-cmd { background: #101922; border-color: #2b3a49; color: #d6dee7; }
 body.dark-mode .approval-actions .ap-approve { background: #0e8a7b; border-color: #0e8a7b; }
 body.dark-mode .approval-actions .ap-deny { background: #2a1a17; border-color: #6e3f38; color: #f0b7ae; }
+
+/* 生成中指示器 */
+#stream-indicator {
+    font-size: 12px;
+    font-weight: 700;
+    color: #8a5a00;
+    background: #fff3d6;
+    border: 1px solid #e3c06b;
+    padding: 5px 12px;
+    border-radius: 999px;
+    animation: stream-pulse 1.2s ease-in-out infinite;
+}
+@keyframes stream-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.45; }
+}
+body.dark-mode #stream-indicator {
+    color: #d8a94a;
+    background: #2a2318;
+    border-color: #8a6d2f;
+}
