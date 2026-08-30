@@ -59,3 +59,6 @@ refinement_assistant/llm_response_cache.sqlite3
 refinement_assistant/server.stderr.log
 refinement_assistant/server.stdout.log
 *.log
+
+# Runtime config accidentally created at repo root (workbench must run from refinement_assistant/)
+/config.json
