@@ -93,6 +93,10 @@ async function restoreLiveSession() {
             renderArchivedConversation(window.chatTranscript);
             document.getElementById('token-info').innerText =
                 formatTokenChip(data.tokens_used, data.tokens_limit);
+            // 提示：刷新会中断正在进行的生成（SSE 流无法跨刷新恢复）
+            const chatBox = document.getElementById('chat-box');
+            chatBox.innerHTML += '<div class="status-tag">ℹ️ 已恢复显示当前对话。注意：若刷新前有正在进行的生成，该次生成已随刷新中断，请重新发送指令。</div>';
+            chatBox.scrollTop = chatBox.scrollHeight;
         }
         window.currentSessionId = data.session_id || null;
     } catch (e) {

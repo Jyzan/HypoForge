@@ -599,7 +599,8 @@ class AIAssistant:
         }
         yield json.dumps(payload)
         yield json.dumps({"type": "status", "content": wait_message})
-        self._wait_for_approval_event(event, timeout=300)
+        # 审批卡片需要用户阅读长内容，等待窗口放宽到 10 分钟
+        self._wait_for_approval_event(event, timeout=600)
         approval_data = self.pending_approvals.pop(tool_call_id, None)
         return bool(approval_data and approval_data.get("approved"))
 
