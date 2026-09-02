@@ -32,6 +32,13 @@ def test_gap_can_record_hypothesized_terminal_state():
 def test_graph_context_never_exposes_bridge_hypothesis_as_evidence():
     state = PipelineState(
         input_question="question",
+        evidence_gap_requests=[EvidenceGapRequest(
+            gap_id="GAP_1",
+            sub_question="Does A cause B?",
+            status="hypothesized",
+            scientific_resolution="unresolved",
+            bridge_hypothesis_node_id="HYP_GAP_1",
+        )],
         evidence_graph=EvidenceGraph(
             nodes=[
                 EvidenceNode(

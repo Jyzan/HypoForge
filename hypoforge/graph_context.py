@@ -94,6 +94,51 @@ def _unique(values: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(value for value in values if value))
 
 
+def active_bridge_ids_for_state(state: PipelineState) -> set[str]:
+    """Return bridge nodes created for gaps that belong to this run state.
+
+    Persistent memory may retrieve established facts from earlier questions,
+    but an unverified bridge is a run-local working assumption.  Treating all
+    historical HYP nodes as active caused, for example, an aging assumption to
+    be attached to a later computer-vision hypothesis.
+    """
+
+    ids: set[str] = set()
+    for collection_name in ("evidence_gap_requests", "evidence_gaps"):
+        for gap in getattr(state, collection_name, []) or []:
+            bridge_id = str(
+                getattr(gap, "bridge_hypothesis_node_id", "") or ""
+            ).strip()
+            if bridge_id:
+                ids.add(bridge_id)
+
+    # Backward compatibility for old checkpoints that persisted the explicit
+    # hypothesis assumption but not its gap record.  Only accept such a
+    # reference when the graph node itself also lacks an origin_gap_id.  A
+    # node carrying another run's origin (the cross-domain leak) must never be
+    # revived merely because an already-contaminated card mentions it.
+    graph = getattr(state, "evidence_graph", None)
+    nodes = {node.id: node for node in graph.nodes} if graph else {}
+    for collection_name in (
+        "candidate_hypotheses",
+        "top_hypotheses",
+        "best_hypotheses",
+    ):
+        for hypothesis in getattr(state, collection_name, []) or []:
+            for assumption in getattr(hypothesis, "working_assumptions", []) or []:
+                bridge_id = str(
+                    getattr(assumption, "bridge_hypothesis_node_id", "") or ""
+                ).strip()
+                node = nodes.get(bridge_id)
+                origin_gap_id = str(
+                    ((node.metadata or {}).get("origin_gap_id") if node else "")
+                    or ""
+                ).strip()
+                if bridge_id and not origin_gap_id:
+                    ids.add(bridge_id)
+    return ids
+
+
 def build_graph_context(
     state: PipelineState,
     *,
@@ -217,10 +262,12 @@ def build_graph_context(
         # Bridge hypotheses are graph nodes, not KnowledgeEntry/evidence
         # buckets. Keep them visible to M4-M6 as explicit assumptions while
         # never adding their IDs to the canonical evidence whitelist below.
+        active_bridge_ids = active_bridge_ids_for_state(state)
         for node in graph.nodes:
             if (
                 node.type is EvidenceNodeType.HYPOTHESIS
                 and (node.metadata or {}).get("verification_status") == "unverified"
+                and node.id in active_bridge_ids
             ):
                 buckets["bridge_hypotheses"].append(GraphContextItem(
                     entry_id=node.id,
