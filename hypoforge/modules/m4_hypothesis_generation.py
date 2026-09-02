@@ -33,7 +33,11 @@ from ..epistemic_contract import (
     normalize_hypothesis_grounding,
     validate_epistemic_contract,
 )
-from ..graph_context import GraphContext, build_graph_context
+from ..graph_context import (
+    GraphContext,
+    active_bridge_ids_for_state,
+    build_graph_context,
+)
 from ..protocol import ModuleProtocol
 from ..prompts.m4_prompts import (
     M4_CONTRACT_REPAIR_SYSTEM_PROMPT,
@@ -1651,6 +1655,7 @@ class M4HypothesisGeneration(ModuleProtocol):
         """
         if not context.bridge_hypotheses:
             return hypotheses
+        active_bridge_ids = active_bridge_ids_for_state(state)
         gap_by_bridge = {
             gap.bridge_hypothesis_node_id: gap
             for gap in state.evidence_gap_requests
@@ -1663,6 +1668,8 @@ class M4HypothesisGeneration(ModuleProtocol):
             }
             assumptions = list(hypothesis.working_assumptions)
             for item in context.bridge_hypotheses:
+                if item.entry_id not in active_bridge_ids:
+                    continue
                 if item.entry_id in existing_ids:
                     continue
                 gap = gap_by_bridge.get(item.entry_id)

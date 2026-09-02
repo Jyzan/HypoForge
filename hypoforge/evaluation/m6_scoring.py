@@ -53,6 +53,9 @@ class M6ScoreConditions:
     core_untestable: bool = False
     experimental_validation_missing: bool = False
     multiple_major_design_defects: bool = False
+    # Keep new flags at the end so any legacy positional construction retains
+    # the original field ordering.
+    invalid_hypothesis_output: bool = False
 
 
 def _normalise_dimensions(
@@ -80,6 +83,28 @@ def _normalise_dimensions(
     ]
 
 
+def _calibrate_display_score(raw_score: float) -> float:
+    """Expand the useful display range around the ordinary 3/5 midpoint.
+
+    The eight auditable dimensions remain untouched.  This monotonic mapping
+    only makes the public score discriminate between the historical anchors:
+    weak-but-structured plans remain below 3, sound plans around 3.7--3.8
+    enter the 4-point range, and an exceptional raw 5 remains 5.
+    """
+
+    if raw_score <= 3.0:
+        calibrated = 3.0 + 1.1 * (raw_score - 3.0)
+    elif raw_score <= 3.6:
+        calibrated = 3.0 + 1.25 * (raw_score - 3.0)
+    elif raw_score <= 3.8:
+        calibrated = 3.75 + 2.25 * (raw_score - 3.6)
+    elif raw_score <= 4.0:
+        calibrated = 4.2 + (raw_score - 3.8)
+    else:
+        calibrated = 4.4 + 0.6 * (raw_score - 4.0)
+    return round(max(1.0, min(5.0, calibrated)), 1)
+
+
 def aggregate_m6_scoring(
     dimensions: Iterable[ScoreDimensionDetail],
     conditions: M6ScoreConditions,
@@ -87,10 +112,21 @@ def aggregate_m6_scoring(
     """Calculate weighted score, then apply the strictest triggered cap."""
 
     rows = _normalise_dimensions(dimensions)
-    raw_score = round(sum(row.weighted_contribution for row in rows), 1)
+    precise_raw_score = sum(row.weighted_contribution for row in rows)
+    raw_score = round(precise_raw_score, 4)
     novelty = next(row.score for row in rows if row.dimension == "novelty")
 
     caps: list[ScoreCap] = []
+    if conditions.invalid_hypothesis_output:
+        caps.append(ScoreCap(
+            rule_id="invalid_hypothesis_output",
+            maximum=1.9,
+            attribution="hypothesis",
+            reason=(
+                "M4 returned a deterministic fallback or unresolved placeholder "
+                "rather than a substantive scientific hypothesis."
+            ),
+        ))
     if conditions.task_misaligned:
         caps.append(ScoreCap(
             rule_id="task_misaligned",
@@ -134,12 +170,14 @@ def aggregate_m6_scoring(
             reason=f"Independent novelty score is {novelty:.1f}/5, below the 2.0 threshold.",
         ))
 
+    calibrated_score = _calibrate_display_score(precise_raw_score)
     final_score = min(
-        raw_score,
+        calibrated_score,
         *(cap.maximum for cap in caps),
-    ) if caps else raw_score
+    ) if caps else calibrated_score
     rationale = (
         f"Weighted raw score {raw_score:.1f}/5; "
+        f"anchor-calibrated display score {calibrated_score:.1f}/5; "
         f"final score {final_score:.1f}/5. "
         "This score is display-only; iteration routing uses structured hard gates "
         "and evidence/validation verdicts, never this numeric value."
