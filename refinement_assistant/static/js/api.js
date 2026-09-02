@@ -93,6 +93,10 @@ async function restoreLiveSession() {
             renderArchivedConversation(window.chatTranscript);
             document.getElementById('token-info').innerText =
                 formatTokenChip(data.tokens_used, data.tokens_limit);
+            // 提示：刷新会中断正在进行的生成（SSE 流无法跨刷新恢复）
+            const chatBox = document.getElementById('chat-box');
+            chatBox.innerHTML += '<div class="status-tag">ℹ️ 已恢复显示当前对话。注意：若刷新前有正在进行的生成，该次生成已随刷新中断，请重新发送指令。</div>';
+            chatBox.scrollTop = chatBox.scrollHeight;
         }
         window.currentSessionId = data.session_id || null;
     } catch (e) {
@@ -179,7 +183,8 @@ async function openRefinementPanel() {
         const res = await fetch('/api/refinement/output');
         const data = await res.json();
         if (!data.exists) {
-            detail.innerHTML = '<div class="archive-empty">还没有细化方案产出。完成一次细化并保存后，这里会展示最新的方案。</div>';
+            detail.innerHTML = `<div class="archive-empty">${escapeHtml(data.reason || '当前对话还没有细化方案产出。')}</div>`;
+            meta.innerText = '';
             return;
         }
         meta.innerText = `run_id: ${data.run_id} · 保存于 ${data.updated_at}`;

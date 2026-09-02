@@ -546,7 +546,7 @@ class AIAssistant:
                 cmd = args.get("command", "")
                 audit_res = (
                     "SAFE"
-                    if permission_gate_approved
+                    if (permission_gate_approved or self.config_manager.config.get("full_trust_mode"))
                     else self.security_agent.audit(
                         cmd,
                         self.context_manager.get_allowlist(),
@@ -597,9 +597,19 @@ class AIAssistant:
             "event": event,
             "approved": False,
         }
-        yield json.dumps(payload)
-        yield json.dumps({"type": "status", "content": wait_message})
-        self._wait_for_approval_event(event, timeout=300)
+        try:
+            yield json.dumps(payload)
+            yield json.dumps({"type": "status", "content": wait_message})
+            # 审批卡片需要用户阅读长内容，等待窗口放宽到 10 分钟
+            self._wait_for_approval_event(event, timeout=600)
+        finally:
+            # 若 SSE 流被客户端中断（如刷新页面）导致审批悬空，
+            # 自动按"拒绝"处理，保证上下文里的工具调用有结果、下轮对话不报错
+            pending = self.pending_approvals.get(tool_call_id)
+            if pending and not pending["event"].is_set():
+                pending["approved"] = False
+                pending["event"].set()
+                logger.info(f"[APPROVAL] 流中断，悬空审批已自动按拒绝处理: {tool_call_id}")
         approval_data = self.pending_approvals.pop(tool_call_id, None)
         return bool(approval_data and approval_data.get("approved"))
 

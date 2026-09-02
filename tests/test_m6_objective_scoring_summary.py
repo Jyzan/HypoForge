@@ -49,8 +49,32 @@ def test_weighted_score_uses_all_eight_dimensions():
     summary = aggregate_m6_scoring(rows, M6ScoreConditions())
 
     assert summary.raw_score == 3.5
-    assert summary.final_score == 3.5
+    assert summary.final_score == 3.6
     assert len(summary.dimensions) == 8
+
+
+@pytest.mark.parametrize(
+    ("raw_dimension_score", "expected_display_score"),
+    [
+        (2.0, 1.9),
+        (3.0, 3.0),
+        (3.6, 3.8),
+        (3.7, 4.0),
+        (3.8, 4.2),
+        (4.0, 4.4),
+        (5.0, 5.0),
+    ],
+)
+def test_display_score_uses_historical_anchor_calibration(
+    raw_dimension_score,
+    expected_display_score,
+):
+    rows = [_detail(name, raw_dimension_score) for name in WEIGHTS]
+
+    summary = aggregate_m6_scoring(rows, M6ScoreConditions())
+
+    assert summary.raw_score == raw_dimension_score
+    assert summary.final_score == expected_display_score
 
 
 def test_low_novelty_caps_an_otherwise_perfect_score_at_3_9():
@@ -82,6 +106,21 @@ def test_multiple_caps_use_the_strictest_limit_and_preserve_reasons():
         "core_fact_contradicted",
         "experimental_validation_missing",
     }
+
+
+def test_invalid_fallback_output_caps_an_otherwise_high_score_at_1_9():
+    rows = [_detail(name, 4.0) for name in WEIGHTS]
+
+    summary = aggregate_m6_scoring(
+        rows,
+        M6ScoreConditions(invalid_hypothesis_output=True),
+    )
+
+    assert summary.raw_score == 4.0
+    assert summary.final_score == 1.9
+    assert [cap.rule_id for cap in summary.applied_caps] == [
+        "invalid_hypothesis_output"
+    ]
 
 
 def test_aggregator_rejects_missing_or_duplicate_dimensions():

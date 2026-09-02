@@ -1048,3 +1048,109 @@ body.dark-mode .schedule-task strong { color: var(--text); }
 body.dark-mode .schedule-task span { color: #b7c7d6; }
 
 body.dark-mode .schedule-item.priority-high { border-left-color: #d05a4c; }
+
+/* ================= 权限审批卡片 ================= */
+.approval-card {
+    border: 1px solid #e3c06b;
+    border-left: 4px solid #d68910;
+    background: #fffaf0;
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin: 6px 0;
+}
+
+.approval-card.ap-approved {
+    border-color: var(--teal);
+    border-left-color: var(--teal);
+    background: #f0faf8;
+    opacity: 0.85;
+}
+
+.approval-card.ap-denied {
+    border-color: #b03a2e;
+    border-left-color: #b03a2e;
+    background: #fdf2f0;
+    opacity: 0.85;
+}
+
+.approval-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: #8a5a00;
+    margin-bottom: 6px;
+}
+
+.approval-card.ap-approved .approval-title { color: #0e8a7b; }
+.approval-card.ap-denied .approval-title { color: #b03a2e; }
+
+.approval-msg {
+    font-size: 12.5px;
+    color: #64768a;
+    margin-bottom: 6px;
+}
+
+.approval-cmd {
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 12px;
+    line-height: 1.55;
+    background: #ffffff;
+    border: 1px solid #dbe3ec;
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin: 0 0 8px;
+    max-height: 220px;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    color: #24384c;
+}
+
+.approval-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.approval-actions .btn { padding: 5px 16px; font-size: 12.5px; }
+.approval-actions .ap-approve { background: #0e8a7b; border: 1px solid #0e8a7b; color: #fff; }
+.approval-actions .ap-approve:hover { background: #0b6f63; }
+.approval-actions .ap-deny { background: #fff; border: 1px solid #e7b6ae; color: #b03a2e; }
+.approval-actions .ap-deny:hover { background: #fdeceb; }
+.approval-actions .btn:disabled { opacity: 0.55; cursor: default; }
+.approval-status { font-size: 12px; color: #64768a; }
+
+/* 审批卡片夜间模式 */
+body.dark-mode .approval-card {
+    border-color: #8a6d2f;
+    border-left-color: #d68910;
+    background: #2a2318;
+}
+body.dark-mode .approval-card.ap-approved { border-color: #0e8a7b; border-left-color: #0e8a7b; background: #14231f; }
+body.dark-mode .approval-card.ap-denied { border-color: #b03a2e; border-left-color: #b03a2e; background: #2a1a17; }
+body.dark-mode .approval-title { color: #d8a94a; }
+body.dark-mode .approval-card.ap-approved .approval-title { color: #2ea894; }
+body.dark-mode .approval-card.ap-denied .approval-title { color: #e08a80; }
+body.dark-mode .approval-cmd { background: #101922; border-color: #2b3a49; color: #d6dee7; }
+body.dark-mode .approval-actions .ap-approve { background: #0e8a7b; border-color: #0e8a7b; }
+body.dark-mode .approval-actions .ap-deny { background: #2a1a17; border-color: #6e3f38; color: #f0b7ae; }
+
+/* 生成中指示器 */
+#stream-indicator {
+    font-size: 12px;
+    font-weight: 700;
+    color: #8a5a00;
+    background: #fff3d6;
+    border: 1px solid #e3c06b;
+    padding: 5px 12px;
+    border-radius: 999px;
+    animation: stream-pulse 1.2s ease-in-out infinite;
+}
+@keyframes stream-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.45; }
+}
+body.dark-mode #stream-indicator {
+    color: #d8a94a;
+    background: #2a2318;
+    border-color: #8a6d2f;
+}
