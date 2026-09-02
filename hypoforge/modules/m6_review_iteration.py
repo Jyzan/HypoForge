@@ -69,6 +69,35 @@ from ..tools.qwen_client import QwenClient
 logger = logging.getLogger(__name__)
 
 
+def _is_invalid_fallback_hypothesis(hypothesis: Any) -> bool:
+    """Identify M4's explicit last-resort output without judging its content."""
+
+    hypothesis_id = str(getattr(hypothesis, "hypothesis_id", "") or "").strip()
+    statement = str(getattr(hypothesis, "statement", "") or "").lower()
+    mechanism = str(getattr(hypothesis, "mechanism", "") or "").lower()
+    rationale = str(getattr(hypothesis, "ranking_rationale", "") or "").lower()
+    return (
+        hypothesis_id.upper().startswith("FH")
+        or "{q}" in statement
+        or "fast-mode fallback" in mechanism
+        or "deterministic fallback hypothesis" in rationale
+    )
+
+
+def _has_missing_core_validation_target(
+    verdict: Optional[ExperimentalValidationVerdict],
+) -> bool:
+    """Only a completely missing core M4 target warrants the severe cap."""
+
+    if verdict is None:
+        return False
+    core_kinds = {"statement", "mechanism", "prediction", "falsification"}
+    return any(
+        item.target_kind in core_kinds and item.verdict == "missing"
+        for item in verdict.items
+    )
+
+
 _CORE_OVERALL_DIMENSIONS = {
     "scientific_logic",
     "objective_evidence_consistency",
@@ -659,7 +688,10 @@ class M6ReviewIteration(ModuleProtocol):
             factual_score = 5.0
         else:
             factual_score = 3.0
-        evidence_coverage = float(gates.get("evidence_coverage", 0.0))
+        evidence_coverage = float(gates.get(
+            "evidence_coverage_hypothesis",
+            gates.get("evidence_coverage", 0.0),
+        ))
         source_quality = float(gates.get("source_quality", 0.0))
         deterministic_evidence_score = round(
             0.6 * factual_score
@@ -668,9 +700,13 @@ class M6ReviewIteration(ModuleProtocol):
             1,
         )
         evidence_semantic = plan_quality.evidence_reliability
-        evidence_score = min(
-            deterministic_evidence_score,
-            evidence_semantic.score,
+        # A structured factual-premise audit is authoritative.  The semantic
+        # plan-quality reviewer may comment on source diversity, but it must
+        # not lower evidence reliability merely because an explicitly novel
+        # architecture or mechanism has no paper that already proves it.
+        evidence_score = (
+            deterministic_evidence_score
+            if audits else evidence_semantic.score
         )
         evidence_row = self._dimension_detail(
             "evidence_reliability",
@@ -680,13 +716,18 @@ class M6ReviewIteration(ModuleProtocol):
                 evidence_semantic.confidence,
                 0.9 if audits else 0.3,
             ),
-            strengths=evidence_semantic.strengths,
-            weaknesses=(
-                list(evidence_semantic.weaknesses)
-                + [item.rationale for item in audits if item.verdict != "supported"]
-                or (["No auditable factual premises were available."] if not audits else [])
+            strengths=(
+                [f"{len(audits)} factual premise(s) received a structured audit."]
+                if audits else evidence_semantic.strengths
             ),
-            deductions=evidence_semantic.deductions,
+            weaknesses=(
+                [item.rationale for item in audits if item.verdict != "supported"]
+                if audits else (
+                    list(evidence_semantic.weaknesses)
+                    or ["No auditable factual premises were available."]
+                )
+            ),
+            deductions=[] if audits else evidence_semantic.deductions,
         )
 
         predictions = list(getattr(hypothesis, "observable_predictions", []) or [])
@@ -775,12 +816,18 @@ class M6ReviewIteration(ModuleProtocol):
         )
 
         conditions = M6ScoreConditions(
-            task_misaligned=not deterministic_alignment_passed,
+            invalid_hypothesis_output=_is_invalid_fallback_hypothesis(hypothesis),
+            # Broken/missing trace pointers are an auditability defect, not by
+            # themselves proof that the scientific answer is off-task.  The
+            # severe display cap requires both structural and semantic failure.
+            task_misaligned=(
+                not deterministic_alignment_passed
+                and not semantic_alignment_passed
+            ),
             core_fact_contradicted="contradicted" in audit_verdicts,
             core_untestable=not predictions or not falsifications,
-            experimental_validation_missing=(
-                experimental_validation_verdict is not None
-                and not experimental_validation_verdict.sufficient
+            experimental_validation_missing=_has_missing_core_validation_target(
+                experimental_validation_verdict
             ),
             multiple_major_design_defects=sum(
                 len(item.blocking_issues)
