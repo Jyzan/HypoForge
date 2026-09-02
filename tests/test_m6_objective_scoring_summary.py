@@ -48,7 +48,7 @@ def test_weighted_score_uses_all_eight_dimensions():
 
     summary = aggregate_m6_scoring(rows, M6ScoreConditions())
 
-    assert summary.raw_score == 3.5
+    assert summary.raw_score == 3.45
     assert summary.final_score == 3.6
     assert len(summary.dimensions) == 8
 
@@ -74,6 +74,26 @@ def test_display_score_uses_historical_anchor_calibration(
     summary = aggregate_m6_scoring(rows, M6ScoreConditions())
 
     assert summary.raw_score == raw_dimension_score
+    assert summary.final_score == expected_display_score
+
+
+@pytest.mark.parametrize(
+    ("precise_raw_score", "expected_display_score"),
+    [
+        (3.55, 3.7),
+        (3.65, 3.9),
+        (3.75, 4.1),
+    ],
+)
+def test_precise_weighted_score_keeps_intermediate_bands_reachable(
+    precise_raw_score,
+    expected_display_score,
+):
+    rows = [_detail(name, precise_raw_score) for name in WEIGHTS]
+
+    summary = aggregate_m6_scoring(rows, M6ScoreConditions())
+
+    assert summary.raw_score == precise_raw_score
     assert summary.final_score == expected_display_score
 
 

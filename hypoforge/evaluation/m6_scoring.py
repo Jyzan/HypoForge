@@ -94,13 +94,15 @@ def _calibrate_display_score(raw_score: float) -> float:
 
     if raw_score <= 3.0:
         calibrated = 3.0 + 1.1 * (raw_score - 3.0)
-    elif raw_score <= 4.0:
+    elif raw_score <= 3.6:
         calibrated = 3.0 + 1.25 * (raw_score - 3.0)
+    elif raw_score <= 3.8:
+        calibrated = 3.75 + 2.25 * (raw_score - 3.6)
+    elif raw_score <= 4.0:
+        calibrated = 4.2 + (raw_score - 3.8)
     else:
-        calibrated = 4.25 + 0.75 * (raw_score - 4.0)
-    calibrated = round(max(1.0, min(5.0, calibrated)), 1)
-    high_quality_lift = min(0.2, max(0.0, raw_score - 3.6))
-    return round(min(5.0, calibrated + high_quality_lift), 1)
+        calibrated = 4.4 + 0.6 * (raw_score - 4.0)
+    return round(max(1.0, min(5.0, calibrated)), 1)
 
 
 def aggregate_m6_scoring(
@@ -110,7 +112,8 @@ def aggregate_m6_scoring(
     """Calculate weighted score, then apply the strictest triggered cap."""
 
     rows = _normalise_dimensions(dimensions)
-    raw_score = round(sum(row.weighted_contribution for row in rows), 1)
+    precise_raw_score = sum(row.weighted_contribution for row in rows)
+    raw_score = round(precise_raw_score, 4)
     novelty = next(row.score for row in rows if row.dimension == "novelty")
 
     caps: list[ScoreCap] = []
@@ -167,7 +170,7 @@ def aggregate_m6_scoring(
             reason=f"Independent novelty score is {novelty:.1f}/5, below the 2.0 threshold.",
         ))
 
-    calibrated_score = _calibrate_display_score(raw_score)
+    calibrated_score = _calibrate_display_score(precise_raw_score)
     final_score = min(
         calibrated_score,
         *(cap.maximum for cap in caps),
