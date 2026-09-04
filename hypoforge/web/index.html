@@ -5,20 +5,26 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>HypoForge · 科研假设流水线</title>
 <script src="https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
+<script src="https://unpkg.com/three@0.149.0/build/three.min.js"></script>
+<script src="/assets/hero-fluid.js"></script>
 <style>
   :root{
-    --bg:#f4f6fb; --card:#ffffff; --ink:#0f172a; --ink2:#475569; --ink3:#94a3b8;
-    --line:#e2e8f0; --accent:#4f46e5; --accent2:#6366f1; --accent-soft:#eef2ff;
-    --green:#16a34a; --green-soft:#ecfdf5; --amber:#d97706; --amber-soft:#fffbeb;
-    --red:#dc2626; --red-soft:#fef2f2; --radius:16px;
-    --shadow:0 1px 2px rgba(15,23,42,.05),0 8px 24px -12px rgba(15,23,42,.12);
-    --shadow-lg:0 12px 40px -12px rgba(15,23,42,.22);
+    --bg:#f3f7f7; --card:#ffffff; --ink:#12323b; --ink2:#49666d; --ink3:#81979c;
+    --line:#dbe7e7; --accent:#0f766e; --accent2:#0891b2; --accent-soft:#e7f6f3;
+    --green:#16855b; --green-soft:#e9f8f1; --amber:#c47a16; --amber-soft:#fff7e6;
+    --red:#c74a4a; --red-soft:#fff0f0; --radius:16px;
+    --shadow:0 1px 2px rgba(18,50,59,.05),0 10px 28px -16px rgba(15,76,82,.2);
+    --shadow-lg:0 16px 44px -16px rgba(15,76,82,.28);
   }
   *{margin:0;padding:0;box-sizing:border-box}
   html,body{height:100%}
   body{
     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Roboto,sans-serif;
-    background:var(--bg);color:var(--ink);font-size:14px;line-height:1.6;
+    background:
+      radial-gradient(circle at 88% 4%,rgba(8,145,178,.08),transparent 28rem),
+      radial-gradient(circle at 12% 92%,rgba(15,118,110,.06),transparent 25rem),
+      var(--bg);
+    color:var(--ink);font-size:14px;line-height:1.6;
     -webkit-font-smoothing:antialiased;
     /* 统一滚动条：所有可滚动区域（实时过程/运行档案/时间线等）样式一致 */
     scrollbar-width:thin;scrollbar-color:var(--line) transparent;
@@ -30,15 +36,15 @@
   button,textarea,input,select{font:inherit}
   /* ---------- 顶栏 ---------- */
   header{
-    height:60px;background:rgba(255,255,255,.85);backdrop-filter:blur(12px);
+    height:60px;background:rgba(255,255,255,.88);backdrop-filter:blur(14px);
     border-bottom:1px solid var(--line);display:flex;align-items:center;
     padding:0 24px;gap:14px;position:sticky;top:0;z-index:50;
   }
   .logo{
     width:34px;height:34px;border-radius:10px;flex:none;
-    background:linear-gradient(135deg,#4f46e5,#7c3aed);
+    background:linear-gradient(135deg,#164e63,#0f766e 58%,#0891b2);
     display:flex;align-items:center;justify-content:center;
-    box-shadow:0 4px 12px -4px rgba(79,70,229,.5);
+    box-shadow:0 6px 16px -6px rgba(15,118,110,.65);
   }
   .logo svg{width:20px;height:20px}
   .brand h1{font-size:16px;font-weight:700;letter-spacing:.2px;line-height:1.2}
@@ -54,7 +60,7 @@
   /* ---------- 布局 ---------- */
   .app{display:flex;height:calc(100vh - 60px);overflow-x:hidden}
   #sidebar{
-    width:288px;flex:none;background:var(--card);border-right:1px solid var(--line);
+    width:288px;flex:none;background:linear-gradient(180deg,#fff,#f8fbfb);border-right:1px solid var(--line);
     display:flex;flex-direction:column;transition:margin-left .2s ease;
   }
   .aside-head{padding:16px 16px 10px;display:flex;align-items:center;justify-content:space-between}
@@ -86,7 +92,7 @@
   .history-empty{padding:28px 16px;text-align:center;color:var(--ink3);font-size:12.5px}
   .h-item{padding:11px 12px;border-radius:12px;cursor:pointer;margin-bottom:4px;border:1px solid transparent;transition:all .15s;position:relative}
   .h-item:hover{background:var(--bg)}
-  .h-item.active{background:var(--accent-soft);border-color:#c7d2fe}
+  .h-item.active{background:var(--accent-soft);border-color:#a7ddd5}
   .h-item .q{font-size:13px;font-weight:500;color:var(--ink);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;padding-right:32px}
   .h-item .meta{display:flex;align-items:center;gap:8px;margin-top:6px;font-size:11.5px;color:var(--ink3);flex-wrap:wrap}
   .status-dot{width:7px;height:7px;border-radius:50%;flex:none}
@@ -137,8 +143,8 @@
   .empty-hero{text-align:center;padding:56px 20px 30px;color:var(--ink2)}
   .empty-hero .big-icon{
     width:72px;height:72px;margin:0 auto 18px;border-radius:22px;
-    background:linear-gradient(135deg,#4f46e5,#7c3aed);display:flex;align-items:center;justify-content:center;
-    box-shadow:0 12px 30px -8px rgba(79,70,229,.45);
+    background:linear-gradient(135deg,#164e63,#0f766e 58%,#0891b2);display:flex;align-items:center;justify-content:center;
+    box-shadow:0 14px 34px -10px rgba(15,118,110,.5);
   }
   .empty-hero .big-icon svg{width:38px;height:38px}
   .empty-hero h2{font-size:22px;color:var(--ink);margin-bottom:8px}
@@ -188,13 +194,13 @@
   .pipe-link svg{width:13px;height:13px}
   .node{
     border:1.5px solid var(--line);border-radius:14px;padding:14px 16px;cursor:pointer;
-    background:#fbfcfe;transition:all .2s;position:relative;
+    background:#fbfdfd;transition:all .2s;position:relative;
   }
-  .node:hover{border-color:#c7d2fe;box-shadow:var(--shadow)}
-  .node.running{border-color:var(--accent);background:linear-gradient(180deg,#eef2ff,#fff);box-shadow:0 0 0 3px rgba(99,102,241,.15),var(--shadow)}
-  .node.done{border-color:#bbf7d0;background:linear-gradient(180deg,#f0fdf4,#fff)}
+  .node:hover{border-color:#9fd7d1;box-shadow:var(--shadow)}
+  .node.running{border-color:var(--accent);background:linear-gradient(180deg,#e7f6f3,#fff);box-shadow:0 0 0 3px rgba(15,118,110,.14),var(--shadow)}
+  .node.done{border-color:#b7e5cf;background:linear-gradient(180deg,#eefaf4,#fff)}
   .node.skipped{border-color:var(--line);background:#f8fafc;opacity:.8}
-  .node.failed{border-color:#fecaca;background:linear-gradient(180deg,#fef2f2,#fff)}
+  .node.failed{border-color:#f1c5c5;background:linear-gradient(180deg,#fff0f0,#fff)}
   .node-top{display:flex;align-items:center;gap:10px;margin-bottom:8px}
   .node-icon{
     width:32px;height:32px;border-radius:9px;flex:none;display:flex;align-items:center;justify-content:center;
@@ -240,13 +246,13 @@
     background:var(--accent);display:none;align-items:center;justify-content:center;
   }
   .node.running .running-pulse{display:flex;animation:pulse 1.4s infinite}
-  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(99,102,241,.5)}100%{box-shadow:0 0 0 10px rgba(99,102,241,0)}}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(15,118,110,.5)}100%{box-shadow:0 0 0 10px rgba(15,118,110,0)}}
   .running-pulse svg{width:12px;height:12px;color:#fff;animation:spin 1s linear infinite}
   @keyframes spin{to{transform:rotate(360deg)}}
   /* ---------- 轮次时间线 ---------- */
   .rounds-card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:20px 24px;margin-bottom:20px}
   .rounds-card h3{font-size:14px;font-weight:600;margin-bottom:12px}
-  .round-entry{border:1px solid var(--line);border-radius:12px;padding:12px 16px;margin-bottom:10px;background:#fbfcfe}
+  .round-entry{border:1px solid var(--line);border-radius:12px;padding:12px 16px;margin-bottom:10px;background:#fbfdfd}
   .round-entry:last-child{margin-bottom:0}
   .round-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:13px;font-weight:600}
   .path-badge{font-size:11px;font-weight:600;padding:2px 10px;border-radius:999px}
@@ -274,7 +280,7 @@
   .counter b{display:block;font-size:22px;font-weight:700;color:var(--accent)}
   .counter span{color:var(--ink3);font-size:11.5px}
   .state-sub h3{font-size:13px;font-weight:600;margin-bottom:10px}
-  .gap-item{border:1px solid var(--line);border-radius:12px;padding:10px 14px;margin-bottom:8px;background:#fbfcfe}
+  .gap-item{border:1px solid var(--line);border-radius:12px;padding:10px 14px;margin-bottom:8px;background:#fbfdfd}
   .gap-item:last-child{margin-bottom:0}
   .gap-item .gap-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
   .gap-item .gap-id{font:11px/1.4 ui-monospace,Consolas,monospace;color:var(--ink3)}
@@ -291,7 +297,7 @@
     padding:12px 14px;resize:none;outline:none;background:var(--bg);font-size:13.5px;color:var(--ink);
     line-height:1.4;overflow-y:auto;
   }
-  .followup-row textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(99,102,241,.12)}
+  .followup-row textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(15,118,110,.12)}
   .followup-hint{margin-top:8px;font-size:12px;color:var(--ink3)}
   .followup-hint.error{color:var(--red)}
   /* ---------- 事件/档案 双栏 ---------- */
@@ -329,11 +335,11 @@
   @keyframes rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
   .plan-head{
     padding:18px 24px;border-bottom:1px solid var(--line);
-    background:linear-gradient(135deg,#eef2ff,#faf5ff);
+    background:linear-gradient(135deg,#e7f6f3,#eef9fb);
     display:flex;align-items:center;gap:12px;flex-wrap:wrap;
   }
   .plan-head .plan-icon{
-    width:36px;height:36px;border-radius:10px;background:linear-gradient(135deg,#4f46e5,#7c3aed);
+    width:36px;height:36px;border-radius:10px;background:linear-gradient(135deg,#164e63,#0f766e 58%,#0891b2);
     display:flex;align-items:center;justify-content:center;flex:none;
   }
   .plan-head .plan-icon svg{width:19px;height:19px}
@@ -372,11 +378,11 @@
   /* 核心假设卡片：statement 深色、mechanism 次级色（不再用最淡的灰色） */
   .hyp-card{border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:10px;background:var(--bg)}
   .hyp-stmt{font-size:14px;line-height:1.6;color:var(--ink);font-weight:500}
-  .hyp-mech{margin-top:8px;font-size:13px;line-height:1.65;color:var(--ink2);border-left:3px solid var(--accent-soft,#c7d2fe);padding-left:10px;background:var(--soft, #f1f5f9);border-radius:0 8px 8px 0;padding:8px 10px}
+  .hyp-mech{margin-top:8px;font-size:13px;line-height:1.65;color:var(--ink2);border-left:3px solid #a7ddd5;padding-left:10px;background:var(--soft, #f1f5f9);border-radius:0 8px 8px 0;padding:8px 10px}
   /* 研究计划字段化展示 */
   .plan-title{font-size:13.5px;margin:0 0 8px}
   .plan-field{display:flex;gap:10px;margin:0 0 8px;font-size:13px;line-height:1.6}
-  .pf-label{flex-shrink:0;font-size:11.5px;font-weight:700;color:var(--accent);background:var(--accent-soft,#eef2ff);border-radius:6px;padding:2px 8px;height:fit-content;margin-top:1px}
+  .pf-label{flex-shrink:0;font-size:11.5px;font-weight:700;color:var(--accent);background:var(--accent-soft);border-radius:6px;padding:2px 8px;height:fit-content;margin-top:1px}
   .plan-value{color:var(--ink);flex:1}
   .timeline{list-style:none;margin:0;padding:0;flex:1}
   .timeline li{position:relative;padding:3px 0 3px 14px;color:var(--ink);font-size:13px;line-height:1.55}
@@ -416,7 +422,7 @@
   .retry-hint{font-size:12px;color:var(--ink3)}
   /* ---------- 输入区 ---------- */
   .input-bar{
-    position:sticky;bottom:0;background:rgba(244,246,251,.9);backdrop-filter:blur(10px);
+    position:sticky;bottom:0;background:rgba(243,247,247,.9);backdrop-filter:blur(12px);
     padding:14px 32px calc(16px + env(safe-area-inset-bottom));border-top:1px solid var(--line);
   }
   .input-wrap{max-width:1080px;margin:0 auto;display:flex;gap:10px;align-items:flex-end}
@@ -434,16 +440,16 @@
   }
   .mode-btn:hover{color:var(--ink)}
   .mode-btn.active{
-    background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;
-    box-shadow:0 4px 12px -4px rgba(79,70,229,.55);
+    background:linear-gradient(135deg,#164e63,#0f766e 58%,#0891b2);color:#fff;
+    box-shadow:0 5px 14px -5px rgba(15,118,110,.55);
   }
-  .input-box:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px rgba(99,102,241,.12)}
+  .input-box:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px rgba(15,118,110,.12)}
   .input-box textarea{flex:1;border:none;outline:none;resize:none;font:inherit;font-size:15px;color:var(--ink);background:transparent;max-height:120px;line-height:1.5}
   .send-btn{
     width:46px;height:46px;flex:none;border:none;border-radius:14px;cursor:pointer;
-    background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;
+    background:linear-gradient(135deg,#164e63,#0f766e 58%,#0891b2);color:#fff;
     display:flex;align-items:center;justify-content:center;
-    box-shadow:0 6px 16px -6px rgba(79,70,229,.55);transition:transform .15s,opacity .15s;
+    box-shadow:0 7px 18px -7px rgba(15,118,110,.6);transition:transform .15s,opacity .15s;
   }
   .send-btn:hover{transform:translateY(-1px)}
   .send-btn:disabled{opacity:.45;cursor:not-allowed;transform:none}
@@ -499,7 +505,7 @@
   .src-row .src-papers li{counter-increment:paper;font-size:12px;color:var(--ink2);padding:5px 0;border-top:1px dashed var(--line);line-height:1.5;overflow-wrap:anywhere;word-break:break-word}
   .src-row .src-papers li::before{content:counter(paper) ".";color:var(--accent);font-weight:700;margin-right:8px;font-variant-numeric:tabular-nums}
   .src-row .src-papers-empty{font-size:11.5px;color:var(--ink3);margin-top:6px;font-style:italic}
-  .detail-lead{padding:12px 14px;border:1px solid #c7d2fe;background:var(--accent-soft);border-radius:12px;color:var(--ink2);font-size:12.5px;line-height:1.7}
+  .detail-lead{padding:12px 14px;border:1px solid #a7ddd5;background:var(--accent-soft);border-radius:12px;color:var(--ink2);font-size:12.5px;line-height:1.7}
   .detail-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin:10px 0}
   /* M5 变量与对照：单列竖排，矩形高度随文字自适应 */
   .detail-stack{display:grid;grid-template-columns:1fr;gap:9px;margin:10px 0}
@@ -507,7 +513,7 @@
   .detail-metric b{display:block;font-size:19px;color:var(--accent);font-variant-numeric:tabular-nums}
   .detail-metric span{font-size:11px;color:var(--ink3)}
   .detail-list{display:flex;flex-direction:column;gap:8px}
-  .detail-card{border:1px solid var(--line);border-radius:12px;background:#fbfcfe;overflow:hidden}
+  .detail-card{border:1px solid var(--line);border-radius:12px;background:#fbfdfd;overflow:hidden}
   .detail-card>summary{list-style:none;cursor:pointer;padding:11px 13px;display:flex;align-items:flex-start;gap:9px;font-size:12.8px;font-weight:600;color:var(--ink)}
   .detail-card>summary::-webkit-details-marker{display:none}
   .detail-card>summary::before{content:"›";color:var(--accent);font-size:18px;line-height:1;transition:transform .15s}
@@ -521,12 +527,12 @@
   .detail-chip.neutral{background:var(--bg);color:var(--ink2);border:1px solid var(--line)}
   .detail-chip.good{background:var(--green-soft);color:var(--green)}
   .detail-chip.warn{background:var(--amber-soft);color:var(--amber)}
-  .m6-radar-wrap{margin:14px 0 16px;padding:12px;border:1px solid var(--line);border-radius:14px;background:linear-gradient(180deg,#fbfcff 0%,#f7f8fc 100%)}
+  .m6-radar-wrap{margin:14px 0 16px;padding:12px;border:1px solid var(--line);border-radius:14px;background:linear-gradient(180deg,#fbfefe 0%,#f3f8f8 100%)}
   .m6-radar-svg{display:block;width:100%;max-width:560px;height:auto;margin:0 auto;overflow:visible}
   .m6-radar-grid{fill:none;stroke:#d9deea;stroke-width:1}
   .m6-radar-grid.outer{stroke:#b9c2d3;stroke-width:1.2}
   .m6-radar-axis{stroke:#c9d0de;stroke-width:1}
-  .m6-radar-score{fill:rgba(79,70,229,.2);stroke:var(--accent);stroke-width:2.4;stroke-linejoin:round}
+  .m6-radar-score{fill:rgba(15,118,110,.2);stroke:var(--accent);stroke-width:2.4;stroke-linejoin:round}
   .m6-radar-dot{fill:#fff;stroke:var(--accent);stroke-width:2}
   .m6-radar-label{fill:var(--ink2);font-size:11px;font-weight:650}
   .m6-radar-value{fill:var(--accent);font-size:10px;font-weight:750}
@@ -659,12 +665,17 @@
 
   <!-- 主区 -->
   <main id="main">
+    <canvas class="hero-flow-canvas" id="heroFlowCanvas" aria-hidden="true"></canvas>
     <div class="main-inner" id="mainInner">
       <div class="empty-hero" id="emptyHero">
-        <div class="big-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M9 3h6M10 3v5.5L4.8 17a2.4 2.4 0 0 0 2.1 3.6h10.2a2.4 2.4 0 0 0 2.1-3.6L14 8.5V3"/><path d="M7.5 14h9"/>
-          </svg>
+        <div class="hero-core" id="heroCore" aria-hidden="true">
+          <div class="hero-core__depth"></div>
+          <div class="big-icon hero-core__surface">
+            <span class="hero-core__specular"></span>
+            <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M9 3h6M10 3v5.5L4.8 17a2.4 2.4 0 0 0 2.1 3.6h10.2a2.4 2.4 0 0 0 2.1-3.6L14 8.5V3"/><path d="M7.5 14h9"/>
+            </svg>
+          </div>
         </div>
         <h2>向 HypoForge 提出一个科学问题</h2>
         <p>系统将自动完成「问题理解 → 文献检索 → 证据图谱 → 假设生成 → 研究计划 → 评审迭代」的完整闭环，全程事件与产物落盘到本机 output/ui_runs。</p>
@@ -986,6 +997,276 @@ let historyRuns = [];
 const $ = id => document.getElementById(id);
 const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[c]));
 const pretty = value => esc(JSON.stringify(value, null, 2));
+
+function computeHeroLighting(pointerX, pointerY, rect){
+  const viewportX = Math.max(window.innerWidth * .42, 320);
+  const viewportY = Math.max(window.innerHeight * .42, 260);
+  const nx = Math.max(-1, Math.min(1, (pointerX - (rect.left + rect.width / 2)) / viewportX));
+  const ny = Math.max(-1, Math.min(1, (pointerY - (rect.top + rect.height / 2)) / viewportY));
+  return {
+    tiltX: -ny * 10,
+    tiltY: nx * 12,
+    shadowX: -nx * 20,
+    shadowY: -ny * 16,
+    glowX: nx * 5,
+    glowY: ny * 5,
+    lightX: 50 + nx * 38,
+    lightY: 48 + ny * 38,
+  };
+}
+
+function createHeroFlowField(canvas){
+  const context = canvas.getContext("2d", {alpha:true});
+  const cols = 52;
+  const rows = 30;
+  const size = cols * rows;
+  return {
+    canvas,
+    context,
+    cols,
+    rows,
+    offsetX:new Float32Array(size),
+    offsetY:new Float32Array(size),
+    velocityX:new Float32Array(size),
+    velocityY:new Float32Array(size),
+    nextVelocityX:new Float32Array(size),
+    nextVelocityY:new Float32Array(size),
+    width:0,
+    height:0,
+    dpr:1,
+    phase:0,
+    active:false,
+    rafId:0,
+    lastFrame:0,
+  };
+}
+
+function resizeHeroFlowField(flow){
+  if(!flow?.context) return;
+  const rect = flow.canvas.getBoundingClientRect();
+  const width = Math.max(1, Math.round(rect.width));
+  const height = Math.max(1, Math.round(rect.height));
+  const dpr = Math.min(window.devicePixelRatio || 1, 1.35);
+  if(width === flow.width && height === flow.height && dpr === flow.dpr) return;
+  flow.width = width;
+  flow.height = height;
+  flow.dpr = dpr;
+  flow.canvas.width = Math.round(width * dpr);
+  flow.canvas.height = Math.round(height * dpr);
+  flow.context.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function injectHeroFlow(flow, clientX, clientY, movementX, movementY){
+  if(!flow?.active || !flow.width || !flow.height) return;
+  const rect = flow.canvas.getBoundingClientRect();
+  const pointerX = clientX - rect.left;
+  const pointerY = clientY - rect.top;
+  if(pointerX < -120 || pointerY < -120 || pointerX > rect.width + 120 || pointerY > rect.height + 120) return;
+
+  const speed = Math.min(34, Math.hypot(movementX, movementY));
+  if(speed < .25) return;
+  const radius = Math.min(155, Math.max(92, Math.min(flow.width, flow.height) * .2));
+  const cellWidth = flow.width / (flow.cols - 1);
+  const cellHeight = flow.height / (flow.rows - 1);
+
+  for(let row = 0; row < flow.rows; row += 1){
+    const baseY = row * cellHeight;
+    for(let col = 0; col < flow.cols; col += 1){
+      const baseX = col * cellWidth;
+      const deltaX = baseX - pointerX;
+      const deltaY = baseY - pointerY;
+      const distance = Math.hypot(deltaX, deltaY);
+      if(distance >= radius) continue;
+      const index = row * flow.cols + col;
+      const falloff = Math.pow(1 - distance / radius, 2.15);
+      const invDistance = 1 / Math.max(distance, 8);
+      const radialForce = (6 + speed * .46) * falloff;
+      const directionalForce = .16 * falloff;
+      const swirl = ((deltaX * movementY - deltaY * movementX) >= 0 ? 1 : -1) * speed * .035 * falloff;
+      flow.velocityX[index] += deltaX * invDistance * radialForce + movementX * directionalForce - deltaY * invDistance * swirl;
+      flow.velocityY[index] += deltaY * invDistance * radialForce + movementY * directionalForce + deltaX * invDistance * swirl;
+    }
+  }
+}
+
+function renderHeroFlowField(flow){
+  const {context:ctx, width, height, cols, rows} = flow;
+  if(!ctx || !width || !height) return;
+  ctx.clearRect(0, 0, width, height);
+  ctx.save();
+  ctx.globalCompositeOperation = "screen";
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+
+  const bands = 14;
+  const cellWidth = width / (cols - 1);
+  const cellHeight = height / (rows - 1);
+  const colors = [
+    [34, 211, 238],
+    [56, 189, 248],
+    [99, 102, 241],
+    [139, 92, 246],
+  ];
+
+  for(let band = 0; band < bands; band += 1){
+    const row = Math.max(1, Math.min(rows - 2, Math.round((band + 1) * (rows - 1) / (bands + 1))));
+    const rgb = colors[band % colors.length];
+    const gradient = ctx.createLinearGradient(0, 0, width, height * .22);
+    gradient.addColorStop(0, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0)`);
+    gradient.addColorStop(.18, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},.13)`);
+    gradient.addColorStop(.72, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},.16)`);
+    gradient.addColorStop(1, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0)`);
+
+    const trace = () => {
+      ctx.beginPath();
+      for(let col = 0; col < cols; col += 1){
+        const index = row * cols + col;
+        const x = col * cellWidth + flow.offsetX[index];
+        const drift = Math.sin(col * .31 + flow.phase * 1.25 + band * .73) * (4.5 + band % 3);
+        const y = row * cellHeight + drift + flow.offsetY[index];
+        if(col === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+    };
+
+    trace();
+    ctx.strokeStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},.035)`;
+    ctx.lineWidth = 17 + (band % 3) * 3;
+    ctx.shadowColor = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},.16)`;
+    ctx.shadowBlur = 18;
+    ctx.stroke();
+
+    trace();
+    ctx.strokeStyle = gradient;
+    ctx.lineWidth = 1.15 + (band % 2) * .45;
+    ctx.shadowBlur = 8;
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function stepHeroFlowField(flow, timestamp){
+  flow.rafId = 0;
+  if(!flow.active) return;
+  resizeHeroFlowField(flow);
+  const frameScale = Math.min(1.8, Math.max(.45, (timestamp - (flow.lastFrame || timestamp - 16.7)) / 16.7));
+  flow.lastFrame = timestamp;
+  flow.phase += .012 * frameScale;
+
+  const {cols, rows, offsetX, offsetY, velocityX, velocityY, nextVelocityX, nextVelocityY} = flow;
+  for(let row = 0; row < rows; row += 1){
+    for(let col = 0; col < cols; col += 1){
+      const index = row * cols + col;
+      const left = row * cols + Math.max(0, col - 1);
+      const right = row * cols + Math.min(cols - 1, col + 1);
+      const above = Math.max(0, row - 1) * cols + col;
+      const below = Math.min(rows - 1, row + 1) * cols + col;
+      const averageX = (offsetX[left] + offsetX[right] + offsetX[above] + offsetX[below]) * .25;
+      const averageY = (offsetY[left] + offsetY[right] + offsetY[above] + offsetY[below]) * .25;
+      nextVelocityX[index] = (velocityX[index] + (averageX - offsetX[index]) * .055 - offsetX[index] * .012) * .895;
+      nextVelocityY[index] = (velocityY[index] + (averageY - offsetY[index]) * .055 - offsetY[index] * .012) * .895;
+    }
+  }
+
+  for(let index = 0; index < offsetX.length; index += 1){
+    velocityX[index] = nextVelocityX[index];
+    velocityY[index] = nextVelocityY[index];
+    offsetX[index] = Math.max(-48, Math.min(48, offsetX[index] + velocityX[index] * frameScale));
+    offsetY[index] = Math.max(-48, Math.min(48, offsetY[index] + velocityY[index] * frameScale));
+  }
+  renderHeroFlowField(flow);
+  flow.rafId = requestAnimationFrame(nextTimestamp => stepHeroFlowField(flow, nextTimestamp));
+}
+
+function setHeroFlowActive(flow, active){
+  if(!flow?.context) return;
+  flow.active = Boolean(active);
+  if(flow.active){
+    resizeHeroFlowField(flow);
+    if(!flow.rafId) flow.rafId = requestAnimationFrame(timestamp => stepHeroFlowField(flow, timestamp));
+  }else{
+    if(flow.rafId) cancelAnimationFrame(flow.rafId);
+    flow.rafId = 0;
+    flow.lastFrame = 0;
+    flow.context.clearRect(0, 0, flow.width, flow.height);
+  }
+}
+
+function setupHeroLighting(){
+  const core = $("heroCore");
+  const main = $("main");
+  const emptyHero = $("emptyHero");
+  const flowCanvas = $("heroFlowCanvas");
+  if(!core || !main || !emptyHero || !flowCanvas) return;
+  const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)");
+  const flow = reduceMotion?.matches ? null : createHeroFluidRenderer(flowCanvas);
+  const syncHeroActive = () => {
+    const active = !emptyHero.classList.contains("hidden");
+    if(!active){
+      delete main.dataset.heroActive;
+    }else{
+      main.dataset.heroActive = "true";
+    }
+    setHeroFluidActive(flow, active);
+  };
+  new MutationObserver(syncHeroActive).observe(emptyHero, {
+    attributes:true,
+    attributeFilter:["class"],
+  });
+  if(flow){
+    if(window.ResizeObserver) new ResizeObserver(() => resizeHeroFluidRenderer(flow, false)).observe(main);
+    window.addEventListener("resize", () => resizeHeroFluidRenderer(flow, false), {passive:true});
+  }
+  syncHeroActive();
+  if(reduceMotion?.matches) return;
+
+  let rafId = 0;
+  let pointer = null;
+  let previousFlowPointer = null;
+  const render = () => {
+    rafId = 0;
+    if(!pointer || !core.isConnected) return;
+    const light = computeHeroLighting(pointer.x, pointer.y, core.getBoundingClientRect());
+    core.style.setProperty("--hero-tilt-x", `${light.tiltX.toFixed(2)}deg`);
+    core.style.setProperty("--hero-tilt-y", `${light.tiltY.toFixed(2)}deg`);
+    core.style.setProperty("--hero-shadow-x", `${light.shadowX.toFixed(2)}px`);
+    core.style.setProperty("--hero-shadow-y", `${light.shadowY.toFixed(2)}px`);
+    core.style.setProperty("--hero-glow-x", `${light.glowX.toFixed(2)}px`);
+    core.style.setProperty("--hero-glow-y", `${light.glowY.toFixed(2)}px`);
+    core.style.setProperty("--hero-light-x", `${light.lightX.toFixed(2)}%`);
+    core.style.setProperty("--hero-light-y", `${light.lightY.toFixed(2)}%`);
+    core.dataset.lit = "true";
+  };
+  const queueRender = event => {
+    if(flow?.active && previousFlowPointer){
+      injectHeroFluid(
+        flow,
+        event.clientX,
+        event.clientY,
+        event.clientX - previousFlowPointer.x,
+        event.clientY - previousFlowPointer.y,
+      );
+    }
+    previousFlowPointer = {x:event.clientX, y:event.clientY};
+    pointer = {x:event.clientX, y:event.clientY};
+    if(!rafId) rafId = requestAnimationFrame(render);
+  };
+  const reset = () => {
+    pointer = null;
+    previousFlowPointer = null;
+    core.dataset.lit = "false";
+    core.style.removeProperty("--hero-tilt-x");
+    core.style.removeProperty("--hero-tilt-y");
+    core.style.removeProperty("--hero-shadow-x");
+    core.style.removeProperty("--hero-shadow-y");
+    core.style.removeProperty("--hero-glow-x");
+    core.style.removeProperty("--hero-glow-y");
+    core.style.removeProperty("--hero-light-x");
+    core.style.removeProperty("--hero-light-y");
+  };
+  document.addEventListener("pointermove", queueRender, {passive:true});
+  document.documentElement.addEventListener("mouseleave", reset);
+}
 // 轻量 markdown 渲染（评审意见）：esc 之后处理 `code` / **bold** / 列表。
 // 仅用于评审文本，不做完整 markdown 解析。
 function renderMarkdown(text){
@@ -3351,6 +3632,7 @@ setInterval(() => {
 }, 1000);
 
 /* ---------- 启动 ---------- */
+setupHeroLighting();
 loadHistory();
 updateHint();
 </script>

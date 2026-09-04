@@ -1262,6 +1262,10 @@ class HypoForgeRequestHandler(BaseHTTPRequestHandler):
             "ui-polish.css",
             "text/css; charset=utf-8",
         ),
+        "/assets/hero-fluid.js": (
+            "hero-fluid.js",
+            "text/javascript; charset=utf-8",
+        ),
     }
 
     def log_message(self, format: str, *args: Any) -> None:
