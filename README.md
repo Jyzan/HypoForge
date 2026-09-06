@@ -1,180 +1,204 @@
 # HypoForge
 
-> 基于 LangGraph StateGraph 的六模块闭环 AI Scientist Pipeline：
-> 从科学问题出发，自动完成问题理解、文献检索、证据图谱构建、假设生成、研究计划设计与评审迭代。
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
+![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1f2937)
 
-## 核心流程
+HypoForge 是一个面向科学假设生成与研究计划设计的开源 AI Scientist 流水线。系统以科学问题为输入，经过问题形式化、文献检索、证据归纳、假设生成、研究计划设计和质量评审，形成可追溯、可验证、可迭代的研究方案。
 
-```text
-M1 问题理解        Problem Understanding      -> ProblemCard + TaskContract
-M2 文献检索        Agentic Literature Search  -> 论文、知识条目与可溯源证据
-M3 证据图谱        Evidence Graph / Grounding -> EvidenceGraph + GroundingReport
-M4 假设生成        Hypothesis Generation      -> 排序后的候选假设 / 澄清请求
-M5 研究计划        Research Plan              -> 结构化实验/计算方案
-M6 评审迭代        Review & Iteration         -> 八维显示评分 + 结构化路由
-```
+## 系统流程
 
-- 每个模块的输出都带可审计溯源（证据 ID、引用、任务契约追踪）。
-- 模块间通过统一 observability 事件流同步到终端与 Web UI。
-- 支持断点续传、失败重试、追问链、标准/快速双模式。
-- 最终研究方案可通过“固定此方案并细化”进入对话式细化工作台。
+![HypoForge 系统流程图](assets/pipeline.png)
 
-## 最新视觉特效
+HypoForge 由六个相互衔接的阶段组成：
 
-本版本已包含两套最新的 Web 端视觉特效：
+1. **问题理解**：将自然语言科学问题整理为问题卡、任务契约、子问题、关键实体和回答要求，并保持对原始问题整体范围的约束。
+2. **文献检索**：根据问题结构规划检索请求，从学术来源获取论文和全文信息，对候选文献进行筛选、排序和阅读，形成带来源信息的证据单元。
+3. **证据图谱构建**：把事实主张、支持证据、限制条件、冲突关系和知识缺口组织为证据图谱，向后续阶段提供带有证据编号、出处和引用片段的上下文。
+4. **科学假设生成**：围绕原始科学问题生成多个候选假设，并明确作用机制、事实前提、待解决的研究缺口、工作假设、可观测预测和可证伪条件。
+5. **研究计划设计**：将候选假设转化为结构化的实验或计算方案，具体描述研究对象、变量、对照、步骤、测量指标、分析方法以及成功和失败判据。
+6. **质量评审与迭代**：从科学逻辑、客观证据一致性、可检验性、方法可行性、实验验证覆盖和任务完成度等方面进行评审，并根据结构化结论决定补充证据、修订假设、修改研究计划、修正证据图谱或结束流程。
 
-### 1. 水波特效（Water Ripple）
+系统在不同阶段按照任务目的裁剪上下文，优先保留关键事实、冲突、知识缺口、证据片段和图谱关系，同时保留证据来源和任务追踪信息。这样可以在控制上下文规模的同时，避免下游生成脱离原始问题或无法核验的结论。
 
-- `hypoforge/web/hero-fluid.js`：基于 Three.js / WebGL 的实时水波折射与交互涟漪。
-- `hypoforge/web/index.html`：引入 `/assets/hero-fluid.js` 与 Three.js。
-- `hypoforge/webapp.py`：新增 `/assets/hero-fluid.js` 静态路由。
+## 迭代与结束规则
 
-### 2. 图标阴影 / 立体光照特效
+评审阶段的数值评分用于结果展示和报告；是否继续迭代主要依据结构化的证据结论和质量门槛，而不是单独依据一个总分。
 
-- `hypoforge/web/index.html`：`hero-core` 根据鼠标位置实时计算光照方向、倾角、阴影偏移。
-- `hypoforge/web/ui-polish.css`：`--hero-shadow-*`、`--hero-light-*`、多层级立体阴影与高光。
+- 当证据存在明显缺口且仍有检索预算时，系统返回证据补充阶段。
+- 当证据之间存在冲突、事实前提缺少支持，或假设与原始问题、科学逻辑、可证伪性不一致时，系统返回假设修订阶段。
+- 当实验验证目标覆盖不足、控制设计不完整、方法不可行或分析方案不充分时，系统返回研究计划修订阶段。
+- 当证据图谱中的实体、关系或证据归属需要修正时，系统先更新证据图谱，再将修正后的上下文交给后续阶段。
+- 当证据充分、关键质量门槛通过且不存在待处理的图谱修正请求时，流程结束并输出最终方案。
+- 达到配置的最大迭代轮数、核心阶段出现无法恢复的错误，或快速模式主动关闭自动迭代时，流程停止；已完成阶段的结果仍会保存。
 
-## M6 评审体系
+在交互模式下，系统可以在迭代节点暂停，接收研究者补充的方向、约束或修改意见，再将这些信息与上一轮证据、假设和研究计划一起用于后续修订。研究者可以据此决定是否继续，但人工意见不会替代证据和质量检查。
 
-M6 是“质量总结 + 迭代路由”分离的评审层：
+## 安装
 
-- **结构化硬门禁**：任务对齐、客观证据一致性、证据覆盖率、答案完整性、实验验证覆盖等。
-- **专家评审**：`scientific_logic`、`method_feasibility` 等 LLM 评审。
-- **八维现代评分**：
-  `task_coverage`、`novelty`、`scientific_logic`、`evidence_reliability`、
-  `testability`、`experimental_rigor`、`statistics_reproducibility`、`technical_feasibility`。
-- **显示分校准**：对 3–4 分区间做单调校准，使展示分更有区分度；异常结构会触发相应封顶。
-- **路由规则**：M6 数值分仅用于展示和报告，不参与迭代路由；路由由硬门禁、证据充分性、实验验证覆盖和图修正请求决定。
+项目建议使用 Python 3.11。
 
-## 快速开始
-
-### 1. 创建环境
+### 使用虚拟环境
 
 ```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-### 2. 配置环境变量
+### 使用 Conda
+
+```powershell
+conda env create -f environment.yml
+conda activate hypoforge
+python -m pip install -r requirements.txt
+```
+
+## 配置
+
+复制环境变量模板，并填写可用的 OpenAI-compatible 模型服务凭证：
 
 ```powershell
 Copy-Item .env_template .env
 ```
 
-最少配置 LLM（推荐 Qwen OpenAI-compatible）：
+核心流水线至少需要配置以下变量之一作为模型 API 密钥：
 
 ```env
-QWEN_API_KEY=your_api_key_here
-QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-QWEN_MODEL=qwen3.7-plus
+OPENAI_API_KEY=your_api_key_here
+# 或：QWEN_API_KEY=your_api_key_here
+OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 ```
 
-### 3. 运行完整 Pipeline
+模型名称和各阶段使用的模型层级在 YAML 配置文件中设置。`QWEN_MODEL` 主要用于方案细化工作台。文献检索所需的来源凭证按实际启用的来源填写，例如 Semantic Scholar、OpenAlex、Serper、ADS 或 Unpaywall；未配置的可选来源会受到相应的访问限制。
+
+不要提交 `.env`、API 密钥、运行结果或本地缓存。
+
+## 命令行运行
+
+运行完整的标准流程：
 
 ```powershell
 python run_hypoforge.py -q "蛋白质如何折叠以及错误折叠导致疾病的机制是什么？"
 ```
 
-常用参数：
+常用选项：
 
 ```powershell
-# 快速模式（约 5 分钟单轮）
+# 快速模式：减少检索和评审开销，执行一次受限流程
 python run_hypoforge.py -q "..." --mode fast
 
-# 只运行部分模块
+# 只运行指定阶段，例如问题理解和文献检索
 python run_hypoforge.py -q "..." --modules m1,m2
 
-# 断点续跑
-python run_hypoforge.py -q "..." --run-id hypoforge-xxxxxxxx --resume
+# 为运行指定 ID，便于定位输出和恢复
+python run_hypoforge.py -q "..." --run-id my-run
 
-# 静默运行
-python run_hypoforge.py -q "..." --quiet
+# 从同一运行 ID 的断点继续
+python run_hypoforge.py -q "..." --run-id my-run --resume
+
+# 基于已有运行提出后续问题
+python run_hypoforge.py -q "请进一步比较两种机制的可检验预测" --followup-run-id my-run
+
+# 不在迭代节点等待人工输入
+python run_hypoforge.py -q "..." --no-interactive
 ```
 
-### 4. 启动 Web UI
+默认配置为 `configs/default.yaml`，也可以通过 `--config` 指定其他 YAML 配置。标准模式默认启用 M1–M6，并允许按配置进行证据补充和质量迭代。
+
+## Web 界面
+
+启动本地 Web 界面：
+
+```powershell
+python run_hypoforge_ui.py
+```
+
+默认访问地址为 `http://127.0.0.1:7860`。如需指定端口或不自动打开浏览器：
 
 ```powershell
 python run_hypoforge_ui.py --port 7862 --no-browser
 ```
 
-Web UI 提供实时事件流、模块详情、历史运行管理、断点重试，以及最新的水波与立体图标特效。
+Web 界面支持提交科学问题、选择运行模式、观察阶段进度和评审信息、查看历史运行，并对已完成的方案发起后续问题。运行数据默认保存在 `output/ui_runs/`。
 
-### 5. 方案细化工作台
+## 方案细化工作台
+
+`refinement_assistant/` 提供独立的方案细化工作台，用于在流水线生成研究计划后进行对话式补充和修改。其依赖和启动方式见 [refinement_assistant/README.md](refinement_assistant/README.md)。
 
 ```powershell
 cd refinement_assistant
-pip install -r requirements.txt
-python app.py        # http://127.0.0.1:5000
+python -m pip install -r requirements.txt
+python app.py
 ```
-
-从 Web UI 方案卡片点击「固定此方案并细化」可自动载入最终方案并开始对话式细化。
-
-> 细化工作台中的可微分渲染干实验（`refinement_assistant/scripts/`）使用生成式训练数据。
-> 该数据未随源码打包，需要时先运行：`python refinement_assistant/scripts/generate_data.py`。
 
 ## 配置文件
 
 | 文件 | 用途 |
-|---|---|
-| `configs/default.yaml` | 默认完整 M1-M6 Pipeline（CLI 默认） |
-| `configs/web_ui.yaml` | Web UI 实跑配置（含快速/标准模式参数与超时） |
-| `configs/evaluation.yaml` | 评估配置 |
+| --- | --- |
+| `configs/default.yaml` | 命令行标准运行配置，包含 M1–M6、检索来源、模型层级和迭代参数 |
+| `configs/web_ui.yaml` | Web 界面运行配置，包含实时运行所需的检索、超时和交互参数 |
+| `configs/evaluation.yaml` | 独立评估和消融实验的参数记录 |
+| `.env_template` | API 服务、学术检索来源和细化工作台的环境变量模板 |
 
-## 输出文件
+## 输出与可追溯性
 
-默认输出目录为 `./output`：
+命令行运行默认将结果保存到 `output/`。其中：
 
 ```text
 output/
-├── <run_id>.json            # 最终状态
-├── <run_id>_checkpoint.json # 模块级断点
-├── <run_id>_scores.json     # 独立评分
-└── snapshots/               # 每轮迭代快照
+├── <run_id>.json             # 最终流水线状态
+├── <run_id>_checkpoint.json  # 阶段级断点状态
+└── <run_id>_scores.json      # 独立评分报告（启用自动评分时生成）
 ```
+
+Web 运行会为每个运行建立独立目录，除上述结果外还会保存：
+
+```text
+output/ui_runs/<run_id>/
+├── manifest.json             # 运行配置、模型和状态摘要
+├── events.jsonl              # 按时间追加的阶段事件流
+└── snapshots/                # 各阶段的完整状态快照
+```
+
+输出状态和快照包含问题理解结果、论文与证据、证据图谱、候选假设、研究计划、评审意见、迭代路由、错误信息以及模型调用统计，便于复核证据如何影响假设和研究计划的变化。
 
 ## 测试
 
-```powershell
-# 完整测试集
-python -m pytest -q tests
+当前仓库保留的整合测试覆盖 M1–M6 的主要流程和回归场景：
 
-# 历史整合测试脚本
-python -m pytest -q scripts/test_pipeline.py
+```powershell
+python -m pytest -q tests/test_pipeline.py
 ```
+
+测试不要求提交 API 密钥；涉及外部模型或检索服务的正式运行仍需按照“配置”章节设置相应凭证。
 
 ## 项目结构
 
 ```text
-hypoforge/
-├── modules/                 # M1-M6 各模块
-├── modules/m2_literature/   # Agentic M2 检索
-├── modules/m3_grounding/    # M3 证据图谱/落地
-├── evaluation/              # M6 八维评分、独立指标
-├── literature/              # M2 检索基础设施
-├── memory/                  # 持久化记忆与缓存
-├── web/                     # Web UI 前端资源（含 hero-fluid.js）
-├── webapp.py                # 本地 Web UI 后端
-├── pipeline.py              # LangGraph 管线编排
-├── state.py                 # 全量状态模型
-├── strict_contracts.py      # 严格契约
-└── config.py                # 配置加载
-
-scripts/
-├── test_pipeline.py         # 历史整合测试
-└── smoke_pipeline.py        # 冒烟验证
-
-tests/                       # 按模块/契约拆分的测试集
-
-refinement_assistant/        # 方案细化工作台
-├── app.py                   # Flask Web 入口
-├── main.py                  # 对话主循环
-├── core/                    # LLM、上下文、权限、RAG
-├── tools/                   # 工具注册表
-├── subagent/                # 子代理与安全审计
-└── skills/                  # 技能与记忆
+.
+├── hypoforge/                # 核心流水线、状态模型、模块和 Web 服务
+│   ├── modules/              # M1–M6 阶段实现
+│   ├── context/              # 面向不同阶段的上下文组织
+│   ├── evaluation/           # 独立评分与评估指标
+│   ├── memory/               # 证据、论文和知识图谱缓存
+│   ├── web/                  # Web 界面静态资源
+│   ├── pipeline.py           # 阶段编排、迭代路由和断点恢复
+│   └── state.py              # 流水线状态模型
+├── configs/                  # 标准运行、Web 和评估配置
+├── refinement_assistant/     # 研究计划细化工作台
+├── tests/                    # 当前整合测试
+├── assets/                   # 项目流程图等说明性资源
+├── run_hypoforge.py          # 命令行入口
+├── run_hypoforge_ui.py       # Web 界面入口
+├── requirements.txt          # Python 依赖
+└── environment.yml           # Conda 环境定义
 ```
 
-## 开发约定
+## 使用边界
 
-- 新增输出字段时同步更新状态模型、严格契约与测试。
-- 不要提交 `.env`、API Key、运行输出、缓存或临时目录。
-- 修改完成后运行完整测试集。
+HypoForge 生成的是面向研究设计的候选假设和方案，不保证自动产生科学真理，也不能替代领域专家对事实、伦理、安全性和实验条件的最终判断。文献可获得性、来源接口限制、模型能力和随机性都会影响运行结果；正式研究前应对证据、推理链和研究计划进行人工复核。
+
+## 许可证
+
+当前仓库未附带 `LICENSE` 文件。正式公开发布前，请项目维护者补充明确的开源许可证，并以仓库根目录中的许可证文件为准。

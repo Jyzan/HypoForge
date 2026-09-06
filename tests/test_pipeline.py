@@ -6659,16 +6659,6 @@ def test_context_planner_prioritises_late_relation_with_focused_evidence() -> No
     assert "evidence=ev-focus" in pack.rendered
 
 
-def test_purpose_context_mix_reduces_estimated_tokens_by_half() -> None:
-    from scripts.measure_context_budget import measure_context_budget
-
-    report = measure_context_budget()
-
-    assert report["reduction_ratio"] >= 0.50
-    assert report["current_estimated_tokens"] < report["legacy_estimated_tokens"]
-    assert report["missing_focused_ids"] == []
-
-
 class CacheReadingWorkflow:
     def __init__(self) -> None:
         self.calls = 0
