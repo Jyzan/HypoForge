@@ -1,8 +1,14 @@
-# HypoForge
+<div align="center">
 
-![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
-![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1f2937)
-![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)
+<h1>HypoForge: Evidence-Grounded Scientific Hypothesis Generation and Research Plan Design</h1>
+
+<p>
+  <img src="https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white" alt="Python 3.11">
+  <img src="https://img.shields.io/badge/Orchestration-LangGraph-1f2937" alt="LangGraph">
+  <img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" alt="Apache-2.0 License">
+</p>
+
+</div>
 
 HypoForge 是一个面向科学假设生成与研究计划设计的开源 AI Scientist 流水线。系统以科学问题为输入，经过问题形式化、文献检索、证据归纳、假设生成、研究计划设计和质量评审，形成可追溯、可验证、可迭代的研究方案。
 
