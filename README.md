@@ -2,6 +2,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
 ![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1f2937)
+![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)
 
 HypoForge 是一个面向科学假设生成与研究计划设计的开源 AI Scientist 流水线。系统以科学问题为输入，经过问题形式化、文献检索、证据归纳、假设生成、研究计划设计和质量评审，形成可追溯、可验证、可迭代的研究方案。
 
@@ -201,4 +202,4 @@ HypoForge 生成的是面向研究设计的候选假设和方案，不保证自�
 
 ## 许可证
 
-当前仓库未附带 `LICENSE` 文件。正式公开发布前，请项目维护者补充明确的开源许可证，并以仓库根目录中的许可证文件为准。
+本项目采用 Apache License 2.0 开源许可证，详见 [LICENSE](LICENSE)。
