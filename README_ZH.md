@@ -20,9 +20,9 @@ HypoForge 是一个面向科学假设生成与研究计划设计的开源 AI Sci
 
 ## Demo 演示
 
-<video controls width="100%" src="https://media.githubusercontent.com/media/Jyzan/HypoForge/main/assets/demo.mp4"></video>
+[![HypoForge 演示预览](assets/demo-preview.gif)](assets/demo.mp4)
 
-[如果播放器不可用，打开 demo.mp4](assets/demo.mp4)。
+[打开完整演示视频](assets/demo.mp4)。
 
 ## 系统流程
 

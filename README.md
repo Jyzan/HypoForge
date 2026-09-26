@@ -20,9 +20,9 @@ HypoForge is an open-source AI Scientist pipeline for scientific hypothesis gene
 
 ## Demo
 
-<video controls width="100%" src="https://media.githubusercontent.com/media/Jyzan/HypoForge/main/assets/demo.mp4"></video>
+[![HypoForge demo preview](assets/demo-preview.gif)](assets/demo.mp4)
 
-[Open the demo video](assets/demo.mp4) if the player is unavailable.
+[Open the full demo video](assets/demo.mp4).
 
 ## Pipeline
 
