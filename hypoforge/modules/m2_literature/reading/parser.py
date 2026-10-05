@@ -12,6 +12,7 @@ from pypdf import PdfReader
 
 from ..models import ContentLevel, DocumentChunk, DocumentRecord
 from ..protocols import DocumentParserProtocol
+from .pdf_validation import validate_pdf_stream
 
 
 class DocumentParseError(ValueError):
@@ -230,6 +231,8 @@ class PDFDocumentParser(DocumentParserProtocol):
 
     @staticmethod
     def _extract_pages(path: Path) -> list[tuple[int, str]]:
+        with path.open("rb") as handle:
+            validate_pdf_stream(handle)
         reader = PdfReader(str(path))
         pages: list[tuple[int, str]] = []
         for page_number, page in enumerate(reader.pages, start=1):

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import http.client
 import json
 import re
-from time import monotonic as _monotonic
+from io import BytesIO
+from time import monotonic as _monotonic, time_ns
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,6 +24,7 @@ from .attribution import (
     OTHER,
     PUBLISHER_BLOCKED,
 )
+from .pdf_validation import PDFIntegrityError, validate_pdf_stream
 
 
 ArxivPDFFetchBackend = Callable[[str, float], Awaitable[bytes]]
@@ -99,12 +102,13 @@ def _read_bounded_response(
         raise ValueError("chunk_size must be positive")
     headers = getattr(response, "headers", {})
     raw_length = headers.get("Content-Length") if headers is not None else None
+    content_length = None
     if raw_length:
         try:
             content_length = int(raw_length)
         except (TypeError, ValueError):
-            content_length = 0
-        if content_length > max_bytes:
+            content_length = None
+        if content_length is not None and content_length > max_bytes:
             raise ValueError("arXiv PDF exceeds configured size limit")
 
     chunks: list[bytes] = []
@@ -142,6 +146,10 @@ def _read_bounded_response(
         if used > max_bytes:
             raise ValueError("arXiv PDF exceeds configured size limit")
         chunks.append(chunk)
+    if content_length is not None and content_length >= 0 and used != content_length:
+        raise PDFIntegrityError(
+            f"Incomplete PDF download: expected {content_length} bytes, received {used}"
+        )
     return b"".join(chunks)
 
 
@@ -227,9 +235,27 @@ class ArxivPDFResolver(FulltextResolverProtocol):
             ):
                 return False
             with path.open("rb") as handle:
-                return handle.read(5) == b"%PDF-"
-        except OSError:
+                validate_pdf_stream(handle)
+            return True
+        except (OSError, PDFIntegrityError):
             return False
+
+    async def _fetch_payload(self, source_uri: str, remaining_seconds: float) -> bytes:
+        if remaining_seconds <= 0:
+            raise ArxivDownloadTimeoutError("arXiv PDF exceeded download deadline")
+        timeout = min(self.timeout_seconds, remaining_seconds)
+        fetch = (
+            _default_fetch(source_uri, timeout, self.max_pdf_bytes, remaining_seconds)
+            if self.backend is None else self.backend(source_uri, timeout)
+        )
+        budget = asyncio.timeout(remaining_seconds)
+        try:
+            async with budget:
+                return await fetch
+        except asyncio.TimeoutError as exc:
+            if budget.expired():
+                raise ArxivDownloadTimeoutError("arXiv PDF exceeded download deadline") from exc
+            raise
 
     def _pdf_document(
         self,
@@ -306,6 +332,8 @@ class ArxivPDFResolver(FulltextResolverProtocol):
                 f"Response body at the link is not a PDF (likely a "
                 f"landing page/HTML): {source_uri}",
             )
+        if isinstance(exc, (PDFIntegrityError, http.client.IncompleteRead)):
+            return OTHER, f"PDF download integrity failure: {source_uri}; {message}"
         if "download deadline" in message:
             return OTHER, f"Download timed out: {source_uri}"
         return OTHER, message
@@ -342,38 +370,28 @@ class ArxivPDFResolver(FulltextResolverProtocol):
         if self._valid_cached_pdf(path):
             return self._pdf_document(paper, path, source_uri)
         try:
-            if self.backend is None:
-                fetch_task = asyncio.create_task(
-                    _default_fetch(
-                        source_uri,
-                        self.timeout_seconds,
-                        self.max_pdf_bytes,
-                        self.download_timeout_seconds,
-                    )
-                )
+            if path.exists():
+                # Keep the invalid artifact for diagnosis, but never reuse it.
+                path.replace(path.with_name(f"paper.invalid-{time_ns()}.pdf"))
+            deadline = _monotonic() + self.download_timeout_seconds
+            for attempt in range(2):
                 try:
-                    done, _ = await asyncio.wait(
-                        {fetch_task},
-                        timeout=self.download_timeout_seconds,
-                    )
-                except asyncio.CancelledError:
-                    fetch_task.cancel()
+                    payload = await self._fetch_payload(source_uri, deadline - _monotonic())
+                    if len(payload) > self.max_pdf_bytes:
+                        raise ValueError("arXiv PDF exceeds configured size limit")
+                    validate_pdf_stream(BytesIO(payload))
+                except (PDFIntegrityError, http.client.IncompleteRead) as exc:
+                    # Retry incomplete PDFs once within the original total time
+                    # budget. HTML responses / invalid links are not retryable.
+                    if (
+                        attempt == 0
+                        and "invalid PDF response" not in str(exc)
+                        and _monotonic() < deadline
+                    ):
+                        continue
                     raise
-                if fetch_task not in done:
-                    fetch_task.cancel()
-                    raise ArxivDownloadTimeoutError(
-                        "arXiv PDF exceeded "
-                        f"{self.download_timeout_seconds:g} second download deadline"
-                    )
-                payload = fetch_task.result()
-            else:
-                payload = await self.backend(source_uri, self.timeout_seconds)
-            if len(payload) > self.max_pdf_bytes:
-                raise ValueError("arXiv PDF exceeds configured size limit")
-            if not payload.lstrip().startswith(b"%PDF-"):
-                raise ValueError("invalid PDF response from arXiv")
-            self._write_atomic(path, payload)
-            return self._pdf_document(paper, path, source_uri)
+                self._write_atomic(path, payload)
+                return self._pdf_document(paper, path, source_uri)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

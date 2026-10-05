@@ -145,8 +145,16 @@ def configure(config_path: Path, csv_path: str | None):
 
 
 def prepare_manifest(output: Path, root: Path, config, topics: list[dict], repeats: int) -> dict:
+    from importlib.metadata import version
     repo = Path(__file__).resolve().parents[2]
-    source_files = [Path(__file__), repo / "hypoforge/tools/qwen_client.py"]
+    source_files = [
+        Path(__file__), repo / "hypoforge/tools/qwen_client.py",
+        repo / "hypoforge/modules/m2_literature/reading/arxiv_resolver.py",
+        repo / "hypoforge/modules/m2_literature/reading/parser.py",
+        repo / "hypoforge/modules/m2_literature/reading/pdf_validation.py",
+        repo / "hypoforge/benchmarks/fixtures/cff_font_check.pdf",
+        repo / "requirements.txt",
+    ]
     protocol = {
         "version": 1, "system": "HypoForge", "resource_setting": "native",
         "config": public_config(config), "topics": topics, "repeats": repeats,
@@ -155,6 +163,7 @@ def prepare_manifest(output: Path, root: Path, config, topics: list[dict], repea
         "export_system": EXPORT_SYSTEM,
         "source_hashes": {str(p.relative_to(repo)): hashlib.sha256(p.read_bytes()).hexdigest()
                           for p in source_files},
+        "pdf_dependencies": {name: version(name) for name in ("pypdf", "fonttools")},
         "release_sha256": hashlib.sha256(
             (root / "release_data/core/lit8d_scores_3seed.csv.gz").read_bytes()).hexdigest(),
     }
@@ -165,10 +174,9 @@ def prepare_manifest(output: Path, root: Path, config, topics: list[dict], repea
         if manifest["fingerprint"] != signature:
             raise ValueError("Experiment configuration/task set changed; use a new --output-dir")
         return manifest
-    from importlib.metadata import version
     manifest = {"fingerprint": signature, "created_at": now(), "protocol": protocol,
                 "hypoforge_revision": source_revision(repo), "agentideabench_revision": source_revision(root),
-                "dependencies": {name: version(name) for name in ("langgraph", "langchain-openai", "openai", "pydantic", "httpx")},
+                "dependencies": {name: version(name) for name in ("langgraph", "langchain-openai", "openai", "pydantic", "httpx", "pypdf", "fonttools")},
                 "expected_cells": cells(topics, repeats)}
     write_json(path, manifest)
     return manifest
@@ -236,12 +244,39 @@ def refresh_exports(output: Path, manifest: dict) -> dict:
     return summary
 
 
+async def check_pdf_environment() -> None:
+    """Fail before model calls when full-text font decoding is unavailable."""
+    try:
+        from fontTools.cffLib import CFFFontSet  # noqa: F401
+        from fontTools.ttLib import TTFont  # noqa: F401
+    except ImportError as exc:
+        raise ValueError(
+            "PDF font decoding requires fonttools; run "
+            "python -m pip install -r requirements.txt and restart Python"
+        ) from exc
+    from hypoforge.modules.m2_literature.models import ContentLevel, DocumentRecord
+    from hypoforge.modules.m2_literature.reading.parser import PDFDocumentParser
+
+    path = Path(__file__).parent / "fixtures/cff_font_check.pdf"
+    chunks = await PDFDocumentParser().parse(DocumentRecord(
+        document_id="pdf-environment-check", paper_id="pdf-environment-check",
+        content_level=ContentLevel.PDF, local_path=str(path),
+    ))
+    if "".join(chunk.text for chunk in chunks).strip() != "B":
+        raise ValueError(
+            "CFF PDF font decoding check failed; update requirements.txt dependencies "
+            "and restart Python"
+        )
+    print("PDF CFF font decoding / text extraction: OK", flush=True)
+
+
 async def generate(output: Path, root: Path, config, topics: list[dict], repeats: int,
                    retry_failed: bool = False, workers: int = 1,
                    llm_concurrency: int = 8) -> bool:
     from hypoforge.tools.qwen_client import limit_llm_concurrency
     if not 1 <= workers <= 4:
         raise ValueError("Generation workers must be between 1 and 4")
+    await check_pdf_environment()
     with experiment_writer(output), limit_llm_concurrency(llm_concurrency):
         started = time.monotonic()
         execution = {"phase": "generate", "started_at": now(), "workers": workers,

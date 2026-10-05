@@ -12,5 +12,6 @@ dependencies:
       - rich>=13.0
       - python-dotenv>=1.0
       - langchain-openai>=0.2.0
-      # Optional Track A / demo / development dependencies are documented
-      # in requirements.txt and should be enabled only when needed.
+      - pypdf>=6.19.0
+      - fonttools>=4.0
+      # Remaining Track A / development dependencies are in requirements.txt.

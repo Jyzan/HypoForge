@@ -17,7 +17,8 @@ from contextlib import closing
 from pathlib import Path
 
 from .agentideabench import (CRITICS, CUTOFF, WEIGHTS, digest, experiment_writer,
-                            now, read_json, record_execution, write_json)
+                            now, read_json, record_execution, write_json,
+                            check_pdf_environment)
 
 
 def load_rubric(root: Path):
@@ -43,7 +44,8 @@ def checked_scores(raw: dict) -> dict:
 
 
 async def preflight(config) -> bool:
-    """Small real requests for the model/embedding/retrieval prerequisites."""
+    """Local PDF decoding, then small model/embedding/retrieval requests."""
+    await check_pdf_environment()
     from hypoforge.tools.qwen_client import QwenClient
     llm = QwenClient.from_config(config.qwen.base)
     response = await llm.structured_chat(

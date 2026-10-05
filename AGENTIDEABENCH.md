@@ -38,7 +38,8 @@ export HF_API_KEY_CSV="/absolute/path/model-studio-key.csv"
 python run_agentideabench.py --phase check --api-key-csv "$HF_API_KEY_CSV"
 ```
 
-`check` 会实际发送少量请求，检查 GLM 的 JSON 输出及指定调用参数、另两个评审、
+`check` 先离线解析一个内嵌 CFF Type1 字体的测试 PDF，校验实际字符解码；
+随后发送少量请求，检查 GLM 的 JSON 输出及指定调用参数、另两个评审、
 嵌入模型和 Semantic Scholar 的日期过滤检索。也可不传 CSV，使用原有 `.env`
 或环境中的 `OPENAI_API_KEY` / `OPENAI_BASE_URL`。现有配置优先解析 `QWEN_API_KEY`
 与 `QWEN_BASE_URL`；显式 CSV 优先于这些设置。
@@ -118,6 +119,42 @@ RPM/TPM 限流器，SDK 内部仍可能因服务端限制而重试。出现限�
 120 次管线的耗时取决于真实样本、迭代次数和检索占比。M2 仍是串行部分，4 条管线
 不能保证四倍提速，先用五学科试跑的吞吐量估计正式生成时间。
 
+## PDF 依赖与下载完整性
+
+生成和 `check` 均在调用模型之前执行本地 CFF PDF 字体解码检查，正常输出为
+`PDF CFF font decoding / text extraction: OK`。`requirements.txt` 显式包含
+`fonttools` 和已验证支持该解码方式的 `pypdf>=6.19.0`。`pip check` 仅验证已声明的
+依赖关系，不能替代这个实际解码检查。安装新依赖后需启动新的 Python 进程。
+
+PDF 下载会核对响应的 Content-Length（存在有效值时）、PDF 文件头与结尾
+`%%EOF` 标记。已缓存但缺少结尾标记的文件会保留为 `paper.invalid-*.pdf`，
+随后重新下载；不完整下载最多重试一次，两次共用原有总下载时间预算。
+HTML、出版商拒绝访问等不触发这一重试。持续失败不会写入正常 PDF 缓存，
+有摘要时仍沿用原生摘要降级，并在 M2 导出中保留失败原因与实际内容层级。
+完整性检查只校验 PDF 外壳，其他结构问题仍由解析器处理并记录。
+
+已停止的旧试跑应保留，用新的输出目录重跑。本次修复涉及 PDF 检索/解析源码及
+依赖，实验指纹会变化，旧成功结果不能与修复后样本混合。服务器原有 `.venv`
+可以继续使用，无需再次创建环境：
+
+```bash
+git pull --ff-only origin AgentIdeaBench
+source .venv/bin/activate
+python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 60
+python -m pip check
+python -c 'import asyncio; from hypoforge.benchmarks.agentideabench import check_pdf_environment; asyncio.run(check_pdf_environment())'
+```
+
+重新设置上文的代理和凭据环境变量，再执行 `--phase check`。重跑五学科时，生成、
+评分、分析均指定 `--output-dir output/agentideabench/glm51-pilot-pdf-fixed`：
+
+```bash
+python run_agentideabench.py --phase check --api-key-csv "$HF_API_KEY_CSV"
+python -u run_agentideabench.py --sample pilot --repeats 1 --workers 2 --llm-concurrency 8 --output-dir output/agentideabench/glm51-pilot-pdf-fixed --api-key-csv "$HF_API_KEY_CSV"
+python -u run_agentideabench.py --phase score --sample pilot --workers 3 --output-dir output/agentideabench/glm51-pilot-pdf-fixed --api-key-csv "$HF_API_KEY_CSV"
+python -u run_agentideabench.py --phase analyze --sample pilot --output-dir output/agentideabench/glm51-pilot-pdf-fixed
+```
+
 ## 恢复与结果
 
 重复执行相同命令会跳过已完成项。失败项不会自动变成新的随机样本；查看对应的
@@ -172,9 +209,10 @@ RPM/TPM 限流器，SDK 内部仍可能因服务端限制而重试。出现限�
 ## 验证
 
 ```bash
-python -m pytest tests/test_agentideabench.py tests/test_pipeline.py -q
+python -m pytest tests/test_agentideabench.py tests/test_pdf_reading.py tests/test_pipeline.py -q
 ```
 
 测试涵盖 API 参数在 JSON 回退中的保持、CSV 解析、并行状态/用量隔离、M2 与文本
 并发上限、取消恢复、目录写锁、共享评分证据、失败评审重试、检索失败、逐维度
-聚合和缺失评审处理。同级 AgentIdeaBench 存在时还验证历史 6.33 基线。
+聚合和缺失评审处理，以及实际 CFF 字体解码、截断 PDF 的有界重试与缓存隔离、
+摘要降级归因、取消和总下载时间预算。同级 AgentIdeaBench 存在时还验证历史 6.33 基线。
