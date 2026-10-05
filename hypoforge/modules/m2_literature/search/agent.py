@@ -354,7 +354,9 @@ class IterativeSearchAgent:
         # semaphore prevents a burst of planner variants from reaching that
         # limiter at once and amplifying HTTP 429 responses.
         self._source_semaphores = {
-            source_name: asyncio.Semaphore(int(source_concurrency_limit))
+            source_name: asyncio.Semaphore(
+                1 if source_name == "semantic_scholar" else int(source_concurrency_limit)
+            )
             for source_name in self.sources
         }
 
@@ -677,6 +679,11 @@ class IterativeSearchAgent:
         classification = await classify_entities(
             self.entity_classifier, sub_question, all_entities, list(domains)
         )
+        excluded = {name.casefold() for name in classification.non_search_entities}
+        # Retrieval projection only: the M1 contract and later hard gates keep
+        # every original entity and requirement unchanged.
+        key_entities = [name for name in key_entities if name.casefold() not in excluded]
+        supplement_entities = [name for name in supplement_entities if name.casefold() not in excluded]
         if classification.total == 0:
             # Nothing to group: degrade to one plain round (legacy shape).
             emit_event(
@@ -1513,6 +1520,9 @@ class IterativeSearchAgent:
         return retained, decisions
 
     async def _search(self, query: SearchQuery) -> list[PaperRecord]:
+        if query.target_source.casefold() == "semantic_scholar":
+            from hypoforge.tools.s2_rate_limit import relevance_query
+            query = query.model_copy(update={"text": relevance_query(query.text)})
         source = self.sources.get(query.target_source.casefold())
         if source is None:
             raise LookupError(f"unknown literature source: {query.target_source}")

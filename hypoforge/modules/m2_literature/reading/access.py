@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -33,6 +34,13 @@ def _json_get(
     timeout: float,
     headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    if urllib.parse.urlparse(url).hostname == "api.semanticscholar.org":
+        from hypoforge.tools.semantic_scholar import _http_get_json
+        key = next((value for name, value in (headers or {}).items()
+                    if name.casefold() == "x-api-key"), "")
+        return _http_get_json(url, s2_api_key=key,
+                              deadline=time.monotonic() + max(30.0, timeout),
+                              request_timeout=timeout)
     request = urllib.request.Request(
         url,
         headers={

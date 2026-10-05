@@ -146,6 +146,9 @@ def extract_queries(api: CriticAPI, rubric, scorer, idea: str) -> list[str]:
 
 def search_prior_art(query: str) -> list[dict]:
     import httpx
+    from hypoforge.tools.semantic_scholar import _S2_RATE_LIMIT
+    from hypoforge.tools.s2_rate_limit import wait_for_slot, defer_requests
+    key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "")
     headers = {}
     if os.environ.get("SEMANTIC_SCHOLAR_API_KEY"):
         headers["x-api-key"] = os.environ["SEMANTIC_SCHOLAR_API_KEY"]
@@ -153,8 +156,15 @@ def search_prior_art(query: str) -> list[dict]:
               "limit": 10, "publicationDateOrYear": f":{CUTOFF}"}
     with httpx.Client(timeout=30) as client:
         for attempt in range(4):
+            wait_for_slot(key, _S2_RATE_LIMIT)
             response = client.get("https://api.semanticscholar.org/graph/v1/paper/search",
                                   params=params, headers=headers)
+            if response.status_code == 429:
+                try:
+                    delay = max(_S2_RATE_LIMIT, float(response.headers.get("Retry-After", (3, 6, 12, 12)[attempt])))
+                except ValueError:
+                    delay = (3, 6, 12, 12)[attempt]
+                defer_requests(key, delay)
             if response.status_code == 429 or response.status_code >= 500:
                 if attempt < 3:
                     time.sleep((3, 6, 12)[attempt])

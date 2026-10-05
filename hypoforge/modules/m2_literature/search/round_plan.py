@@ -78,6 +78,13 @@ class EntityClassificationSchema(BaseModel):
             "when a query is too narrow. Everything not must belongs here."
         ),
     )
+    non_search_entities: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Output artifacts or writing/evaluation instructions, not scientific "
+            "search concepts. Keep them in the task contract, not in queries."
+        ),
+    )
 
 
 class _RoundGroupingSchema(BaseModel):
@@ -96,7 +103,7 @@ class _RoundGroupingSchema(BaseModel):
 _CLASSIFY_SYSTEM = (
     "You are a scientific literature search assistant. For one atomic "
     "research sub-question you receive the candidate search entities. "
-    "Split them into must_entities and unmapped_entities.\n\n"
+    "Split them into must_entities, unmapped_entities, and non_search_entities.\n\n"
     "Rules:\n"
     "1. must_entities are the entities the search should always try to "
     "include — the core research object and its central relation partner. "
@@ -105,10 +112,17 @@ _CLASSIFY_SYSTEM = (
     "entities.\n"
     "2. unmapped_entities are supporting concepts (methods, co-factors, "
     "context terms) that can be dropped from a query when needed.\n"
-    "3. Every supplied entity must appear in exactly one list, using the "
+    "3. Every supplied entity must appear in exactly one of the three lists, using the "
     "exact names given (aliases allowed only alongside the given name).\n"
     "4. Prefer the more central, domain-specific terms as must; generic "
-    "modifiers belong in unmapped."
+    "modifiers belong in unmapped.\n"
+    "5. non_search_entities contains only generic requested output artifacts "
+    "or criteria (e.g. proposing a scientific hypothesis, novelty, specificity, "
+    "testability, or explaining a methodology). These remain task requirements, "
+    "but must not be forced into every literature query. Do not put an actual "
+    "research object, named technique, disease, endpoint, or scientific mechanism "
+    "here. A phrase about a method may be a real scientific topic: decide from "
+    "the sub-question rather than deleting words by a fixed blacklist."
 )
 
 _CLASSIFY_USER = (
@@ -117,7 +131,7 @@ _CLASSIFY_USER = (
     "## Candidate entities\n{entities}\n\n"
     "## Task\n"
     "Split the candidate entities into must_entities (keep this list as "
-    "short as possible, ideally at most 3) and unmapped_entities. Return "
+    "short as possible, ideally at most 3), unmapped_entities, and non_search_entities. Return "
     "the JSON object only."
 )
 
@@ -150,6 +164,7 @@ class EntityClassification:
     must_entities: List[str] = field(default_factory=list)
     unmapped_entities: List[str] = field(default_factory=list)
     degraded: bool = False
+    non_search_entities: List[str] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -305,15 +320,20 @@ async def classify_entities(
     known = set(ordered)
     must = _clean_names(parsed.must_entities, known)
     unmapped = _clean_names(parsed.unmapped_entities, known)
+    excluded = _clean_names(parsed.non_search_entities, known)
+    # A contradictory classification cannot silently exclude a scientific cue.
+    searchable = set(must) | set(unmapped)
+    excluded = [name for name in excluded if name not in searchable]
     must_norms = {normalise_entity_name(name) for name in must}
     # Every supplied entity must land somewhere; anything the LLM dropped or
     # double-listed falls into the unmapped bucket deterministically.
     for name in ordered:
         norm = normalise_entity_name(name)
-        if norm not in must_norms and name not in unmapped:
+        if norm not in must_norms and name not in unmapped and name not in excluded:
             unmapped.append(name)
     classification = EntityClassification(
-        must_entities=must, unmapped_entities=unmapped, degraded=False
+        must_entities=must, unmapped_entities=unmapped, degraded=False,
+        non_search_entities=excluded,
     )
     emit_event(
         "tool_completed",
@@ -328,6 +348,7 @@ async def classify_entities(
             "sub_question": sub_question,
             "must_entities": list(must),
             "unmapped_entities": list(unmapped),
+            "non_search_entities": list(excluded),
             "soft_limit": MUST_ENTITY_SOFT_LIMIT,
             "over_soft_limit": len(must) > MUST_ENTITY_SOFT_LIMIT,
         },

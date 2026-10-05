@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from hypoforge.modules.m2_literature.models import QueryIntent, SearchQuery, SearchState
 from hypoforge.modules.m2_literature.protocols import QueryPlannerProtocol
 from hypoforge.tools.qwen_client import QwenClient
+from hypoforge.tools.s2_rate_limit import relevance_query
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,8 @@ _FIELD_TAG_PATTERN = re.compile(r"\[[^\]]+\]")
 def _sanitize_query(text: str, backend: str) -> str:
     if backend != "pubmed":
         text = _FIELD_TAG_PATTERN.sub("", text)
+    if backend == "semantic_scholar":
+        text = relevance_query(text)
     return " ".join(text.split())
 
 
@@ -104,7 +107,17 @@ current year is 2026.
   - `Hsp70 mechanism` ← single vague term
   - `"protein misfolding"[MeSH Terms]` ← fabricated MeSH heading, 0 hits
 
-### For Semantic Scholar/OpenAlex queries (cross-disciplinary discovery):
+### For Semantic Scholar queries (cross-disciplinary discovery):
+- The endpoint is `/paper/search`, which accepts PLAIN TEXT ONLY. Never use
+  quotes, parentheses, AND/OR/NOT, or field tags. Replace hyphens with spaces.
+- Use 2-3 short scientific concepts or established aliases, for example
+  `neural radiance fields scene understanding` or `graphene heterostructure`.
+- Preserve the research target semantically, not as a verbatim long phrase.
+- Output instructions such as proposing a scientific hypothesis, novelty,
+  specificity, testability, or describing a methodology are not mandatory
+  literature keywords. Actual named methods and scientific outcomes ARE.
+
+### For OpenAlex queries (cross-disciplinary discovery):
 - Use phrase quotes for multi-word terms: `"protein folding"`.
 - Keep each concept short (no more than 3 words); combine with AND/OR when helpful. No more than 3 concepts.
 - S2 syntax is simpler than PubMed — keyword search works fine.
@@ -465,14 +478,14 @@ class QueryPlanner(QueryPlannerProtocol):
             text = _sanitize_query(raw.get("text", "").strip(), backend)
             if not text:
                 continue
-            # The round's focus entities are mandatory concepts: anchor every
-            # one the LLM omitted.  Then keep M1's first key entity as a
-            # structured conjunct as well; never append loose words to the
-            # tail of the query.
-            for focus_entity in focus_list:
-                text = _anchor_query(text, focus_entity, backend)
-            if entities:
-                text = _anchor_query(text, entities[0], backend)
+            # Relevance search uses semantic topic cues. Forcing every M1
+            # phrase verbatim both destroys aliases and adds output artifacts.
+            # Actual relevance and task alignment remain audited downstream.
+            if backend != "semantic_scholar":
+                for focus_entity in focus_list:
+                    text = _anchor_query(text, focus_entity, backend)
+                if entities:
+                    text = _anchor_query(text, entities[0], backend)
 
             purpose = raw.get("purpose", "").strip()
             intent = _purpose_to_intent(purpose)

@@ -175,6 +175,14 @@ def prepare_manifest(output: Path, root: Path, config, topics: list[dict], repea
         repo / "hypoforge/evaluation/metrics.py",
         repo / "hypoforge/modules/m1_problem_understanding.py",
         repo / "hypoforge/tools/semantic_scholar.py",
+        repo / "hypoforge/tools/s2_rate_limit.py",
+        repo / "hypoforge/prompts/m1_prompts.py",
+        repo / "hypoforge/modules/m2_literature/search/query_planner.py",
+        repo / "hypoforge/modules/m2_literature/search/round_plan.py",
+        repo / "hypoforge/modules/m2_literature/search/agent.py",
+        repo / "hypoforge/modules/m2_literature/reading/access.py",
+        repo / "hypoforge/modules/m4_hypothesis_generation.py",
+        repo / "hypoforge/modules/m6_review_iteration.py",
         repo / "hypoforge/modules/m2_literature/reading/arxiv_resolver.py",
         repo / "hypoforge/modules/m2_literature/reading/parser.py",
         repo / "hypoforge/modules/m2_literature/reading/pdf_validation.py",
@@ -190,6 +198,13 @@ def prepare_manifest(output: Path, root: Path, config, topics: list[dict], repea
         "source_hashes": {str(p.relative_to(repo)): hashlib.sha256(p.read_bytes()).hexdigest()
                           for p in source_files},
         "pdf_dependencies": {name: version(name) for name in ("pypdf", "fonttools")},
+        "semantic_scholar_transport": {
+            "min_interval_seconds": max(1.1, float(os.environ.get("SEMANTIC_SCHOLAR_MIN_INTERVAL_SECONDS", "5"))),
+            "search_deadline_seconds": 25,
+            "metadata_min_deadline_seconds": 30,
+            "coordination": "per-key cross-endpoint local-process file lock",
+            "search_endpoint": "/graph/v1/paper/search",
+        },
         "release_sha256": hashlib.sha256(
             (root / "release_data/core/lit8d_scores_3seed.csv.gz").read_bytes()).hexdigest(),
     }
@@ -223,6 +238,9 @@ def select_submission(state) -> dict:
     if not state.top_hypotheses or not state.reviews:
         raise ValueError("No final hypothesis reviewed by M6 is available")
     card = state.top_hypotheses[0]
+    from hypoforge.modules.m6_review_iteration import _is_invalid_fallback_hypothesis
+    if _is_invalid_fallback_hypothesis(card):
+        raise ValueError("Deterministic fallback is not a model-generated benchmark hypothesis")
     plans = [plan for plan in state.research_plans if plan.hypothesis_id == card.hypothesis_id]
     if not plans:
         raise ValueError("The selected hypothesis has no matching research plan")
@@ -324,14 +342,21 @@ async def _generate(output: Path, root: Path, config, topics: list[dict], repeat
     class BatchRunner(PipelineRunner):
         def _make_node_wrapper(self, name, module):
             node = super()._make_node_wrapper(name, module)
+            async def observed(state):
+                label = getattr(self, "benchmark_label", "HypoForge")
+                print(f"  [{label}] {name.upper()} started", flush=True)
+                started_at = time.monotonic()
+                result = await node(state)
+                print(f"  [{label}] {name.upper()} completed ({time.monotonic() - started_at:.0f}s)", flush=True)
+                return result
             if name != "m2":
-                return node
+                return observed
 
             async def serial_literature(state):
                 # Queue before the native node starts its timers. This prevents
                 # parallel cases from exhausting retrieval deadlines in a queue.
                 async with m2_gate:
-                    return await node(state)
+                    return await observed(state)
             return serial_literature
 
     async def run_cell(index, cell):
@@ -364,7 +389,11 @@ async def _generate(output: Path, root: Path, config, topics: list[dict], repeat
                 run_config.memory_cache_dir = str(run_directory / "knowledge_graph")
                 run_config.entity_cache_dir = str(run_directory / "entity_cache")
                 runner = BatchRunner(run_config)
+                runner.benchmark_label = cell["domain"]
                 run_id = f"{cell['item_id']}-a{record['attempt']}"
+                if hasattr(runner, "event_recorder"):
+                    from hypoforge.observability import RunEventRecorder
+                    runner.event_recorder = RunEventRecorder(run_directory / "telemetry", run_id)
                 record["checkpoint_path"] = str(run_directory / f"{run_id}_checkpoint.json")
                 state = await runner.run(QUESTION.format(**cell), run_id=run_id)
                 record["state_path"] = str(run_directory / f"{run_id}.json")

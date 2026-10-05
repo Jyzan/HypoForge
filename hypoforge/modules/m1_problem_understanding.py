@@ -573,10 +573,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
 
             violations = self._sub_question_violations(questions)
             if violations:
-                raise ValueError(
-                    "coverage repair produced non-atomic sub-questions: "
-                    + "; ".join(violations)
-                )
+                questions = await self._repair_subquestion_shape(question, questions)
 
         final_payload = await self._tracked_llm_call(
             "qwen_subquestion_coverage_final",
@@ -611,6 +608,46 @@ class M1ProblemUnderstanding(ModuleProtocol):
             },
         )
         return questions
+
+    async def _repair_subquestion_shape(
+        self, question: str, questions: List[str],
+    ) -> List[str]:
+        """One semantic rewrite; the coverage loop audits the rewritten list."""
+        violations = self._sub_question_violations(questions)
+        if not violations:
+            return questions
+        payload = await self._tracked_llm_call(
+            "qwen_subquestion_atomic_repair",
+            self.client.structured_chat(
+                disable_thinking=True,
+                system_prompt=M1_COVERAGE_MERGE_SYSTEM_PROMPT,
+                user_prompt=M1_COVERAGE_MERGE_USER_TEMPLATE.format(
+                    question=question,
+                    sub_questions_text="\n".join(f"- {item}" for item in questions),
+                    merge_instructions_text=(
+                        "Rewrite the full list to correct these structural violations. "
+                        "Preserve every required aspect and the core action. Do not "
+                        "truncate text or invent a method.\n"
+                        + "\n".join(f"- {item}" for item in violations)
+                    ),
+                ),
+                output_schema=_SubQuestionSupplement.model_json_schema(),
+                max_tokens=2048, temperature=0.0,
+            ),
+        )
+        result = list(dict.fromkeys(
+            " ".join(item.split())
+            for item in _SubQuestionSupplement.model_validate(payload).sub_questions
+            if item.strip()
+        ))
+        remaining = self._sub_question_violations(result)
+        if not result or remaining:
+            raise ValueError(
+                "coverage atomic repair failed: "
+                + "; ".join(remaining or ["no sub-questions returned"])
+                + f"; sub_questions={result!r}"
+            )
+        return result
 
     async def _merge_subquestions_to_limit(
         self,
@@ -647,10 +684,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
         ))
         violations = self._sub_question_violations(result)
         if violations:
-            raise ValueError(
-                "sub-question limit merge produced an invalid decomposition: "
-                + "; ".join(violations)
-            )
+            result = await self._repair_subquestion_shape(question, result)
         if not result:
             raise ValueError("sub-question limit merge returned no questions")
         return result

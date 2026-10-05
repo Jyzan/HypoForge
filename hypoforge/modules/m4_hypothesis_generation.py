@@ -160,12 +160,18 @@ class M4HypothesisGeneration(ModuleProtocol):
         total_time_budget_seconds: float = 540.0,
         semantic_alignment_timeout_seconds: float = 60.0,
         fast_mode: bool = False,
+        generator_batch_size: int = 0,
+        allow_continuity_fallback: bool = True,
         **kwargs,
     ):
         self.num_candidates = num_candidates
         self.top_k = top_k
         self.mode = mode
         self.fast_mode = bool(fast_mode)
+        if generator_batch_size < 0:
+            raise ValueError("generator_batch_size cannot be negative")
+        self.generator_batch_size = int(generator_batch_size)
+        self.allow_continuity_fallback = bool(allow_continuity_fallback)
         self.llm_config = llm_config
         # Composite weights come from a single source (PipelineConfig.scoring →
         # rubric defaults); the ranker prompt and the recompute below share them.
@@ -1010,6 +1016,7 @@ class M4HypothesisGeneration(ModuleProtocol):
 
         card_schema = HypothesisCard.model_json_schema()
         item_schema = dict(card_schema)
+        item_schema.pop("$defs", None)
         item_schema["type"] = "object"
         item_schema["properties"] = dict(card_schema.get("properties", {}))
         item_schema["required"] = [
@@ -2010,6 +2017,53 @@ class M4HypothesisGeneration(ModuleProtocol):
         requested = (
             self.num_candidates if requested_count is None else int(requested_count)
         )
+        if self.generator_batch_size and requested > self.generator_batch_size:
+            generated_all, accepted_all, failures_all = [], [], []
+            for offset in range(0, requested, self.generator_batch_size):
+                count = min(self.generator_batch_size, requested - offset)
+                previous = "\n".join(card.statement for card in accepted_all)
+                batch_feedback = feedback_context + (
+                    f"\nPortfolio batch {offset // self.generator_batch_size + 1}. "
+                    f"Generate {count} distinct candidates. Keep each complete card "
+                    "concise and retain all required provenance. Avoid repeating "
+                    f"these prior candidates:\n{previous}"
+                )
+                try:
+                    raw, accepted, failures = await self._generate_hypothesis_batch(
+                        state, question=question, graph_context=graph_context,
+                        feedback_context=batch_feedback, tool_name=tool_name,
+                        attempt=attempt, requested_count=count,
+                        disable_thinking=disable_thinking,
+                    )
+                except TimeoutError:
+                    if not accepted_all:
+                        raise
+                    failures_all.append({
+                        "failure_type": "portfolio_batch_timeout",
+                        "rationale": f"Batch at candidate offset {offset} timed out; earlier model candidates retained.",
+                    })
+                    emit_event(
+                        "tool_result", module="m4", tool=tool_name, status="warning",
+                        message="Portfolio batch timed out; preserving completed model candidates",
+                        details={"candidate_offset": offset, "retained_candidates": len(accepted_all)},
+                    )
+                    break
+                # IDs are local to each provider response, not to the portfolio.
+                cards = self._normalise_hypotheses(raw)
+                remap = {card.hypothesis_id: f"H{len(generated_all) + i}"
+                         for i, card in enumerate(cards, 1)}
+                generated_all.extend(card.model_copy(update={
+                    "hypothesis_id": remap[card.hypothesis_id],
+                }).model_dump(mode="json") for card in cards)
+                accepted_all.extend(card.model_copy(update={
+                    "hypothesis_id": remap[card.hypothesis_id],
+                }) for card in accepted)
+                failures_all.extend(
+                    {**failure, "hypothesis_id": remap[failure["hypothesis_id"]]}
+                    if failure.get("hypothesis_id") in remap else failure
+                    for failure in failures
+                )
+            return generated_all, accepted_all, failures_all
         focus_ids = [
             *self._supplement_focus_evidence_ids(state),
             *(
@@ -2213,8 +2267,8 @@ class M4HypothesisGeneration(ModuleProtocol):
                 ):
                     raise
                 logger.warning(
-                    "M4 reasoning-enabled generator timed out (%s); retrying "
-                    "once without extended thinking.",
+                    "M4 generator request timed out (%s); retrying "
+                    "once with thinking disabled.",
                     exc,
                 )
                 try:
@@ -2402,6 +2456,12 @@ class M4HypothesisGeneration(ModuleProtocol):
                     str(item.get("rationale") or "contract validation failed")
                     for item in contract_failures[-3:]
                 )
+                if not self.allow_continuity_fallback:
+                    raise RuntimeError(
+                        "M4 produced no contract-valid model hypotheses after bounded "
+                        "recovery; deterministic continuity fallback is disabled for "
+                        f"this experiment. {diagnostics}"
+                    )
                 candidates = self._continuity_fallback_hypotheses(
                     state,
                     question,

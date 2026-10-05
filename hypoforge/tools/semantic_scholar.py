@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 
 from ..protocol import ToolProtocol
 from ..registry import ToolRegistry
+from .s2_rate_limit import wait_for_slot, defer_requests, relevance_query
 
 logger = logging.getLogger(__name__)
 
@@ -56,35 +57,11 @@ _S2_API_KEY, _BACKEND = _resolve_config()
 _OPENALEX_API_KEY = os.environ.get("OPENALEX_API_KEY", "")
 _OPENALEX_MAILTO = os.environ.get("OPENALEX_MAILTO", "")
 
-# Module-level 429 circuit-breaker.  When S2 repeatedly rate-limits us,
-# subsequent calls in the same process fail fast for a short cooldown.
-# OpenAlex is a separate configured source, not a fallback from this module.
-_s2_circuit_open_until: float = 0.0
-_CIRCUIT_COOLDOWN_SECONDS = 120.0  # keep S2 off for 2 min after a 429 storm
-
-
-def _s2_circuit_open() -> bool:
-    """Return True when S2 should be skipped (breaker is tripped)."""
-    return time.monotonic() < _s2_circuit_open_until
-
-
-def _s2_circuit_break() -> None:
-    """Trip the S2 circuit breaker for the cooldown period."""
-    global _s2_circuit_open_until
-    _s2_circuit_open_until = time.monotonic() + _CIRCUIT_COOLDOWN_SECONDS
-
-
-def _s2_circuit_reset() -> None:
-    """Reset the S2 circuit breaker (e.g. after a successful call)."""
-    global _s2_circuit_open_until
-    _s2_circuit_open_until = 0.0
-
-# Free S2 keys are limited to ~1 request per second, but some trial /
-# academic keys have even stricter quotas.  The default is deliberately
+# Initial S2 keys allow 1 request/s across all endpoints. The default is
 # conservative; set SEMANTIC_SCHOLAR_MIN_INTERVAL_SECONDS in .env to
 # adjust for your specific key tier.
 _S2_RATE_LIMIT = max(
-    1.0,
+    1.1,
     float(os.environ.get("SEMANTIC_SCHOLAR_MIN_INTERVAL_SECONDS", "5.0")),
 )
 _OPENALEX_RATE_LIMIT = max(
@@ -100,7 +77,7 @@ _HTTP_OPENER = urllib.request.build_opener()
 
 # Cap on the S2 stage of a search: rate-limit sleep + request + retries must
 # fit inside the agent's per-source timeout (default 30.0s).
-_S2_STAGE_DEADLINE_SECONDS = 15.0
+_S2_STAGE_DEADLINE_SECONDS = 25.0
 _OPENALEX_STAGE_DEADLINE_SECONDS = 15.0
 
 
@@ -119,7 +96,11 @@ def _sleep_with_deadline(seconds: float, deadline: float | None) -> None:
     time.sleep(seconds)
 
 
-def _rate_limit(min_interval: float, deadline: float | None = None) -> None:
+def _rate_limit(min_interval: float, deadline: float | None = None,
+                api_key: str | None = None) -> None:
+    if api_key is not None:
+        wait_for_slot(api_key, min_interval, deadline)
+        return
     global _last_request_time
     with _rate_limit_lock:
         now = time.monotonic()
@@ -130,14 +111,15 @@ def _rate_limit(min_interval: float, deadline: float | None = None) -> None:
 
 
 def _http_get_json(
-    url: str, *, s2_api_key: str = "", deadline: float | None = None
+    url: str, *, s2_api_key: str = "", deadline: float | None = None,
+    request_timeout: float = 30.0,
 ) -> dict:
     """GET *url*, parse JSON, with rate-limit + retry on transient errors.
 
     ``deadline`` (absolute ``time.monotonic()`` time) bounds the whole call:
     rate-limit waits, backoff sleeps and the socket timeout all respect it.
     Authenticated Semantic Scholar requests retry one transient HTTP 429
-    inside the existing deadline, then allow the circuit breaker to engage.
+    inside the existing deadline. Cooldown is shared across endpoints/processes.
     Anonymous requests fail fast on HTTP 429.
     OpenAlex 429 is retried within the same bounded stage because concurrent
     evidence-gap searches can briefly exceed its burst allowance. Other
@@ -147,14 +129,10 @@ def _http_get_json(
     # The endpoint determines the provider; an absent key must not make an
     # S2 request look like an OpenAlex request or use OpenAlex's rate limit.
     is_s2 = "semanticscholar.org" in url
-    if is_s2 and _s2_circuit_open():
-        # A concurrent worker already tripped the breaker; don't queue
-        # behind an 8s rate-limit sleep for a doomed request.
-        raise RuntimeError("Semantic Scholar circuit is open (rate-limited)")
     request_interval = _S2_RATE_LIMIT if is_s2 else _OPENALEX_RATE_LIMIT
     last_exc = None
     for attempt in range(4):
-        _rate_limit(request_interval, deadline)
+        _rate_limit(request_interval, deadline, s2_api_key if is_s2 else None)
         req = urllib.request.Request(url)
         req.add_header("User-Agent", "HypoForge/0.1.0 (Academic Research)")
         if is_s2:
@@ -162,8 +140,8 @@ def _http_get_json(
         try:
             with _HTTP_OPENER.open(
                 req,
-                timeout=min(30.0, _remaining_seconds(deadline))
-                if deadline is not None else 30.0,
+                timeout=min(request_timeout, _remaining_seconds(deadline))
+                if deadline is not None else request_timeout,
             ) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 if deadline is not None:
@@ -173,13 +151,14 @@ def _http_get_json(
             last_exc = e
             if e.code == 429:
                 if is_s2:
+                    try:
+                        wait = max(request_interval, float(
+                            (e.headers or {}).get("Retry-After", request_interval * (attempt + 1))
+                        ))
+                    except (TypeError, ValueError):
+                        wait = request_interval * (attempt + 1)
+                    defer_requests(s2_api_key, wait)
                     if s2_api_key and attempt == 0:
-                        try:
-                            wait = max(request_interval, float(
-                                (e.headers or {}).get("Retry-After", request_interval)
-                            ))
-                        except (TypeError, ValueError):
-                            wait = request_interval
                         # Do not replace a genuine 429 with a local timeout
                         # when the provider asks us to wait beyond the budget.
                         if deadline is None or wait < deadline - time.monotonic():
@@ -236,7 +215,7 @@ def _s2_search(
 ) -> List[dict]:
     """Search Semantic Scholar, return standardised paper dicts."""
     params: Dict[str, str] = {
-        "query": query,
+        "query": relevance_query(query),
         "limit": str(min(limit, 100)),
         "fields": "title,year,authors,journal,externalIds,citationCount,abstract,openAccessPdf,isOpenAccess",
     }
@@ -440,19 +419,12 @@ def _oa_normalise(raw: dict) -> dict:
 def _search(query: str, limit: int = 20) -> List[dict]:
     """Dispatch search to the active backend.
 
-    When Semantic Scholar is persistently rate-limiting us (HTTP 429), a
-    circuit-breaker opens and subsequent calls fail fast for a cooldown period.
+    HTTP 429 creates a shared bounded cooldown, rather than disabling every
+    subsequent query for two minutes after a single unsuccessful retry.
     OpenAlex is not invoked here; it has its own independent source adapter.
     """
     deadline = time.monotonic() + _S2_STAGE_DEADLINE_SECONDS
-    if _s2_circuit_open():
-        raise RuntimeError("Semantic Scholar circuit is open (rate-limited)")
-    try:
-        return _s2_search(query, limit, _S2_API_KEY, deadline=deadline)
-    except urllib.error.HTTPError as exc:
-        if exc.code == 429:
-            _s2_circuit_break()
-        raise
+    return _s2_search(query, limit, _S2_API_KEY, deadline=deadline)
 
 
 def _fetch(identifier: str) -> dict:

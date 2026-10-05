@@ -280,6 +280,8 @@ class M6ReviewIteration(ModuleProtocol):
         gap_no_gain_limit: int = 3,
         semantic_alignment_timeout_seconds: float = 60.0,
         reviewer_timeout_seconds: float = 180.0,
+        reviewer_concurrency: int = 1,
+        reviewer_max_tokens: int = 8192,
         fast_mode: bool = False,
         **kwargs,
     ):
@@ -313,6 +315,10 @@ class M6ReviewIteration(ModuleProtocol):
             semantic_alignment_timeout_seconds
         )
         self.reviewer_timeout_seconds = float(reviewer_timeout_seconds)
+        if reviewer_concurrency < 1 or reviewer_max_tokens < 512:
+            raise ValueError("Reviewer concurrency and token budget must be positive")
+        self.reviewer_concurrency = int(reviewer_concurrency)
+        self.reviewer_max_tokens = int(reviewer_max_tokens)
         self.client = QwenClient.from_config(llm_config) if llm_config else None
         # Real configured runs receive the detailed semantic audits. Tests and
         # legacy callers that inject a fake client without an LLM config keep
@@ -1082,7 +1088,7 @@ class M6ReviewIteration(ModuleProtocol):
         )
         factual_verdict: Optional[EvidenceSufficiencyVerdict] = None
 
-        for dim in specialist_dims:
+        async def request_review(dim):
             context_purpose = (
                 "m6_feasibility"
                 if dim == "method_feasibility"
@@ -1113,6 +1119,9 @@ class M6ReviewIteration(ModuleProtocol):
                     M6_FORMAT_NOTE,
                 ) if p
             )
+            if self.reviewer_max_tokens < 8192:
+                system_prompt += ("\nKeep the complete review concise; cite evidence IDs "
+                                  "without repeating the supplied hypothesis, plan, or graph.")
             started_at = time.monotonic()
             emit_event(
                 "tool_started",
@@ -1141,7 +1150,7 @@ class M6ReviewIteration(ModuleProtocol):
                             gaps_count=len(graph.knowledge_gaps) if graph else 0,
                         ),
                         output_schema=ReviewResult.model_json_schema(),
-                        max_tokens=8192,
+                        max_tokens=self.reviewer_max_tokens,
                         temperature=getattr(self.llm_config, "temperature", 0.1),
                         disable_thinking=True,
                     ),
@@ -1152,6 +1161,31 @@ class M6ReviewIteration(ModuleProtocol):
                     f"M6 reviewer {dim!r} timed out after "
                     f"{self.reviewer_timeout_seconds:g} seconds"
                 ) from exc
+            return payload, started_at
+
+        async def review_results():
+            if self.reviewer_concurrency == 1:
+                for dim in specialist_dims:
+                    yield dim, await request_review(dim)
+                return
+            gate = asyncio.Semaphore(self.reviewer_concurrency)
+
+            async def limited(dim):
+                async with gate:
+                    return await request_review(dim)
+
+            tasks = [asyncio.create_task(limited(dim)) for dim in specialist_dims]
+            try:
+                results = await asyncio.gather(*tasks)
+                for dim, result in zip(specialist_dims, results):
+                    yield dim, result
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        async for dim, (payload, started_at) in review_results():
             payload = dict(payload)
             payload["dimension"] = dim
             payload["version"] = version

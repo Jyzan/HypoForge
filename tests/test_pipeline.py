@@ -4919,7 +4919,8 @@ async def test_m5_builds_a_focused_context_for_each_hypothesis(tmp_path) -> None
 
 
 @pytest.mark.asyncio
-async def test_m6_uses_reviewer_specific_context_purposes(tmp_path) -> None:
+@pytest.mark.parametrize("reviewer_concurrency", [1, 2])
+async def test_m6_uses_reviewer_specific_context_purposes(tmp_path, reviewer_concurrency) -> None:
     """Logic and method reviewers must receive independently planned context."""
 
     state = robot_state()
@@ -4936,9 +4937,15 @@ async def test_m6_uses_reviewer_specific_context_purposes(tmp_path) -> None:
     class ReviewerClient:
         def __init__(self) -> None:
             self.calls = []
+            self.active = self.peak = 0
 
         async def structured_chat(self, **kwargs):
+            import asyncio
             self.calls.append(kwargs)
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            await asyncio.sleep(.01)
+            self.active -= 1
             return {
                 "reasoning": "The hypothesis-plan pair is auditable.",
                 "score": 4.0,
@@ -4951,6 +4958,8 @@ async def test_m6_uses_reviewer_specific_context_purposes(tmp_path) -> None:
     module = M6ReviewIteration(
         reviewers=["scientific_logic", "method_feasibility"],
         fast_mode=True,
+        reviewer_concurrency=reviewer_concurrency,
+        reviewer_max_tokens=2048,
     )
     module.client = client
     recorder = RunEventRecorder(tmp_path / "m6-context", "m6-context")
@@ -4959,6 +4968,8 @@ async def test_m6_uses_reviewer_specific_context_purposes(tmp_path) -> None:
         await module(state)
 
     assert len(client.calls) == 2
+    assert client.peak == reviewer_concurrency
+    assert all(call["max_tokens"] == 2048 for call in client.calls)
     events = [
         event for event in recorder.read_events()
         if event["event_type"] == "llm_context_built"
@@ -5764,6 +5775,39 @@ async def test_m6_pair_semantic_audit_times_out_without_blocking() -> None:
             module._audit_pair_semantics(state, hypothesis(), plan),
             timeout=0.5,
         )
+
+
+@pytest.mark.asyncio
+async def test_m6_parallel_review_failure_cancels_other_provider_calls() -> None:
+    import asyncio
+    state = robot_state()
+    card = hypothesis()
+    state.top_hypotheses = [card]
+    state.research_plans = [ResearchPlan(
+        hypothesis_id=card.hypothesis_id, study_subjects="机械臂 sim-to-real 操控",
+        procedures=["执行仿真与现实对照实验。"], task_trace=card.task_trace,
+    )]
+
+    class Client:
+        calls = cancelled = 0
+        async def structured_chat(self, **kw):
+            self.calls += 1
+            number = self.calls
+            if number == 1:
+                await asyncio.sleep(.01)
+                raise RuntimeError("provider failed")
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
+
+    module = M6ReviewIteration(fast_mode=True, reviewer_concurrency=3)
+    module.client = Client()
+    with pytest.raises(RuntimeError, match="provider failed"):
+        await module(state)
+    assert module.client.calls == 3
+    assert module.client.cancelled == 2
 
 
 @pytest.mark.asyncio

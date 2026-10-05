@@ -62,8 +62,9 @@ export SEMANTIC_SCHOLAR_MIN_INTERVAL_SECONDS=5
 ```
 
 不要为文献 API 设置绕过代理的 `NO_PROXY` / `no_proxy` 规则。生成侧默认将
-Semantic Scholar 请求间隔限制为 5 秒；该变量不控制独立评分器，评分器串行执行，
-每个查询前等待 1 秒并在 429 时退避重试。先通过 `check` 并完成五学科试跑，再启动
+Semantic Scholar 请求间隔限制为 5 秒。搜索、论文详情和独立评分器共享按 Key
+划分的文件锁，同一台机器的不同进程也共用请求间隔及 429 冷却；不同机器不共享。
+该变量现在同样控制外部评分请求。先通过 `check` 并完成五学科试跑，再启动
 正式实验。独立 Key 不能保证永久没有 429；失败记录和断点恢复仍保留。
 
 本配置的生成检索来源固定为 Semantic Scholar 和 PubMed，默认关闭学科路由。
@@ -81,6 +82,19 @@ Semantic Scholar 不可用时，PubMed 对计算机和物理学科的覆盖可�
 原有百炼配置保留。`--api-key-file` 从 JSON 或包含一条 `sk-` Key 和一条 HTTPS
 接口地址的文本读取凭据，支持地址外围的中文引号，不把密钥写入配置或 manifest。
 
+2026-10-05 的首轮五学科试跑全部失败。修复版增加覆盖修复后的原子性重写和
+独立复审；Semantic Scholar 仍使用原 `/paper/search` 接口，但按其文档发送纯文本
+短关键词，避免强制 AND 拼接整条任务名与通用输出要求。M1 原始任务合同保留，
+检索及生成结果仍接受后续任务、证据和科学性检查。
+
+硅基流动配置将七候选生成拆为 2/2/2/1 小批次，保留全部候选的审查与前三选择；
+三个独立内部评审并发执行，每个评审的输出上限改为 2048 tokens。阶段时间上限
+及检索预算未改变，Semantic Scholar 单次查询等待与重试预算由 15 秒改为 25 秒，
+仍小于源检索的 30 秒上限。这些是明确记录的新生成条件，不是论文资源匹配复现。
+若 M4 恢复后仍没有有效模型候选，该配置直接记为失败；确定性降级候选不能导出
+为有效测评结果。终端显示各模块开始/结束，详细事件与阶段快照保存在每次尝试的
+`telemetry/` 目录。原失败目录保留，修复版必须使用新的输出目录。
+
 本地 Mac 可执行以下命令。`caffeinate -i` 在生成进程运行期间阻止空闲休眠；
 两条管线共享 8 个文本请求并发名额，M2 仍按顺序运行。
 
@@ -96,7 +110,7 @@ export SEMANTIC_SCHOLAR_API_KEY="$(cat '../semantic_scholar_api.txt')"
 export SEMANTIC_SCHOLAR_MIN_INTERVAL_SECONDS=5
 export HF_API_KEY_FILE="../llm_api.txt"
 export HF_CONFIG="configs/agentideabench_glm51_siliconflow.yaml"
-export HF_OUTPUT="output/agentideabench/glm51-siliconflow-pilot"
+export HF_OUTPUT="output/agentideabench/glm51-siliconflow-pilot-v2"
 
 python run_agentideabench.py --phase check --check-scope generation \
   --config "$HF_CONFIG" --api-key-file "$HF_API_KEY_FILE" && \

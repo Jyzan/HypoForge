@@ -190,30 +190,29 @@ def fake_s2_opener(monkeypatch, *, failures=1, retry_after="0"):
     monkeypatch.setattr(s2, "_HTTP_OPENER", opener)
     monkeypatch.setattr(s2, "_rate_limit", lambda *args: None)
     monkeypatch.setattr(s2, "_sleep_with_deadline", lambda seconds, deadline: waits.append(seconds))
-    monkeypatch.setattr(s2, "_s2_circuit_open_until", 0.0)
     monkeypatch.setattr(s2, "_S2_API_KEY", "test")
+    opener.cooldowns = []
+    monkeypatch.setattr(s2, "defer_requests", lambda key, seconds: opener.cooldowns.append((key, seconds)))
     return opener, waits
 
 
-def test_authenticated_s2_recovers_one_429_without_opening_circuit(monkeypatch):
+def test_authenticated_s2_recovers_one_429_with_shared_cooldown(monkeypatch):
     opener, waits = fake_s2_opener(monkeypatch)
     assert s2._search("test") == []
     assert opener.calls == 2
     assert waits == [s2._S2_RATE_LIMIT]
-    assert not s2._s2_circuit_open()
 
 
-def test_persistent_s2_429_opens_circuit_after_only_one_retry(monkeypatch):
+def test_persistent_s2_429_bounds_retries_without_disabling_later_queries(monkeypatch):
     opener, waits = fake_s2_opener(monkeypatch, failures=3)
     with pytest.raises(urllib.error.HTTPError) as error:
         s2._search("test")
     assert error.value.code == 429
     assert opener.calls == 2
     assert len(waits) == 1
-    assert s2._s2_circuit_open()
-    with pytest.raises(RuntimeError, match="circuit is open"):
-        s2._search("another test")
-    assert opener.calls == 2
+    assert len(opener.cooldowns) == 2
+    assert s2._search("another test") == []
+    assert opener.calls == 4
 
 
 @pytest.mark.parametrize("key,retry_after", [("", "0"), ("test", "60")])
@@ -227,7 +226,6 @@ def test_anonymous_or_out_of_budget_s2_429_fails_fast(monkeypatch, key, retry_af
 
 
 def test_s2_local_timeout_does_not_poison_later_queries(monkeypatch):
-    monkeypatch.setattr(s2, "_s2_circuit_open_until", 0.0)
 
     def timeout(*args, **kwargs):
         raise TimeoutError("Local rate-limit queue exhausted the deadline")
@@ -235,7 +233,6 @@ def test_s2_local_timeout_does_not_poison_later_queries(monkeypatch):
     monkeypatch.setattr(s2, "_s2_search", timeout)
     with pytest.raises(TimeoutError):
         s2._search("test")
-    assert not s2._s2_circuit_open()
     monkeypatch.setattr(s2, "_s2_search", lambda *args, **kwargs: [{"paper_id": "test"}])
     assert s2._search("next query") == [{"paper_id": "test"}]
 

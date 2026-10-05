@@ -22,6 +22,9 @@ a target count. Each must contain exactly one
 research object and one relation/action. Split mechanism, method, modification,
 environment, or evaluation tasks into separate questions. Do not use semicolons,
 parenthesized enumerations, parallel requests, or more than one question mark.
+Each sub-question must be at most 240 characters, including spaces. Preserve
+the requested work across the list rather than packing every detail into one
+long question. Do not repeat generic output instructions in every question.
 
 For an unfamiliar named artifact, coined term, model, instrument, or method
 whose existence/source is not established by the user's text, make the first
@@ -88,7 +91,8 @@ Current sub-questions:
 M1_COVERAGE_SUPPLEMENT_SYSTEM_PROMPT = """\
 Generate exactly one short atomic sub-question for each supplied missing
 aspect. Each result contains one research object, one relation/action, and at
-most one question mark. Do not introduce a concrete method not named by the
+most one question mark and at most 240 characters including spaces. Do not
+use semicolons or parenthesized enumerations. Do not introduce a concrete method not named by the
 user. Write every returned sub-question in scientific English, regardless of
 the language of the original question. Return JSON with only `sub_questions`.
 """
@@ -108,6 +112,10 @@ M1_COVERAGE_MERGE_SYSTEM_PROMPT = """\
 Merge only the over-fragmented groups described by the audit. Return the full
 sub-question list, preserve all unmerged questions and the original core
 action, keep every result atomic, and never return more than 5 sub-questions.
+Each result must be at most 240 characters including spaces, have at most one
+question mark, and contain no semicolon or parenthesized enumeration. Preserve
+distinct indispensable actions in separate concise questions when merging
+them would violate these limits. Never truncate or remove a required aspect.
 Write every returned sub-question in scientific English, regardless of the
 language of the original question.
 Return JSON with only `sub_questions`.

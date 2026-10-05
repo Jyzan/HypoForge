@@ -517,10 +517,13 @@ class QwenClient:
         if output_schema and isinstance(output_schema, dict):
             if output_schema.get("type") == "array":
                 array_wrapped = True
+                array_schema = dict(output_schema)
+                definitions = array_schema.pop("$defs", {})
                 output_schema = {
+                    "$defs": definitions,
                     "type": "object",
                     "properties": {
-                        "entries": output_schema,
+                        "entries": array_schema,
                     },
                     "required": ["entries"],
                 }
