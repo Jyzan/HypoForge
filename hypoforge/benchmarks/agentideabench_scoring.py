@@ -7,6 +7,7 @@ No AgentIdeaBench databases or HypoForge pipeline state are modified.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import os
@@ -43,8 +44,10 @@ def checked_scores(raw: dict) -> dict:
     return values
 
 
-async def preflight(config) -> bool:
+async def preflight(config, *, critic_config=None, scope="all") -> bool:
     """Local PDF decoding, then small model/embedding/retrieval requests."""
+    if scope not in ("all", "generation"):
+        raise ValueError("Check scope must be all or generation")
     await check_pdf_environment()
     from hypoforge.tools.qwen_client import QwenClient
     llm = QwenClient.from_config(config.qwen.base)
@@ -53,30 +56,53 @@ async def preflight(config) -> bool:
         temperature=0.0, disable_thinking=True)
     if response != {"ok": True}:
         raise ValueError("GLM-5.1 structured-output check failed")
-    print("glm-5.1 structured output / thinking disabled / seed=42: OK", flush=True)
+    print(f"{config.qwen.base.model} structured output / thinking disabled / seed={config.qwen.base.seed}: OK", flush=True)
     text_response = await llm.chat(
         user_prompt="Reply with OK", max_tokens=32,
         temperature=0.0, disable_thinking=True)
     if not text_response.strip():
         raise ValueError("GLM-5.1 text-output check returned an empty response")
-    print("glm-5.1 text output / submission export: OK", flush=True)
-    api = CriticAPI(config.qwen.base)
-    try:
-        for critic in CRITICS[1:]:
-            if not api.completion(critic, "", "Reply with OK", max_tokens=32).strip():
-                raise ValueError(f"{critic} returned an empty response")
-            print(f"{critic}: OK", flush=True)
-        if config.entity_embedding_model:
-            response = api.client.embeddings.create(model=config.entity_embedding_model, input="scientific hypothesis")
-            if not response.data or not response.data[0].embedding:
+    print(f"{config.qwen.base.model} text output / submission export: OK", flush=True)
+    if config.entity_embedding_model:
+        embedding_config = config.qwen.base.model_copy(deep=True)
+        embedding_config.api_base = (config.evaluation.embedding.base_url
+                                     or os.environ.get("ENTITY_EMBEDDING_BASE_URL")
+                                     or embedding_config.api_base)
+        embedding_config.api_key = (os.environ.get(config.evaluation.embedding.api_key_env_var)
+                                    or os.environ.get("ENTITY_EMBEDDING_API_KEY")
+                                    or embedding_config.api_key)
+        api = CriticAPI(embedding_config)
+        try:
+            response = api.client.embeddings.create(
+                model=config.entity_embedding_model,
+                input=["scientific hypothesis", "graph neural networks"],
+                encoding_format="float")
+            if len(response.data) != 2 or any(not item.embedding for item in response.data):
                 raise ValueError("Embedding check returned no vector")
             print(f"{config.entity_embedding_model}: OK", flush=True)
-    finally:
-        api.client.close()
+        finally:
+            api.client.close()
+    if scope == "all":
+        api = CriticAPI(critic_config or config.qwen.base)
+        try:
+            for critic in CRITICS:
+                if not api.completion(critic, "", "Reply with OK", max_tokens=32).strip():
+                    raise ValueError(f"{critic} returned an empty response")
+                print(f"External critic {critic}: OK", flush=True)
+        finally:
+            api.client.close()
+    else:
+        print("Generation-only check; external critics have not been checked", flush=True)
     # A search failure is distinct from an authenticated model-service failure.
     try:
-        hits = search_prior_art("graph neural networks")
-        print(f"Semantic Scholar date-filtered search: OK ({len(hits)} hits)", flush=True)
+        if scope == "generation":
+            from hypoforge.tools.semantic_scholar import _search
+            hits = await asyncio.to_thread(_search, "graph neural networks", 1)
+            label = "native search"
+        else:
+            hits = search_prior_art("graph neural networks")
+            label = "date-filtered search"
+        print(f"Semantic Scholar {label}: OK ({len(hits)} hits)", flush=True)
         return True
     except Exception as exc:
         print(f"Semantic Scholar check failed: {exc}", flush=True)

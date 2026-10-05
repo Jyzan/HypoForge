@@ -1,0 +1,67 @@
+# Separate generation condition: SiliconFlow GLM-5.1 + Qwen3 embeddings.
+# Original GLM/Qwen3.6-Plus/Kimi critics are supplied separately at score time.
+run_name: agentideabench-glm51-siliconflow
+output_dir: ./output/agentideabench
+verbose: false
+interactive: false
+advanced_model_tiers: false
+run_mode: standard
+
+pipeline:
+  enabled_modules: [m1, m2, m3, m4, m5, m6]
+  max_iterations: 3
+  max_evidence_gap_rounds: 1
+  enable_iteration: true
+  iteration_module_target: m3
+
+qwen:
+  base: &glm
+    model: Pro/zai-org/GLM-5.1
+    api_base: https://api.siliconflow.cn/v1
+    max_tokens: 8192
+    temperature: 0.7
+    enable_thinking: false
+    seed: 42
+    request_timeout_seconds: 180
+    max_retries: 2
+  max: *glm
+  plus: *glm
+  turbo: *glm
+
+search:
+  tools: [semantic_scholar, pubmed]
+  papers_per_sub_question: 20
+  max_papers_total: 100
+  max_rounds: 3
+  max_queries: 12
+  max_tokens: 100000
+  max_seconds: 900
+
+entity_embedding_model: Qwen/Qwen3-Embedding-8B
+evaluation:
+  embedding:
+    model_name: Qwen/Qwen3-Embedding-8B
+    api_key_env_var: ENTITY_EMBEDDING_API_KEY
+    base_url: https://api.siliconflow.cn/v1
+
+module_overrides:
+  m1:
+    kwargs: {mode: llm, llm_tier: base}
+  m2:
+    kwargs: {variant: integrated, llm_tier: base}
+  m3:
+    kwargs: {mode: llm, llm_tier: base}
+  m4:
+    kwargs: {mode: multi_agent, llm_tier: base, num_candidates: 7, top_k: 3}
+  m5:
+    kwargs: {mode: llm, llm_tier: base}
+  m6:
+    kwargs:
+      mode: llm
+      llm_tier: base
+      reviewers: [scientific_logic, objective_evidence_consistency, method_feasibility, overall]
+
+scoring:
+  auto_score: false
+memory_cache_dir: ""
+enabled_skills: []

@@ -73,6 +73,61 @@ Semantic Scholar 不可用时，PubMed 对计算机和物理学科的覆盖可�
 
 ## 先做五学科试跑
 
+### 硅基流动生成试跑，外部评分暂缓
+
+`configs/agentideabench_glm51_siliconflow.yaml` 保留完整 M1–M6、搜索预算、候选数、
+迭代数和种子，使用 `Pro/zai-org/GLM-5.1`，实体规范化和证据一致性嵌入均改为
+`Qwen/Qwen3-Embedding-8B`。这是新的提供商及嵌入条件，必须使用独立输出目录。
+原有百炼配置保留。`--api-key-file` 从 JSON 或包含一条 `sk-` Key 和一条 HTTPS
+接口地址的文本读取凭据，支持地址外围的中文引号，不把密钥写入配置或 manifest。
+
+本地 Mac 可执行以下命令。`caffeinate -i` 在生成进程运行期间阻止空闲休眠；
+两条管线共享 8 个文本请求并发名额，M2 仍按顺序运行。
+
+```bash
+cd "/Users/jiangyi/Desktop/HypoForge课题文件/HypoForge"
+source .venv/bin/activate
+export http_proxy="http://127.0.0.1:7890"
+export https_proxy="$http_proxy"
+export HTTP_PROXY="$http_proxy"
+export HTTPS_PROXY="$https_proxy"
+unset no_proxy NO_PROXY
+export SEMANTIC_SCHOLAR_API_KEY="$(cat '../semantic_scholar_api.txt')"
+export SEMANTIC_SCHOLAR_MIN_INTERVAL_SECONDS=5
+export HF_API_KEY_FILE="../llm_api.txt"
+export HF_CONFIG="configs/agentideabench_glm51_siliconflow.yaml"
+export HF_OUTPUT="output/agentideabench/glm51-siliconflow-pilot"
+
+python run_agentideabench.py --phase check --check-scope generation \
+  --config "$HF_CONFIG" --api-key-file "$HF_API_KEY_FILE" && \
+caffeinate -i python -u run_agentideabench.py --sample pilot --repeats 1 \
+  --workers 2 --llm-concurrency 8 --config "$HF_CONFIG" \
+  --api-key-file "$HF_API_KEY_FILE" --output-dir "$HF_OUTPUT"
+```
+
+`--check-scope generation` 校验 PDF、GLM JSON/普通文本、嵌入和 Semantic Scholar，
+明确跳过外部评审。请求预检通过后可以开始生成试跑，但不能代替 M1–M6 的真实
+执行验证。先检查五项的 `generation_summary.json` 和各项 `result.json`；M1 覆盖
+检查或 M2 证据获取仍失败时，保留记录并处理原因，再扩大实验。
+
+外部评分保持原三评审 GLM-5.1、Qwen3.6-Plus、Kimi-K2.6，暂不运行 `score/analyze`。
+原服务恢复后先做完整预检，并传入独立评审凭据：
+
+```bash
+python run_agentideabench.py --phase check --config "$HF_CONFIG" \
+  --api-key-file "$HF_API_KEY_FILE" --critic-api-key-csv "../默认业务空间-apiKey-6225319.csv" && \
+python run_agentideabench.py --phase score --sample pilot --workers 3 \
+  --config "$HF_CONFIG" --api-key-file "$HF_API_KEY_FILE" \
+  --critic-api-key-csv "../默认业务空间-apiKey-6225319.csv" --output-dir "$HF_OUTPUT"
+python run_agentideabench.py --phase analyze --sample pilot --output-dir "$HF_OUTPUT"
+```
+
+`--embedding-api-key-csv` / `--embedding-api-key-file` 可指定独立嵌入凭据；默认沿用
+生成凭据。`--embedding-model` 是显式模型替换，同时更新实体规范化和一致性评估的
+模型名称，并改变实验指纹。切换接口不会自动替换原配置中的嵌入模型或三位评审。
+
+### 原百炼配置
+
 试跑选用公开评分数据中每个学科按子领域名称排序后的第一个子领域，各运行一次。
 该子集是本入口固定的工程试跑集，不是原论文的 20 子领域 pilot。
 

@@ -15,12 +15,14 @@ from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 DOMAINS = ("Biology", "CS", "Chemistry", "Medicine", "Physics")
 CRITICS = ("glm-5.1", "qwen3.6-plus", "kimi-k2.6")
 WEIGHTS = {"originality": 2.0, "feasibility": 1.0, "clarity": 0.5,
            "impact": 1.5, "specificity": 0.5}
 CUTOFF = "2026-05-31"
+GENERATION_MODELS = {"glm-5.1", "Pro/zai-org/GLM-5.1"}
 QUESTION = "Propose a novel, specific, and testable scientific hypothesis in the following research subfield: {subdomain}."
 EXPORT_SYSTEM = """You serialize an existing scientific hypothesis for evaluation.
 Return exactly one English paragraph of 80–150 whitespace-separated words,
@@ -120,24 +122,44 @@ def source_revision(root: Path) -> str:
     return result.stdout.strip() if result.returncode == 0 else "unknown"
 
 
-def configure(config_path: Path, csv_path: str | None):
+def configure(config_path: Path, csv_path: str | None, *, api_key_file: str | None = None,
+              embedding_csv: str | None = None, embedding_file: str | None = None,
+              embedding_model: str | None = None):
     from hypoforge.config import PipelineConfig
     from hypoforge.tools.qwen_client import QwenClient  # load .env before explicit CLI credentials
-    from hypoforge.tools.credentials import read_api_key_csv
+    from hypoforge.tools.credentials import read_api_key_csv, read_api_key_file
 
     config = PipelineConfig.from_yaml(config_path)
-    if csv_path:
-        key, base = read_api_key_csv(csv_path)
+    if csv_path and api_key_file:
+        raise ValueError("Use one generation credential file: CSV or text")
+    if embedding_csv and embedding_file:
+        raise ValueError("Use one embedding credential file: CSV or text")
+    generation_credentials = (read_api_key_csv(csv_path) if csv_path else
+                              read_api_key_file(api_key_file) if api_key_file else None)
+    if generation_credentials:
+        key, base = generation_credentials
         for tier in (config.qwen.base, config.qwen.max, config.qwen.plus, config.qwen.turbo):
             tier.api_key, tier.api_base = key, base
+            if urlparse(base).hostname == "api.siliconflow.cn" and tier.model == "glm-5.1":
+                tier.model = "Pro/zai-org/GLM-5.1"
+    embedding_credentials = (read_api_key_csv(embedding_csv) if embedding_csv else
+                             read_api_key_file(embedding_file) if embedding_file else
+                             generation_credentials)
+    if embedding_credentials:
+        key, base = embedding_credentials
         # The entity-normalization embedding client resolves credentials via env.
         os.environ["ENTITY_EMBEDDING_API_KEY"] = key
         os.environ["ENTITY_EMBEDDING_BASE_URL"] = base
         config.evaluation.embedding.base_url = base
+    if embedding_model is not None:
+        if not embedding_model.strip():
+            raise ValueError("Embedding model must be nonempty")
+        config.entity_embedding_model = embedding_model.strip()
+        config.evaluation.embedding.model_name = embedding_model.strip()
     config.interactive = False
     config.scoring.auto_score = False
     for tier in (config.qwen.base, config.qwen.max, config.qwen.plus, config.qwen.turbo):
-        if tier.model != "glm-5.1" or tier.enable_thinking is not False or tier.seed is None:
+        if tier.model not in GENERATION_MODELS or tier.enable_thinking is not False or tier.seed is None:
             raise ValueError("This experiment requires glm-5.1, enable_thinking=false and an explicit seed in every model tier")
     if config.run_mode != "standard" or config.enabled_modules != ["m1", "m2", "m3", "m4", "m5", "m6"]:
         raise ValueError("The benchmark adapter requires the complete standard M1–M6 pipeline")
@@ -149,6 +171,7 @@ def prepare_manifest(output: Path, root: Path, config, topics: list[dict], repea
     repo = Path(__file__).resolve().parents[2]
     source_files = [
         Path(__file__), repo / "hypoforge/tools/qwen_client.py",
+        repo / "hypoforge/tools/credentials.py",
         repo / "hypoforge/evaluation/metrics.py",
         repo / "hypoforge/modules/m1_problem_understanding.py",
         repo / "hypoforge/tools/semantic_scholar.py",
