@@ -72,6 +72,10 @@ class LLMConfig(BaseModel):
     temperature: float = 0.1
     request_timeout_seconds: float = Field(default=120.0, ge=1.0)
     max_retries: int = Field(default=1, ge=0, le=5)
+    # Explicit provider parameters survive structured-output fallback retries.
+    # None preserves the existing provider defaults for ordinary runs.
+    enable_thinking: Optional[bool] = None
+    seed: Optional[int] = None
 
     @model_validator(mode="after")
     def _resolve_env(self) -> "LLMConfig":
@@ -324,6 +328,8 @@ class PipelineConfig(BaseModel):
                 tier.model = base.model
                 tier.api_base = base.api_base
                 tier.api_key = base.api_key
+                tier.enable_thinking = base.enable_thinking
+                tier.seed = base.seed
         return self
 
     # ------------------------------------------------------------------

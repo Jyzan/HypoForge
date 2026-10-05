@@ -126,6 +126,11 @@ python run_hypoforge.py -q "..." --no-interactive
 
 The default configuration is <code>configs/default.yaml</code>. Use <code>--config</code> to select another YAML file. Standard mode enables M1–M6 and allows evidence collection and quality review iterations according to the configuration.
 
+For GLM-5.1 experiments on AgentIdeaBench, use `run_agentideabench.py` with
+`configs/agentideabench_glm51.yaml`. It supports isolated repeats, resumable
+generation, independent lit8d scoring, and historical baseline comparison.
+See the [experiment guide](AGENTIDEABENCH.md) for commands and protocol details.
+
 ## Web interface
 
 Start the local web interface:

@@ -125,6 +125,10 @@ python run_hypoforge.py -q "..." --no-interactive
 
 默认配置为 `configs/default.yaml`，也可以通过 `--config` 指定其他 YAML 配置。标准模式默认启用 M1–M6，并允许按配置进行证据补充和质量迭代。
 
+GLM-5.1 的 AgentIdeaBench 批量实验使用 `run_agentideabench.py` 和
+`configs/agentideabench_glm51.yaml`，支持独立重复、恢复、外部评分及历史基线比较。
+启动步骤与实验规则见 [AgentIdeaBench 实验说明](AGENTIDEABENCH.md)。
+
 ## Web 界面
 
 启动本地 Web 界面：

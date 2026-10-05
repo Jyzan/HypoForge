@@ -23,7 +23,7 @@ pytest-timeout>=2.0
 
 # Agentic M2 + full-text reading (Track A — enabled)
 arxiv>=2.1
-httpx>=0.27
+httpx[socks]>=0.27
 pypdf>=4.0
 tiktoken>=0.7
 rank-bm25>=0.2

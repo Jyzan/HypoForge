@@ -223,6 +223,8 @@ class QwenClient:
         api_base: str = "",
         request_timeout_seconds: float = 120.0,
         max_retries: int = 1,
+        enable_thinking: Optional[bool] = None,
+        seed: Optional[int] = None,
     ):
         self.model = model
         self.api_key = api_key or os.environ.get("QWEN_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
@@ -233,6 +235,8 @@ class QwenClient:
         )
         self.request_timeout_seconds = max(1.0, float(request_timeout_seconds))
         self.max_retries = max(0, int(max_retries))
+        self.enable_thinking = enable_thinking
+        self.seed = seed
 
     @classmethod
     def get_token_totals(cls) -> tuple[int, int]:
@@ -258,6 +262,8 @@ class QwenClient:
                 llm_config, "request_timeout_seconds", 120.0
             ),
             max_retries=getattr(llm_config, "max_retries", 1),
+            enable_thinking=getattr(llm_config, "enable_thinking", None),
+            seed=getattr(llm_config, "seed", None),
         )
 
     def list_models(self) -> list[str]:
@@ -311,16 +317,25 @@ class QwenClient:
         merged_kwargs: Dict[str, Any] = dict(model_kwargs or {})
         caller_extra_body = merged_kwargs.pop("extra_body", None)
         extra_body: Dict[str, Any] = {}
-        if disable_thinking:
-            extra_body["thinking"] = {"type": "disabled"}
         if caller_extra_body:
             extra_body.update(dict(caller_extra_body))
+        if self.enable_thinking is not None:
+            # Bailian GLM uses enable_thinking, not thinking.type. Keep the
+            # explicit experiment setting even when JSON mode is retried.
+            extra_body["enable_thinking"] = self.enable_thinking
+        elif disable_thinking:
+            if "aliyuncs.com" in self.api_base:
+                extra_body["enable_thinking"] = False
+            else:
+                extra_body["thinking"] = {"type": "disabled"}
 
         chat_kwargs: Dict[str, Any] = {}
         if merged_kwargs:
             chat_kwargs["model_kwargs"] = merged_kwargs
         if extra_body:
             chat_kwargs["extra_body"] = extra_body
+        if self.seed is not None:
+            chat_kwargs["seed"] = self.seed
 
         return ChatOpenAI(
             model=self.model,
