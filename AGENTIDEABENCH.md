@@ -48,6 +48,23 @@ Semantic Scholar 的匿名访问可能限流；外部评分检索收到 429、�
 本入口会保留错误并停止该条评分，不将其当成“没有相关文献”。模型检查通过而
 检索检查失败时，先处理网络、限流或检索凭据，再进行完整评分。
 
+生成侧 Semantic Scholar/OpenAlex 和外部评分均遵循代理环境变量，不强制直连。
+本机使用 7890 端口代理，Semantic Scholar Key 文件是单行明文时，可在启动前执行：
+
+```bash
+export http_proxy="http://127.0.0.1:7890"
+export https_proxy="$http_proxy"
+export HTTP_PROXY="$http_proxy"
+export HTTPS_PROXY="$https_proxy"
+export SEMANTIC_SCHOLAR_API_KEY="$(cat '../semantic_scholar_api.txt')"
+export SEMANTIC_SCHOLAR_MIN_INTERVAL_SECONDS=5
+```
+
+不要为文献 API 设置绕过代理的 `NO_PROXY` / `no_proxy` 规则。生成侧默认将
+Semantic Scholar 请求间隔限制为 5 秒；该变量不控制独立评分器，评分器串行执行，
+每个查询前等待 1 秒并在 429 时退避重试。先通过 `check` 并完成五学科试跑，再启动
+正式实验。独立 Key 不能保证永久没有 429；失败记录和断点恢复仍保留。
+
 ## 先做五学科试跑
 
 试跑选用公开评分数据中每个学科按子领域名称排序后的第一个子领域，各运行一次。

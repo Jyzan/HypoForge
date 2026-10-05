@@ -11866,7 +11866,7 @@ def test_openalex_retries_transient_429_within_stage_deadline(
 
     opener = Opener()
     waits = []
-    monkeypatch.setattr(semantic_scholar, "_NO_PROXY_OPENER", opener)
+    monkeypatch.setattr(semantic_scholar, "_HTTP_OPENER", opener)
     monkeypatch.setattr(semantic_scholar, "_rate_limit", lambda *args: None)
     monkeypatch.setattr(
         semantic_scholar,

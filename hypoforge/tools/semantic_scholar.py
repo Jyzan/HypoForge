@@ -94,9 +94,9 @@ _OPENALEX_RATE_LIMIT = max(
 _last_request_time: float = 0.0
 _rate_limit_lock = threading.Lock()
 
-# Bypass the system proxy (e.g. Clash on 127.0.0.1:7897) for the API.
-# A shared proxy exit IP can trip Semantic Scholar's per-IP limits.
-_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# Honor HTTP(S)_PROXY / NO_PROXY, matching the external benchmark scorer.
+# Forcing direct connections can break a working VPN route.
+_HTTP_OPENER = urllib.request.build_opener()
 
 # Cap on the S2 stage of a search: rate-limit sleep + request + retries must
 # fit inside the agent's per-source timeout (default 30.0s).
@@ -158,7 +158,7 @@ def _http_get_json(
         if is_s2:
             req.add_header("x-api-key", s2_api_key)
         try:
-            with _NO_PROXY_OPENER.open(
+            with _HTTP_OPENER.open(
                 req,
                 timeout=min(30.0, _remaining_seconds(deadline))
                 if deadline is not None else 30.0,
