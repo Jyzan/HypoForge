@@ -55,13 +55,13 @@ async def preflight(config, *, critic_config=None, scope="all") -> bool:
         user_prompt='Return exactly this JSON object: {"ok": true}', max_tokens=64,
         temperature=0.0, disable_thinking=True)
     if response != {"ok": True}:
-        raise ValueError("GLM-5.1 structured-output check failed")
+        raise ValueError(f"{config.qwen.base.model} structured-output check failed")
     print(f"{config.qwen.base.model} structured output / thinking disabled / seed={config.qwen.base.seed}: OK", flush=True)
     text_response = await llm.chat(
         user_prompt="Reply with OK", max_tokens=32,
         temperature=0.0, disable_thinking=True)
     if not text_response.strip():
-        raise ValueError("GLM-5.1 text-output check returned an empty response")
+        raise ValueError(f"{config.qwen.base.model} text-output check returned an empty response")
     print(f"{config.qwen.base.model} text output / submission export: OK", flush=True)
     if config.entity_embedding_model:
         embedding_config = config.qwen.base.model_copy(deep=True)

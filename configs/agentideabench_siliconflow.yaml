@@ -1,6 +1,6 @@
-# Separate generation condition: SiliconFlow GLM-5.1 + Qwen3 embeddings.
-# Original GLM/Qwen3.6-Plus/Kimi critics are supplied separately at score time.
-run_name: agentideabench-glm51-siliconflow
+# Separate generation condition: SiliconFlow generation model + Qwen3 embeddings.
+# Original GLM-5.1/Qwen3.6-Plus/Kimi-K2.6 critics are supplied separately at score time.
+run_name: agentideabench-siliconflow
 output_dir: ./output/agentideabench
 verbose: false
 interactive: false
@@ -18,8 +18,9 @@ pipeline:
   iteration_module_target: m3
 
 qwen:
-  base: &glm
-    model: Pro/zai-org/GLM-5.1
+  # The model ID is read from HYPOFORGE_MODEL in .env, using SiliconFlow
+  # naming (e.g. Pro/zai-org/GLM-5.1).
+  base: &llm
     api_base: https://api.siliconflow.cn/v1
     max_tokens: 8192
     temperature: 0.7
@@ -27,9 +28,9 @@ qwen:
     seed: 42
     request_timeout_seconds: 180
     max_retries: 2
-  max: *glm
-  plus: *glm
-  turbo: *glm
+  max: *llm
+  plus: *llm
+  turbo: *llm
 
 search:
   tools: [semantic_scholar, pubmed]

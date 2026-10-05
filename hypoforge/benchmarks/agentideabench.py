@@ -8,6 +8,7 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import statistics
 import subprocess
 import time
@@ -22,7 +23,6 @@ CRITICS = ("glm-5.1", "qwen3.6-plus", "kimi-k2.6")
 WEIGHTS = {"originality": 2.0, "feasibility": 1.0, "clarity": 0.5,
            "impact": 1.5, "specificity": 0.5}
 CUTOFF = "2026-05-31"
-GENERATION_MODELS = {"glm-5.1", "Pro/zai-org/GLM-5.1"}
 QUESTION = "Propose a novel, specific, and testable scientific hypothesis in the following research subfield: {subdomain}."
 EXPORT_SYSTEM = """You serialize an existing scientific hypothesis for evaluation.
 Return exactly one English paragraph of 80–150 whitespace-separated words,
@@ -99,7 +99,12 @@ def select_topics(root: Path, sample: str, limit: int | None = None) -> list[dic
 
 
 def item_id(topic: dict, index: int) -> str:
-    return "hf-glm51-" + digest([topic["domain"], topic["subdomain"], index])[:20]
+    return "hf-" + digest([topic["domain"], topic["subdomain"], index])[:20]
+
+
+def model_slug(model: str) -> str:
+    """Directory-safe short name, e.g. Pro/zai-org/GLM-5.1 -> glm51."""
+    return re.sub(r"[^a-z0-9]+", "", model.rsplit("/", 1)[-1].lower()) or "model"
 
 
 def cells(topics: list[dict], repeats: int):
@@ -122,6 +127,15 @@ def source_revision(root: Path) -> str:
     return result.stdout.strip() if result.returncode == 0 else "unknown"
 
 
+def configured_model(config_path: Path) -> str | None:
+    """Generation model: qwen.base.model in the config, else HYPOFORGE_MODEL."""
+    import hypoforge.config  # noqa: F401  (loads .env)
+    import yaml
+    raw = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
+    model = ((raw.get("qwen") or {}).get("base") or {}).get("model") or os.environ.get("HYPOFORGE_MODEL", "")
+    return model.strip() or None
+
+
 def configure(config_path: Path, csv_path: str | None, *, api_key_file: str | None = None,
               embedding_csv: str | None = None, embedding_file: str | None = None,
               embedding_model: str | None = None):
@@ -129,6 +143,8 @@ def configure(config_path: Path, csv_path: str | None, *, api_key_file: str | No
     from hypoforge.tools.qwen_client import QwenClient  # load .env before explicit CLI credentials
     from hypoforge.tools.credentials import read_api_key_csv, read_api_key_file
 
+    if configured_model(config_path) is None:
+        raise ValueError("Set HYPOFORGE_MODEL in .env (or qwen.base.model in the config) to choose the generation model")
     config = PipelineConfig.from_yaml(config_path)
     if csv_path and api_key_file:
         raise ValueError("Use one generation credential file: CSV or text")
@@ -140,8 +156,6 @@ def configure(config_path: Path, csv_path: str | None, *, api_key_file: str | No
         key, base = generation_credentials
         for tier in (config.qwen.base, config.qwen.max, config.qwen.plus, config.qwen.turbo):
             tier.api_key, tier.api_base = key, base
-            if urlparse(base).hostname == "api.siliconflow.cn" and tier.model == "glm-5.1":
-                tier.model = "Pro/zai-org/GLM-5.1"
     embedding_credentials = (read_api_key_csv(embedding_csv) if embedding_csv else
                              read_api_key_file(embedding_file) if embedding_file else
                              generation_credentials)
@@ -159,8 +173,8 @@ def configure(config_path: Path, csv_path: str | None, *, api_key_file: str | No
     config.interactive = False
     config.scoring.auto_score = False
     for tier in (config.qwen.base, config.qwen.max, config.qwen.plus, config.qwen.turbo):
-        if tier.model not in GENERATION_MODELS or tier.enable_thinking is not False or tier.seed is None:
-            raise ValueError("This experiment requires glm-5.1, enable_thinking=false and an explicit seed in every model tier")
+        if tier.model != config.qwen.base.model or tier.enable_thinking is not False or tier.seed is None:
+            raise ValueError("This experiment requires one model, enable_thinking=false and an explicit seed in every model tier")
     if config.run_mode != "standard" or config.enabled_modules != ["m1", "m2", "m3", "m4", "m5", "m6"]:
         raise ValueError("The benchmark adapter requires the complete standard M1–M6 pipeline")
     return config
@@ -381,7 +395,7 @@ async def _generate(output: Path, root: Path, config, topics: list[dict], repeat
         if old:
             history.append({k: old[k] for k in ("status", "attempt", "error", "elapsed_seconds",
                                                "pipeline_usage", "export_usage", "state_path") if k in old})
-        record = {**cell, "idea_model": "HypoForge/glm-5.1", "track": "HypoForge-native",
+        record = {**cell, "idea_model": f"HypoForge/{config.qwen.base.model}", "track": "HypoForge-native",
                   "status": "pipeline_failed", "started_at": now(), "attempt": old.get("attempt", 0) + 1}
         record["generation_seed"] = config.qwen.base.seed + cell["idea_index"] - 1
         record["attempt_history"] = history
@@ -459,19 +473,38 @@ async def _generate(output: Path, root: Path, config, topics: list[dict], repeat
     return summary["complete"]
 
 
-def historical_baseline(root: Path) -> dict:
+def baseline_model(root: Path, model: str | None) -> str | None:
+    """Released Active-track model matching the generation model.
+
+    AGENTIDEABENCH_BASELINE_MODEL overrides the match; otherwise the final
+    path segment is compared case-insensitively (glm-5.1 -> z-ai/glm-5.1).
+    """
+    override = os.environ.get("AGENTIDEABENCH_BASELINE_MODEL", "").strip()
+    if override or not model:
+        return override or None
+    name = model.rsplit("/", 1)[-1].lower()
+    matches = sorted({row["idea_model"] for row in released_scores(root)
+                      if row["idea_model"].rsplit("/", 1)[-1].lower() == name})
+    return matches[0] if len(matches) == 1 else None
+
+
+def historical_baseline(root: Path, model: str | None) -> tuple[str | None, dict]:
+    """Released model ID and its per-cell lit8d Active-track dimensions."""
     ratings = defaultdict(lambda: defaultdict(list))
+    release_model = baseline_model(root, model)
+    if release_model is None:
+        return None, {}
     for row in released_scores(root):
-        if row["idea_model"] != "z-ai/glm-5.1" or row["track"] != "C":
+        if row["idea_model"] != release_model or row["track"] != "C":
             continue
         key = (row["domain"], row["subdomain"], int(row["idea_index"]))
         for dimension in WEIGHTS:
             value = row.get("score_" + dimension)
             if value:
                 ratings[key][dimension].append(float(value))
-    return {key: {dimension: statistics.mean(sorted(values)[:-1] if len(values) > 1 else values)
-                  for dimension, values in dimensions.items()}
-            for key, dimensions in ratings.items()}
+    return release_model, {key: {dimension: statistics.mean(sorted(values)[:-1] if len(values) > 1 else values)
+                                 for dimension, values in dimensions.items()}
+                           for key, dimensions in ratings.items()}
 
 
 def weighted(dimensions: dict) -> float:
@@ -488,7 +521,8 @@ def analyze(output: Path, root: Path) -> bool:
     if release_sha and release_sha != hashlib.sha256(
             (root / "release_data/core/lit8d_scores_3seed.csv.gz").read_bytes()).hexdigest():
         raise ValueError("Historical baseline data changed since generation")
-    baseline = historical_baseline(root)
+    generation_model = ((manifest["protocol"].get("config") or {}).get("qwen") or {}).get("base", {}).get("model")
+    release_model, baseline = historical_baseline(root, generation_model)
     per_cell, missing = {}, []
     for cell in manifest["expected_cells"]:
         try:
@@ -507,6 +541,7 @@ def analyze(output: Path, root: Path) -> bool:
             missing.append({**cell, "reason": str(exc)})
     report = {"complete": not missing, "scored_cells": len(per_cell), "expected_cells": len(manifest["expected_cells"]),
               "missing": missing, "resource_setting": "native", "critic_base_url": score_manifest["base_url"],
+              "generation_model": generation_model, "historical_baseline_model": release_model,
               "historical_comparison": "cross-provider, current retrieval; not resource-matched"}
     # Never turn missing or failed cells into an apparently complete headline score.
     if not missing:
@@ -522,23 +557,27 @@ def analyze(output: Path, root: Path) -> bool:
         base_means = {key: {d: statistics.mean(v[d] for v in values) for d in WEIGHTS}
                       for key, values in base_topic.items()}
         dims = {d: statistics.mean(v[d] for v in means.values()) for d in WEIGHTS}
-        base_dims = {d: statistics.mean(v[d] for v in base_means.values()) for d in WEIGHTS}
-        report.update(dimensions=dims, weighted_total=weighted(dims), historical_baseline=weighted(base_dims),
-                      delta=weighted(dims) - weighted(base_dims),
-                      win_rate=statistics.mean(weighted(means[k]) > weighted(base_means[k]) for k in means),
+        # Without released rows for this model, report the absolute score only.
+        compare = bool(means) and all(k in base_means for k in means)
+        report.update(dimensions=dims, weighted_total=weighted(dims),
                       table2_comparable_sample=len(means) == 40 and manifest["protocol"]["repeats"] == 3)
+        if compare:
+            base_dims = {d: statistics.mean(base_means[k][d] for k in means) for d in WEIGHTS}
+            report.update(historical_baseline=weighted(base_dims), delta=weighted(dims) - weighted(base_dims),
+                          win_rate=statistics.mean(weighted(means[k]) > weighted(base_means[k]) for k in means))
         # Paired bootstrap over subfields; independent repeats are averaged first.
         import random
         rng = random.Random(42)
         totals = [weighted(v) for v in means.values()]
-        differences = [weighted(means[k]) - weighted(base_means[k]) for k in means]
         samples = [([rng.randrange(len(totals)) for _ in totals]) for _ in range(5000)]
         total_samples = sorted(statistics.mean(totals[i] for i in indices) for indices in samples)
-        delta_samples = sorted(statistics.mean(differences[i] for i in indices) for indices in samples)
         report["weighted_total_ci95"] = [total_samples[125], total_samples[4874]]
-        report["delta_ci95"] = [delta_samples[125], delta_samples[4874]]
-        report["per_subdomain"] = [{"domain": k[0], "subdomain": k[1], "dimensions": value,
-                                   "total": weighted(value), "baseline_total": weighted(base_means[k])}
+        if compare:
+            differences = [weighted(means[k]) - weighted(base_means[k]) for k in means]
+            delta_samples = sorted(statistics.mean(differences[i] for i in indices) for indices in samples)
+            report["delta_ci95"] = [delta_samples[125], delta_samples[4874]]
+        report["per_subdomain"] = [{"domain": k[0], "subdomain": k[1], "dimensions": value, "total": weighted(value),
+                                   "baseline_total": weighted(base_means[k]) if compare else None}
                                   for k, value in means.items()]
     write_json(output / "comparison.json", report)
     print(json.dumps({k: v for k, v in report.items() if k not in ("missing", "per_subdomain")}, ensure_ascii=False, indent=2))

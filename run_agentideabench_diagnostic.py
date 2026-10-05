@@ -82,7 +82,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--after", choices=("m3", "m4"), required=True)
-    parser.add_argument("--config", type=Path, default=Path("configs/agentideabench_glm51_siliconflow.yaml"))
+    parser.add_argument("--config", type=Path, default=Path("configs/agentideabench_siliconflow.yaml"))
     parser.add_argument("--api-key-file", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--llm-concurrency", type=int, default=4)

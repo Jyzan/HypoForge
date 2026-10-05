@@ -171,7 +171,7 @@ def scoring_fixture(tmp_path, monkeypatch):
     bench.write_json(tmp_path / "score_manifest.json", {"generation_fingerprint": "test", "base_url": "test"})
     bench.write_json(tmp_path / "cells" / cell["item_id"] / "result.json", {"status": "success", "idea_text": "idea"})
     baseline = {(topic["domain"], topic["subdomain"], i): {d: 5 for d in bench.WEIGHTS} for i in (1, 2, 3)}
-    monkeypatch.setattr(bench, "historical_baseline", lambda root: baseline)
+    monkeypatch.setattr(bench, "historical_baseline", lambda root, model: ("z-ai/glm-5.1", baseline))
     return cell
 
 
@@ -191,6 +191,19 @@ def test_aggregation_trims_per_dimension(tmp_path, monkeypatch):
     assert report["table2_comparable_sample"] is False
 
 
+def test_model_without_released_baseline_reports_absolute_score_only(tmp_path, monkeypatch):
+    cell = scoring_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(bench, "historical_baseline", lambda root, model: (None, {}))
+    for critic in bench.CRITICS:
+        bench.write_json(tmp_path / "scores" / cell["item_id"] / f"{critic}.json",
+                         {"scores": {d: 6 for d in bench.WEIGHTS}, "idea_sha256": bench.digest("idea")})
+    assert bench.analyze(tmp_path, tmp_path)
+    report = bench.read_json(tmp_path / "comparison.json")
+    assert report["weighted_total"] == 6
+    assert report["historical_baseline_model"] is None
+    assert "historical_baseline" not in report and "delta_ci95" not in report
+
+
 def test_missing_critic_prevents_headline_score(tmp_path, monkeypatch):
     cell = scoring_fixture(tmp_path, monkeypatch)
     bench.write_json(tmp_path / "scores" / cell["item_id"] / "glm-5.1.json",
@@ -206,7 +219,8 @@ def test_upstream_table2_baseline_when_release_is_present():
         pytest.skip("Optional adjacent AgentIdeaBench checkout is absent")
     topics = bench.scored_topics(root)
     assert len(topics) == 40
-    scores = bench.historical_baseline(root)
+    model, scores = bench.historical_baseline(root, "Pro/zai-org/GLM-5.1")
+    assert model == "z-ai/glm-5.1"
     assert len(scores) == 120
     total = sum(bench.weighted(value) for value in scores.values()) / len(scores)
     assert total == pytest.approx(6.3326, abs=0.0001)

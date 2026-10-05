@@ -1,11 +1,15 @@
 #!/usr/bin/env python
-"""Run, independently score, and compare GLM-5.1 HypoForge experiments."""
+"""Run, independently score, and compare HypoForge experiments.
+
+The generation model is read from HYPOFORGE_MODEL in .env.
+"""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 def main() -> int:
@@ -13,7 +17,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--phase", choices=("check", "generate", "score", "analyze"), default="generate")
     parser.add_argument("--agentideabench-root", type=Path, default=repo.parent / "AgentIdeaBench")
-    parser.add_argument("--config", type=Path, default=repo / "configs/agentideabench_glm51.yaml")
+    parser.add_argument("--config", type=Path, default=repo / "configs/agentideabench.yaml")
     generation_keys = parser.add_mutually_exclusive_group()
     generation_keys.add_argument("--api-key-csv", help="Model Studio export; read at runtime, never copied")
     generation_keys.add_argument("--api-key-file", help="JSON/text API key and base URL; read at runtime")
@@ -25,7 +29,7 @@ def main() -> int:
     critic_keys.add_argument("--critic-api-key-csv", help="Separate credentials for the original three critics")
     critic_keys.add_argument("--critic-api-key-file", help="Separate text/JSON credentials for the original three critics")
     parser.add_argument("--check-scope", choices=("all", "generation"), default="all",
-                        help="Generation checks GLM, embeddings and retrieval; all also checks the three critics")
+                        help="Generation checks the generation model, embeddings and retrieval; all also checks the three critics")
     parser.add_argument("--sample", choices=("pilot", "full"), default="pilot")
     parser.add_argument("--repeats", type=int, choices=(1, 2, 3), default=3)
     parser.add_argument("--limit", type=int, help="Limit subfields for a smoke test")
@@ -43,8 +47,13 @@ def main() -> int:
         parser.error("--llm-concurrency must be positive")
     from hypoforge.benchmarks import agentideabench as bench
     root = args.agentideabench_root.expanduser().resolve()
-    output = (args.output_dir or repo / f"output/agentideabench/glm51-{args.sample}").resolve()
     try:
+        if args.output_dir is None:
+            model = bench.configured_model(args.config)
+            if model is None:
+                raise ValueError("Set HYPOFORGE_MODEL in .env or pass --output-dir")
+            args.output_dir = repo / f"output/agentideabench/{bench.model_slug(model)}-{args.sample}"
+        output = args.output_dir.resolve()
         if args.dry_run:
             import json
             topics = bench.select_topics(root, args.sample, args.limit)
@@ -71,8 +80,8 @@ def main() -> int:
                 critic_config.api_key, critic_config.api_base = (
                     read_api_key_csv(args.critic_api_key_csv) if args.critic_api_key_csv
                     else read_api_key_file(args.critic_api_key_file))
-                critic_config.model = "glm-5.1"
-            elif (config.qwen.base.model == "Pro/zai-org/GLM-5.1"
+                critic_config.model = bench.CRITICS[0]
+            elif (urlparse(config.qwen.base.api_base).hostname == "api.siliconflow.cn"
                   and (args.phase == "score" or (args.phase == "check" and args.check_scope == "all"))):
                 raise ValueError("SiliconFlow generation uses separate original critic credentials: "
                                  "provide --critic-api-key-csv / --critic-api-key-file, "

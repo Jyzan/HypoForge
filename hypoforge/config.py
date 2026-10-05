@@ -65,7 +65,8 @@ DEFAULT_MODEL_MAP = {
 class LLMConfig(BaseModel):
     """Configuration for a single LLM endpoint."""
 
-    model: str = "qwen3.7-max-2026-06-08"
+    # Empty = HYPOFORGE_MODEL from .env, else the default base model.
+    model: str = ""
     api_base: str = ""
     api_key: str = ""
     max_tokens: int = 4096
@@ -79,6 +80,12 @@ class LLMConfig(BaseModel):
 
     @model_validator(mode="after")
     def _resolve_env(self) -> "LLMConfig":
+        # ---- model ----
+        if not self.model:
+            self.model = (
+                os.environ.get("HYPOFORGE_MODEL", "").strip()
+                or DEFAULT_MODEL_MAP["base"]
+            )
         # ---- api_key ----
         if not self.api_key:
             self.api_key = (

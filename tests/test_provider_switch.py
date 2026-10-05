@@ -14,8 +14,8 @@ from hypoforge.tools.qwen_client import QwenClient
 
 
 REPO = Path(__file__).resolve().parents[1]
-SF_CONFIG = REPO / "configs/agentideabench_glm51_siliconflow.yaml"
-ORIGINAL_CONFIG = REPO / "configs/agentideabench_glm51.yaml"
+SF_CONFIG = REPO / "configs/agentideabench_siliconflow.yaml"
+ORIGINAL_CONFIG = REPO / "configs/agentideabench.yaml"
 
 
 @pytest.mark.parametrize("content", [
@@ -46,6 +46,7 @@ def test_ambiguous_or_unsafe_credentials_fail_without_disclosing_key(tmp_path, c
 
 
 def configure_sf(tmp_path, monkeypatch):
+    monkeypatch.setenv("HYPOFORGE_MODEL", "Pro/zai-org/GLM-5.1")
     # Restore even variables changed by configure() when this test finishes.
     monkeypatch.setenv("ENTITY_EMBEDDING_API_KEY", "previous-key")
     monkeypatch.setenv("ENTITY_EMBEDDING_BASE_URL", "https://previous.test/v1")
@@ -82,6 +83,20 @@ def test_generation_and_embedding_credentials_can_use_separate_providers(tmp_pat
     assert config.qwen.base.api_key == "sk-test-key"
     assert config.evaluation.embedding.base_url == "https://embedding.test/v1"
     assert os.environ["ENTITY_EMBEDDING_API_KEY"] == "separate-embedding-key"
+
+
+def test_generation_model_is_read_from_env(monkeypatch):
+    monkeypatch.setenv("HYPOFORGE_MODEL", "deepseek-v4-pro")
+    config = bench.configure(ORIGINAL_CONFIG, None)
+    assert all(t.model == "deepseek-v4-pro"
+               for t in (config.qwen.base, config.qwen.max, config.qwen.plus, config.qwen.turbo))
+    assert bench.model_slug("Pro/zai-org/GLM-5.1") == "glm51"
+
+
+def test_missing_generation_model_fails_before_any_run(monkeypatch):
+    monkeypatch.delenv("HYPOFORGE_MODEL", raising=False)
+    with pytest.raises(ValueError, match="HYPOFORGE_MODEL"):
+        bench.configure(ORIGINAL_CONFIG, None)
 
 
 def test_switch_does_not_silently_replace_unsupported_embedding_model(tmp_path, monkeypatch):

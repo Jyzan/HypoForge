@@ -247,7 +247,7 @@ def test_diagnostic_resume_preserves_scientific_gates_and_source_state(tmp_path)
     from run_agentideabench_diagnostic import prepare_replay
     from hypoforge.config import PipelineConfig
     from hypoforge.state import EvidenceGraph, EvidenceNode, EvidenceNodeType, ProblemCard
-    config = PipelineConfig.from_yaml("configs/agentideabench_glm51_siliconflow.yaml")
+    config = PipelineConfig.from_yaml("configs/agentideabench_siliconflow.yaml")
     state = PipelineState(
         input_question="Propose a CRISPR hypothesis", iteration_count=2,
         problem_card=ProblemCard(original_question="Propose a CRISPR hypothesis"),

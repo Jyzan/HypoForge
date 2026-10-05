@@ -1,9 +1,9 @@
-# GLM-5.1 + HypoForge 的 AgentIdeaBench 实验
+# HypoForge 的 AgentIdeaBench 实验
 
 本入口运行完整的 HypoForge M1–M6，然后使用 AgentIdeaBench 的 `lit8d`
 提示词和三个外部评审独立评分。默认是 **HypoForge 原生资源设置**：候选生成、
 内部审查、证据图、研究计划和迭代都保留，不限制为论文的 10 次工具调用。
-与 Table 2 的 GLM-5.1 Active 行比较时，应报告资源、服务商及检索时间的差异。
+与 Table 2 中同一模型的 Active 行比较时，应报告资源、服务商及检索时间的差异。
 
 ## 环境与凭据
 
@@ -16,11 +16,30 @@ python -m pip install -r requirements.txt
 ```
 
 本机已建立并验证的 `.venv` 使用 Python 3.12。默认实验配置为
-`configs/agentideabench_glm51.yaml`，所有文本模型层级都是 `glm-5.1`，显式
+`configs/agentideabench.yaml`，所有文本模型层级使用同一个生成模型，显式
 `enable_thinking=false`，三次生成分别使用种子 42、43、44，避免支持 seed 的服务
 因重复同一随机流而给出三个相同样本；导出和外部评分固定 seed=42。
 生成温度 0.7，导出和外部评分温度 0.0。
 `text-embedding-v3` 单独用于实体规范化。内部模块仍可按原有逻辑使用自己的调用温度。
+
+### 选择生成模型
+
+生成模型不写在配置文件里，而是从 `.env` 的 `HYPOFORGE_MODEL` 读取，填写服务商
+使用的模型 ID：
+
+```bash
+HYPOFORGE_MODEL=glm-5.1               # 百炼
+# HYPOFORGE_MODEL=Pro/zai-org/GLM-5.1 # 硅基流动
+```
+
+未设置时 `configure` 直接报错，不会回退到其他模型。`.env` 以 `override=True`
+加载，会覆盖同名的 shell 环境变量。模型 ID 进入实验指纹，换模型须使用新输出目录；
+默认输出目录按模型名生成，例如 `Pro/zai-org/GLM-5.1` → `output/agentideabench/glm51-pilot`。
+
+`analyze` 按模型 ID 的最后一段（不区分大小写）在 AgentIdeaBench 发布数据中匹配
+历史 Active 基线，例如 `glm-5.1` → `z-ai/glm-5.1`。服务商命名不同时用
+`AGENTIDEABENCH_BASELINE_MODEL` 显式指定；发布数据中没有该模型时只报告绝对分数，
+不输出差值。三位外部评审属于基准协议，不随生成模型变化。
 
 将 AgentIdeaBench 放在 HypoForge 的同级目录，或在每次命令中传入
 `--agentideabench-root /path/to/AgentIdeaBench`。没有该仓库时可以克隆：
@@ -76,8 +95,8 @@ Semantic Scholar 不可用时，PubMed 对计算机和物理学科的覆盖可�
 
 ### 硅基流动生成试跑，外部评分暂缓
 
-`configs/agentideabench_glm51_siliconflow.yaml` 保留完整 M1–M6、搜索预算、候选数、
-迭代数和种子，使用 `Pro/zai-org/GLM-5.1`，实体规范化和证据一致性嵌入均改为
+`configs/agentideabench_siliconflow.yaml` 保留完整 M1–M6、搜索预算、候选数、
+迭代数和种子，使用硅基流动接口（`.env` 中设置 `HYPOFORGE_MODEL=Pro/zai-org/GLM-5.1`），实体规范化和证据一致性嵌入均改为
 `Qwen/Qwen3-Embedding-8B`。这是新的提供商及嵌入条件，必须使用独立输出目录。
 原有百炼配置保留。`--api-key-file` 从 JSON 或包含一条 `sk-` Key 和一条 HTTPS
 接口地址的文本读取凭据，支持地址外围的中文引号，不把密钥写入配置或 manifest。
@@ -136,7 +155,7 @@ M5–M6 诊断已执行完成，但原 M5 验证审核两次达到 60 秒上限�
 ```bash
 caffeinate -i python -u run_agentideabench_diagnostic.py \
   --after m4 --state /path/to/successful-m4-state.json \
-  --config configs/agentideabench_glm51_siliconflow.yaml \
+  --config configs/agentideabench_siliconflow.yaml \
   --api-key-file ../llm_api.txt \
   --output-dir output/agentideabench/post-m4-diagnostic-v4
 ```
@@ -160,7 +179,7 @@ unset no_proxy NO_PROXY
 export SEMANTIC_SCHOLAR_API_KEY="$(cat '../semantic_scholar_api.txt')"
 export SEMANTIC_SCHOLAR_MIN_INTERVAL_SECONDS=5
 export HF_API_KEY_FILE="../llm_api.txt"
-export HF_CONFIG="configs/agentideabench_glm51_siliconflow.yaml"
+export HF_CONFIG="configs/agentideabench_siliconflow.yaml"
 export HF_OUTPUT="output/agentideabench/glm51-siliconflow-pilot-v6"
 
 python run_agentideabench.py --phase check --check-scope generation \
@@ -205,7 +224,7 @@ python run_agentideabench.py --phase score --sample pilot --workers 3 --api-key-
 python run_agentideabench.py --phase analyze --sample pilot
 ```
 
-默认输出在 `output/agentideabench/glm51-pilot/`。只检查一个子领域可在生成命令中
+默认输出在 `output/agentideabench/<模型名>-pilot/`（GLM-5.1 为 `glm51-pilot`）。只检查一个子领域可在生成命令中
 加 `--limit 1`，同时指定独立的 `--output-dir output/agentideabench/smoke`；后续评分
 和分析使用相同的 `--output-dir`。试跑分数仅对照历史数据的相同子领域，不能直接
 对照全体 40 子领域的 6.33。
@@ -219,7 +238,7 @@ python run_agentideabench.py --phase score --sample full --workers 3 --api-key-c
 python run_agentideabench.py --phase analyze --sample full
 ```
 
-输出在 `output/agentideabench/glm51-full/`。正式生成是 120 次独立完整管线运行；
+输出在 `output/agentideabench/<模型名>-full/`。正式生成是 120 次独立完整管线运行；
 评分至少涉及 360 次评审调用，另有查询提取、检索和必要的格式重试。
 默认 `--workers 1`；上面的命令启用受控并行。可用 `--output-dir` 保存不同实验。
 同一输出目录只允许一个生成或评分命令占用，重复启动会被文件锁拒绝。
@@ -334,7 +353,7 @@ M1 仍失败或 M2 无可用证据时，先处理对应原因；安装 PDF 依�
    校验五学科各 8 个，避免误用全部 100 个子领域或早期 paper-centric 流程。
 2. 每个子领域独立运行三次，每次提交最终 `top_hypotheses[0]` 及其对应计划。
    不使用外部评审选择赢家，也不将一次运行的 top-3 当作三个独立样本。
-3. 一个固定的 GLM 导出调用将已有卡片与计划压缩/翻译为 80–150 个英文单词。
+3. 一个使用生成模型的固定导出调用将已有卡片与计划压缩/翻译为 80–150 个英文单词。
    它被明确要求保留原有内容，最多进行一次格式重试；原文和调用用量均保留。
    格式校验不能证明语义完全忠实，正式报告前应抽样核对导出内容。
 4. 外部评审沿用上游 `LIT8D_SYSTEM`、`USER_TEMPLATE` 和解析器，模型为

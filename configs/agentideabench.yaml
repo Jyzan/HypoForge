@@ -1,6 +1,6 @@
 # Native-resource HypoForge on the 40 scored AgentIdeaBench subfields.
 # This is NOT a ten-tool-call, resource-matched reproduction of Table 2.
-run_name: agentideabench-glm51
+run_name: agentideabench
 output_dir: ./output/agentideabench
 verbose: false
 interactive: false
@@ -15,17 +15,17 @@ pipeline:
   iteration_module_target: m3
 
 qwen:
-  base: &glm
-    model: glm-5.1
+  # The model ID is read from HYPOFORGE_MODEL in .env.
+  base: &llm
     max_tokens: 8192
     temperature: 0.7
     enable_thinking: false
     seed: 42
     request_timeout_seconds: 180
     max_retries: 2
-  max: *glm
-  plus: *glm
-  turbo: *glm
+  max: *llm
+  plus: *llm
+  turbo: *llm
 
 # Fixed native sources for this experiment; domain routing is disabled by
 # default. Actual retrieval records are saved per run.
