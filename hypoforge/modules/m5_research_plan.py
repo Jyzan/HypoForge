@@ -76,6 +76,9 @@ class M5ResearchPlan(ModuleProtocol):
         generation_timeout_seconds: float = 180.0,
         semantic_alignment_timeout_seconds: float = 60.0,
         validation_timeout_seconds: float = 60.0,
+        validation_batch_size: int = 0,
+        validation_concurrency: int = 1,
+        validation_max_tokens: int = 8192,
         fast_mode: bool = False,
         **kwargs,
     ):
@@ -88,6 +91,8 @@ class M5ResearchPlan(ModuleProtocol):
             )
         if validation_timeout_seconds <= 0:
             raise ValueError("validation_timeout_seconds must be positive")
+        if validation_batch_size < 0 or validation_concurrency < 1 or validation_max_tokens < 1:
+            raise ValueError("Validation batch size must be nonnegative; concurrency and max_tokens must be positive")
         self.mode = mode
         self.llm_config = llm_config
         self.generation_timeout_seconds = float(generation_timeout_seconds)
@@ -95,6 +100,9 @@ class M5ResearchPlan(ModuleProtocol):
             semantic_alignment_timeout_seconds
         )
         self.validation_timeout_seconds = float(validation_timeout_seconds)
+        self.validation_batch_size = int(validation_batch_size)
+        self.validation_concurrency = int(validation_concurrency)
+        self.validation_max_tokens = int(validation_max_tokens)
         self.client = QwenClient.from_config(llm_config) if llm_config else None
 
     @staticmethod
@@ -969,6 +977,16 @@ class M5ResearchPlan(ModuleProtocol):
                 )
                 plan = self._ensure_bridge_validations(plan, h)
                 plans.append(plan)
+                if state.experimental_validation_verdict is not None:
+                    prior_verdict = state.experimental_validation_verdict
+                    targets = {target.target_id for target in ExperimentalValidationAuditor.validation_targets(h)}
+                    reused_items = [item for item in prior_verdict.items if item.target_id in targets]
+                    validation_verdicts.append(prior_verdict.model_copy(update={
+                        "items": reused_items,
+                        "sufficient": len(reused_items) == len(targets) and all(
+                            item.verdict == "covered" for item in reused_items
+                        ) and not prior_verdict.audit_errors,
+                    }))
                 emit_event(
                     "tool_completed",
                     module="m5",
@@ -1001,6 +1019,9 @@ class M5ResearchPlan(ModuleProtocol):
                 client=self.client,
                 llm_config=self.llm_config,
                 timeout_seconds=self.validation_timeout_seconds,
+                target_batch_size=self.validation_batch_size,
+                concurrency=self.validation_concurrency,
+                max_tokens=self.validation_max_tokens,
             )
             for coverage_attempt in range(1 if self.fast_mode else 2):
                 final_plan = await self._generate_plan_candidate(
@@ -1030,6 +1051,7 @@ class M5ResearchPlan(ModuleProtocol):
                     final_plan,
                     version=state.iteration_count + 1,
                 )
+                final_validation_verdict = outcome.verdict
                 if outcome.error:
                     emit_event(
                         "tool_result",
@@ -1037,7 +1059,7 @@ class M5ResearchPlan(ModuleProtocol):
                         tool="experimental_validation_precheck",
                         status="warning",
                         message=(
-                            "M5 precheck failed; plan preserved for formal M6 review"
+                            "M5 precheck failed; plan and failed audit preserved for M6"
                         ),
                         details={
                             "hypothesis_id": h.hypothesis_id,
@@ -1046,7 +1068,6 @@ class M5ResearchPlan(ModuleProtocol):
                         },
                     )
                     break
-                final_validation_verdict = outcome.verdict
                 unresolved = [
                     item for item in outcome.verdict.items
                     if item.verdict != "covered"
@@ -1110,6 +1131,9 @@ class M5ResearchPlan(ModuleProtocol):
                 rationale=" ".join(
                     item.rationale for item in validation_verdicts if item.rationale
                 ),
+                audit_errors=list(dict.fromkeys(
+                    error for item in validation_verdicts for error in item.audit_errors
+                )),
             )
         elif reusable and state.experimental_validation_verdict is not None:
             validation_verdict = state.experimental_validation_verdict.model_copy(deep=True)

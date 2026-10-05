@@ -1,7 +1,7 @@
 """Shared M4-to-M5 experimental validation coverage audit.
 
-M5 uses this service for one bounded self-check before its result reaches M6.
-M6 uses the same service again as the authoritative independent review.  The
+M5 uses this service for a bounded self-check before its result reaches M6.
+M6 reuses the persisted audit as the authoritative validation review.  The
 service deliberately returns a fail-closed verdict together with a separate
 error string so callers can distinguish an incomplete plan from an unavailable
 auditor.
@@ -12,7 +12,9 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
+
+from pydantic import BaseModel, Field
 
 from .prompts.m6_prompts import (
     M6_EXPERIMENTAL_VALIDATION_SYSTEM,
@@ -34,6 +36,52 @@ class ExperimentalValidationAuditOutcome:
     error: str = ""
 
 
+class _ValidationAuditRow(BaseModel):
+    """Only decisions and indexed refs travel back from the model."""
+
+    target_id: str
+    verdict: Literal["covered", "partial", "missing"]
+    procedure_refs: List[str] = Field(default_factory=list)
+    measurement_refs: List[str] = Field(default_factory=list)
+    control_refs: List[str] = Field(default_factory=list)
+    analysis_refs: List[str] = Field(default_factory=list)
+    bridge_validation_refs: List[str] = Field(default_factory=list)
+    falsification_text: str = ""
+    rationale: str = ""
+
+
+class _ValidationAuditResponse(BaseModel):
+    sufficient: bool
+    items: List[_ValidationAuditRow] = Field(default_factory=list)
+    rationale: str = ""
+
+
+def validation_audit_errors(hypotheses, verdict) -> List[str]:
+    """Distinguish unavailable/stale audits from completed negative decisions."""
+    expected = {
+        target.target_id: target
+        for hypothesis in hypotheses
+        for target in ExperimentalValidationAuditor.validation_targets(hypothesis)
+    }
+    if not expected:
+        return []
+    if verdict is None:
+        return ["No experimental validation audit was persisted by M5."]
+    errors = list(verdict.audit_errors)
+    seen = set()
+    for item in verdict.items:
+        if item.target_id in seen:
+            errors.append(f"Duplicate validation target: {item.target_id}")
+        seen.add(item.target_id)
+        target = expected.get(item.target_id)
+        if target and (item.target_kind != target.target_kind or item.target_text != target.target_text):
+            errors.append(f"Stale validation target: {item.target_id}")
+    missing = sorted(set(expected) - seen)
+    if missing:
+        errors.append(f"Unaudited validation targets: {missing}")
+    return errors
+
+
 class ExperimentalValidationAuditor:
     """Audit whether one M5 plan can test every non-empty M4 target."""
 
@@ -43,12 +91,20 @@ class ExperimentalValidationAuditor:
         client: Any,
         llm_config: Optional[Any],
         timeout_seconds: float,
+        target_batch_size: int = 0,
+        concurrency: int = 1,
+        max_tokens: int = 8192,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        if target_batch_size < 0 or concurrency < 1 or max_tokens < 1:
+            raise ValueError("Audit batch size must be nonnegative; concurrency and max_tokens must be positive")
         self.client = client
         self.llm_config = llm_config
         self.timeout_seconds = float(timeout_seconds)
+        self.target_batch_size = int(target_batch_size)
+        self.concurrency = int(concurrency)
+        self.max_tokens = int(max_tokens)
 
     @staticmethod
     def validation_targets(hypothesis: Any) -> List[ValidationTarget]:
@@ -271,29 +327,55 @@ class ExperimentalValidationAuditor:
             "analysis_refs": set(plan_context["analysis"]),
             "bridge_validation_refs": set(plan_context["bridge_validations"]),
         }
-        user_payload = {
-            "validation_targets": [target.model_dump(mode="json") for target in targets],
-            "m5_plan_index": plan_context,
-            "review_version": version,
-        }
-        try:
-            response = await asyncio.wait_for(
-                self.client.structured_chat(
+        batch_size = self.target_batch_size or len(targets)
+        batches = [targets[index:index + batch_size] for index in range(0, len(targets), batch_size)]
+        gate = asyncio.Semaphore(self.concurrency)
+
+        async def query_batch(batch):
+            user_payload = {
+                "validation_targets": [target.model_dump(mode="json") for target in batch],
+                "m5_plan_index": plan_context,
+                "review_version": version,
+            }
+            async with gate:
+                response = await self.client.structured_chat(
                     system_prompt=M6_EXPERIMENTAL_VALIDATION_SYSTEM,
                     user_prompt=M6_EXPERIMENTAL_VALIDATION_TEMPLATE.format(
                         validation_payload=json.dumps(user_payload, ensure_ascii=False, indent=2),
                     ),
-                    output_schema=ExperimentalValidationVerdict.model_json_schema(),
-                    max_tokens=8192,
+                    output_schema=_ValidationAuditResponse.model_json_schema(),
+                    max_tokens=self.max_tokens,
                     temperature=getattr(self.llm_config, "temperature", 0.1) if self.llm_config else 0.1,
                     disable_thinking=True,
-                ),
-                timeout=self.timeout_seconds,
-            )
-            parsed = ExperimentalValidationVerdict.model_validate(dict(response or {}))
+                )
+            parsed = _ValidationAuditResponse.model_validate(dict(response or {}))
+            expected_ids = {target.target_id for target in batch}
+            actual_ids = [item.target_id for item in parsed.items]
+            if set(actual_ids) != expected_ids or len(actual_ids) != len(batch):
+                raise ValueError(
+                    "Validation audit must return exactly one row per requested target; "
+                    f"expected IDs={sorted(expected_ids)}, actual IDs={actual_ids}"
+                )
+            return parsed
+
+        async def query_all():
+            tasks = [asyncio.create_task(query_batch(batch)) for batch in batches]
+            try:
+                return await asyncio.gather(*tasks)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        try:
+            responses = await asyncio.wait_for(query_all(), timeout=self.timeout_seconds)
             raw_by_id: Dict[str, Dict[str, Any]] = {}
-            for item in parsed.items:
-                raw_by_id.setdefault(item.target_id, item.model_dump(mode="json"))
+            for batch, response in zip(batches, responses):
+                batch_ids = {target.target_id for target in batch}
+                for item in response.items:
+                    if item.target_id in batch_ids:
+                        raw_by_id.setdefault(item.target_id, item.model_dump(mode="json"))
             items = [
                 self.validation_item_from_target(
                     target, raw_by_id.get(target.target_id), valid_refs, plan_context,
@@ -302,7 +384,7 @@ class ExperimentalValidationAuditor:
             ]
             sufficient = all(item.verdict == "covered" for item in items)
             rationale = " ".join(filter(None, [
-                parsed.rationale,
+                *(response.rationale for response in responses),
                 "All required M4 targets have explicit M5 coverage." if sufficient
                 else "At least one required M4 target lacks complete M5 coverage.",
             ]))
@@ -327,6 +409,7 @@ class ExperimentalValidationAuditor:
                     sufficient=False,
                     items=items,
                     rationale=f"Experimental validation audit failed closed: {error}",
+                    audit_errors=[error],
                 ),
                 error=error,
             )

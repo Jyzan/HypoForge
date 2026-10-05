@@ -296,9 +296,11 @@ below; never invent a reference.
 
 {validation_payload}
 
-For every validation target return its target_id, target_kind, target_text,
-verdict, valid procedure_refs, measurement_refs, control_refs,
+For every validation target return its target_id, verdict,
+valid procedure_refs, measurement_refs, control_refs,
 analysis_refs, bridge_validation_refs when applicable, falsification_text, and
-a concise rationale. Set sufficient=true only if every required target is
-covered.
+a concise rationale (one short sentence per target). Do not repeat target_kind
+or target_text; these are restored from the canonical input by the caller.
+Keep the overall rationale to one short sentence. Set sufficient=true only if
+every required target in this batch is covered.
 """

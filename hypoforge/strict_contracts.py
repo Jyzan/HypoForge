@@ -2008,7 +2008,20 @@ class StrictM5ResearchPlan(M5ResearchPlan):
 
 
 class StrictM6ReviewIteration(M6ReviewIteration):
-    """Built-in M6 marker ensuring strict runtime hooks are loaded explicitly."""
+    """Require an available, complete M5 audit before scientific review."""
+
+    async def __call__(self, state: PipelineState, config=None):
+        if not self.fast_mode:
+            from .experimental_validation import validation_audit_errors
+            errors = validation_audit_errors(
+                state.top_hypotheses, state.experimental_validation_verdict,
+            )
+            if errors:
+                raise RuntimeError(
+                    "M6 requires a completed M5 experimental validation audit; "
+                    "rerun M5 instead of skipping this quality gate: " + "; ".join(errors)
+                )
+        return await super().__call__(state, config)
 
 
 from .modules.m2_literature.search.agent import IterativeSearchAgent as _IterativeSearchAgent

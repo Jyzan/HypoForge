@@ -182,6 +182,10 @@ def prepare_manifest(output: Path, root: Path, config, topics: list[dict], repea
         repo / "hypoforge/modules/m2_literature/search/agent.py",
         repo / "hypoforge/modules/m2_literature/reading/access.py",
         repo / "hypoforge/modules/m4_hypothesis_generation.py",
+        repo / "hypoforge/modules/m5_research_plan.py",
+        repo / "hypoforge/experimental_validation.py",
+        repo / "hypoforge/prompts/m6_prompts.py",
+        repo / "hypoforge/state.py",
         repo / "hypoforge/strict_contracts.py",
         repo / "hypoforge/modules/m6_review_iteration.py",
         repo / "hypoforge/modules/m2_literature/reading/arxiv_resolver.py",
@@ -242,6 +246,12 @@ def select_submission(state) -> dict:
     from hypoforge.modules.m6_review_iteration import _is_invalid_fallback_hypothesis
     if _is_invalid_fallback_hypothesis(card):
         raise ValueError("Deterministic fallback is not a model-generated benchmark hypothesis")
+    from hypoforge.experimental_validation import validation_audit_errors
+    audit_errors = validation_audit_errors(
+        [card], getattr(state, "experimental_validation_verdict", None),
+    )
+    if audit_errors:
+        raise ValueError("Selected hypothesis has no completed M5 validation audit: " + "; ".join(audit_errors))
     plans = [plan for plan in state.research_plans if plan.hypothesis_id == card.hypothesis_id]
     if not plans:
         raise ValueError("The selected hypothesis has no matching research plan")

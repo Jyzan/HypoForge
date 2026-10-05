@@ -67,7 +67,13 @@ module_overrides:
       total_time_budget_seconds: 900
       allow_continuity_fallback: false
   m5:
-    kwargs: {mode: llm, llm_tier: base}
+    kwargs:
+      mode: llm
+      llm_tier: base
+      validation_timeout_seconds: 120
+      validation_batch_size: 3
+      validation_concurrency: 2
+      validation_max_tokens: 2048
   m6:
     kwargs:
       mode: llm

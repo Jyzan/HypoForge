@@ -556,6 +556,7 @@ class ExperimentalValidationVerdict(BaseModel):
     sufficient: bool
     items: List[ValidationCoverageItem] = Field(default_factory=list)
     rationale: str = ""
+    audit_errors: List[str] = Field(default_factory=list)
 
 
 class WorkingAssumptionValidation(BaseModel):

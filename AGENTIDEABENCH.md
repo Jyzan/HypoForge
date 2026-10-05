@@ -92,8 +92,8 @@ Semantic Scholar 不可用时，PubMed 对计算机和物理学科的覆盖可�
 子问题，合并、数量压缩及原子性修复保留这些问题，随后仍独立复审。
 审核评估未来回答能否完成任务，不要求 M1 已生成具体假说或实验结果；
 M1 不预选用户未指定的协同机制、系统或疾病位点。此修复使用新实验指纹。
-先用 `--sample pilot --limit 1 --workers 1 --llm-concurrency 4` 和新目录
-`output/agentideabench/glm51-siliconflow-smoke-v4` 验证完整管线，再扩大试跑。
+当前修复已用已保存状态分别验证 M4 和 M5–M6，可直接按下面的命令进入
+五学科生成试跑。每次方法或预算变更都使用新的输出目录。
 
 硅基流动配置将七候选生成拆为 2/2/2/1 小批次，保留全部候选的审查与前三选择；
 三个独立内部评审并发执行，每个评审的输出上限改为 2048 tokens。检索预算保留，
@@ -111,6 +111,19 @@ Semantic Scholar 单次查询等待与重试预算由 15 秒改为 25 秒，
 上限保留。预算耗尽会报告发生的步骤，而不是包装为科学性评审失败。
 这些预算及审核批次变更进入实验指纹，不能复用 v3 输出目录。使用已有 M3
 快照重放 M4 的诊断结果只验证后续模块，不计为新的完整基准样本。
+
+M5–M6 诊断已执行完成，但原 M5 验证审核两次达到 60 秒上限。M5 现在让模型
+仅返回验证目标 ID、判定和方法引用，由代码恢复完整目标文本；硅基流动配置
+每批审核 3 个目标、最多并发 2 批，每批输出上限 2048 tokens，每个假说的全部
+批次共享 120 秒预算。全部目标保留，引用仍由代码核验，覆盖不足仍触发原有的
+一次内部方案重写和后续 M6/M5 迭代。审核发生技术错误时保存失败判定及
+`audit_errors`，M6 和基准导出拒绝将缺失、过时或失败的审核当作已通过。
+复用方案时同时保留对应目标的审核，避免只汇总新生成方案而遗漏旧方案。
+这些变化进入新的实验指纹，使用 `glm51-siliconflow-pilot-v5` 输出目录。
+
+已保存的两份方案共 15 个目标经真实 GLM-5.1 分批审核后，分别耗时约 53 和
+44 秒，没有技术错误；部分机制和协同目标被判为覆盖不充分。这验证了审核执行
+路径，不表示旧方案质量全部通过，也不会将这些诊断结果计入正式基准。
 
 调试入口 `run_agentideabench_diagnostic.py` 可以从成功的 M3 或 M4 状态继续。
 例如，从 M4 状态仅验证 M5–M6：
@@ -143,7 +156,7 @@ export SEMANTIC_SCHOLAR_API_KEY="$(cat '../semantic_scholar_api.txt')"
 export SEMANTIC_SCHOLAR_MIN_INTERVAL_SECONDS=5
 export HF_API_KEY_FILE="../llm_api.txt"
 export HF_CONFIG="configs/agentideabench_glm51_siliconflow.yaml"
-export HF_OUTPUT="output/agentideabench/glm51-siliconflow-pilot-v4"
+export HF_OUTPUT="output/agentideabench/glm51-siliconflow-pilot-v5"
 
 python run_agentideabench.py --phase check --check-scope generation \
   --config "$HF_CONFIG" --api-key-file "$HF_API_KEY_FILE" && \
@@ -157,7 +170,9 @@ caffeinate -i python -u run_agentideabench.py --sample pilot --repeats 1 \
 执行验证。先检查五项的 `generation_summary.json` 和各项 `result.json`；M1 覆盖
 检查或 M2 证据获取仍失败时，保留记录并处理原因，再扩大实验。
 
-外部评分保持原三评审 GLM-5.1、Qwen3.6-Plus、Kimi-K2.6，暂不运行 `score/analyze`。
+外部评分保持原三评审 GLM-5.1、Qwen3.6-Plus、Kimi-K2.6。2026-10-05 重新检查
+原百炼凭据时，三者均返回 HTTP 401 `API-key is blocked.`；当前可先运行生成阶段，
+外部评分暂缓，不把内部 M6 分数当成 AgentIdeaBench 分数。
 原服务恢复后先做完整预检，并传入独立评审凭据：
 
 ```bash
