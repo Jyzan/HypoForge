@@ -37,6 +37,14 @@ from langchain_core.messages import HumanMessage, SystemMessage
 logger = logging.getLogger(__name__)
 
 
+def is_model_access_error(exc: Exception) -> bool:
+    """An authentication/permission failure cannot be repaired by JSON fallback."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    return status in (401, 403)
+
+
 def _recover_partial_edges(raw: str) -> Optional[dict]:
     """Recover complete edge objects from a response truncated mid-JSON.
 
@@ -550,7 +558,9 @@ class QwenClient:
             )
             response = await _invoke_llm(llm_with_format, messages)
             self._record_tokens(response)
-        except Exception:
+        except Exception as exc:
+            if is_model_access_error(exc):
+                raise
             if disable_thinking:
                 # Attempt 2: retry without thinking disable
                 # (the model / proxy may not support the parameter)
@@ -567,7 +577,9 @@ class QwenClient:
                     )
                     response = await _invoke_llm(llm_rfmt, messages)
                     self._record_tokens(response)
-                except Exception:
+                except Exception as exc:
+                    if is_model_access_error(exc):
+                        raise
                     logger.debug(
                         "Model %s may not support response_format; falling back to text parse.",
                         self.model,

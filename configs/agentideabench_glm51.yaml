@@ -27,8 +27,8 @@ qwen:
   plus: *glm
   turbo: *glm
 
-# Initial sources; native HypoForge domain routing can additionally choose
-# discipline-specific sources. Actual retrieval records are saved per run.
+# Fixed native sources for this experiment; domain routing is disabled by
+# default. Actual retrieval records are saved per run.
 search:
   tools: [semantic_scholar, pubmed]
   papers_per_sub_question: 20

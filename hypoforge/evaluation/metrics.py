@@ -247,6 +247,35 @@ class GraphMetricBase(MetricProtocol):
         self._client = QwenClient.from_config(llm_config) if llm_config else None
         self._embed_config = embed_config
         
+    @staticmethod
+    def _validated_claims(payload: Any) -> List[Dict[str, Any]]:
+        """Reject the whole malformed batch rather than change the denominator."""
+        claims = payload.get("claims") if isinstance(payload, dict) else None
+        if not isinstance(claims, list) or not claims:
+            return []
+        for claim in claims:
+            if not isinstance(claim, dict):
+                return []
+            if any(not isinstance(claim.get(key), str)
+                   for key in ("subject", "relation", "object", "claim")):
+                return []
+            if not claim["claim"].strip():
+                return []
+            for side in ("subject", "object"):
+                synonyms = claim.get(f"{side}_synonyms", [])
+                components = claim.get(f"{side}_components", [])
+                if not isinstance(synonyms, list) or any(
+                    not isinstance(item, str) for item in synonyms
+                ):
+                    return []
+                if not isinstance(components, list) or any(
+                    not isinstance(group, list) or any(
+                        not isinstance(item, str) for item in group
+                    ) for group in components
+                ):
+                    return []
+        return claims
+
     async def _decompose_hypothesis(self, hypothesis: HypothesisCard) -> List[Dict[str, Any]]:
         if not self._client:
             return [{"subject": "", "relation": "", "object": "", "claim": hypothesis.statement}]
@@ -282,8 +311,10 @@ class GraphMetricBase(MetricProtocol):
                 temperature=0.1,
                 disable_thinking=True,
             )
-            if isinstance(result, dict) and "claims" in result and result["claims"]:
-                return result["claims"]
+            claims = self._validated_claims(result)
+            if claims:
+                return claims
+            logger.warning("Structured decomposition returned invalid claims; attempting manual fallback.")
         except Exception as exc:
             logger.warning("Structured chat failed: %s. Attempting manual fallback.", exc)
             
@@ -312,8 +343,9 @@ class GraphMetricBase(MetricProtocol):
                 else:
                     parsed = {}
 
-            if isinstance(parsed, dict) and "claims" in parsed and parsed["claims"]:
-                return parsed["claims"]
+            claims = self._validated_claims(parsed)
+            if claims:
+                return claims
             logger.warning("Manual fallback failed to find valid claims array.")
             return [{"subject": "", "relation": "", "object": "", "claim": hypothesis.statement}]
         except Exception as exc:

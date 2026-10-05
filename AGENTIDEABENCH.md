@@ -39,7 +39,7 @@ python run_agentideabench.py --phase check --api-key-csv "$HF_API_KEY_CSV"
 ```
 
 `check` 先离线解析一个内嵌 CFF Type1 字体的测试 PDF，校验实际字符解码；
-随后发送少量请求，检查 GLM 的 JSON 输出及指定调用参数、另两个评审、
+随后发送少量请求，检查 GLM 的 JSON 与普通文本输出及指定调用参数、另两个评审、
 嵌入模型和 Semantic Scholar 的日期过滤检索。也可不传 CSV，使用原有 `.env`
 或环境中的 `OPENAI_API_KEY` / `OPENAI_BASE_URL`。现有配置优先解析 `QWEN_API_KEY`
 与 `QWEN_BASE_URL`；显式 CSV 优先于这些设置。
@@ -65,6 +65,11 @@ export SEMANTIC_SCHOLAR_MIN_INTERVAL_SECONDS=5
 Semantic Scholar 请求间隔限制为 5 秒；该变量不控制独立评分器，评分器串行执行，
 每个查询前等待 1 秒并在 429 时退避重试。先通过 `check` 并完成五学科试跑，再启动
 正式实验。独立 Key 不能保证永久没有 429；失败记录和断点恢复仍保留。
+
+本配置的生成检索来源固定为 Semantic Scholar 和 PubMed，默认关闭学科路由。
+Semantic Scholar 不可用时，PubMed 对计算机和物理学科的覆盖可能不足；预检中的
+一次成功检索不能证明整轮实验不会限流。若增加其他来源，应使用新的配置和输出
+目录，并报告资源条件的变化。
 
 ## 先做五学科试跑
 
@@ -157,6 +162,29 @@ python -u run_agentideabench.py --phase analyze --sample pilot --output-dir outp
 
 ## 恢复与结果
 
+### API 与管线失败
+
+模型返回 401/403 时，JSON 客户端会直接抛出错误，不再通过切换 thinking 参数或
+普通文本模式重试。生成器收到该错误后保存当前失败记录、取消其他在途管线并停止
+批次，保留已完成结果。`check` 同时检查 GLM 的普通文本调用，覆盖提交导出所用的
+接口路径。`AccessDenied.Unpurchased` 本身不能证明免费额度耗尽，应结合对应业务
+空间的模型开通状态、额度、账单及调用日志判断。
+
+生成侧持 Key 的 Semantic Scholar 请求遇到 429 时，在原有 15 秒检索阶段预算内
+最多重试一次；持续 429 仍开启 120 秒熔断。匿名访问不增加这一重试。本地排队或
+请求超时不会被错误标记为服务端限流，也不会因此封锁后续查询。
+
+M1 的覆盖与拆分检查仍严格执行。预算耗尽后，错误记录包含最终审核理由及子问题，
+供定位失败原因。M6 对原子声明要求对象结构；被异常 JSON 恢复为字符串的声明会
+尝试重新解析，整批无效时保留“证据图覆盖不足”的降级结果，不丢弃坏行来改变分母。
+
+这类源码修复会改变实验指纹，保留旧失败目录，使用新的 `--output-dir`，例如
+`output/agentideabench/glm51-pilot-repaired`。先通过 `--phase check`，再运行一条
+独立样本（`--sample pilot --limit 1 --workers 1`）检查模块状态和检索记录。
+M1 仍失败或 M2 无可用证据时，先处理对应原因；安装 PDF 依赖不能解决这些问题。
+
+### 断点与导出
+
 重复执行相同命令会跳过已完成项。失败项不会自动变成新的随机样本；查看对应的
 `result.json` 或评分错误后，给生成或评分命令加 `--retry-failed` 明确重试。
 成功的假说不会重新生成，成功的评审不会重新评分；仅导出失败时复用已完成的管线。
@@ -209,10 +237,12 @@ python -u run_agentideabench.py --phase analyze --sample pilot --output-dir outp
 ## 验证
 
 ```bash
-python -m pytest tests/test_agentideabench.py tests/test_pdf_reading.py tests/test_pipeline.py -q
+python -m pytest tests -q
 ```
 
 测试涵盖 API 参数在 JSON 回退中的保持、CSV 解析、并行状态/用量隔离、M2 与文本
 并发上限、取消恢复、目录写锁、共享评分证据、失败评审重试、检索失败、逐维度
 聚合和缺失评审处理，以及实际 CFF 字体解码、截断 PDF 的有界重试与缓存隔离、
 摘要降级归因、取消和总下载时间预算。同级 AgentIdeaBench 存在时还验证历史 6.33 基线。
+失败回归还覆盖 401/403 的立即停止及在途任务取消、导出文本预检、异常声明结构、
+有界 Semantic Scholar 429 重试、超时不触发限流熔断，以及 M1 的严格检查与诊断保留。

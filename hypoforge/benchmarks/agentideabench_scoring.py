@@ -54,6 +54,12 @@ async def preflight(config) -> bool:
     if response != {"ok": True}:
         raise ValueError("GLM-5.1 structured-output check failed")
     print("glm-5.1 structured output / thinking disabled / seed=42: OK", flush=True)
+    text_response = await llm.chat(
+        user_prompt="Reply with OK", max_tokens=32,
+        temperature=0.0, disable_thinking=True)
+    if not text_response.strip():
+        raise ValueError("GLM-5.1 text-output check returned an empty response")
+    print("glm-5.1 text output / submission export: OK", flush=True)
     api = CriticAPI(config.qwen.base)
     try:
         for critic in CRITICS[1:]:

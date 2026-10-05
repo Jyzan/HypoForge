@@ -149,6 +149,9 @@ def prepare_manifest(output: Path, root: Path, config, topics: list[dict], repea
     repo = Path(__file__).resolve().parents[2]
     source_files = [
         Path(__file__), repo / "hypoforge/tools/qwen_client.py",
+        repo / "hypoforge/evaluation/metrics.py",
+        repo / "hypoforge/modules/m1_problem_understanding.py",
+        repo / "hypoforge/tools/semantic_scholar.py",
         repo / "hypoforge/modules/m2_literature/reading/arxiv_resolver.py",
         repo / "hypoforge/modules/m2_literature/reading/parser.py",
         repo / "hypoforge/modules/m2_literature/reading/pdf_validation.py",
@@ -291,6 +294,7 @@ async def generate(output: Path, root: Path, config, topics: list[dict], repeats
 async def _generate(output: Path, root: Path, config, topics: list[dict], repeats: int,
                     retry_failed: bool, workers: int) -> bool:
     from hypoforge.pipeline import PipelineRunner
+    from hypoforge.tools.qwen_client import is_model_access_error
     manifest = prepare_manifest(output, root, config, topics, repeats)
     m2_gate = asyncio.Semaphore(1)
 
@@ -338,6 +342,7 @@ async def _generate(output: Path, root: Path, config, topics: list[dict], repeat
                 run_config.entity_cache_dir = str(run_directory / "entity_cache")
                 runner = BatchRunner(run_config)
                 run_id = f"{cell['item_id']}-a{record['attempt']}"
+                record["checkpoint_path"] = str(run_directory / f"{run_id}_checkpoint.json")
                 state = await runner.run(QUESTION.format(**cell), run_id=run_id)
                 record["state_path"] = str(run_directory / f"{run_id}.json")
                 record["pipeline_usage"] = {
@@ -364,6 +369,9 @@ async def _generate(output: Path, root: Path, config, topics: list[dict], repeat
         except Exception as exc:
             record["error"] = str(exc)
             print(f"  {record['status']}: {exc}", flush=True)
+            if is_model_access_error(exc):
+                # Preserve completed work and stop spending on a blocked model.
+                raise
         finally:
             record["elapsed_seconds"] = time.monotonic() - started
             record["finished_at"] = now()

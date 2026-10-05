@@ -136,7 +136,9 @@ def _http_get_json(
 
     ``deadline`` (absolute ``time.monotonic()`` time) bounds the whole call:
     rate-limit waits, backoff sleeps and the socket timeout all respect it.
-    Semantic Scholar HTTP 429 fails fast so its circuit breaker can engage.
+    Authenticated Semantic Scholar requests retry one transient HTTP 429
+    inside the existing deadline, then allow the circuit breaker to engage.
+    Anonymous requests fail fast on HTTP 429.
     OpenAlex 429 is retried within the same bounded stage because concurrent
     evidence-gap searches can briefly exceed its burst allowance. Other
     providers are not called from this helper; source independence is handled
@@ -171,10 +173,19 @@ def _http_get_json(
             last_exc = e
             if e.code == 429:
                 if is_s2:
-                    logger.debug(
-                        "Semantic Scholar 429 (attempt %d); failing fast",
-                        attempt,
-                    )
+                    if s2_api_key and attempt == 0:
+                        try:
+                            wait = max(request_interval, float(
+                                (e.headers or {}).get("Retry-After", request_interval)
+                            ))
+                        except (TypeError, ValueError):
+                            wait = request_interval
+                        # Do not replace a genuine 429 with a local timeout
+                        # when the provider asks us to wait beyond the budget.
+                        if deadline is None or wait < deadline - time.monotonic():
+                            logger.debug("Semantic Scholar 429; retrying once in %.1fs", wait)
+                            _sleep_with_deadline(wait, deadline)
+                            continue
                     raise
                 if attempt < 3:
                     raw_retry_after = str(
@@ -441,9 +452,6 @@ def _search(query: str, limit: int = 20) -> List[dict]:
     except urllib.error.HTTPError as exc:
         if exc.code == 429:
             _s2_circuit_break()
-        raise
-    except TimeoutError:
-        _s2_circuit_break()
         raise
 
 

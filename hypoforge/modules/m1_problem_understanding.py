@@ -593,10 +593,11 @@ class M1ProblemUnderstanding(ModuleProtocol):
             ),
         )
         final_audit = _SubQuestionCoverage.model_validate(final_payload)
+        diagnostic = f"; audit={final_audit.model_dump_json()}; sub_questions={questions!r}"
         if not final_audit.core_intent_covered:
-            raise ValueError("core user intent remains uncovered after coverage repair")
+            raise ValueError("core user intent remains uncovered after coverage repair" + diagnostic)
         if final_audit.over_fragmented:
-            raise ValueError("sub-questions remain over-fragmented after coverage repair")
+            raise ValueError("sub-questions remain over-fragmented after coverage repair" + diagnostic)
         emit_event(
             "m1_subquestion_coverage",
             module="m1",
