@@ -35,6 +35,11 @@ until that premise has been verified by retrieval; M2 will handle aliases.
 3. At least one sub-question must directly preserve the original core action.
 If the user asks how to implement something, a background or influencing-factor
 question cannot replace the requested implementation question.
+If the user asks to propose a hypothesis, include a synthesis question such as
+"What novel, specific, and testable hypothesis can be proposed for the user's
+research topic?" Keep the actual topic in that question. M1 asks what must be
+answered; it does not supply the hypothesis. Do not choose a new system,
+synergistic mechanism, disease locus, or intervention absent from the user.
 
 4. Never promote a concrete technique that the user did not name into a core
 sub-question. Keep the question at the method-category level and let literature
@@ -62,16 +67,29 @@ M1_COVERAGE_CHECK_SYSTEM_PROMPT = """\
 You audit whether a list of scientific sub-questions preserves the user's
 original intent and has an appropriate granularity.
 
+This is a decomposition audit, not an answer audit. Judge whether future
+answers to these questions can produce the requested result. Do not demand
+that M1 already supply a concrete hypothesis, prediction, or experiment;
+hypothesis generation and experimental design occur in later modules.
+
 Judge all of these independently:
 - `sufficient`: the answers together can reconstruct the requested answer;
 - `core_intent_covered`: at least one sub-question directly carries the
   original core action (for example how to implement, why it happens, or
   whether it exists);
+- `core_intent_question_indices`: the one-based indices of questions that
+  explicitly carry that core action. Return an empty list if it is uncovered;
 - `missing_aspects`: only aspects explicitly required or necessarily implied
   by the original question;
 - `over_fragmented`: parallel aspects of the same relation were split into
   separate questions;
 - `merge_instructions`: exact groups to merge when over-fragmented.
+
+A synthesis question asking for a new hypothesis and a background question
+asking what is already known perform different actions. Sharing a research
+topic alone does not make them over-fragmented. Do not merge a synthesis
+question into a historical mechanism or system-design question. A broad
+topic list does not require inventing a unified solution or synergy.
 
 Do not invent a concrete technology that the original question did not name.
 The current sub-questions must be scientific English. Return
@@ -94,7 +112,10 @@ aspect. Each result contains one research object, one relation/action, and at
 most one question mark and at most 240 characters including spaces. Do not
 use semicolons or parenthesized enumerations. Do not introduce a concrete method not named by the
 user. Write every returned sub-question in scientific English, regardless of
-the language of the original question. Return JSON with only `sub_questions`.
+the language of the original question. Explicitly carry a missing core action:
+if the user asks for a novel hypothesis, ask what hypothesis can be proposed
+for their topic, rather than choosing its mechanism or solution in advance.
+Return JSON with only `sub_questions`.
 """
 
 M1_COVERAGE_SUPPLEMENT_USER_TEMPLATE = """\
@@ -116,6 +137,10 @@ Each result must be at most 240 characters including spaces, have at most one
 question mark, and contain no semicolon or parenthesized enumeration. Preserve
 distinct indispensable actions in separate concise questions when merging
 them would violate these limits. Never truncate or remove a required aspect.
+Preserve a question explicitly asking for the original requested output.
+Synthesis and background retrieval are different actions even when they share
+a topic. Never rewrite "propose a hypothesis" into "describe known mechanisms"
+or "design a unified system". Preserve any supplied protected questions verbatim.
 Write every returned sub-question in scientific English, regardless of the
 language of the original question.
 Return JSON with only `sub_questions`.

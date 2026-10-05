@@ -74,6 +74,74 @@ async def test_atomic_rewrite_cannot_bypass_core_intent_audit():
 
 
 @pytest.mark.asyncio
+async def test_last_coverage_merge_retains_independently_audited_core_action():
+    core = "What novel, specific, and testable hypothesis can be proposed for therapeutic CRISPR base and prime editing?"
+    background = "What mechanisms of CRISPR base and prime editing are already characterized?"
+    module = M1ProblemUnderstanding(coverage_max_rounds=1)
+    module.client = SequenceClient([
+        {**MERGE, "core_intent_question_indices": [3]},
+        {"sub_questions": [background]},  # The model drops the requested action.
+        {**PASS, "core_intent_question_indices": [2]},
+    ])
+    result = await module._check_subquestion_coverage(
+        "Propose a novel, specific, and testable hypothesis for therapeutic CRISPR editing.",
+        ["What is known about base editing?", "What is known about prime editing?", core],
+    )
+    assert result == [background, core]
+    assert core in module.client.calls[1]["user_prompt"]
+    assert core in module.client.calls[2]["user_prompt"]  # Independent final audit.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repair", ["shape", "limit"])
+async def test_structural_repair_cannot_discard_audited_core_action(repair):
+    core = "What new hypothesis can be proposed for CRISPR therapy?"
+    background = "Which CRISPR mechanisms are already characterized?"
+    module = M1ProblemUnderstanding()
+    module.client = SequenceClient([{"sub_questions": [background]}])
+    if repair == "shape":
+        result = await module._repair_subquestion_shape(
+            "Propose a CRISPR hypothesis", [LONG, core], protected_questions=[core],
+        )
+    else:
+        result = await module._merge_subquestions_to_limit(
+            "Propose a CRISPR hypothesis", [f"Background aspect {i}?" for i in range(5)] + [core],
+            protected_questions=[core],
+        )
+    assert result == [background, core]
+    assert core in module.client.calls[0]["user_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_protected_action_still_requires_a_passing_final_coverage_audit():
+    core = "What new hypothesis can be proposed for CRISPR therapy?"
+    module = M1ProblemUnderstanding(coverage_max_rounds=1)
+    module.client = SequenceClient([
+        {**MERGE, "core_intent_question_indices": [1]},
+        {"sub_questions": ["What is CRISPR?"]},
+        {**PASS, "core_intent_covered": False},
+    ])
+    with pytest.raises(ValueError, match="core user intent remains uncovered"):
+        await module._check_subquestion_coverage("Propose a CRISPR hypothesis", [core])
+    assert core in module.client.calls[-1]["user_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_core_question_indices_do_not_select_other_questions():
+    module = M1ProblemUnderstanding(coverage_max_rounds=1)
+    module.client = SequenceClient([
+        {**MERGE, "core_intent_question_indices": [0, -1, 99]},
+        {"sub_questions": ["What is CRISPR?"]},
+        {**PASS, "core_intent_covered": False},
+    ])
+    with pytest.raises(ValueError, match="core user intent remains uncovered"):
+        await module._check_subquestion_coverage(
+            "Propose a CRISPR hypothesis", ["How can a unified editing system be designed?"],
+        )
+    assert "How can a unified editing system be designed?" not in module.client.calls[-1]["user_prompt"]
+
+
+@pytest.mark.asyncio
 async def test_relevance_query_keeps_nerf_alias_without_forced_output_artifacts():
     client = SequenceClient([{"queries": [{"text": 'NeRF AND "scene understanding"',
                                           "tool": "semantic_scholar", "purpose": "methods"}]}])

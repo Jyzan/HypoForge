@@ -83,6 +83,10 @@ class _FollowupTriageDecision(BaseModel):
 class _SubQuestionCoverage(BaseModel):
     sufficient: bool = False
     core_intent_covered: bool = False
+    core_intent_question_indices: List[int] = Field(
+        default_factory=list,
+        description="One-based indices of questions explicitly preserving the original core action",
+    )
     missing_aspects: List[str] = []
     over_fragmented: bool = False
     merge_instructions: List[str] = []
@@ -460,6 +464,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
             return questions
 
         started_at = time.monotonic()
+        protected_questions: List[str] = []
 
         def render(items: List[str]) -> str:
             return "\n".join(f"- {item}" for item in items)
@@ -480,6 +485,14 @@ class M1ProblemUnderstanding(ModuleProtocol):
                 ),
             )
             audit = _SubQuestionCoverage.model_validate(payload)
+            if audit.core_intent_covered:
+                audited_anchors = [
+                    questions[index - 1]
+                    for index in audit.core_intent_question_indices
+                    if 1 <= index <= len(questions)
+                ]
+                if audited_anchors:
+                    protected_questions = list(dict.fromkeys(audited_anchors))
             emit_event(
                 "m1_subquestion_coverage",
                 module="m1",
@@ -490,6 +503,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
                     "round": round_index,
                     "sufficient": audit.sufficient,
                     "core_intent_covered": audit.core_intent_covered,
+                    "core_intent_question_indices": list(audit.core_intent_question_indices),
                     "missing_aspects": list(audit.missing_aspects),
                     "over_fragmented": audit.over_fragmented,
                     "merge_instructions": list(audit.merge_instructions),
@@ -521,7 +535,11 @@ class M1ProblemUnderstanding(ModuleProtocol):
                         user_prompt=M1_COVERAGE_MERGE_USER_TEMPLATE.format(
                             question=question,
                             sub_questions_text=render(questions),
-                            merge_instructions_text=render(audit.merge_instructions),
+                            merge_instructions_text=(
+                                render(audit.merge_instructions)
+                                + "\nKeep these independently audited core-action questions verbatim:\n"
+                                + render(protected_questions)
+                            ),
                         ),
                         output_schema=_SubQuestionSupplement.model_json_schema(),
                         max_tokens=4096,
@@ -535,7 +553,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
                     if item.strip()
                 ]
                 if replacement:
-                    questions = list(dict.fromkeys(replacement))
+                    questions = list(dict.fromkeys([*replacement, *protected_questions]))
 
             if not audit.sufficient:
                 supplement_payload = await self._tracked_llm_call(
@@ -569,11 +587,14 @@ class M1ProblemUnderstanding(ModuleProtocol):
                 questions = await self._merge_subquestions_to_limit(
                     question,
                     questions,
+                    protected_questions=protected_questions,
                 )
 
             violations = self._sub_question_violations(questions)
             if violations:
-                questions = await self._repair_subquestion_shape(question, questions)
+                questions = await self._repair_subquestion_shape(
+                    question, questions, protected_questions=protected_questions,
+                )
 
         final_payload = await self._tracked_llm_call(
             "qwen_subquestion_coverage_final",
@@ -611,6 +632,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
 
     async def _repair_subquestion_shape(
         self, question: str, questions: List[str],
+        *, protected_questions: List[str] | None = None,
     ) -> List[str]:
         """One semantic rewrite; the coverage loop audits the rewritten list."""
         violations = self._sub_question_violations(questions)
@@ -629,6 +651,8 @@ class M1ProblemUnderstanding(ModuleProtocol):
                         "Preserve every required aspect and the core action. Do not "
                         "truncate text or invent a method.\n"
                         + "\n".join(f"- {item}" for item in violations)
+                        + "\nKeep these independently audited core-action questions verbatim:\n"
+                        + "\n".join(protected_questions or [])
                     ),
                 ),
                 output_schema=_SubQuestionSupplement.model_json_schema(),
@@ -640,6 +664,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
             for item in _SubQuestionSupplement.model_validate(payload).sub_questions
             if item.strip()
         ))
+        result = list(dict.fromkeys([*result, *(protected_questions or [])]))
         remaining = self._sub_question_violations(result)
         if not result or remaining:
             raise ValueError(
@@ -653,6 +678,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
         self,
         question: str,
         sub_questions: List[str],
+        *, protected_questions: List[str] | None = None,
     ) -> List[str]:
         """Semantically merge overflow instead of dropping questions by position."""
 
@@ -669,6 +695,8 @@ class M1ProblemUnderstanding(ModuleProtocol):
                         "Merge overlapping or adjacent aspects so the complete "
                         "list contains at most 5 atomic sub-questions. Preserve "
                         "the original core action and every indispensable aspect."
+                        "\nKeep these independently audited core-action questions verbatim:\n"
+                        + "\n".join(protected_questions or [])
                     ),
                 ),
                 output_schema=_SubQuestionSupplement.model_json_schema(),
@@ -682,9 +710,12 @@ class M1ProblemUnderstanding(ModuleProtocol):
             for item in merged.sub_questions
             if item.strip()
         ))
+        result = list(dict.fromkeys([*result, *(protected_questions or [])]))
         violations = self._sub_question_violations(result)
         if violations:
-            result = await self._repair_subquestion_shape(question, result)
+            result = await self._repair_subquestion_shape(
+                question, result, protected_questions=protected_questions,
+            )
         if not result:
             raise ValueError("sub-question limit merge returned no questions")
         return result
