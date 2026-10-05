@@ -93,15 +93,40 @@ Semantic Scholar 不可用时，PubMed 对计算机和物理学科的覆盖可�
 审核评估未来回答能否完成任务，不要求 M1 已生成具体假说或实验结果；
 M1 不预选用户未指定的协同机制、系统或疾病位点。此修复使用新实验指纹。
 先用 `--sample pilot --limit 1 --workers 1 --llm-concurrency 4` 和新目录
-`output/agentideabench/glm51-siliconflow-smoke-v3` 验证完整管线，再扩大试跑。
+`output/agentideabench/glm51-siliconflow-smoke-v4` 验证完整管线，再扩大试跑。
 
 硅基流动配置将七候选生成拆为 2/2/2/1 小批次，保留全部候选的审查与前三选择；
-三个独立内部评审并发执行，每个评审的输出上限改为 2048 tokens。阶段时间上限
-及检索预算未改变，Semantic Scholar 单次查询等待与重试预算由 15 秒改为 25 秒，
+三个独立内部评审并发执行，每个评审的输出上限改为 2048 tokens。检索预算保留，
+Semantic Scholar 单次查询等待与重试预算由 15 秒改为 25 秒，
 仍小于源检索的 30 秒上限。这些是明确记录的新生成条件，不是论文资源匹配复现。
 若 M4 恢复后仍没有有效模型候选，该配置直接记为失败；确定性降级候选不能导出
 为有效测评结果。终端显示各模块开始/结束，详细事件与阶段快照保存在每次尝试的
 `telemetry/` 目录。原失败目录保留，修复版必须使用新的输出目录。
+
+单样本 v3 已通过 M1–M3，并生成七个候选。M4 的 540 秒共享预算在完整边界
+审核中耗尽，Critic 尚未发出请求便失败。硅基流动配置现在将边界审核拆为
+2/2/2/1 批次，最多并发两批，仍逐一审核全部候选并保留原来的质量检查；
+生成批次仍顺序执行以避免重复。M4 共享预算改为 900 秒，管线节点上限改为
+1200 秒，为后续 Critic、可证伪性、排序及证据检查留出时间。其他阶段的
+上限保留。预算耗尽会报告发生的步骤，而不是包装为科学性评审失败。
+这些预算及审核批次变更进入实验指纹，不能复用 v3 输出目录。使用已有 M3
+快照重放 M4 的诊断结果只验证后续模块，不计为新的完整基准样本。
+
+调试入口 `run_agentideabench_diagnostic.py` 可以从成功的 M3 或 M4 状态继续。
+例如，从 M4 状态仅验证 M5–M6：
+
+```bash
+caffeinate -i python -u run_agentideabench_diagnostic.py \
+  --after m4 --state /path/to/successful-m4-state.json \
+  --config configs/agentideabench_glm51_siliconflow.yaml \
+  --api-key-file ../llm_api.txt \
+  --output-dir output/agentideabench/post-m4-diagnostic-v4
+```
+
+该入口保留标准模型和质量检查，给 M6 一次评审机会，关闭自动迭代。
+它使用新缓存和新输出目录，记录源状态哈希及诊断条件，不能覆盖已有目录，
+不会导出基准 submission，也不运行外部评分。`completed` 表示后续流程执行完成，
+假说质量需另看评审结果。正式评测仍从头运行完整、指纹一致的标准配置。
 
 本地 Mac 可执行以下命令。`caffeinate -i` 在生成进程运行期间阻止空闲休眠；
 两条管线共享 8 个文本请求并发名额，M2 仍按顺序运行。
@@ -118,7 +143,7 @@ export SEMANTIC_SCHOLAR_API_KEY="$(cat '../semantic_scholar_api.txt')"
 export SEMANTIC_SCHOLAR_MIN_INTERVAL_SECONDS=5
 export HF_API_KEY_FILE="../llm_api.txt"
 export HF_CONFIG="configs/agentideabench_glm51_siliconflow.yaml"
-export HF_OUTPUT="output/agentideabench/glm51-siliconflow-pilot-v2"
+export HF_OUTPUT="output/agentideabench/glm51-siliconflow-pilot-v4"
 
 python run_agentideabench.py --phase check --check-scope generation \
   --config "$HF_CONFIG" --api-key-file "$HF_API_KEY_FILE" && \

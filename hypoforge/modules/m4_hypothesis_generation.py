@@ -80,6 +80,10 @@ from ..tools.qwen_client import QwenClient, track_token_scope
 logger = logging.getLogger(__name__)
 
 
+class M4TimeBudgetExceeded(TimeoutError):
+    """The shared stage budget expired, independently of a quality verdict."""
+
+
 class M4RefinementRequired(Exception):
     """Raised when M4 cannot form an acceptable whole-question hypothesis.
 
@@ -161,6 +165,8 @@ class M4HypothesisGeneration(ModuleProtocol):
         semantic_alignment_timeout_seconds: float = 60.0,
         fast_mode: bool = False,
         generator_batch_size: int = 0,
+        epistemic_audit_batch_size: int = 0,
+        epistemic_audit_concurrency: int = 1,
         allow_continuity_fallback: bool = True,
         **kwargs,
     ):
@@ -171,6 +177,10 @@ class M4HypothesisGeneration(ModuleProtocol):
         if generator_batch_size < 0:
             raise ValueError("generator_batch_size cannot be negative")
         self.generator_batch_size = int(generator_batch_size)
+        if epistemic_audit_batch_size < 0 or epistemic_audit_concurrency < 1:
+            raise ValueError("Epistemic audit batch size must be nonnegative and concurrency positive")
+        self.epistemic_audit_batch_size = int(epistemic_audit_batch_size)
+        self.epistemic_audit_concurrency = int(epistemic_audit_concurrency)
         self.allow_continuity_fallback = bool(allow_continuity_fallback)
         self.llm_config = llm_config
         # Composite weights come from a single source (PipelineConfig.scoring →
@@ -202,7 +212,7 @@ class M4HypothesisGeneration(ModuleProtocol):
     # LLM helpers
     # ------------------------------------------------------------------
 
-    def _tool_call(
+    async def _tool_call(
         self,
         tool: str,
         operation,
@@ -217,14 +227,29 @@ class M4HypothesisGeneration(ModuleProtocol):
                 close = getattr(operation, "close", None)
                 if callable(close):
                     close()
-                raise RuntimeError("M4 exhausted its shared LLM time budget")
+                raise self._budget_error(tool)
             timeout = min(timeout, remaining)
-        return self._observe_tool(
-            tool,
-            operation,
-            details=details,
-            timeout=timeout,
+        try:
+            return await self._observe_tool(
+                tool, operation, details=details, timeout=timeout,
+            )
+        except TimeoutError as exc:
+            if self._run_deadline is not None and time.monotonic() >= self._run_deadline:
+                raise self._budget_error(tool) from exc
+            raise
+
+    def _budget_error(self, tool: str) -> M4TimeBudgetExceeded:
+        message = (
+            f"M4 exhausted its shared LLM time budget "
+            f"({self.total_time_budget_seconds:g} seconds) at {tool}; "
+            "this is a runtime failure, not a scientific rejection"
         )
+        emit_event(
+            "m4_time_budget_exhausted", module="m4", tool=tool,
+            status="failed", message=message,
+            details={"total_time_budget_seconds": self.total_time_budget_seconds},
+        )
+        return M4TimeBudgetExceeded(message)
 
     @staticmethod
     async def _observe_tool(
@@ -1128,7 +1153,32 @@ class M4HypothesisGeneration(ModuleProtocol):
         cards: List[HypothesisCard],
         context: GraphContext,
     ) -> tuple[List[HypothesisCard], List[EpistemicContractDiagnostic]]:
-        """Run exactly one LLM epistemic audit, then deterministic normalization."""
+        """Audit each card once, then normalize; optionally use bounded batches."""
+
+        if self.epistemic_audit_batch_size and len(cards) > self.epistemic_audit_batch_size:
+            batches = [
+                cards[offset:offset + self.epistemic_audit_batch_size]
+                for offset in range(0, len(cards), self.epistemic_audit_batch_size)
+            ]
+            gate = asyncio.Semaphore(self.epistemic_audit_concurrency)
+
+            async def audit_batch(batch):
+                async with gate:
+                    return await self._audit_and_repair_epistemic_structure(state, batch, context)
+
+            tasks = [asyncio.create_task(audit_batch(batch)) for batch in batches]
+            try:
+                results = await asyncio.gather(*tasks)
+            except BaseException:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+            return (
+                [card for repaired, _ in results for card in repaired],
+                [diagnostic for _, diagnostics in results for diagnostic in diagnostics],
+            )
 
         normalized = [
             normalize_hypothesis_grounding(card, context)
@@ -1193,6 +1243,8 @@ class M4HypothesisGeneration(ModuleProtocol):
                 ),
                 details={"candidates": len(normalized), "repair_attempt": 1},
             )
+        except M4TimeBudgetExceeded:
+            raise
         except Exception as exc:
             emit_event(
                 "epistemic_contract_failed",

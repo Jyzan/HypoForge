@@ -15,6 +15,7 @@ from hypoforge.modules.m1_problem_understanding import M1ProblemUnderstanding
 from hypoforge.modules.m2_literature.search.query_planner import QueryPlanner, _sanitize_query
 from hypoforge.modules.m2_literature.search.round_plan import classify_entities
 from hypoforge.modules.m4_hypothesis_generation import M4HypothesisGeneration
+from hypoforge.modules.m4_hypothesis_generation import M4TimeBudgetExceeded
 from hypoforge.state import HypothesisCard, PipelineState
 from hypoforge.tools import semantic_scholar as s2
 from hypoforge.tools.qwen_client import QwenClient
@@ -139,6 +140,146 @@ async def test_invalid_core_question_indices_do_not_select_other_questions():
             "Propose a CRISPR hypothesis", ["How can a unified editing system be designed?"],
         )
     assert "How can a unified editing system be designed?" not in module.client.calls[-1]["user_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_epistemic_batches_audit_every_card_and_preserve_order_and_diagnostics():
+    from hypoforge.graph_context import build_graph_context
+    active = peak = 0
+    seen = []
+
+    class Client:
+        async def structured_chat(self, **kw):
+            nonlocal active, peak
+            cards = json.loads(kw["user_prompt"].split("Current hypotheses:\n")[1]
+                               .split("\n\nDeterministic diagnostics:")[0])
+            seen.extend(card["hypothesis_id"] for card in cards)
+            active += 1
+            peak = max(peak, active)
+            try:
+                await asyncio.sleep(.03 if cards[0]["hypothesis_id"] == "H1" else .005)
+                return {"items": [{"hypothesis_id": card["hypothesis_id"],
+                                   "passed": card["hypothesis_id"] != "H2",
+                                   "hidden_factual_claims": ["unsupported fact"] if card["hypothesis_id"] == "H2" else [],
+                                   "overclaim_segments": [], "repair_summary": "audit",
+                                   "corrected_hypothesis": card} for card in cards]}
+            finally:
+                active -= 1
+
+    state = PipelineState(input_question="Propose a CRISPR hypothesis")
+    module = M4HypothesisGeneration(epistemic_audit_batch_size=2, epistemic_audit_concurrency=2)
+    module.client = Client()
+    cards = [HypothesisCard(hypothesis_id=f"H{i}", statement=f"CRISPR intervention {i} changes an outcome.") for i in range(1, 8)]
+    revised, diagnostics = await module._audit_and_repair_epistemic_structure(
+        state, cards, build_graph_context(state),
+    )
+    assert peak == 2
+    assert sorted(seen) == [f"H{i}" for i in range(1, 8)]
+    assert [card.hypothesis_id for card in revised] == [f"H{i}" for i in range(1, 8)]
+    assert [item.hypothesis_id for item in diagnostics] == [f"H{i}" for i in range(1, 8)]
+    assert "hidden_factual_overclaim" in diagnostics[1].codes
+    assert not diagnostics[1].valid
+
+
+@pytest.mark.asyncio
+async def test_shared_budget_expiry_before_critic_is_named_and_sends_no_request():
+    import time
+    from hypoforge.strict_contracts import StrictM4HypothesisGeneration
+    module = StrictM4HypothesisGeneration()
+    module.client = SequenceClient([])
+    module._run_deadline = time.monotonic() - 1
+    with pytest.raises(M4TimeBudgetExceeded, match="shared LLM time budget.*hypothesis_critic"):
+        await module._run_critic(
+            PipelineState(input_question="Propose a CRISPR hypothesis"),
+            [HypothesisCard(hypothesis_id="H1", statement="CRISPR changes an outcome.")],
+        )
+    assert module.client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_shared_budget_expiry_during_audit_propagates_instead_of_skipping_audit():
+    import time
+    from hypoforge.graph_context import build_graph_context
+    module = M4HypothesisGeneration()
+    class SlowClient:
+        async def structured_chat(self, **kwargs):
+            await asyncio.sleep(5)
+    module.client = SlowClient()
+    module._run_deadline = time.monotonic() + .03
+    state = PipelineState(input_question="Propose a CRISPR hypothesis")
+    with pytest.raises(M4TimeBudgetExceeded, match="epistemic_boundary_auditor"):
+        await module._audit_and_repair_epistemic_structure(
+            state, [HypothesisCard(hypothesis_id="H1", statement="CRISPR changes an outcome.")],
+            build_graph_context(state),
+        )
+
+
+@pytest.mark.asyncio
+async def test_failed_epistemic_batch_cancels_its_active_sibling():
+    from hypoforge.graph_context import build_graph_context
+    sibling_started = asyncio.Event()
+    cancelled = []
+    class Client:
+        async def structured_chat(self, **kw):
+            cards = json.loads(kw["user_prompt"].split("Current hypotheses:\n")[1]
+                               .split("\n\nDeterministic diagnostics:")[0])
+            if cards[0]["hypothesis_id"] == "H1":
+                await sibling_started.wait()
+                raise M4TimeBudgetExceeded("Shared stage deadline")
+            sibling_started.set()
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                cancelled.append(cards[0]["hypothesis_id"])
+                raise
+    module = M4HypothesisGeneration(epistemic_audit_batch_size=1, epistemic_audit_concurrency=2)
+    module.client = Client()
+    state = PipelineState(input_question="Propose a CRISPR hypothesis")
+    with pytest.raises(M4TimeBudgetExceeded):
+        await module._audit_and_repair_epistemic_structure(
+            state, [HypothesisCard(hypothesis_id=f"H{i}", statement=f"CRISPR {i} changes an outcome.") for i in range(1, 3)],
+            build_graph_context(state),
+        )
+    assert cancelled == ["H2"]
+
+
+def test_diagnostic_resume_preserves_scientific_gates_and_source_state(tmp_path):
+    from run_agentideabench_diagnostic import prepare_replay
+    from hypoforge.config import PipelineConfig
+    from hypoforge.state import EvidenceGraph, EvidenceNode, EvidenceNodeType, ProblemCard
+    config = PipelineConfig.from_yaml("configs/agentideabench_glm51_siliconflow.yaml")
+    state = PipelineState(
+        input_question="Propose a CRISPR hypothesis", iteration_count=2,
+        problem_card=ProblemCard(original_question="Propose a CRISPR hypothesis"),
+        evidence_graph=EvidenceGraph(nodes=[EvidenceNode(id="N1", type=EvidenceNodeType.ENTITY, label="CRISPR")]),
+        top_hypotheses=[HypothesisCard(hypothesis_id="H1", statement="CRISPR changes an outcome.")],
+    ).model_dump(mode="json")
+    original = json.loads(json.dumps(state))
+    replay_config, seed = prepare_replay(config, state, after="m4", output=tmp_path)
+    assert state == original
+    assert config.enable_iteration is True
+    assert replay_config.run_mode == "standard"
+    assert replay_config.enabled_modules == ["m1", "m2", "m3", "m4", "m5", "m6"]
+    assert replay_config.qwen.base.model == config.qwen.base.model
+    assert replay_config.module_overrides["m6"].kwargs == config.module_overrides["m6"].kwargs
+    assert replay_config.max_iterations == seed["max_iterations"] == 3
+    assert seed["_last_module"] == "m4"
+    assert seed["evidence_graph"] == original["evidence_graph"]
+    assert seed["top_hypotheses"] == original["top_hypotheses"]
+    assert seed["entity_cache_dir"] == str(tmp_path / "entity_cache")
+
+
+def test_diagnostic_cannot_skip_unfinished_m4(tmp_path):
+    from run_agentideabench_diagnostic import prepare_replay
+    from hypoforge.config import PipelineConfig
+    from hypoforge.state import EvidenceGraph, EvidenceNode, EvidenceNodeType, ProblemCard
+    state = PipelineState(
+        input_question="Propose a CRISPR hypothesis",
+        problem_card=ProblemCard(original_question="Propose a CRISPR hypothesis"),
+        evidence_graph=EvidenceGraph(nodes=[EvidenceNode(id="N1", type=EvidenceNodeType.ENTITY, label="CRISPR")]),
+    ).model_dump(mode="json")
+    with pytest.raises(ValueError, match="accepted top hypotheses"):
+        prepare_replay(PipelineConfig(), state, after="m4", output=tmp_path)
 
 
 @pytest.mark.asyncio

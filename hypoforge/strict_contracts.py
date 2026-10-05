@@ -40,6 +40,7 @@ from .modules.m3_evidence_graph import M3EvidenceGraph
 from .modules.m4_hypothesis_generation import (
     M4HypothesisGeneration,
     M4RefinementRequired,
+    M4TimeBudgetExceeded,
 )
 from .modules.m5_research_plan import M5ResearchPlan
 from .modules.m6_review_iteration import M6ReviewIteration
@@ -1349,9 +1350,12 @@ class StrictM4HypothesisGeneration(M4HypothesisGeneration):
                     ),
                     details={"candidates": len(candidates), "attempt": attempt},
                 )
+            except M4TimeBudgetExceeded:
+                raise
             except Exception as exc:
                 raise RuntimeError(
-                    "M4 Critic stage failed; the configured quality gate cannot be skipped."
+                    "M4 Critic stage failed; the configured quality gate cannot be skipped. "
+                    f"Cause: {type(exc).__name__}: {exc}"
                 ) from exc
 
             if not isinstance(result, list):

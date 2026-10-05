@@ -182,6 +182,7 @@ def prepare_manifest(output: Path, root: Path, config, topics: list[dict], repea
         repo / "hypoforge/modules/m2_literature/search/agent.py",
         repo / "hypoforge/modules/m2_literature/reading/access.py",
         repo / "hypoforge/modules/m4_hypothesis_generation.py",
+        repo / "hypoforge/strict_contracts.py",
         repo / "hypoforge/modules/m6_review_iteration.py",
         repo / "hypoforge/modules/m2_literature/reading/arxiv_resolver.py",
         repo / "hypoforge/modules/m2_literature/reading/parser.py",

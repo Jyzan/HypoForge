@@ -7,6 +7,9 @@ interactive: false
 advanced_model_tiers: false
 run_mode: standard
 
+# Preserve native deadlines for other stages; allow generation plus all M4 gates.
+node_timeouts: {m1: 180, m2: 900, m3: 480, m4: 1200, m5: 1200, m6: 360}
+
 pipeline:
   enabled_modules: [m1, m2, m3, m4, m5, m6]
   max_iterations: 3
@@ -53,7 +56,16 @@ module_overrides:
     kwargs: {mode: llm, llm_tier: base}
   m4:
     # Keep the seven-candidate portfolio; use smaller responses per request.
-    kwargs: {mode: multi_agent, llm_tier: base, num_candidates: 7, top_k: 3, generator_batch_size: 2, allow_continuity_fallback: false}
+    kwargs:
+      mode: multi_agent
+      llm_tier: base
+      num_candidates: 7
+      top_k: 3
+      generator_batch_size: 2
+      epistemic_audit_batch_size: 2
+      epistemic_audit_concurrency: 2
+      total_time_budget_seconds: 900
+      allow_continuity_fallback: false
   m5:
     kwargs: {mode: llm, llm_tier: base}
   m6:
