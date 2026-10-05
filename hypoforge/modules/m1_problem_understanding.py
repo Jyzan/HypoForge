@@ -264,6 +264,33 @@ class M1ProblemUnderstanding(ModuleProtocol):
             0.0, min(1.0, float(followup_triage_confidence_threshold))
         )
         self.client = QwenClient.from_config(llm_config) if llm_config else None
+        self._decomposition_attempts = 0
+        self._rewritten_decompositions = 0
+        self._subquestion_rewrite_calls = 0
+        self._current_decomposition_rewritten = False
+
+    def _record_subquestion_rewrite_stats(self, *, triggered: bool = False) -> None:
+        """Record structural rewrite frequency without an extra model call."""
+        if triggered:
+            self._subquestion_rewrite_calls += 1
+            if self._decomposition_attempts and not self._current_decomposition_rewritten:
+                self._rewritten_decompositions += 1
+                self._current_decomposition_rewritten = True
+        emit_event(
+            "m1_subquestion_rewrite_stats",
+            module="m1",
+            status="running",
+            message="M1 structural rewrite statistics updated",
+            details={
+                "decomposition_attempts": self._decomposition_attempts,
+                "rewritten_decompositions": self._rewritten_decompositions,
+                "rewrite_calls": self._subquestion_rewrite_calls,
+                "rewrite_trigger_rate": (
+                    self._rewritten_decompositions / self._decomposition_attempts
+                    if self._decomposition_attempts else 0.0
+                ),
+            },
+        )
 
     @staticmethod
     async def _tracked_llm_call(tool: str, operation: Any) -> Any:
@@ -340,6 +367,9 @@ class M1ProblemUnderstanding(ModuleProtocol):
     # ------------------------------------------------------------------
 
     async def _understand_question(self, question: str) -> ProblemCard:
+        self._decomposition_attempts += 1
+        self._current_decomposition_rewritten = False
+        self._record_subquestion_rewrite_stats()
         started_at = time.monotonic()
         emit_event(
             "tool_started",
@@ -373,6 +403,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
         decomposition = _CandidateDecomposition.model_validate(payload)
         violations = self._sub_question_violations(decomposition.sub_questions)
         if violations:
+            self._record_subquestion_rewrite_stats(triggered=True)
             retry_prompt = "\n".join([
                 M1_USER_TEMPLATE.format(question=question),
                 "The previous decomposition violated the atomic-sub-question contract:",
@@ -638,6 +669,7 @@ class M1ProblemUnderstanding(ModuleProtocol):
         violations = self._sub_question_violations(questions)
         if not violations:
             return questions
+        self._record_subquestion_rewrite_stats(triggered=True)
         payload = await self._tracked_llm_call(
             "qwen_subquestion_atomic_repair",
             self.client.structured_chat(

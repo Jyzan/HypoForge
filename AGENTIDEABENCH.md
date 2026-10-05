@@ -92,6 +92,11 @@ Semantic Scholar 不可用时，PubMed 对计算机和物理学科的覆盖可�
 子问题，合并、数量压缩及原子性修复保留这些问题，随后仍独立复审。
 审核评估未来回答能否完成任务，不要求 M1 已生成具体假说或实验结果；
 M1 不预选用户未指定的协同机制、系统或疾病位点。此修复使用新实验指纹。
+M1 初始分解、覆盖补充和合并提示词现在优先要求 180–200 字符或更短（含空格），
+不为达到目标长度填充文字。代码的 240 字符硬上限及条件重写保留。
+`telemetry/events.jsonl` 的 `m1_subquestion_rewrite_stats` 记录分解尝试次数、
+发生结构重写的分解次数、重写调用次数及触发率；统计本身不调用模型。
+此提示词变更使用新输出目录 `glm51-siliconflow-pilot-v6`。
 当前修复已用已保存状态分别验证 M4 和 M5–M6，可直接按下面的命令进入
 五学科生成试跑。每次方法或预算变更都使用新的输出目录。
 
@@ -156,7 +161,7 @@ export SEMANTIC_SCHOLAR_API_KEY="$(cat '../semantic_scholar_api.txt')"
 export SEMANTIC_SCHOLAR_MIN_INTERVAL_SECONDS=5
 export HF_API_KEY_FILE="../llm_api.txt"
 export HF_CONFIG="configs/agentideabench_glm51_siliconflow.yaml"
-export HF_OUTPUT="output/agentideabench/glm51-siliconflow-pilot-v5"
+export HF_OUTPUT="output/agentideabench/glm51-siliconflow-pilot-v6"
 
 python run_agentideabench.py --phase check --check-scope generation \
   --config "$HF_CONFIG" --api-key-file "$HF_API_KEY_FILE" && \
