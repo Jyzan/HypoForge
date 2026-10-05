@@ -20,10 +20,16 @@ def main() -> int:
     parser.add_argument("--limit", type=int, help="Limit subfields for a smoke test")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--retry-failed", action="store_true", help="Retry failed cells; successful cells are reused")
+    parser.add_argument("--workers", type=int, choices=(1, 2, 3, 4), default=1,
+                        help="Concurrent pipelines in generate; concurrent critics (up to 3) in score")
+    parser.add_argument("--llm-concurrency", type=int, default=8,
+                        help="Shared in-flight text request cap for generation (default: 8)")
     parser.add_argument("--dry-run", action="store_true", help="Print the task plan without API calls or credentials")
     args = parser.parse_args()
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be positive")
+    if args.llm_concurrency < 1:
+        parser.error("--llm-concurrency must be positive")
     from hypoforge.benchmarks import agentideabench as bench
     root = args.agentideabench_root.expanduser().resolve()
     output = (args.output_dir or repo / f"output/agentideabench/glm51-{args.sample}").resolve()
@@ -33,7 +39,11 @@ def main() -> int:
             topics = bench.select_topics(root, args.sample, args.limit)
             print(json.dumps({"output_dir": str(output), "resource_setting": "native", "topics": topics,
                               "pipeline_runs": len(topics) * args.repeats,
-                              "critic_calls_minimum": len(topics) * args.repeats * 3}, ensure_ascii=False, indent=2))
+                              "critic_calls_minimum": len(topics) * args.repeats * 3,
+                              "generation_workers": args.workers,
+                              "generation_llm_concurrency": args.llm_concurrency,
+                              "generation_m2_concurrency": 1,
+                              "scoring_critic_concurrency": min(args.workers, 3)}, ensure_ascii=False, indent=2))
             return 0
         if args.phase == "analyze":
             complete = bench.analyze(output, root)
@@ -46,10 +56,11 @@ def main() -> int:
                 complete = asyncio.run(preflight(config))
             elif args.phase == "generate":
                 topics = bench.select_topics(root, args.sample, args.limit)
-                complete = asyncio.run(bench.generate(output, root, config, topics, args.repeats, args.retry_failed))
+                complete = asyncio.run(bench.generate(output, root, config, topics, args.repeats,
+                                                     args.retry_failed, args.workers, args.llm_concurrency))
             else:
                 from hypoforge.benchmarks.agentideabench_scoring import score
-                complete = score(output, root, config.qwen.base, args.retry_failed)
+                complete = score(output, root, config.qwen.base, args.retry_failed, args.workers)
         return 0 if complete else 1
     except KeyboardInterrupt:
         print("Interrupted. Re-run the same command to continue; use --retry-failed for failed cells.")

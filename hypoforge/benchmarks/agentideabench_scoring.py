@@ -12,9 +12,12 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 
-from .agentideabench import CRITICS, CUTOFF, WEIGHTS, digest, now, read_json, write_json
+from .agentideabench import (CRITICS, CUTOFF, WEIGHTS, digest, experiment_writer,
+                            now, read_json, record_execution, write_json)
 
 
 def load_rubric(root: Path):
@@ -172,7 +175,40 @@ def judge(api: CriticAPI, rubric, scorer, model: str, idea: str, domain: str, ev
     return {"error": "No complete five-dimensional score after three responses", "responses": attempts}
 
 
-def score(output: Path, root: Path, config, retry_failed: bool = False) -> bool:
+def _judge_one(config, rubric, scorer, model, idea, domain, evidence):
+    # Each task owns its SDK client and usage counter. Evidence stays frozen.
+    api = CriticAPI(config)
+    try:
+        try:
+            result = judge(api, rubric, scorer, model, idea, domain, evidence)
+        except Exception as exc:
+            if getattr(exc, "status_code", None) in (401, 403):
+                raise
+            result = {"error": str(exc)}
+        return {**result, "usage": dict(api.usage)}
+    finally:
+        api.client.close()
+
+
+def score(output: Path, root: Path, config, retry_failed: bool = False,
+          workers: int = 1) -> bool:
+    if not 1 <= workers <= 4:
+        raise ValueError("Scoring workers must be between 1 and 4")
+    with experiment_writer(output), ThreadPoolExecutor(max_workers=min(workers, len(CRITICS))) as pool:
+        started = time.monotonic()
+        execution = {"phase": "score", "started_at": now(),
+                     "critic_concurrency": min(workers, len(CRITICS)),
+                     "evidence_concurrency": 1}
+        try:
+            api = CriticAPI(config)
+            with closing(api.client):
+                return _score(output, root, config, retry_failed, pool, api)
+        finally:
+            execution.update(finished_at=now(), elapsed_seconds=time.monotonic() - started)
+            record_execution(output, execution)
+
+
+def _score(output: Path, root: Path, config, retry_failed: bool, pool, api) -> bool:
     rubric, scorer = load_rubric(root)
     manifest = read_json(output / "manifest.json")
     protocol = {"generation_fingerprint": manifest["fingerprint"], "base_url": config.api_base,
@@ -184,7 +220,6 @@ def score(output: Path, root: Path, config, retry_failed: bool = False) -> bool:
     if score_manifest.exists() and read_json(score_manifest) != protocol:
         raise ValueError("Scoring protocol changed; use a separate experiment directory")
     write_json(score_manifest, protocol)
-    api = CriticAPI(config)
     complete = True
     for index, cell in enumerate(manifest["expected_cells"], 1):
         generation_path = output / "cells" / cell["item_id"] / "result.json"
@@ -209,6 +244,7 @@ def score(output: Path, root: Path, config, retry_failed: bool = False) -> bool:
                 evidence = build_evidence(api, rubric, scorer, idea)
                 evidence["usage"] = {k: api.usage[k] - before[k] for k in before}
                 write_json(evidence_path, evidence)
+            pending = []
             for critic in CRITICS:
                 path = directory / f"{critic}.json"
                 old = read_json(path) if path.exists() else None
@@ -218,10 +254,12 @@ def score(output: Path, root: Path, config, retry_failed: bool = False) -> bool:
                     if not old.get("scores"):
                         complete = False
                     continue
-                before = dict(api.usage)
-                result = judge(api, rubric, scorer, critic, idea, cell["domain"], evidence)
+                pending.append((critic, path, pool.submit(
+                    _judge_one, config, rubric, scorer, critic, idea, cell["domain"], evidence)))
+            for critic, path, future in pending:
+                result = future.result()
                 result.update(critic_model=critic, item_id=cell["item_id"], idea_sha256=digest(idea),
-                              created_at=now(), usage={k: api.usage[k] - before[k] for k in before})
+                              created_at=now())
                 write_json(path, result)
                 if "scores" not in result:
                     complete = False
@@ -232,5 +270,4 @@ def score(output: Path, root: Path, config, retry_failed: bool = False) -> bool:
             print(f"  scoring failed: {exc}", flush=True)
             if getattr(exc, "status_code", None) in (401, 403):
                 raise ValueError("API authentication/permission failed; correct credentials before retrying") from exc
-    api.client.close()
     return complete

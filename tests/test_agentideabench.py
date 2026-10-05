@@ -1,6 +1,8 @@
 """Benchmark protocol, resume isolation, scoring completeness and API parameters."""
 
+import asyncio
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -208,3 +210,175 @@ def test_upstream_table2_baseline_when_release_is_present():
     assert len(scores) == 120
     total = sum(bench.weighted(value) for value in scores.values()) / len(scores)
     assert total == pytest.approx(6.3326, abs=0.0001)
+
+
+@pytest.mark.asyncio
+async def test_parallel_generation_bounds_requests_and_isolates_usage(tmp_path, monkeypatch):
+    from hypoforge import pipeline
+    from hypoforge.tools.qwen_client import track_token_usage
+    config = PipelineConfig(qwen={"base": {"model": "glm-5.1", "api_key": "test",
+                                           "enable_thinking": False, "seed": 42}})
+    topic = {"domain": "CS", "subdomain": "test topic"}
+    manifest = {"expected_cells": bench.cells([topic], 3)}
+    monkeypatch.setattr(bench, "prepare_manifest", lambda *args: manifest)
+    counters = {"cases": 0, "case_peak": 0, "m2": 0, "m2_peak": 0, "llm": 0, "llm_peak": 0}
+    observed = []
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            self.seed = kwargs["seed"]
+
+        async def ainvoke(self, messages):
+            counters["llm"] += 1
+            counters["llm_peak"] = max(counters["llm_peak"], counters["llm"])
+            await asyncio.sleep(0.01)
+            counters["llm"] -= 1
+            return SimpleNamespace(content="OK", response_metadata={},
+                                   usage_metadata={"input_tokens": self.seed, "output_tokens": 1})
+
+    class FakeRunner:
+        def __init__(self, cfg):
+            self.config = cfg
+
+        def _make_node_wrapper(self, name, module):
+            async def node(state):
+                counters["m2"] += 1
+                counters["m2_peak"] = max(counters["m2_peak"], counters["m2"])
+                await asyncio.sleep(0.01)
+                counters["m2"] -= 1
+                return {}
+            return node
+
+        async def run(self, question, run_id):
+            counters["cases"] += 1
+            counters["case_peak"] = max(counters["case_peak"], counters["cases"])
+            observed.append((self.config.memory_cache_dir, self.config.entity_cache_dir, run_id))
+            with track_token_usage() as usage:
+                await self._make_node_wrapper("m2", None)(None)
+                await QwenClient.from_config(self.config.qwen.base).chat(user_prompt="test")
+                snapshot = usage.snapshot()
+            counters["cases"] -= 1
+            return SimpleNamespace(total_input_tokens=snapshot["input"], total_output_tokens=snapshot["output"],
+                                   token_usage_by_module={"m1": snapshot}, iteration_count=1, search_round=1,
+                                   literature_results=[], m2_knowledge_export=None,
+                                   search_ledger=SimpleNamespace(model_dump=lambda **kw: {}))
+
+    async def fake_export(config, payload):
+        return "I will " + "test " * 98, {"input": 1, "output": 2, "calls": 1}
+
+    monkeypatch.setattr("hypoforge.tools.qwen_client.ChatOpenAI", FakeLLM)
+    monkeypatch.setattr(pipeline, "PipelineRunner", FakeRunner)
+    monkeypatch.setattr(bench, "select_submission", lambda state: {"hypothesis": {"statement": "claim"}})
+    monkeypatch.setattr(bench, "export_submission", fake_export)
+    assert await bench.generate(tmp_path, tmp_path, config, [topic], 3, workers=2, llm_concurrency=1)
+    assert counters["case_peak"] == 2
+    assert counters["m2_peak"] == counters["llm_peak"] == 1
+    rows = [json.loads(line) for line in (tmp_path / "submissions.jsonl").read_text().splitlines()]
+    assert [row["pipeline_usage"]["input"] for row in rows] == [42, 43, 44]
+    assert all(row["pipeline_usage"]["calls"] == 1 for row in rows)
+    assert len({row[0] for row in observed}) == len({row[1] for row in observed}) == 3
+    assert await bench.generate(tmp_path, tmp_path, config, [topic], 3, workers=4)
+    assert len(observed) == 3
+    executions = [json.loads(line) for line in (tmp_path / "execution_history.jsonl").read_text().splitlines()]
+    assert [entry["workers"] for entry in executions] == [2, 4]
+
+
+def test_experiment_rejects_another_writer_and_releases_lock(tmp_path):
+    with bench.experiment_writer(tmp_path):
+        with pytest.raises(ValueError, match="Another generator/scorer"):
+            with bench.experiment_writer(tmp_path):
+                pass
+    with bench.experiment_writer(tmp_path):
+        pass
+
+
+@pytest.mark.parametrize("failed_critic", [None, bench.CRITICS[1]])
+def test_parallel_critics_share_one_evidence_and_resume_only_failures(tmp_path, monkeypatch, failed_critic):
+    topic = {"domain": "CS", "subdomain": "test topic"}
+    cell = bench.cells([topic], 1)[0]
+    bench.write_json(tmp_path / "manifest.json", {"fingerprint": "test", "expected_cells": [cell]})
+    bench.write_json(tmp_path / "cells" / cell["item_id"] / "result.json",
+                     {"status": "success", "idea_text": "idea"})
+    rubric = SimpleNamespace(LIT8D_SYSTEM="rubric", EXTRACT_SYSTEM="extract", EXTRACT_TEMPLATE="queries")
+    scorer = SimpleNamespace(USER_TEMPLATE="prompt")
+    monkeypatch.setattr(scoring, "load_rubric", lambda root: (rubric, scorer))
+    barrier = threading.Barrier(3)
+    observations, clients = [], []
+    evidence_calls = []
+    retrying = False
+
+    class FakeAPI:
+        def __init__(self, config):
+            self.usage = {"input": 0, "output": 0, "calls": 0}
+            self.closed = False
+            self.client = SimpleNamespace(close=lambda: setattr(self, "closed", True))
+            clients.append(self)
+
+    def fake_evidence(api, rubric, scorer, idea):
+        evidence_calls.append(idea)
+        api.usage.update(input=7, output=1, calls=1)
+        return {"queries": ["q"], "evidence": [], "idea_sha256": bench.digest(idea)}
+
+    def fake_judge(api, rubric, scorer, model, idea, domain, evidence):
+        if not retrying:
+            barrier.wait(timeout=3)
+        assert evidence["idea_sha256"] == bench.digest(idea)
+        assert (tmp_path / "scores" / cell["item_id"] / "evidence.json").exists()
+        observations.append((model, id(api)))
+        api.usage.update(input=10 + bench.CRITICS.index(model), output=2, calls=1)
+        if model == failed_critic and not retrying:
+            return {"error": "invalid critic response"}
+        return {"scores": {dimension: 5 for dimension in bench.WEIGHTS}, "responses": ["raw"]}
+
+    monkeypatch.setattr(scoring, "CriticAPI", FakeAPI)
+    monkeypatch.setattr(scoring, "build_evidence", fake_evidence)
+    monkeypatch.setattr(scoring, "judge", fake_judge)
+    config = SimpleNamespace(api_base="https://example.test/v1")
+    assert scoring.score(tmp_path, tmp_path, config, workers=3) is (failed_critic is None)
+    assert len({identifier for _, identifier in observations}) == 3
+    for index, model in enumerate(bench.CRITICS):
+        result = bench.read_json(tmp_path / "scores" / cell["item_id"] / f"{model}.json")
+        assert result["usage"] == {"input": 10 + index, "output": 2, "calls": 1}
+    retrying = True
+    assert scoring.score(tmp_path, tmp_path, config, retry_failed=True, workers=1)
+    assert len(observations) == 3 + int(failed_critic is not None)
+    assert evidence_calls == ["idea"]
+    assert all(client.closed for client in clients)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_parallel_generation_persists_failures_and_unlocks(tmp_path, monkeypatch):
+    from hypoforge import pipeline
+    config = PipelineConfig(qwen={"base": {"model": "glm-5.1", "api_key": "test",
+                                           "enable_thinking": False, "seed": 42}})
+    topic = {"domain": "CS", "subdomain": "test topic"}
+    manifest = {"expected_cells": bench.cells([topic], 3)}
+    monkeypatch.setattr(bench, "prepare_manifest", lambda *args: manifest)
+    both_started = asyncio.Event()
+    blocked = asyncio.Event()
+    active = 0
+
+    class FakeRunner:
+        def __init__(self, config):
+            pass
+
+        async def run(self, *args, **kwargs):
+            nonlocal active
+            active += 1
+            if active == 2:
+                both_started.set()
+            await blocked.wait()
+
+    monkeypatch.setattr(pipeline, "PipelineRunner", FakeRunner)
+    task = asyncio.create_task(bench.generate(tmp_path, tmp_path, config, [topic], 3, workers=2))
+    await asyncio.wait_for(both_started.wait(), timeout=3)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    summary = bench.read_json(tmp_path / "generation_summary.json")
+    assert summary["statuses"] == {"pipeline_failed": 2, "pending": 1}
+    for cell in manifest["expected_cells"][:2]:
+        result = bench.read_json(tmp_path / "cells" / cell["item_id"] / "result.json")
+        assert "interrupted" in result["error"]
+    with bench.experiment_writer(tmp_path):
+        pass

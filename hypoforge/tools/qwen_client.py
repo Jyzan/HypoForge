@@ -18,6 +18,7 @@ Usage::
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -142,6 +143,30 @@ _CURRENT_TOKEN_SCOPE: ContextVar[TokenUsageTracker | None] = ContextVar(
     "hypoforge_token_usage_scope",
     default=None,
 )
+
+_CURRENT_LLM_GATE: ContextVar[asyncio.Semaphore | None] = ContextVar(
+    "hypoforge_llm_concurrency_gate", default=None,
+)
+
+
+@contextmanager
+def limit_llm_concurrency(limit: int) -> Iterator[None]:
+    """Share an in-flight request cap across this batch's async child tasks."""
+    if limit < 1:
+        raise ValueError("LLM concurrency must be positive")
+    token = _CURRENT_LLM_GATE.set(asyncio.Semaphore(limit))
+    try:
+        yield
+    finally:
+        _CURRENT_LLM_GATE.reset(token)
+
+
+async def _invoke_llm(llm, messages):
+    gate = _CURRENT_LLM_GATE.get()
+    if gate is None:
+        return await llm.ainvoke(messages)
+    async with gate:
+        return await llm.ainvoke(messages)
 
 
 @contextmanager
@@ -419,7 +444,7 @@ class QwenClient:
         )
 
         try:
-            response = await llm.ainvoke(messages)
+            response = await _invoke_llm(llm, messages)
             self._record_tokens(response)
             content = response.content
 
@@ -523,7 +548,7 @@ class QwenClient:
                 disable_thinking=disable_thinking,
                 model_kwargs=response_format_kwargs,
             )
-            response = await llm_with_format.ainvoke(messages)
+            response = await _invoke_llm(llm_with_format, messages)
             self._record_tokens(response)
         except Exception:
             if disable_thinking:
@@ -540,7 +565,7 @@ class QwenClient:
                         disable_thinking=False,
                         model_kwargs=response_format_kwargs,
                     )
-                    response = await llm_rfmt.ainvoke(messages)
+                    response = await _invoke_llm(llm_rfmt, messages)
                     self._record_tokens(response)
                 except Exception:
                     logger.debug(
@@ -561,7 +586,7 @@ class QwenClient:
                 temperature=temperature,
                 disable_thinking=False,
             )
-            response = await llm.ainvoke(messages)
+            response = await _invoke_llm(llm, messages)
             self._record_tokens(response)
 
         content = response.content

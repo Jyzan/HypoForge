@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import gzip
 import hashlib
@@ -11,6 +12,7 @@ import statistics
 import subprocess
 import time
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -48,6 +50,28 @@ def write_json(path: Path, value) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     temporary.replace(path)
+
+
+@contextmanager
+def experiment_writer(output: Path):
+    """One generator/scorer owns a directory; workers share that owner."""
+    import fcntl
+    output.mkdir(parents=True, exist_ok=True)
+    with (output / ".benchmark-writer.lock").open("a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValueError("Another generator/scorer is using this output directory") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def record_execution(output: Path, execution: dict) -> None:
+    """Record scheduling separately, allowing worker changes when resuming."""
+    with (output / "execution_history.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(execution, ensure_ascii=False) + "\n")
 
 
 def released_scores(root: Path):
@@ -213,16 +237,48 @@ def refresh_exports(output: Path, manifest: dict) -> dict:
 
 
 async def generate(output: Path, root: Path, config, topics: list[dict], repeats: int,
-                   retry_failed: bool = False) -> bool:
+                   retry_failed: bool = False, workers: int = 1,
+                   llm_concurrency: int = 8) -> bool:
+    from hypoforge.tools.qwen_client import limit_llm_concurrency
+    if not 1 <= workers <= 4:
+        raise ValueError("Generation workers must be between 1 and 4")
+    with experiment_writer(output), limit_llm_concurrency(llm_concurrency):
+        started = time.monotonic()
+        execution = {"phase": "generate", "started_at": now(), "workers": workers,
+                     "llm_concurrency": llm_concurrency, "m2_concurrency": 1}
+        try:
+            return await _generate(output, root, config, topics, repeats, retry_failed, workers)
+        finally:
+            execution.update(finished_at=now(), elapsed_seconds=time.monotonic() - started)
+            record_execution(output, execution)
+
+
+async def _generate(output: Path, root: Path, config, topics: list[dict], repeats: int,
+                    retry_failed: bool, workers: int) -> bool:
     from hypoforge.pipeline import PipelineRunner
     manifest = prepare_manifest(output, root, config, topics, repeats)
-    for index, cell in enumerate(manifest["expected_cells"], 1):
+    m2_gate = asyncio.Semaphore(1)
+
+    class BatchRunner(PipelineRunner):
+        def _make_node_wrapper(self, name, module):
+            node = super()._make_node_wrapper(name, module)
+            if name != "m2":
+                return node
+
+            async def serial_literature(state):
+                # Queue before the native node starts its timers. This prevents
+                # parallel cases from exhausting retrieval deadlines in a queue.
+                async with m2_gate:
+                    return await node(state)
+            return serial_literature
+
+    async def run_cell(index, cell):
         directory = output / "cells" / cell["item_id"]
         result_path = directory / "result.json"
         old = read_json(result_path) if result_path.exists() else {}
         if old and (old["status"] == "success" or not retry_failed):
             print(f"[{index}/{len(manifest['expected_cells'])}] {old['status']}: {cell['subdomain']}", flush=True)
-            continue
+            return
         history = list(old.get("attempt_history", []))
         if old:
             history.append({k: old[k] for k in ("status", "attempt", "error", "elapsed_seconds",
@@ -245,7 +301,7 @@ async def generate(output: Path, root: Path, config, topics: list[dict], repeats
                 run_config.output_dir = str(run_directory)
                 run_config.memory_cache_dir = str(run_directory / "knowledge_graph")
                 run_config.entity_cache_dir = str(run_directory / "entity_cache")
-                runner = PipelineRunner(run_config)
+                runner = BatchRunner(run_config)
                 run_id = f"{cell['item_id']}-a{record['attempt']}"
                 state = await runner.run(QUESTION.format(**cell), run_id=run_id)
                 record["state_path"] = str(run_directory / f"{run_id}.json")
@@ -267,13 +323,31 @@ async def generate(output: Path, root: Path, config, topics: list[dict], repeats
             paragraph, export_usage = await export_submission(config, record["submission_source"])
             record.update(status="success", idea_text=paragraph, word_count=len(paragraph.split()),
                           export_usage=export_usage)
+        except asyncio.CancelledError:
+            record["error"] = "Generation interrupted; use --retry-failed to retry"
+            raise
         except Exception as exc:
             record["error"] = str(exc)
             print(f"  {record['status']}: {exc}", flush=True)
-        record["elapsed_seconds"] = time.monotonic() - started
-        record["finished_at"] = now()
-        write_json(result_path, record)
-        refresh_exports(output, manifest)
+        finally:
+            record["elapsed_seconds"] = time.monotonic() - started
+            record["finished_at"] = now()
+            write_json(result_path, record)
+            refresh_exports(output, manifest)
+
+    jobs = iter(enumerate(manifest["expected_cells"], 1))
+
+    async def worker():
+        for index, cell in jobs:
+            await run_cell(index, cell)
+
+    tasks = [asyncio.create_task(worker()) for _ in range(workers)]
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
     summary = refresh_exports(output, manifest)
     print(json.dumps(summary, ensure_ascii=False), flush=True)
     return summary["complete"]

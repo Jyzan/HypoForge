@@ -72,8 +72,8 @@ Semantic Scholar 请求间隔限制为 5 秒；该变量不控制独立评分器
 
 ```bash
 python run_agentideabench.py --sample pilot --repeats 1 --dry-run
-python run_agentideabench.py --sample pilot --repeats 1 --api-key-csv "$HF_API_KEY_CSV"
-python run_agentideabench.py --phase score --sample pilot --api-key-csv "$HF_API_KEY_CSV"
+python run_agentideabench.py --sample pilot --repeats 1 --workers 2 --api-key-csv "$HF_API_KEY_CSV"
+python run_agentideabench.py --phase score --sample pilot --workers 3 --api-key-csv "$HF_API_KEY_CSV"
 python run_agentideabench.py --phase analyze --sample pilot
 ```
 
@@ -86,15 +86,37 @@ python run_agentideabench.py --phase analyze --sample pilot
 
 ```bash
 python run_agentideabench.py --sample full --repeats 3 --dry-run
-python run_agentideabench.py --sample full --repeats 3 --api-key-csv "$HF_API_KEY_CSV"
-python run_agentideabench.py --phase score --sample full --api-key-csv "$HF_API_KEY_CSV"
+python run_agentideabench.py --sample full --repeats 3 --workers 2 --api-key-csv "$HF_API_KEY_CSV"
+python run_agentideabench.py --phase score --sample full --workers 3 --api-key-csv "$HF_API_KEY_CSV"
 python run_agentideabench.py --phase analyze --sample full
 ```
 
 输出在 `output/agentideabench/glm51-full/`。正式生成是 120 次独立完整管线运行；
 评分至少涉及 360 次评审调用，另有查询提取、检索和必要的格式重试。
-执行是串行的，便于追踪错误与检索限流。可用 `--output-dir` 保存不同实验。
-同一输出目录应只由一个命令执行生成或评分，避免同时写入。
+默认 `--workers 1`；上面的命令启用受控并行。可用 `--output-dir` 保存不同实验。
+同一输出目录只允许一个生成或评分命令占用，重复启动会被文件锁拒绝。
+
+## 并行与耗时
+
+生成阶段 `--workers 1–4` 控制同时运行的独立管线数。建议先使用 2，检查试跑中
+的耗时、token 用量、429、超时及各模块完成情况，再决定是否升到 4。
+`--llm-concurrency 8` 是所有生成管线和导出调用共享的文本请求并发上限；它不是
+RPM/TPM 限流器，SDK 内部仍可能因服务端限制而重试。出现限流时可降低至 4。
+
+跨管线的 M2 按顺序执行，排队发生在模块计时开始之前，因此不消耗该次 M2 的
+原有时间预算。M2 内部原有来源并发和全局请求间隔保留，M1、M3–M6 和导出可与
+另一条管线重叠。每条假说仍有独立的 runner、状态、知识图、实体缓存、随机种子和
+用量计数；并行不会把单次 top-3 当作三个独立实验。
+
+评分阶段 `--workers 3` 让三个评审同时读取该假说已经冻结的同一份证据，各有独立
+客户端和用量计数；证据提取和 Semantic Scholar 查询保持串行。失败评审单独保存，
+`--retry-failed` 复用成功评审及既有证据。
+
+`execution_history.jsonl` 记录每次调用的并发设置和实际总耗时。仅改变 worker 数或
+文本并发上限可以继续同一实验；科学配置、任务集和已记录源码变更仍需新输出目录。
+同一个检索 Key 建议只运行一个实验进程，通过本入口的 workers 增加并行。
+120 次管线的耗时取决于真实样本、迭代次数和检索占比。M2 仍是串行部分，4 条管线
+不能保证四倍提速，先用五学科试跑的吞吐量估计正式生成时间。
 
 ## 恢复与结果
 
@@ -111,6 +133,7 @@ python run_agentideabench.py --phase analyze --sample full
 - `submissions.jsonl`：所有成功导出的假说；遗漏项同时列在 `generation_summary.json`。
 - `scores/<item_id>/`：冻结的检索证据、三位评审的原始输出与用量。
 - `score_manifest.json`：评审接口、提示词摘要、截止日期与评分参数。
+- `execution_history.jsonl`：每次执行的并发设置、起止时间与实际总耗时。
 - `comparison.json`：总分、五维分数、相同子领域历史基线、差值、胜率及按子领域配对
   bootstrap 的 95% 区间；未完成时列出遗漏项，不产生完整总分。
 
@@ -152,5 +175,6 @@ python run_agentideabench.py --phase analyze --sample full
 python -m pytest tests/test_agentideabench.py tests/test_pipeline.py -q
 ```
 
-测试涵盖 API 参数在 JSON 回退中的保持、CSV 解析、独立缓存、恢复、检索失败、
-逐维度聚合和缺失评审处理。同级 AgentIdeaBench 存在时还验证历史 6.33 基线。
+测试涵盖 API 参数在 JSON 回退中的保持、CSV 解析、并行状态/用量隔离、M2 与文本
+并发上限、取消恢复、目录写锁、共享评分证据、失败评审重试、检索失败、逐维度
+聚合和缺失评审处理。同级 AgentIdeaBench 存在时还验证历史 6.33 基线。
